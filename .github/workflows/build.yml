@@ -1,0 +1,109 @@
+name: build
+
+# The two things this build needs cannot come from a public registry:
+#
+#   vars.XCLANG_URL              tarball of the xclang tree (C++23 modules)
+#   vars.HTTPANT_REGISTRY_URL    git URL of the vcpkg registry that serves httpant
+#   vars.HTTPANT_GIT_URL         current httpant source repository
+#
+# Until they are set the job skips with a notice instead of failing: the compiler
+# and one of the dependencies are not public.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    if: vars.XCLANG_URL != '' && vars.HTTPANT_REGISTRY_URL != '' && vars.HTTPANT_GIT_URL != ''
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        working-directory: fughetta-service
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-x64
+            os: ubuntu-24.04
+          - name: macos-arm64
+            os: macos-15
+          - name: windows-x64
+            os: windows-2025
+    env:
+      # Everything else is derived from these two: the xclang target from the host,
+      # the vcpkg triplet from the target.
+      VCPKG_ROOT: ${{ github.workspace }}/.vcpkg
+      HTTPANT_GIT_URL: ${{ vars.HTTPANT_GIT_URL }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          path: fughetta-service
+
+
+      - name: Fetch xclang
+        shell: bash
+        run: |
+          set -euo pipefail
+          url="${{ vars.XCLANG_URL }}"
+          case "$url" in
+            *.tar.zst) curl -fsSL "$url" -o "$RUNNER_TEMP/xclang.tar"; tar --use-compress-program=unzstd -xf "$RUNNER_TEMP/xclang.tar" -C "$RUNNER_TEMP" ;;
+            *.tar.xz)  curl -fsSL "$url" -o "$RUNNER_TEMP/xclang.tar"; tar -xf "$RUNNER_TEMP/xclang.tar" -C "$RUNNER_TEMP" ;;
+            *)         curl -fsSL "$url" -o "$RUNNER_TEMP/xclang.tar"; tar -xzf "$RUNNER_TEMP/xclang.tar" -C "$RUNNER_TEMP" ;;
+          esac
+          # The archive holds one top-level xclang/ directory.
+          echo "XCLANG_ROOT=$RUNNER_TEMP/xclang" >> "$GITHUB_ENV"
+          echo "XCLANG_ROOT=$RUNNER_TEMP/xclang" >> "$GITHUB_PATH"
+
+      - name: Install vcpkg (latest)
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone --depth 1 https://github.com/microsoft/vcpkg "$VCPKG_ROOT"
+          if [ -f "$VCPKG_ROOT/bootstrap-vcpkg.sh" ]; then
+            "$VCPKG_ROOT/bootstrap-vcpkg.sh" -disableMetrics
+          else
+            "$VCPKG_ROOT/bootstrap-vcpkg.bat" -disableMetrics
+          fi
+
+      - name: Cache vcpkg binaries
+        uses: actions/cache@v4
+        with:
+          path: ${{ github.workspace }}/.vcpkg/downloads
+          key: vcpkg-${{ runner.os }}-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json') }}
+          restore-keys: vcpkg-${{ runner.os }}-
+
+      - name: Fetch current dependency sources
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone --depth 1 "${{ vars.HTTPANT_REGISTRY_URL }}" ../vcpkg-registry
+          git clone --depth 1 "$HTTPANT_GIT_URL" ../httpant
+
+      - name: Configure
+        shell: bash
+        run: cmake -B build/debug -G Ninja -DCMAKE_TOOLCHAIN_FILE=cmake/toolchain.cmake -DCMAKE_BUILD_TYPE=Debug -DSANITIZERS=address,undefined
+
+      - name: Build
+        shell: bash
+        run: cmake --build build/debug --parallel 2
+
+      - name: Test
+        shell: bash
+        run: ctest --test-dir build/debug --output-on-failure
+
+      - name: Upload logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: logs-${{ matrix.name }}
+          path: |
+            fughetta-service/build/debug/vcpkg-manifest-install.log
+            fughetta-service/build/debug/Testing/Temporary/LastTest.log
+          if-no-files-found: ignore

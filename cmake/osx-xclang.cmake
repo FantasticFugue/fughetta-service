@@ -1,0 +1,6 @@
+if(VCPKG_TARGET_ARCHITECTURE STREQUAL "arm64")
+  set(XCLANG_TARGET aarch64-apple-darwin)
+else()
+  set(XCLANG_TARGET x86_64-apple-darwin)
+endif()
+include("$ENV{XCLANG_ROOT}/lib/cmake/xclang/toolchain.cmake")

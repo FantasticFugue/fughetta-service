@@ -1,0 +1,6 @@
+if(VCPKG_TARGET_ARCHITECTURE STREQUAL "arm64")
+  set(XCLANG_TARGET aarch64-pc-windows-msvc)
+else()
+  set(XCLANG_TARGET x86_64-pc-windows-msvc)
+endif()
+include("$ENV{XCLANG_ROOT}/lib/cmake/xclang/toolchain.cmake")

@@ -1,0 +1,19 @@
+.vs/
+.nvim/
+.idea/
+.vscode/
+.clice/
+build/
+# Machine-specific (absolute xclang/vcpkg paths); keep local presets untracked.
+CMakePresets.json
+CMakeUserPresets.json
+# Local configure/build logs contain absolute paths.
+*.log
+out/
+.env
+.env.*
+!.env.example
+state/
+vcpkg_installed/
+# Local runtime configuration: bearer-token hashes and revision counters.
+config.json

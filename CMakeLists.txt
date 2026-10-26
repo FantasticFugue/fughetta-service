@@ -1,0 +1,86 @@
+cmake_minimum_required(VERSION 4.0)
+project(fughetta-service VERSION 0.1.0 LANGUAGES CXX)
+
+## Language
+#
+# C++23 modules with the standard library as a module; the compiler comes from
+# the xclang tree that cmake/toolchain.cmake selects.
+
+set(CMAKE_CXX_STANDARD 23)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_EXTENSIONS OFF)
+set(CMAKE_CXX_SCAN_FOR_MODULES ON)
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+
+set(SANITIZERS "" CACHE STRING "Comma-separated sanitizers")
+if(SANITIZERS)
+  add_compile_options("-fsanitize=${SANITIZERS}")
+  add_link_options("-fsanitize=${SANITIZERS}")
+endif()
+
+if(WIN32)
+  add_compile_definitions(WIN32_LEAN_AND_MEAN NOMINMAX _WIN32_WINNT=0x0A00)
+  add_link_options("LINKER:/STACK:8388608")
+endif()
+
+## Options
+
+include(CTest)
+option(BUILD_BENCHMARKS "Build benchmarks" OFF)
+
+## Dependencies and modules
+
+include(cmake/dependencies.cmake)
+set(FUGHETTA_SOURCE "${PROJECT_SOURCE_DIR}/src")
+include(cmake/modules.cmake)
+
+foreach(ROLE IN ITEMS gateway source worker)
+  add_module(${ROLE} "${PROJECT_SOURCE_DIR}/src/service/${ROLE}.cppm")
+endforeach()
+add_implementation(worker ${FUGHETTA_SOURCE}/service/join.cppm)
+add_module(runtime "${PROJECT_SOURCE_DIR}/src/service/runtime.cppm")
+target_link_libraries(runtime PUBLIC configuration native coroutine reflection durability)
+target_link_libraries(gateway PRIVATE environment coroutine native signals http protocol mcp
+  configuration usage keyring registry tools front fleet runtime host)
+target_link_libraries(worker PRIVATE coroutine native signals protocol executor configuration durability host runtime tls websocket resolver constants enrollment)
+target_link_libraries(source PRIVATE coroutine native signals protocol configuration server argparse::argparse runtime)
+add_executable(fughetta-service src/fughetta-service.cpp)
+target_link_libraries(fughetta-service PRIVATE gateway source worker)
+
+## Package
+#
+# The modules are installed as sources with the same module registration, so a
+# consumer (the hosted gateway) compiles them with its own compiler: module BMIs
+# are not portable. The services and the test support are not part of it.
+
+include(GNUInstallDirs)
+install(TARGETS fughetta-service RUNTIME DESTINATION "${CMAKE_INSTALL_BINDIR}")
+include(CMakePackageConfigHelpers)
+install(DIRECTORY src/ DESTINATION "${CMAKE_INSTALL_DATADIR}/fughetta-service/src"
+  FILES_MATCHING PATTERN "*.cppm" PATTERN "testing" EXCLUDE PATTERN "service" EXCLUDE)
+install(FILES cmake/dependencies.cmake cmake/modules.cmake DESTINATION "${CMAKE_INSTALL_LIBDIR}/cmake/fughetta-service")
+configure_package_config_file(cmake/fughetta-service-config.cmake.in "${CMAKE_CURRENT_BINARY_DIR}/fughetta-service-config.cmake"
+  INSTALL_DESTINATION "${CMAKE_INSTALL_LIBDIR}/cmake/fughetta-service")
+write_basic_package_version_file("${CMAKE_CURRENT_BINARY_DIR}/fughetta-service-config-version.cmake"
+  VERSION "${PROJECT_VERSION}" COMPATIBILITY SameMinorVersion ARCH_INDEPENDENT)
+install(FILES "${CMAKE_CURRENT_BINARY_DIR}/fughetta-service-config.cmake" "${CMAKE_CURRENT_BINARY_DIR}/fughetta-service-config-version.cmake"
+  DESTINATION "${CMAKE_INSTALL_LIBDIR}/cmake/fughetta-service")
+install(FILES LICENSE DESTINATION "${CMAKE_INSTALL_DATADIR}/licenses/fughetta-service")
+
+## Tests and benchmarks
+#
+# Tests and benchmarks have separate build options.
+
+if(BUILD_TESTING)
+  add_subdirectory(tests)
+endif()
+
+if(BUILD_BENCHMARKS)
+  add_executable(crossing-bench bench/crossing.cpp)
+  target_compile_definitions(crossing-bench PRIVATE ASIO_NO_DEPRECATED ASIO_NO_TS_EXECUTORS)
+  target_link_libraries(crossing-bench PRIVATE coroutine native http asio::asio)
+  if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    add_executable(engine-bench bench/engine.cpp)
+    target_link_libraries(engine-bench PRIVATE engine archive codec content reflection)
+  endif()
+endif()

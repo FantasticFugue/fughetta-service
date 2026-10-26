@@ -1,0 +1,25 @@
+{
+    "dependencies": [
+        "argparse",
+        "c-ares",
+        "asio",
+        "bext-ut",
+        "llhttp",
+        "nghttp2",
+        "nghttp3",
+        "libsodium",
+        "reflectcpp",
+        "sqlite3",
+        {
+            "name": "stdexec"
+        },
+        "zstd",
+        {
+            "name": "httpant",
+            "features": [
+                "io",
+                "tls"
+            ]
+        }
+    ]
+}
