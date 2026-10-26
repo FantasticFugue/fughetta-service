@@ -208,6 +208,32 @@ Worker. Reconnection does not replay interrupted jobs. Pair again after
 revocation using a new configuration path. Local validation and remaining
 limits are recorded in the gateway's [verification entry](../cloud-gateway/README.md#verification).
 
+## C++ and Python toolchains
+
+Projects store build graphs and language-service configurations. Create one with
+`PUT /api/v1/projects/{project}` and a revisioned settings value; source-file
+generation operates on existing projects. Import the project's own source and
+build manifests before executing its tasks.
+
+| Component | Execution and configuration |
+| --- | --- |
+| CMake / CTest | Configure and build with explicit directories, presets, compilers, variables, and targets. The CMake builder's `test` object controls CTest selection, parallelism, timeout, reports, and failure behavior. An empty test selection fails by default. |
+| vcpkg | Install a manifest into `install_dir`; the task exports the installed directory. Point CMake at the selected checkout's `scripts/buildsystems/vcpkg.cmake`, bind `VCPKG_INSTALLED_DIR` to that output, and set `VCPKG_MANIFEST_INSTALL=OFF` when the graph already performs installation. |
+| clice | Read compilation-database outputs from the preparation graph, with explicit cache, compile-flag additions/removals, executable, and environment settings. |
+| uv | Lock, sync, build distributions, and run a command. Environment and distribution directories are explicit; dependency groups, extras, interpreter selection, and offline execution are modeled separately. |
+| ty | Run type checks with import environments and rule severity settings; warnings fail by default. Its language server has independent diagnostic, completion, inlay-hint, and configuration settings. |
+| Ruff | Check lint and formatting without rewriting source. The language server has independent rules, formatting, code-action, and configuration settings. |
+
+Language services negotiate symbol and diagnostic capabilities, collect pull or
+push diagnostics, and publish them into the semantic outline. Diagnostics retain
+source anchors and survive source-service restart. Executable mappings and
+prepared-tree environment bindings apply on both the source and worker paths.
+Saving settings does not execute preparation or analysis.
+
+The Console exposes component-specific editors. Local executable versions,
+behavioral acceptance, and remaining deployment limits are recorded once in the
+[toolchain acceptance record](../console/DEPLOYMENT.md#c-and-python-toolchains--october-27-2026).
+
 ## Concurrency budget
 
 The configuration owns the execution thread budget and subprocess CPU budget:

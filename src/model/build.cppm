@@ -7,6 +7,10 @@ export import provider;
 export import cmake;
 export import bazel;
 export import commands;
+export import vcpkg;
+export import uv;
+export import ty;
+export import ruff;
 
 export namespace builds {
     // One builder of a configuration: a build system by name and that system's options.
@@ -30,7 +34,7 @@ export namespace builds {
         // Calls `f` with the format named `name`; false when no format has that name.
         template <class F> static auto find(std::string_view name, F&& f) -> bool { return ((name == Names.view() && (f(format<Names>{}), true)) || ...); }
     };
-    using adapters = catalog<"cmake", "bazel", "command">;
+    using adapters = catalog<"cmake", "bazel", "command", "vcpkg", "uv", "ty", "ruff">;
     using artifacts = formats<"compilation_database">;
     using builder = adapters::builder;
 

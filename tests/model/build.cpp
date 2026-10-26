@@ -6,6 +6,7 @@ import reflection;
 import support;
 import fixture;
 import protocol;
+import semantic;
 
 namespace {
     using namespace boost::ut;
@@ -176,6 +177,68 @@ namespace {
             c.tasks["build"] = {.builder = "main", .operation = "build"};
             c.operations["build"] = {.tasks = {"build"}};
             expect(throws<std::invalid_argument>([&] { builds::validate(c); })) << "a database is a file";
+        };
+
+        "CMake presets and CTest selection become executable plans"_test = [] {
+            auto c = fixture::cmake("build/cmake", "cc");
+            auto& o = fixture::options<"cmake">(c.builders.at("main"));
+            o.preset = "debug";
+            o.toolchain_file = "/opt/vcpkg/scripts/buildsystems/vcpkg.cmake";
+            o.configuration = "Release";
+            o.test.include = "^unit";
+            o.test.labels = "fast";
+            o.test.exclude_labels = "network";
+            o.test.timeout = 30;
+            o.test.output_junit = "build/cmake/results.xml";
+            auto p = builds::prepare(c, {.operation = "test", .parameters = {.filter = "^gateway", .parallel = 3}});
+            auto& configure = p.steps.front().argv;
+            expect(std::ranges::contains(configure, "--preset"));
+            expect(std::ranges::contains(configure, "-DCMAKE_TOOLCHAIN_FILE=/opt/vcpkg/scripts/buildsystems/vcpkg.cmake"));
+            expect(!std::ranges::contains(configure, "-G"));
+            auto local = builds::locate(p.steps.back(), "/work/project", {{"ctest", "/opt/cmake/bin/ctest"}}, 2);
+            auto after = [&](std::string_view flag) {
+                auto at = std::ranges::find(local.argv, flag);
+                return at == local.argv.end() || ++at == local.argv.end() ? std::string{} : *at;
+            };
+            expect(local.argv.front() == "/opt/cmake/bin/ctest");
+            expect(after("--test-dir") == "/work/project/build/cmake" && after("-R") == "^gateway");
+            expect(after("-L") == "fast" && after("-LE") == "network" && after("-j") == "3");
+            expect(after("--timeout") == "30" && after("-C") == "Release");
+            expect(after("--output-junit") == "/work/project/build/cmake/results.xml");
+            expect(std::ranges::contains(local.argv, "--no-tests=error"));
+            expect(local.env.at("CTEST_PARALLEL_LEVEL") == "2");
+        };
+        "extra CMake and CTest options cannot replace structured settings"_test = [] {
+            for (auto option : {"-Belsewhere", "-Selsewhere", "-GMakefiles", "--preset=other", "-DCMAKE_C_COMPILER=other",
+                                "-DCMAKE_BUILD_TYPE:STRING=Release", "-DCMAKE_EXPORT_COMPILE_COMMANDS=ON"}) {
+                auto c = fixture::cmake("build/cmake");
+                fixture::options<"cmake">(c.builders.at("main")).configure_options = {option};
+                expect(throws<std::invalid_argument>([&] { builds::validate(c); })) << option;
+            }
+            for (auto option : {"--no-tests=ignore", "-j4", "--tests-regex=skip", "--test-dir=elsewhere", "-N"}) {
+                auto c = fixture::cmake("build/cmake");
+                expect(throws<std::invalid_argument>([&] { builds::prepare(c, {.operation = "test", .parameters = {.args = {option}}}); })) << option;
+            }
+            auto c = fixture::cmake("build/cmake");
+            auto& o = fixture::options<"cmake">(c.builders.at("main"));
+            o.test.no_tests_action = "ignore";
+            o.build_options = {"--", "-k", "0"};
+            builds::validate(c);
+            expect(std::ranges::contains(builds::prepare(c, {.operation = "test"}).steps.back().argv, "--no-tests=ignore"));
+            o.test.parallel = 0;
+            expect(throws<std::invalid_argument>([&] { builds::validate(c); }));
+        };
+        "worker reports carry language diagnostics to source publication"_test = [] {
+            jobs::build_report report;
+            report.outline = semantic::outline{};
+            report.outline->diagnostics.push_back({.range = {.place = semantic::place{"app.py", 2, 5}},
+                                                   .severity = "error", .message = "invalid assignment"});
+            auto decoded = transport::codec<jobs::build_report>::decode(transport::encode(report));
+            expect((decoded.outline.has_value()) >> fatal);
+            expect(decoded.outline->diagnostics.size() == 1u);
+            auto& diagnostic = decoded.outline->diagnostics.front();
+            expect(diagnostic.message == "invalid assignment" && diagnostic.range.place->path == "app.py");
+            expect(diagnostic.range.place->begin == 2u && diagnostic.range.place->end == 5u);
         };
     };
 } // namespace

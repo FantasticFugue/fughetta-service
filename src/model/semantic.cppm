@@ -55,9 +55,10 @@ export namespace semantic {
         std::vector<relation> relations;
         std::vector<diagnostic> diagnostics;
     };
-    // What a language server reported about some documents, before its places are anchored in a version.
+    // What a language server reported before its places are anchored in a source version.
     struct outline {
         std::vector<scope> scopes;
         std::vector<symbol> symbols;
+        std::vector<diagnostic> diagnostics;
     };
 } // namespace semantic

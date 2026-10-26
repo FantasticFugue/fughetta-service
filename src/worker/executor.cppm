@@ -211,7 +211,9 @@ export namespace replica {
                 });
                 for (auto& d : documents)
                     report.surveyed.push_back(d.path);
-                io::command server{.argv = r.survey->argv, .cwd = dir, .env = environment(r.env, r.survey->env),
+                auto local = language::locate({.provider = r.survey->provider, .argv = r.survey->argv, .env = r.survey->env},
+                                              dir, options_.tools, options_.parallel);
+                io::command server{.argv = std::move(local.argv), .cwd = dir, .env = environment(r.env, local.env),
                                    .isolation = resources ? std::optional{resources->target()} : std::nullopt};
                 report.outline = co_await lsp::survey(rt_.get_scheduler(home_), std::move(server), r.survey->initialization, dir, std::move(documents), bounds);
             } catch (const std::exception& e) {

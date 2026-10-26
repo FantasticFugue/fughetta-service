@@ -151,7 +151,9 @@ namespace {
             expect(!listed.body.contains(R"("name":"receipt")"));
 
             auto catalog = call("generate", "app", R"("action":"catalog")");
-            expect(catalog.contains("cpp-class") && catalog.contains("cpp-console"));
+            expect(catalog.contains("cpp-class") && !catalog.contains("console"));
+            auto offered = test::request(http_port, http::method::GET, "/api/v1/templates");
+            expect(offered.status == 200 && offered.body.contains("cpp-class") && !offered.body.contains("console")) << offered.body;
             auto parameters = std::string{R"("parameters":{"template_id":"cpp-class","name":"Generated","directory":"src"})"};
             auto preview = call("generate", "app", R"("action":"preview",)" + parameters);
             expect(preview.contains("src/Generated.hpp") && !preview.contains("receipt"));
@@ -165,27 +167,28 @@ namespace {
                                 std::string{R"("parameters":{"template_id":"cpp-class","name":"Other","directory":"src"})"}, true);
             expect(refused.contains("scope_locked")) << "generation without the global scope: " << refused;
 
-            // The console creates a project from a template on its user's behalf.
+            // Projects come from their settings, and generation only writes files into a project that already exists.
+            auto created = test::request(http_port, http::method::PUT, "/api/v1/projects/demo", R"({"revision":0,"value":{}})");
+            test::require(created.status == 200, "project settings saved: " + created.body);
             auto path = std::string{"/api/v1/projects/demo/generate"};
-            auto project = std::string{R"({"template_id":"cpp-console","name":"demo"})"};
-            auto shown = test::request(http_port, http::method::POST, path, std::format(R"({{"parameters":{},"preview":true}})", project));
-            expect(shown.status == 200 && shown.body.contains("src/main.cpp")) << shown.body;
-            expect(test::request(http_port, http::method::GET, "/api/v1/projects/demo").status == 404);
-            auto body = std::format(R"({{"parameters":{},"preview":false,"operation_id":"create-demo","revision":0}})", project);
-            auto created = test::request(http_port, http::method::POST, path, body);
-            expect(created.status == 200) << created.body;
-            expect(call("read", "demo", R"("path":"src/main.cpp")").contains("main"));
+            auto refused_template = test::request(http_port, http::method::POST, path,
+                                                  R"({"parameters":{"template_id":"cpp-console","name":"demo"},"preview":false,"operation_id":"create-demo"})");
+            expect(refused_template.status == 400 && refused_template.body.contains("invalid_request")) << refused_template.body;
+            auto shown = test::request(http_port, http::method::POST, path,
+                                       R"({"parameters":{"template_id":"cpp-class","name":"Shown","directory":"src"},"preview":true})");
+            expect(shown.status == 200 && shown.body.contains("src/Shown.hpp")) << shown.body;
+            auto body = R"({"parameters":{"template_id":"cpp-class","name":"Made","directory":"src"},"preview":false,"operation_id":"make-class"})";
+            auto made = test::request(http_port, http::method::POST, path, body);
+            expect(made.status == 200) << made.body;
+            expect(call("read", "demo", R"("path":"src/Made.hpp")").contains("Made"));
             auto again = test::request(http_port, http::method::POST, path, body);
             expect(again.status == 200 && again.body.contains(R"("replayed":true)")) << again.body;
-            auto duplicate = test::request(http_port, http::method::POST, path,
-                std::format(R"({{"parameters":{},"preview":false,"operation_id":"duplicate-demo","revision":0}})", project));
-            expect(duplicate.status == 409) << duplicate.body;
             expect(call("worldline", "demo", R"("action":"locks")").contains(R"("locks":[])")) << "a console generation leaves no lock behind";
+            test::require(test::request(http_port, http::method::PUT, "/api/v1/projects/small", R"({"revision":0,"value":{}})").status == 200, "small project saved");
             test::require(test::save(http_port, "/api/v1/config/limits", R"({"max_file_bytes":8})").status == 200, "limits saved");
             auto oversized = test::request(http_port, http::method::POST, "/api/v1/projects/small/generate",
-                R"({"parameters":{"template_id":"cpp-console","name":"small"},"preview":false,"operation_id":"small-demo","revision":0})");
+                R"({"parameters":{"template_id":"cpp-class","name":"Small","directory":"src"},"preview":false,"operation_id":"small-class"})");
             expect(oversized.status == 400 && oversized.body.contains("resource_limit")) << oversized.body;
-            expect(test::request(http_port, http::method::GET, "/api/v1/projects/small").status == 404) << "a refused creation leaves no project";
             test::require(test::save(http_port, "/api/v1/config/limits", "{}").status == 200, "limits restored");
 
 

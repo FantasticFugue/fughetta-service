@@ -60,7 +60,6 @@ export namespace config {
     };
 
     struct settings {
-        std::optional<std::string> template_creation;
         std::vector<std::string> ignore;
         std::map<std::string, std::string> env;
         std::map<std::string, builds::configuration> build_configurations;
@@ -672,7 +671,6 @@ export namespace config {
             {"build", "Build graph producing language analysis inputs."},
             {"server", "Language server provider and its options, or gateway server settings, according to the enclosing object."},
             {"argv", "Executable and arguments. Example: [make, -j4]."},
-            {"template_creation", "Template creation operation identifier retained for project generation receipts; omit for manual creation."},
             {"value", "Complete replacement section value; read the section and preserve fields that should remain."},
             {"body", "REST request body; section saves require revision and value."},
         };

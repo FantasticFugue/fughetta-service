@@ -24,8 +24,11 @@ namespace {
         return node(endpoint, {.action = "apply", .worldline = "main", .operation = content::hash_of("create " + path).str(), .expected = tree.frontier,
                                .edits = {{.kind = "create", .path = std::move(path), .text = std::move(text)}}, .scopes = {"::"}});
     }
-    auto start_source(const std::filesystem::path& root, std::uint16_t port) {
-        auto process = std::make_unique<test::child>(test::source_command(SERVICE_EXECUTABLE, root, {"--port", std::to_string(port), "--storage", (root / "source").string()}));
+    auto start_source(const std::filesystem::path& root, std::uint16_t port, const builds::toolset& tools = {}) {
+        std::vector<std::string> args{"--port", std::to_string(port), "--storage", (root / "source").string()};
+        for (auto& [name, executable] : tools)
+            args.insert(args.end(), {"--tool", name + "=" + executable});
+        auto process = std::make_unique<test::child>(test::source_command(SERVICE_EXECUTABLE, root, std::move(args)));
         test::eventually([&] {
             test::require(!process->finished(), process->output());
             return process->output().contains("source: internal file service");
@@ -155,6 +158,68 @@ execute_process(COMMAND ${CMAKE_COMMAND} -E sleep 30)
             expect(!std::filesystem::exists(marker.parent_path() / "compile_commands.json"));
             auto source = node(endpoint, {.action = "read", .worldline = "main", .target = "main.c"}, true);
             expect(source.files.size() == 1u && source.files[0].text == "int main(void) { return 0; }\n");
+            expect(process->stop() == 0);
+        };
+        "Python tools execute on the prepared tree and diagnostics survive restart"_test = [] {
+            auto uv = std::getenv("TEST_UV"), ty = std::getenv("TEST_TY"), ruff = std::getenv("TEST_RUFF");
+            if (!uv || !ty || !ruff) {
+                std::println("skipped: TEST_UV, TEST_TY and TEST_RUFF name the Python tool executables");
+                return;
+            }
+            test::scratch tmp{"python-toolchain"};
+            auto port = test::port();
+            net::ip::tcp::endpoint endpoint{net::ip::address_v4{{127, 0, 0, 1}}, port};
+            builds::toolset tools{{"uv", uv}, {"ty", ty}, {"ruff", ruff}};
+            auto process = start_source(tmp.dir, port, tools);
+            create(endpoint, "pyproject.toml", "[project]\nname = \"toolchain-probe\"\nversion = \"0\"\nrequires-python = \">=3.11\"\n"
+                                               "[build-system]\nrequires = [\"uv_build\"]\nbuild-backend = \"uv_build\"\n");
+            create(endpoint, "src/toolchain_probe/__init__.py", "def answer() -> int:\n    return 42\n");
+            auto version = create(endpoint, "bad.py", "import os\nanswer: int = \"wrong\"\n").version;
+            builds::configuration build;
+            build.builders["environment"] = builds::with<"uv">{.options = {
+                .env_dir = "build/env", .build_dir = "build/dist", .cache_dir = "build/cache", .python = "python3",
+                .run_command = {"python", "-c", "from toolchain_probe import answer; print(answer())"}, .locked = false}};
+            build.builders["types"] = builds::with<"ty">{.options = {.python = "build/env", .paths = {"bad.py"}}};
+            build.builders["lint"] = builds::with<"ruff">{.options = {.paths = {"bad.py"}, .select = {"F401"}}};
+            build.tasks = {{"sync", {.builder = "environment", .operation = "sync"}},
+                           {"package", {.builder = "environment", .operation = "build", .after = {"sync"}}},
+                           {"run", {.builder = "environment", .operation = "run", .after = {"package"}}},
+                           {"check", {.builder = "types", .operation = "check", .after = {"sync"}}},
+                           {"lint", {.builder = "lint", .operation = "check", .after = {"sync"}}}};
+            build.operations = {{"prepare", {.tasks = {"run"}}}, {"check", {.tasks = {"check"}}}, {"lint", {.tasks = {"lint"}}}};
+            build.limits.timeout_s = 90;
+            language::configuration config{.server = language::with<"ty">{.options = {.python = "build/env"}}, .build = build};
+            language::request request{.project = "app", .operation_id = "python-prepare", .worldline = "main", .revision = version,
+                                      .config = config, .environment = "python-types"};
+            auto prepared = source::call(endpoint, request);
+            expect((prepared.status == "prepared") >> fatal) << prepared.error << rfl::json::write(prepared.steps);
+            expect(prepared.steps.size() == 3u && prepared.steps.back().output.contains("42"));
+            expect((prepared.analysis == "analyzed") >> fatal) << prepared.analysis_error.value_or("");
+            auto semantic = node(endpoint, {.action = "semantic", .worldline = "main", .environment = "python-types"}, true);
+            expect((semantic.semantic.has_value() && !semantic.semantic->diagnostics.empty()) >> fatal);
+            expect(std::ranges::any_of(semantic.semantic->diagnostics, [](auto& d) {
+                return d.range.place && d.range.place->path == "bad.py" && !d.range.document.empty();
+            }));
+            auto replay = source::call(endpoint, request);
+            expect(replay.replayed && replay.tree == prepared.tree);
+            for (auto operation : {"check", "lint"}) {
+                request.operation_id = std::string{"python-"} + operation;
+                request.config.operation = operation;
+                auto failed = source::call(endpoint, request);
+                expect(failed.status == "failed") << rfl::json::write(failed);
+                expect(!failed.steps.empty() && failed.steps.back().exit_code != 0);
+            }
+            request.operation_id = "python-ruff-language";
+            request.config = {.server = language::with<"ruff">{}};
+            request.environment = "python-lint";
+            auto linted = source::call(endpoint, request);
+            expect((linted.status == "prepared" && linted.analysis == "analyzed") >> fatal) << rfl::json::write(linted);
+            auto lint = node(endpoint, {.action = "semantic", .worldline = "main", .environment = "python-lint"}, true);
+            expect(lint.semantic.has_value() && !lint.semantic->diagnostics.empty());
+            expect(process->stop() == 0);
+            process = start_source(tmp.dir, port, tools);
+            auto restored = node(endpoint, {.action = "semantic", .worldline = "main", .environment = "python-types"}, true);
+            expect(restored.semantic.has_value() && restored.semantic->version == version && restored.semantic->diagnostics.size() == semantic.semantic->diagnostics.size());
             expect(process->stop() == 0);
         };
     };

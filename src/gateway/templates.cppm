@@ -41,11 +41,7 @@ export namespace templates {
     };
 
     inline auto catalog() -> std::vector<descriptor> {
-        return {{"cpp-console", "C++ Console", "C++", "project", {"20", "23"}},
-                {"python-console", "Python Console", "Python", "project", {}},
-                {"java-console", "Java Console", "Java", "project", {"17", "21"}, true},
-                {"typescript-console", "TypeScript Console", "TypeScript", "project", {}},
-                {"cpp-class", "C++ Class", "C++", "file", {}},
+        return {{"cpp-class", "C++ Class", "C++", "file", {}},
                 {"python-class", "Python Class", "Python", "file", {}},
                 {"java-class", "Java Class", "Java", "file", {}, true},
                 {"typescript-class", "TypeScript Class", "TypeScript", "file", {}},
@@ -89,58 +85,18 @@ export namespace templates {
         auto item = std::ranges::find(items, p.template_id, &descriptor::id);
         if (item == items.end())
             throw std::invalid_argument("Unknown template.");
-        if (item->kind == "project") {
-            auto alnum = [](unsigned char c) { return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9'); };
-            if (p.name.empty() || p.name.size() > 64 || !alnum(p.name.front()) || !alnum(p.name.back()) ||
-                !std::ranges::all_of(p.name, [alnum](unsigned char c) { return alnum(c) || c == '_' || c == '-'; }))
-                throw std::invalid_argument("Use a project name containing ASCII letters, digits, underscores, and hyphens.");
-        } else
-            identifier(p.name);
+        identifier(p.name);
         auto standard = p.standard.empty() && !item->standards.empty() ? item->standards.front() : p.standard;
         if ((!standard.empty() && std::ranges::find(item->standards, standard) == item->standards.end()))
             throw std::invalid_argument("Unsupported language standard for this template.");
         auto prefix = p.directory.empty() ? std::string{} : std::string{content::checked_path(p.directory)} + "/";
-        if (item->kind == "project" && !prefix.empty())
-            throw std::invalid_argument("Project templates start at the project root.");
         plan out{p.template_id};
         auto add = [&](std::string path, std::string text) {
             auto full = prefix + path;
             content::checked_path(full);
             out.files.push_back({std::move(full), std::move(text)});
         };
-        if (p.template_id == "cpp-console") {
-            add("CMakeLists.txt", "cmake_minimum_required(VERSION 3.20)\nproject(" + p.name + " LANGUAGES CXX)\nset(CMAKE_CXX_STANDARD " + standard +
-                                      ")\nset(CMAKE_CXX_STANDARD_REQUIRED ON)\nset(CMAKE_CXX_EXTENSIONS OFF)\nadd_executable(app src/main.cpp)\n");
-            add("src/main.cpp",
-                p.sample ? "#include <iostream>\n\nint main() {\n    std::cout << \"Hello, world!\\n\";\n}\n" : "int main() {\n    return 0;\n}\n");
-            add(".gitignore", "build/\n");
-        } else if (p.template_id == "python-console") {
-            add("pyproject.toml", "[project]\nname = \"" + p.name + "\"\nversion = \"0.1.0\"\nrequires-python = \">=3.10\"\n");
-            add("main.py", p.sample ? "def main() -> None:\n    print(\"Hello, world!\")\n\n\nif __name__ == \"__main__\":\n    main()\n"
-                                    : "def main() -> None:\n    pass\n\n\nif __name__ == \"__main__\":\n    main()\n");
-            add(".gitignore", "__pycache__/\n.venv/\n*.pyc\n");
-        } else if (p.template_id == "java-console") {
-            auto path = package_path(p.package);
-            add("pom.xml",
-                "<project xmlns=\"http://maven.apache.org/POM/4.0.0\">\n  <modelVersion>4.0.0</modelVersion>\n  <groupId>" + p.package +
-                    "</groupId>\n  <artifactId>" + p.name + "</artifactId>\n  <version>0.1.0</version>\n  <properties>\n    <maven.compiler.source>" +
-                    standard + "</maven.compiler.source>\n    <maven.compiler.target>" + standard +
-                    "</maven.compiler.target>\n    <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>\n  </properties>\n</project>\n");
-            add("src/main/java/" + path + "/Main.java", "package " + p.package + ";\n\npublic class Main {\n    public static void main(String[] args) {\n" +
-                                                            (p.sample ? std::string{"        System.out.println(\"Hello, world!\");\n"} : std::string{}) +
-                                                            "    }\n}\n");
-            add(".gitignore", "target/\n*.class\n");
-        } else if (p.template_id == "typescript-console") {
-            std::string name = p.name;
-            std::ranges::transform(name, name.begin(), [](unsigned char c) { return std::tolower(c); });
-            add("package.json", "{\n  \"name\": \"" + name +
-                                    "\",\n  \"version\": \"0.1.0\",\n  \"private\": true,\n  \"type\": \"module\",\n  \"devDependencies\": {\n    "
-                                    "\"typescript\": \"*\"\n  }\n}\n");
-            add("tsconfig.json", "{\n  \"compilerOptions\": {\n    \"target\": \"ES2022\",\n    \"module\": \"NodeNext\",\n    \"strict\": true,\n    "
-                                 "\"outDir\": \"dist\"\n  },\n  \"include\": [\"src\"]\n}\n");
-            add("src/main.ts", p.sample ? "console.log(\"Hello, world!\");\nexport {};\n" : "export {};\n");
-            add(".gitignore", "node_modules/\ndist/\n");
-        } else if (p.template_id == "cpp-class") {
+        if (p.template_id == "cpp-class") {
             add(p.name + ".hpp", "#pragma once\n\nclass " + p.name + " {\npublic:\n    " + p.name + "() = default;\n};\n");
             add(p.name + ".cpp", "#include \"" + p.name + ".hpp\"\n");
         } else if (p.template_id == "python-class") {
@@ -152,8 +108,6 @@ export namespace templates {
         } else if (p.template_id == "typescript-interface") {
             add(p.name + ".ts", "export interface " + p.name + " {\n}\n");
         }
-        if (item->kind == "project")
-            add("README.md", "# " + p.name + "\n\nCreated with the Fughetta " + item->name + " template.\n");
         return out;
     }
 } // namespace templates

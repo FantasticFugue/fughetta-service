@@ -4,7 +4,7 @@ import semantic;
 import engine;
 
 // Turns what a language server reported about a prepared tree into one semantic generation of a node version: places become the
-// identities of source characters, so scopes and symbols follow later edits.
+// identities of source characters, so scopes, symbols and diagnostics follow later edits.
 export namespace survey {
     // The generation of `version` on `worldline`: every place the outline names is anchored in that version.
     inline auto generation(nodes::local_node& node, const std::string& worldline, const std::string& version, std::string environment, std::string service,
@@ -18,6 +18,8 @@ export namespace survey {
             for (auto& d : s.definitions)
                 spans.push_back(&d);
         }
+        for (auto& d : found.diagnostics)
+            spans.push_back(&d.range);
         constexpr std::size_t batch = 10000;
         for (std::size_t first = 0; first < spans.size(); first += batch) {
             nodes::node_request ask{.action = "anchor", .worldline = worldline, .revision = version};
@@ -32,7 +34,7 @@ export namespace survey {
                 *spans[first + i] = std::move(anchored.spans[i]);
         }
         semantic::generation out{.version = version, .environment = std::move(environment), .service = std::move(service), .service_version = "1",
-                                 .scopes = std::move(found.scopes), .symbols = std::move(found.symbols)};
+                                 .scopes = std::move(found.scopes), .symbols = std::move(found.symbols), .diagnostics = std::move(found.diagnostics)};
         // Every surveyed document is covered, with the digest of the text the server read.
         auto tree = node.call({.action = "tree", .worldline = worldline, .revision = version});
         if (tree.code != "ok" || tree.version != version)

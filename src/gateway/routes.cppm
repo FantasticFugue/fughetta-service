@@ -350,6 +350,7 @@ namespace front {
             }
         };
 
+        // Only the templates that render files into an existing project are offered; projects are made with PUT /api/v1/projects/{project}.
         struct get_templates : endpoint<"GET", "/api/v1/templates", access::member> {
             static auto handle(context&, params, const web::target&, std::string_view) -> coroutine::task<web::reply> {
                 co_return ok(templates::catalog());
@@ -359,7 +360,6 @@ namespace front {
             templates::parameters parameters;
             std::string operation_id;
             bool preview = true;
-            std::optional<std::uint64_t> revision;
         };
         struct post_generate : endpoint<"POST", "/api/v1/projects/{project}/generate", access::member> {
             static auto handle(context& c, params p, const web::target&, std::string_view body) -> coroutine::task<web::reply> {
@@ -367,58 +367,13 @@ namespace front {
                 auto plan = templates::render(in.parameters);
                 std::string project{p[0]};
                 config::check_name("project", project);
-                auto catalog = templates::catalog();
-                auto item = std::ranges::find(catalog, in.parameters.template_id, &templates::descriptor::id);
-                bool creating = item->kind == "project";
-                if (creating && in.parameters.name != project)
-                    throw std::invalid_argument("Project name must match the template parameters.");
+                if (!c.config.current(c.core)->find(project))
+                    throw config::not_found(std::format("unknown project '{}'", project));
                 if (in.preview)
                     co_return ok(tools::generation_result{std::move(plan)});
                 if (in.operation_id.empty())
                     throw std::invalid_argument("Generation requires operation_id.");
-                auto actor = *c.who;
-                auto key = content::hash_of(worlds::identity_key(actor) + in.operation_id + rfl::json::write(in.parameters)).str();
-                auto created = std::make_shared<bool>(false);
-                if (creating) {
-                    if (!in.revision)
-                        throw coded_error(400, "missing_revision", "Name revision 0 to create a project.");
-                    co_await c.config.edit(c.core, [project, key, revision = *in.revision, created](config::store& store) {
-                        if (auto existing = store.current()->find(project)) {
-                            if (existing->template_creation != key)
-                                throw coded_error(409, "project_exists", "A project with this name already exists.");
-                        } else {
-                            store.put_project(project, {.template_creation = key}, revision);
-                            *created = true;
-                        }
-                    });
-                }
-                auto& services = *c.services;
-                std::optional<tools::generation_result> result;
-                std::exception_ptr refused;
-                try {
-                    result = co_await tools::generate_globally(services, project, in.parameters, actor, in.operation_id);
-                } catch (const tools::tool_error& e) {
-                    // A project this request registered is withdrawn when its source was refused; an unknown outcome keeps it for a retry.
-                    if (!*created || e.code == nodes::code::outcome_unknown)
-                        throw;
-                    refused = std::current_exception();
-                } catch (const std::exception&) {
-                    if (!*created)
-                        throw;
-                    refused = std::current_exception();
-                }
-                if (refused) {
-                    try {
-                        co_await c.config.edit(c.core, [project, key](config::store& store) {
-                            if (auto existing = store.current()->find(project); existing && existing->template_creation == key)
-                                store.remove_project(project);
-                        });
-                    } catch (const std::exception& e) {
-                        logging::error(std::format("withdrawing project {}: {}", project, e.what()));
-                    }
-                    std::rethrow_exception(refused);
-                }
-                co_return ok(std::move(*result));
+                co_return ok(co_await tools::generate_globally(*c.services, project, in.parameters, *c.who, in.operation_id));
             }
         };
 

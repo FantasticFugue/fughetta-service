@@ -4,7 +4,32 @@ import reflection;
 export import provider;
 
 namespace builds {
+    // CMake configures and builds; CTest runs the tests beside it. Each command has one layer of typed fields, and the
+    // adapter composes its argv from them. An option that would set a field again is refused, so the field is the one
+    // place its argv comes from.
     template <> struct adapter<"cmake"> {
+        // What `ctest` runs, and what a run that found no test means.
+        struct ctest {
+            std::string executable = "ctest";
+            // CTest reads CMakePresets.json from the source directory it is run in.
+            std::string preset;
+            // CTest regular expressions over test names and labels: -R, -E, -L and -LE.
+            std::string include;
+            std::string exclude;
+            std::string labels;
+            std::string exclude_labels;
+            // Absent leaves each test's timeout to CMakeLists.txt, and the jobs to the runner's ${jobs}.
+            std::optional<std::uint32_t> timeout;
+            std::optional<std::uint32_t> parallel;
+            bool output_on_failure = true;
+            bool stop_on_failure = false;
+            // `error` fails a run that ran no test; a suite is never reported passing because nothing ran.
+            std::string no_tests_action = "error";
+            // --output-junit: a report named relative to the project; absent writes none.
+            std::optional<std::string> output_junit;
+            // Arguments CTest itself has no typed field for; the flags a field composes are refused.
+            std::vector<std::string> args;
+        };
         struct options {
             std::string executable = "cmake";
             std::string source_dir = ".";
@@ -18,12 +43,12 @@ namespace builds {
             std::vector<std::string> targets;
             std::string c_compiler;
             std::string cxx_compiler;
-            std::string ctest = "ctest";
             std::vector<std::string> configure_options;
             std::vector<std::string> build_options;
             bool export_compile_commands = false;
             std::map<std::string, std::string> inputs;
             std::map<std::string, artifact> outputs;
+            ctest test;
         };
         static void validate(const options& c);
         static auto describe(const options& c) -> std::map<std::string, operation_spec>;

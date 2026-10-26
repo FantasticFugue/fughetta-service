@@ -1885,9 +1885,10 @@ export namespace tools {
                            std::string operation_id) -> coroutine::task<generation_result> {
         co_return co_await generate_files(s, project, std::move(parameters), actor, std::move(operation_id), false, true);
     }
-    struct generate : tool<"generate", "Preview or generate project templates and source classes/interfaces. List templates with action=catalog. Render with "
-                                       "action=preview. Create the files in main with action=apply and an operation_id; this needs the \"::\" lock "
-                                       "(worldline lock). Existing files are never overwritten."> {
+    struct generate : tool<"generate", "Preview or generate source classes/interfaces in an existing project. List file templates with action=catalog. "
+                                       "Render with action=preview. Create the files in main with action=apply and an operation_id; this needs the "
+                                       "\"::\" lock (worldline lock). Projects are created with the project settings, not here. Existing files are "
+                                       "never overwritten."> {
         struct input {
             rfl::Description<"Project name", std::string> project;
             std::optional<std::string> action;

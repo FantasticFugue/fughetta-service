@@ -51,6 +51,18 @@ namespace language {
                 .fingerprint = content::hash_of(rfl::json::write(c)),
                 .recipe = std::move(recipe)};
     }
+    auto locate(program value, const std::filesystem::path& tree, const builds::toolset& tools, std::uint32_t jobs) -> program {
+        if (value.argv.empty())
+            throw std::invalid_argument("language server executable is required");
+        if (!std::filesystem::path(value.argv.front()).is_absolute()) {
+            builds::tools({value.argv.front()});
+            value.argv.front() = builds::tool(value.argv.front());
+        }
+        auto bound = builds::locate({.argv = std::move(value.argv), .env = std::move(value.env)}, tree, tools, jobs);
+        value.argv = std::move(bound.argv);
+        value.env = std::move(bound.env);
+        return value;
+    }
     void validate(const configuration& c) {
         if (!c.build.builders.empty() || !c.build.tasks.empty() || !c.build.operations.empty() || !c.build.outputs.empty() ||
             !c.inputs.empty() || c.operation != "prepare")

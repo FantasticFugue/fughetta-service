@@ -24,7 +24,7 @@ export namespace source_server {
 
         service(cores::context<native::scheduler>& rt, std::filesystem::path storage, execution::thread_pool& pool, builds::toolset tools = {})
             : rt_(rt), storage_(std::move(storage)), lock_(storage_, "source"), pool_(pool), cores_(rt.size()),
-              analysis_(rt, storage_ / ".analysis", pool, std::move(tools)), token_(jobs::source_token()) {}
+              tools_(std::move(tools)), analysis_(rt, storage_ / ".analysis", pool, tools_), token_(jobs::source_token()) {}
 
         auto serve(native::scheduler& io, socket peer, std::size_t core) -> coroutine::task<> {
             transport::channel<socket> chan{peer};
@@ -378,10 +378,11 @@ export namespace source_server {
                     }
                     return true;
                 });
+                auto local = language::locate(plan.server, result.tree, tools_, 1);
                 auto env = host::environment();
-                for (auto& [key, value] : plan.server.env)
+                for (auto& [key, value] : local.env)
                     env[key] = value;
-                io::command server{.argv = plan.server.argv, .cwd = result.tree, .env = std::move(env)};
+                io::command server{.argv = std::move(local.argv), .cwd = result.tree, .env = std::move(env)};
                 std::vector<std::string> surveyed;
                 for (auto& d : documents)
                     surveyed.push_back(d.path);
@@ -428,6 +429,7 @@ export namespace source_server {
         std::unique_ptr<isolation::pool> survey_resources_;
         execution::thread_pool& pool_;
         std::vector<per_core> cores_;
+        builds::toolset tools_;
         preparation::service analysis_;
         std::string token_;
     };

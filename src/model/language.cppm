@@ -5,6 +5,8 @@ import reflection;
 import content;
 export import build;
 export import clice;
+export import ty;
+export import ruff;
 
 export namespace language {
     // The language server of an analysis: a provider by name and that provider's options.
@@ -35,7 +37,7 @@ export namespace language {
             return out;
         }
     };
-    using providers = catalog<"clice">;
+    using providers = catalog<"clice", "ty", "ruff">;
     using provider = providers::choice;
 
     struct configuration {
@@ -98,6 +100,7 @@ export namespace language {
     auto provider_of(const provider& p) -> std::string_view;
     void validate(const configuration& c);
     auto prepare(const configuration& c) -> plan;
+    auto locate(program value, const std::filesystem::path& tree, const builds::toolset& tools, std::uint32_t jobs) -> program;
     // Refuses a plan whose build directories or outputs overlap the tracked files of the tree to prepare.
     void check(const plan& p, const std::vector<content::entry>& files);
     auto timeout(const configuration& c) -> std::uint32_t;

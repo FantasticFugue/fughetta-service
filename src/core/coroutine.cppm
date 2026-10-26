@@ -418,7 +418,7 @@ export namespace coroutine {
                 if constexpr (detail::is_task<D>) {
                     return detail::task_awaiter<typename D::value_type, detail::mode::plain>{std::exchange(a.h_, {}), *this};
                 } else if constexpr (requires { std::forward<A>(a).as_awaitable(*this); }) {
-                    return execution::as_awaitable(std::forward<A>(a), *this);
+                    return std::forward<A>(a).as_awaitable(*this);
                 } else if constexpr (requires { typename D::promise_type; }) {
                     static_assert(sizeof(D) == 0, "a coroutine task must provide promise-aware as_awaitable");
                 } else if constexpr (detail::tagged_sender<D>) {
