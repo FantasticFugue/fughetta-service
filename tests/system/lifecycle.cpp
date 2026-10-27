@@ -9,10 +9,9 @@ namespace {
             test::scratch tmp{"addresses"};
             test::spit(tmp.dir / "gateway.json", R"({"server":{"http_bind":"localhost"}})");
             test::spit(tmp.dir / "worker.json", R"({"gateway":"127.0.0.1:65536"})");
-            for (auto command : {
-                    test::gateway_command(SERVICE_EXECUTABLE, tmp.dir, {(tmp.dir / "gateway.json").string()}),
-                    test::source_command(SERVICE_EXECUTABLE, tmp.dir, {"--bind", "localhost"}),
-                    test::worker_command(SERVICE_EXECUTABLE, tmp.dir, {(tmp.dir / "worker.json").string()})}) {
+            for (auto command : {test::gateway_command(SERVICE_EXECUTABLE, tmp.dir, {(tmp.dir / "gateway.json").string()}),
+                                 test::source_command(SERVICE_EXECUTABLE, tmp.dir, {"--bind", "localhost"}),
+                                 test::worker_command(SERVICE_EXECUTABLE, tmp.dir, {(tmp.dir / "worker.json").string()})}) {
                 test::child process{command};
                 expect(process.wait(std::chrono::seconds{5}) == 1);
                 expect(process.output().contains("invalid endpoint")) << process.output();
@@ -63,7 +62,7 @@ namespace {
             expect(attempts.load() == 1_u);
         };
     };
-}
+} // namespace
 
 int main(int argc, const char** argv) {
     boost::ut::suite<"lifecycle">{cases};

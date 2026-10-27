@@ -1,7 +1,7 @@
 module;
 #ifdef _WIN32
-#include <winsock2.h>
 #include <windows.h>
+#include <winsock2.h>
 #else
 #include <errno.h>
 #include <netinet/in.h>
@@ -155,8 +155,7 @@ export namespace test {
             // when they enable SO_REUSEPORT. The child binds this loopback address.
             lease probe{SOCK_STREAM};
             address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-            if (::bind(probe.socket, reinterpret_cast<const sockaddr*>(&address), sizeof(address)) != 0 ||
-                ::listen(probe.socket, 1) != 0) {
+            if (::bind(probe.socket, reinterpret_cast<const sockaddr*>(&address), sizeof(address)) != 0 || ::listen(probe.socket, 1) != 0) {
                 auto error = lease::error();
                 if (lease::busy(error))
                     continue;
@@ -200,13 +199,17 @@ export namespace test {
                     promise.set_value({net::ip::address_v4{{127, 0, 0, 1}}, acceptor.local_endpoint().port()});
                     co_await coroutine::with_scope([&](coroutine::scope& tasks) -> coroutine::task<> {
                         for (;;)
-                            tasks.spawn(serve(scheduler, co_await execution::then(net::async_accept(acceptor), [](auto socket, auto) { return std::move(socket); })));
+                            tasks.spawn(
+                                serve(scheduler, co_await execution::then(net::async_accept(acceptor), [](auto socket, auto) { return std::move(socket); })));
                     });
                 });
             });
             endpoint_ = result.get();
         }
-        ~listener() { context_.stop(); thread_.join(); }
+        ~listener() {
+            context_.stop();
+            thread_.join();
+        }
         auto endpoint() const -> net::ip::tcp::endpoint { return endpoint_; }
     };
 
@@ -220,8 +223,8 @@ export namespace test {
             auto peer = co_await io::connect(context.get_scheduler(), {net::ip::address_v4{{127, 0, 0, 1}}, port});
             web::stream<native::socket> stream{peer};
             http::v1::client client{stream};
-            http::request head{.method = method, .target = std::move(path), .scheme = "http", .authority = "localhost",
-                               .fields = {{"content-type", "application/json"}}};
+            http::request head{
+                .method = method, .target = std::move(path), .scheme = "http", .authority = "localhost", .fields = {{"content-type", "application/json"}}};
             if (!token.empty())
                 head.fields.push_back({"authorization", "Bearer " + token});
             auto result = co_await http::coroutine::fetch(client, std::move(head), std::string_view{body});
@@ -241,16 +244,22 @@ export namespace test {
     inline auto save(std::uint16_t port, std::string path, std::string value) -> response {
         auto current = request(port, http::method::GET, path);
         require(current.status == 200, current.body);
-        struct revision { std::uint64_t revision = 0; };
-        return request(port, http::method::PUT, path,
-                       std::format(R"({{"revision":{},"value":{}}})", decode<revision>(current.body).revision, value));
+        struct revision {
+            std::uint64_t revision = 0;
+        };
+        return request(port, http::method::PUT, path, std::format(R"({{"revision":{},"value":{}}})", decode<revision>(current.body).revision, value));
     }
     inline auto tool(std::uint16_t port, std::string name, std::string args, bool error = false) -> std::string {
         auto response = request(port, http::method::POST, "/mcp",
-            std::format(R"({{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{{"name":"{}","arguments":{}}}}})", name, args));
+                                std::format(R"({{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{{"name":"{}","arguments":{}}}}})", name, args));
         require(response.status == 200, response.body);
-        struct payload { bool isError = false; rfl::Generic structuredContent; };
-        struct reply { std::optional<payload> result; };
+        struct payload {
+            bool isError = false;
+            rfl::Generic structuredContent;
+        };
+        struct reply {
+            std::optional<payload> result;
+        };
         auto parsed = decode<reply>(response.body);
         require(parsed.result && parsed.result->isError == error, response.body);
         return error ? response.body : rfl::json::write(parsed.result->structuredContent);
@@ -270,8 +279,7 @@ export namespace test {
         args.insert(args.begin(), binary.string());
         return {.argv = std::move(args), .cwd = std::move(root)};
     }
-    inline auto role_command(std::filesystem::path binary, std::filesystem::path root, std::string role,
-                             std::vector<std::string> args = {}) -> io::command {
+    inline auto role_command(std::filesystem::path binary, std::filesystem::path root, std::string role, std::vector<std::string> args = {}) -> io::command {
         args.insert(args.begin(), {"--role", std::move(role)});
         return command(std::move(binary), std::move(root), std::move(args));
     }

@@ -129,7 +129,6 @@ namespace {
                 expect(!l.recovery().has_value()) << "the rewritten log is clean";
             }
         };
-
     };
 } // namespace
 

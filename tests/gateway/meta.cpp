@@ -56,9 +56,7 @@ namespace {
         struct output {
             std::string said;
         };
-        static auto run(tools::services&, input in, mcp::notifier&, const worlds::actor&) -> coroutine::task<output> {
-            co_return output{in.text};
-        }
+        static auto run(tools::services&, input in, mcp::notifier&, const worlds::actor&) -> coroutine::task<output> { co_return output{in.text}; }
     };
 
     struct shout : tools::tool<"shout", "Say it back, louder."> {

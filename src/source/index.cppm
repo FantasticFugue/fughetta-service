@@ -39,15 +39,30 @@ export namespace nodes {
         mutable std::uint64_t flush_visits_ = 0;
 
         static auto branch_digest(std::string_view key, std::string_view left, std::string_view right, std::string_view value) -> std::string {
-            return digest_of(codec::encode(value::map{{"key", std::string(key)}, {"left", std::string(left)}, {"right", std::string(right)}, {"value", std::string(value)}}));
+            return digest_of(codec::encode(
+                value::map{{"key", std::string(key)}, {"left", std::string(left)}, {"right", std::string(right)}, {"value", std::string(value)}}));
         }
-        static auto weight(const T& item) -> std::uint64_t { if constexpr (requires { item.count; }) return item.count; else return 1; }
-        static auto shell(std::string digest, std::string object, std::size_t count, bool bound, std::uint64_t mass, const std::shared_ptr<backend>& storage) -> pointer {
-            if (digest.empty()) { if (count || mass || !object.empty()) fail(nodes::code::storage_failure, "empty index root has nonempty counts"); return {}; }
-            if (!count || !mass || (digest.size() != 64 || std::ranges::any_of(digest, [](char c) { return !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')); }))) fail(nodes::code::storage_failure, "index root counts or identity differ");
+        static auto weight(const T& item) -> std::uint64_t {
+            if constexpr (requires { item.count; })
+                return item.count;
+            else
+                return 1;
+        }
+        static auto shell(std::string digest, std::string object, std::size_t count, bool bound, std::uint64_t mass, const std::shared_ptr<backend>& storage)
+            -> pointer {
+            if (digest.empty()) {
+                if (count || mass || !object.empty())
+                    fail(nodes::code::storage_failure, "empty index root has nonempty counts");
+                return {};
+            }
+            if (!count || !mass ||
+                (digest.size() != 64 || std::ranges::any_of(digest, [](char c) { return !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')); })))
+                fail(nodes::code::storage_failure, "index root counts or identity differ");
             auto out = std::make_shared<branch>();
-            if (object.empty()) fail(nodes::code::missing_objects, "authenticated index object is absent");
-            out->digest = std::move(digest); out->object = std::move(object);
+            if (object.empty())
+                fail(nodes::code::missing_objects, "authenticated index object is absent");
+            out->digest = std::move(digest);
+            out->object = std::move(object);
             out->count = count;
             out->mass = mass;
             out->bound = bound;
@@ -70,16 +85,20 @@ export namespace nodes {
             p->item = {std::move(data.key), std::move(data.item)};
             p->priority = digest_of(p->item.first);
             p->value_digest = std::move(data.value_digest);
-            p->left_digest = data.left; p->left_object = data.left_object;
-            p->right_digest = data.right; p->right_object = data.right_object;
+            p->left_digest = data.left;
+            p->left_object = data.left_object;
+            p->right_digest = data.right;
+            p->right_object = data.right_object;
             p->left_count = data.left_count;
             p->right_count = data.right_count;
             p->left_bound = data.left_bound;
             p->right_bound = data.right_bound;
-            if (data.mass != data.left_mass + data.right_mass + weight(p->item.second) ||
-                (data.left.empty() != (data.left_count == 0)) || (data.right.empty() != (data.right_count == 0)))
+            if (data.mass != data.left_mass + data.right_mass + weight(p->item.second) || (data.left.empty() != (data.left_count == 0)) ||
+                (data.right.empty() != (data.right_count == 0)))
                 fail(nodes::code::storage_failure, "persistent index scalar counts differ");
-            p->mass = data.mass; p->left_mass = data.left_mass; p->right_mass = data.right_mass;
+            p->mass = data.mass;
+            p->left_mass = data.left_mass;
+            p->right_mass = data.right_mass;
             p->left = shell(std::move(data.left), std::move(data.left_object), data.left_count, data.left_bound, data.left_mass, p->storage);
             p->right = shell(std::move(data.right), std::move(data.right_object), data.right_count, data.right_bound, data.right_mass, p->storage);
             p->count = data.count;
@@ -219,18 +238,21 @@ export namespace nodes {
             p->left_object = p->left ? p->left->object : std::string{};
             p->right_object = p->right ? p->right->object : std::string{};
             p->object = storage->store({.key = p->item.first,
-                            .item = p->item.second,
-                            .value_digest = p->value_digest,
-                            .left = p->left_digest,
-                            .right = p->right_digest,
-                            .left_object = p->left_object, .right_object = p->right_object,
-                            .count = p->count,
-                            .left_count = p->left_count,
-                            .right_count = p->right_count,
-                            .mass = p->mass, .left_mass = p->left_mass, .right_mass = p->right_mass,
-                            .bound = p->bound,
-                            .left_bound = p->left_bound,
-                            .right_bound = p->right_bound});
+                                        .item = p->item.second,
+                                        .value_digest = p->value_digest,
+                                        .left = p->left_digest,
+                                        .right = p->right_digest,
+                                        .left_object = p->left_object,
+                                        .right_object = p->right_object,
+                                        .count = p->count,
+                                        .left_count = p->left_count,
+                                        .right_count = p->right_count,
+                                        .mass = p->mass,
+                                        .left_mass = p->left_mass,
+                                        .right_mass = p->right_mass,
+                                        .bound = p->bound,
+                                        .left_bound = p->left_bound,
+                                        .right_bound = p->right_bound});
             p->dirty = false;
         }
         static std::size_t loaded(const pointer& p) {
@@ -310,11 +332,17 @@ export namespace nodes {
         }
         auto mass() const -> std::uint64_t { return root_ ? root_->mass : 0; }
         auto floor(std::string_view key, bool strict = false) const -> iterator {
-            auto p = root_; std::string found; bool have = false;
+            auto p = root_;
+            std::string found;
+            bool have = false;
             while (p) {
                 ensure(p);
-                if (p->item.first < key || (!strict && p->item.first == key)) { found = p->item.first; have = true; p = p->right; }
-                else p = p->left;
+                if (p->item.first < key || (!strict && p->item.first == key)) {
+                    found = p->item.first;
+                    have = true;
+                    p = p->right;
+                } else
+                    p = p->left;
             }
             return have ? iterator{root_, found} : end();
         }
@@ -322,19 +350,29 @@ export namespace nodes {
             auto p = root_;
             while (p) {
                 ensure(p);
-                if (offset < p->left_mass) { p = p->left; continue; }
+                if (offset < p->left_mass) {
+                    p = p->left;
+                    continue;
+                }
                 offset -= p->left_mass;
-                if (offset < weight(p->item.second)) return {iterator{root_, p->item.first}, offset};
-                offset -= weight(p->item.second); p = p->right;
+                if (offset < weight(p->item.second))
+                    return {iterator{root_, p->item.first}, offset};
+                offset -= weight(p->item.second);
+                p = p->right;
             }
             fail(nodes::code::invalid_record, "sequence offset exceeds the authenticated scalar count");
         }
         auto mass_before(std::string_view key) const -> std::uint64_t {
-            auto p = root_; std::uint64_t offset = 0;
+            auto p = root_;
+            std::uint64_t offset = 0;
             while (p) {
                 ensure(p);
-                if (key <= p->item.first) p = p->left;
-                else { offset += p->left_mass + weight(p->item.second); p = p->right; }
+                if (key <= p->item.first)
+                    p = p->left;
+                else {
+                    offset += p->left_mass + weight(p->item.second);
+                    p = p->right;
+                }
             }
             return offset;
         }

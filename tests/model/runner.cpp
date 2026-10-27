@@ -12,27 +12,27 @@ namespace {
     using namespace boost::ut;
     using namespace std::chrono_literals;
 
-    auto run(native::context& context, std::filesystem::path dir, std::vector<std::string> argv, std::chrono::seconds timeout = 10s, std::uint64_t limit = 1 << 20,
-             io::command extra = {}) {
+    auto run(native::context& context, std::filesystem::path dir, std::vector<std::string> argv, std::chrono::seconds timeout = 10s,
+             std::uint64_t limit = 1 << 20, io::command extra = {}) {
         auto io = context.get_scheduler();
         extra.argv = std::move(argv);
         extra.cwd = std::move(dir);
         return *cores::run(context, ::runner::run_step(io, std::move(extra), timeout, limit, "test"));
     }
 
-auto require(bool ok, std::string_view what) -> void {
-    if (!ok)
-        throw std::runtime_error(std::string{what});
-}
+    auto require(bool ok, std::string_view what) -> void {
+        if (!ok)
+            throw std::runtime_error(std::string{what});
+    }
 
-auto command(native::context& rt, const std::filesystem::path& dir, isolation::scope& group, std::string script, std::chrono::milliseconds timeout = 5s)
-    -> jobs::step_report {
-    auto io = rt.get_scheduler();
-    io::command cmd{.argv = {"python3", "-c", std::move(script)}, .cwd = dir, .max_cpu_seconds = 1, .isolation = group.target()};
-    auto report = cores::run(rt, ::runner::run_step(io, std::move(cmd), timeout, 16384, "kernel", &group));
-    require(report.has_value(), "unexpected cancellation");
-    return *report;
-}
+    auto command(native::context& rt, const std::filesystem::path& dir, isolation::scope& group, std::string script, std::chrono::milliseconds timeout = 5s)
+        -> jobs::step_report {
+        auto io = rt.get_scheduler();
+        io::command cmd{.argv = {"python3", "-c", std::move(script)}, .cwd = dir, .max_cpu_seconds = 1, .isolation = group.target()};
+        auto report = cores::run(rt, ::runner::run_step(io, std::move(cmd), timeout, 16384, "kernel", &group));
+        require(report.has_value(), "unexpected cancellation");
+        return *report;
+    }
 
     static constexpr auto cases = [] {
         "a command's exit code and merged output come back"_test = [] {
@@ -101,60 +101,62 @@ auto command(native::context& rt, const std::filesystem::path& dir, isolation::s
             auto key = content::hash_of(tmp.dir.string());
             isolation::pool pool{configured, key};
             native::context rt;
-        {
-            auto group = pool.start(96ull << 20, {});
-            auto r = command(rt, tmp.dir, *group, "import subprocess; subprocess.Popen(['sleep','60'], start_new_session=True); print('leader', flush=True)");
-            require(r.exit_code == 0 && !r.timed_out && r.seconds < 3, "setsid descendant kept the command alive");
-            group->close();
-            require(!std::filesystem::exists(std::filesystem::path{group->target().identity}), "normal command cgroup not removed");
-        }
-        {
-            auto group = pool.start(96ull << 20, {});
-            auto r = command(rt, tmp.dir, *group,
-                             "import subprocess,sys,time; code='import time; x=bytearray(64*1024*1024); time.sleep(30)'; "
-                             "a=subprocess.Popen([sys.executable,'-c',code]); b=subprocess.Popen([sys.executable,'-c',code]); a.wait(); b.wait()",
-                             10s);
-            require(r.exit_code == 137 && r.output.contains("memory limit exceeded (OOM)"), "process-tree OOM was not reported");
-            group->close();
-        }
-        {
-            auto group = pool.start({}, 1);
-            std::string burn = "import time; end=time.process_time()+0.65\nwhile time.process_time()<end: pass";
-            auto first = command(rt, tmp.dir, *group, burn);
-            auto second = command(rt, tmp.dir, *group, burn);
-            require(first.exit_code == 0, "CPU budget exhausted on first short step");
-            require(second.exit_code == 137 && second.output.contains("CPU budget exhausted"), "CPU budget did not span steps");
-            group->close();
-        }
-        {
-            auto group = pool.start({}, {});
-            auto r = command(rt, tmp.dir, *group, "import subprocess,time; subprocess.Popen(['sleep','60'], start_new_session=True); time.sleep(60)", 200ms);
-            require(r.timed_out && r.seconds < 3, "process-tree timeout did not finish promptly");
-            group->close();
-        }
-        {
-            auto group = pool.start({}, {});
-            auto io = rt.get_scheduler();
-            auto stop_later = [](auto& io) -> coroutine::task<> {
-                co_await execution::schedule_after(io, 200ms);
-                co_await execution::just_stopped();
-            };
-            auto stopped = !cores::run(
-                rt,
-                execution::when_all(
-                    ::runner::run_step(io,
-                                      io::command{.argv = {"python3", "-c",
-                                                           "import subprocess,time; subprocess.Popen(['sleep','60'], start_new_session=True); time.sleep(60)"},
-                                                  .cwd = tmp.dir,
-                                                  .isolation = group->target()},
-                                      10s, 1024, "cancel", group.get()),
-                    stop_later(io)));
-            require(stopped, "cancellation was not propagated");
-            group->close();
-        }
+            {
+                auto group = pool.start(96ull << 20, {});
+                auto r =
+                    command(rt, tmp.dir, *group, "import subprocess; subprocess.Popen(['sleep','60'], start_new_session=True); print('leader', flush=True)");
+                require(r.exit_code == 0 && !r.timed_out && r.seconds < 3, "setsid descendant kept the command alive");
+                group->close();
+                require(!std::filesystem::exists(std::filesystem::path{group->target().identity}), "normal command cgroup not removed");
+            }
+            {
+                auto group = pool.start(96ull << 20, {});
+                auto r = command(rt, tmp.dir, *group,
+                                 "import subprocess,sys,time; code='import time; x=bytearray(64*1024*1024); time.sleep(30)'; "
+                                 "a=subprocess.Popen([sys.executable,'-c',code]); b=subprocess.Popen([sys.executable,'-c',code]); a.wait(); b.wait()",
+                                 10s);
+                require(r.exit_code == 137 && r.output.contains("memory limit exceeded (OOM)"), "process-tree OOM was not reported");
+                group->close();
+            }
+            {
+                auto group = pool.start({}, 1);
+                std::string burn = "import time; end=time.process_time()+0.65\nwhile time.process_time()<end: pass";
+                auto first = command(rt, tmp.dir, *group, burn);
+                auto second = command(rt, tmp.dir, *group, burn);
+                require(first.exit_code == 0, "CPU budget exhausted on first short step");
+                require(second.exit_code == 137 && second.output.contains("CPU budget exhausted"), "CPU budget did not span steps");
+                group->close();
+            }
+            {
+                auto group = pool.start({}, {});
+                auto r =
+                    command(rt, tmp.dir, *group, "import subprocess,time; subprocess.Popen(['sleep','60'], start_new_session=True); time.sleep(60)", 200ms);
+                require(r.timed_out && r.seconds < 3, "process-tree timeout did not finish promptly");
+                group->close();
+            }
+            {
+                auto group = pool.start({}, {});
+                auto io = rt.get_scheduler();
+                auto stop_later = [](auto& io) -> coroutine::task<> {
+                    co_await execution::schedule_after(io, 200ms);
+                    co_await execution::just_stopped();
+                };
+                auto stopped = !cores::run(
+                    rt, execution::when_all(
+                            ::runner::run_step(
+                                io,
+                                io::command{.argv = {"python3", "-c",
+                                                     "import subprocess,time; subprocess.Popen(['sleep','60'], start_new_session=True); time.sleep(60)"},
+                                            .cwd = tmp.dir,
+                                            .isolation = group->target()},
+                                10s, 1024, "cancel", group.get()),
+                            stop_later(io)));
+                require(stopped, "cancellation was not propagated");
+                group->close();
+            }
         };
     };
-}
+} // namespace
 
 auto main(int argc, const char** argv) -> int {
     boost::ut::suite<"runner">{cases};

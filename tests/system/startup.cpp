@@ -25,9 +25,8 @@ namespace {
             expect(health.status == 200 && health.body.contains(R"("source":true)")) << health.body;
             expect(process.stop() == 0) << process.output();
             native::context context;
-            expect(throws<std::system_error>([&] {
-                cores::run(context, io::connect(context.get_scheduler(), {net::ip::address_v4::loopback(), source_port}));
-            }));
+            expect(
+                throws<std::system_error>([&] { cores::run(context, io::connect(context.get_scheduler(), {net::ip::address_v4::loopback(), source_port})); }));
         };
         "the managed entry restarts after its parent is killed"_test = [] {
             test::scratch tmp{"managed-restart"};
@@ -46,7 +45,9 @@ namespace {
                     native::context context;
                     cores::run(context, io::connect(context.get_scheduler(), {net::ip::address_v4::loopback(), source_port}));
                     return false;
-                } catch (const std::system_error&) { return true; }
+                } catch (const std::system_error&) {
+                    return true;
+                }
             });
             test::child process{test::command(SERVICE_EXECUTABLE, tmp.dir)};
             test::ready(process, port);
@@ -116,7 +117,7 @@ namespace {
             }
         };
     };
-}
+} // namespace
 
 int main(int argc, const char** argv) {
     boost::ut::suite<"startup">{cases};

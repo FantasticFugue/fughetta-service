@@ -9,7 +9,8 @@ namespace host {
     auto executable() -> std::filesystem::path {
         std::wstring buffer(32768, L'\0');
         auto size = ::GetModuleFileNameW(nullptr, buffer.data(), static_cast<DWORD>(buffer.size()));
-        if (!size || size == buffer.size()) winapi::fail("GetModuleFileName");
+        if (!size || size == buffer.size())
+            winapi::fail("GetModuleFileName");
         buffer.resize(size);
         return std::filesystem::path{buffer};
     }

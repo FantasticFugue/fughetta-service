@@ -308,15 +308,17 @@ namespace {
             auto client = native::socket{scheduler, net::ip::tcp::v4()};
             allocation_counts counts;
             auto connected = cores::run(
-                context, execution::when_all(execution::just(net::ip::tcp::endpoint{net::ip::address_v4{{127, 0, 0, 1}}, listener.local_endpoint().port()}) | net::async_connect(client),
-                                             execution::write_env(net::async_accept(listener),
-                                                                  execution::prop{execution::get_allocator, recording_allocator<std::byte>{&counts}})));
+                context,
+                execution::when_all(
+                    execution::just(net::ip::tcp::endpoint{net::ip::address_v4{{127, 0, 0, 1}}, listener.local_endpoint().port()}) | net::async_connect(client),
+                    execution::write_env(net::async_accept(listener), execution::prop{execution::get_allocator, recording_allocator<std::byte>{&counts}})));
             expect(connected.has_value() >> fatal);
             auto peer = std::move(std::get<0>(*connected));
             expect(counts.allocated.load() == counts.freed.load());
             std::array<std::byte, 3> out{std::byte{'a'}, std::byte{'b'}, std::byte{'c'}}, in{};
-            auto transferred = cores::run(context, execution::when_all(execution::just(net::buffer(std::span<const std::byte>{out})) | io::async_write_some(client),
-                                                                       execution::just(net::buffer(std::span<std::byte>{in})) | io::async_read_some(peer)));
+            auto transferred =
+                cores::run(context, execution::when_all(execution::just(net::buffer(std::span<const std::byte>{out})) | io::async_write_some(client),
+                                                        execution::just(net::buffer(std::span<std::byte>{in})) | io::async_read_some(peer)));
             expect(transferred.has_value() >> fatal);
             expect(std::get<0>(*transferred) == 3u && std::get<1>(*transferred) == 3u);
             expect(std::ranges::equal(in, out));

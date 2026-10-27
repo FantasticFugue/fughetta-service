@@ -43,9 +43,8 @@ namespace {
             expect(throws<std::invalid_argument>([] { language::validate({.server = language::with<"clice">{.options = {.cache_dir = "../cache"}}}); }));
             expect(throws<std::invalid_argument>([] { language::validate({.server = fixture::clice("")}); }));
             expect(throws<std::invalid_argument>([] { config::parse_as<language::configuration>(R"({"server":{"provider":"clangd"}})", "analysis"); }));
-            expect(throws<std::invalid_argument>([] {
-                config::parse_as<language::configuration>(R"({"server":{"provider":"clice","command":["sh","-c","touch sentinel"]}})", "analysis");
-            }));
+            expect(throws<std::invalid_argument>(
+                [] { config::parse_as<language::configuration>(R"({"server":{"provider":"clice","command":["sh","-c","touch sentinel"]}})", "analysis"); }));
         };
     };
 } // namespace
@@ -74,8 +73,6 @@ namespace {
     }
 
     static constexpr auto config_suite = [] {
-
-
         "selections say what they cannot do when the settings are read"_test = [] {
             auto d = sample();
             auto& app = d.projects.at("app");
@@ -154,8 +151,7 @@ namespace {
             options.export_compile_commands = true;
             source_build.outputs["database"] = {"configure", "compilation_database"};
             source_build.env["OWNER"] = "source";
-            d.projects.at("app").analysis["cpp"] = {
-                .build = source_build, .inputs = {"database"}};
+            d.projects.at("app").analysis["cpp"] = {.build = source_build, .inputs = {"database"}};
             config::validate(d);
             auto e = config::resolve(d, "app");
             expect(e.config("Debug-gcc").build.env.contains("CC"));
@@ -166,8 +162,7 @@ namespace {
 
         "project names and operation references are validated"_test = [] {
             expect(config::valid_name("app-1.2_x") && !config::valid_name("") && !config::valid_name(".hidden") && !config::valid_name("a/b"));
-            expect(throws<std::invalid_argument>(
-                [] { config::parse(R"({"projects":{"../x":{}}})"); }));
+            expect(throws<std::invalid_argument>([] { config::parse(R"({"projects":{"../x":{}}})"); }));
             expect(throws<std::invalid_argument>([] { config::parse("{not json"); }));
             auto d = sample();
             d.projects.at("app").default_configurations = {"missing"};
@@ -188,10 +183,10 @@ namespace {
             auto before = store.current();
             auto saved = test::slurp(file);
             for (auto token : std::vector<config::token>{{.name = "", .hash = good},
-                                                          {.name = "../x", .hash = good},
-                                                          {.name = "short", .hash = "abc"},
-                                                          {.name = "upper", .hash = std::string(64, 'A')},
-                                                          {.name = "operator", .hash = good, .role = "operator"}}) {
+                                                         {.name = "../x", .hash = good},
+                                                         {.name = "short", .hash = "abc"},
+                                                         {.name = "upper", .hash = std::string(64, 'A')},
+                                                         {.name = "operator", .hash = good, .role = "operator"}}) {
                 auto changed = before->server;
                 changed.auth.tokens.push_back(token);
                 expect(throws<std::invalid_argument>([&] { store.put_server(changed, before->revisions.server); })) << token.name;
@@ -252,17 +247,11 @@ namespace {
 
         "configuration readers reject misspelled fields"_test = [] {
             expect(throws<std::invalid_argument>([] { config::parse_as<config::worker>(R"({"max_infligth":4})", "worker"); }));
-            expect(throws<std::invalid_argument>(
-                [] { config::parse(R"({"limits":{"max_projcts":1}})"); }));
-            expect(throws<std::invalid_argument>([] {
-                config::parse(
-                    R"({"projects":{"app":{"build_configurations":{"x":{"operatons":{}}}}}})");
-            }));
+            expect(throws<std::invalid_argument>([] { config::parse(R"({"limits":{"max_projcts":1}})"); }));
+            expect(throws<std::invalid_argument>([] { config::parse(R"({"projects":{"app":{"build_configurations":{"x":{"operatons":{}}}}}})"); }));
             expect(throws<std::invalid_argument>(
                 [] { config::parse_as<builds::builder>(R"({"adapter":"cmake","options":{"build_dir":"build/debug","generatr":"Ninja"}})", "builder"); }));
         };
-
-
 
         "saves name the revision they read; a stale one is refused with the current value"_test = [] {
             test::scratch tmp{"config-revision"};
@@ -291,8 +280,7 @@ namespace {
             s.put_project("app", {.ignore = {"b"}}, config::revision_of(*s.current(), "app"));
             expect(s.current()->projects.at("app").ignore == std::vector<std::string>{"b"});
             auto after = config::load(file);
-            expect(after.revisions.counter == s.current()->revisions.counter &&
-                   config::revision_of(after, "app") == config::revision_of(*s.current(), "app"));
+            expect(after.revisions.counter == s.current()->revisions.counter && config::revision_of(after, "app") == config::revision_of(*s.current(), "app"));
             s.remove_project("app");
             s.put_project("app", {}, 0);
             expect(s.current()->projects.contains("app")) << "a removed project is created again from revision 0";
@@ -302,8 +290,7 @@ namespace {
             test::scratch tmp{"config"};
             cores::io_context<native::context> rt{3};
             execution::thread_pool pool{1};
-            front::config_hub hub{
-                rt, config::store{config::document{}, tmp.dir / "gateway.json"}, pool};
+            front::config_hub hub{rt, config::store{config::document{}, tmp.dir / "gateway.json"}, pool};
             std::vector<bool> seen;
             rt.run([&](scheduler&, std::size_t core) -> coroutine::task<> {
                 if (core != 0)
@@ -371,6 +358,22 @@ namespace {
             expect(again.events(0, 10).events.at(0).seq == 3u) << "a log pruned to nothing still remembers the last number";
         };
 
+        "ledger notifications follow visible committed state"_test = [] {
+            test::scratch tmp{"usage-events"};
+            usage::ledger ledger{tmp.dir};
+            unsigned notifications = 0;
+            ledger.changed = [&] { ++notifications; };
+            auto ticket = ledger.admit_build("app", config::effective_limits{});
+            expect(notifications == 1u && ledger.running() == 1u);
+            ledger.record(ticket, {.project = "app", .ok = true});
+            expect(notifications == 2u && ledger.running() == 0u);
+            expect(ledger.events(0, 10).events.size() == 1u);
+            ledger.record({.project = "app", .tool = "read"});
+            expect(notifications == 3u && ledger.events(0, 10).events.size() == 2u);
+            ledger.release(ticket);
+            expect(notifications == 3u) << "no change does not emit a notification";
+        };
+
         "build quotas: rate and build time"_test = [] {
             test::scratch tmp{"usage"};
             usage::ledger l{tmp.dir};
@@ -400,12 +403,13 @@ namespace {
         "an unknown execution outcome is charged and is not classified as unrun"_test = [] {
             test::scratch tmp{"usage-unknown"};
             usage::ledger ledger{tmp.dir};
-            config::effective_limits limits{.builds_per_hour=1};
-            ledger.record(ledger.admit_build("app",limits),{.project="app",.worker="remote",.error="connection lost",.error_code="outcome_unknown"});
-            expect(ledger.builds_last_hour("app")==1u);
-            expect(throws<usage::quota_exceeded>([&]{ledger.admit_build("app",limits);}));
-            auto totals=ledger.counters().projects.at("app");
-            expect(totals.builds_unknown==1u && totals.builds_not_run==0u && totals.builds_failed==0u);
+            config::effective_limits limits{.builds_per_hour = 1};
+            ledger.record(ledger.admit_build("app", limits),
+                          {.project = "app", .worker = "remote", .error = "connection lost", .error_code = "outcome_unknown"});
+            expect(ledger.builds_last_hour("app") == 1u);
+            expect(throws<usage::quota_exceeded>([&] { ledger.admit_build("app", limits); }));
+            auto totals = ledger.counters().projects.at("app");
+            expect(totals.builds_unknown == 1u && totals.builds_not_run == 0u && totals.builds_failed == 0u);
         };
 
         "the ledger survives a restart"_test = [] {
@@ -432,7 +436,6 @@ namespace {
         };
     };
 } // namespace
-
 
 auto main(int argc, const char** argv) -> int {
     boost::ut::suite<"source_config">{cases};

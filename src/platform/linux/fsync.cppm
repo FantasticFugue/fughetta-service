@@ -77,18 +77,23 @@ namespace durability {
         durable_write(target, std::as_bytes(std::span{text}), executable, temp_suffix);
     }
 
-    void durable_private_write(const std::filesystem::path& target,std::string_view text) {
-        auto temporary=target;
-        temporary+=".private-write";
+    void durable_private_write(const std::filesystem::path& target, std::string_view text) {
+        auto temporary = target;
+        temporary += ".private-write";
         try {
             ::unlink(temporary.c_str());
-            auto file=open(temporary,O_WRONLY|O_CREAT|O_EXCL|O_NOFOLLOW,0600);
-            if (::fchmod(file.get(),0600)!=0) fail("cannot protect",temporary);
-            write_all(file,std::as_bytes(std::span{text}),temporary);
-            sync(file,temporary);
+            auto file = open(temporary, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, 0600);
+            if (::fchmod(file.get(), 0600) != 0)
+                fail("cannot protect", temporary);
+            write_all(file, std::as_bytes(std::span{text}), temporary);
+            sync(file, temporary);
             file.close(temporary);
-            if (::rename(temporary.c_str(),target.c_str())!=0) fail("cannot publish",target);
-        } catch (...) {::unlink(temporary.c_str());throw;}
+            if (::rename(temporary.c_str(), target.c_str()) != 0)
+                fail("cannot publish", target);
+        } catch (...) {
+            ::unlink(temporary.c_str());
+            throw;
+        }
         sync_dir(target.parent_path());
     }
 
@@ -103,39 +108,40 @@ namespace durability {
     }
 
     namespace {
-    auto read_checked(std::filesystem::path path, std::uint64_t limit, bool secret) -> util::generator<std::span<const std::byte>> {
-        int raw = ::open(path.c_str(), O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC);
-        if (raw < 0)
-            throw unreadable{path.string()};
-        fd f{raw};
-        struct ::stat st{};
-        if (::fstat(f.get(), &st) != 0 || !S_ISREG(st.st_mode) || static_cast<std::uint64_t>(st.st_size) > limit)
-            throw unreadable{path.string()};
-        if (secret && (st.st_uid!=::geteuid() || (st.st_mode&0777)!=0600)) throw unreadable{path.string()};
-        std::array<std::byte, 1 << 16> buffer;
-        std::uint64_t total = 0;
-        for (;;) {
-            auto n = ::read(f.get(), buffer.data(), buffer.size());
-            if (n < 0 && errno == EINTR)
-                continue;
-            if (n < 0)
+        auto read_checked(std::filesystem::path path, std::uint64_t limit, bool secret) -> util::generator<std::span<const std::byte>> {
+            int raw = ::open(path.c_str(), O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC);
+            if (raw < 0)
                 throw unreadable{path.string()};
-            if (n == 0)
-                break;
-            total += static_cast<std::uint64_t>(n);
-            if (total > static_cast<std::uint64_t>(st.st_size))
+            fd f{raw};
+            struct ::stat st{};
+            if (::fstat(f.get(), &st) != 0 || !S_ISREG(st.st_mode) || static_cast<std::uint64_t>(st.st_size) > limit)
                 throw unreadable{path.string()};
-            co_yield std::span<const std::byte>{buffer.data(), static_cast<std::size_t>(n)};
+            if (secret && (st.st_uid != ::geteuid() || (st.st_mode & 0777) != 0600))
+                throw unreadable{path.string()};
+            std::array<std::byte, 1 << 16> buffer;
+            std::uint64_t total = 0;
+            for (;;) {
+                auto n = ::read(f.get(), buffer.data(), buffer.size());
+                if (n < 0 && errno == EINTR)
+                    continue;
+                if (n < 0)
+                    throw unreadable{path.string()};
+                if (n == 0)
+                    break;
+                total += static_cast<std::uint64_t>(n);
+                if (total > static_cast<std::uint64_t>(st.st_size))
+                    throw unreadable{path.string()};
+                co_yield std::span<const std::byte>{buffer.data(), static_cast<std::size_t>(n)};
+            }
+            if (total != static_cast<std::uint64_t>(st.st_size))
+                throw unreadable{path.string()};
         }
-        if (total != static_cast<std::uint64_t>(st.st_size))
-            throw unreadable{path.string()};
+    } // namespace
+    auto read_plain(const std::filesystem::path& path, std::uint64_t limit) -> util::generator<std::span<const std::byte>> {
+        return read_checked(path, limit, false);
     }
-    }
-    auto read_plain(const std::filesystem::path& path,std::uint64_t limit) -> util::generator<std::span<const std::byte>> {
-        return read_checked(path,limit,false);
-    }
-    auto read_private(const std::filesystem::path& path,std::uint64_t limit) -> util::generator<std::span<const std::byte>> {
-        return read_checked(path,limit,true);
+    auto read_private(const std::filesystem::path& path, std::uint64_t limit) -> util::generator<std::span<const std::byte>> {
+        return read_checked(path, limit, true);
     }
 
     void durable_remove(const std::filesystem::path& p) {

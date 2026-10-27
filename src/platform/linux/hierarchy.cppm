@@ -52,7 +52,8 @@ namespace isolation {
         auto cpu_exhausted() const -> bool { return cpu_ && counter(read(path_ / "cpu.stat"), "usage_usec") >= std::uint64_t{*cpu_} * 1000000; }
         auto memory_failures() const -> std::uint64_t { return counter(read(path_ / "memory.events"), "oom_kill"); }
         void concurrency(std::uint32_t parallel) {
-            if (!parallel) throw std::invalid_argument("CPU concurrency must be positive");
+            if (!parallel)
+                throw std::invalid_argument("CPU concurrency must be positive");
             write(path_ / "cpu.max", std::format("{} 100000", std::uint64_t{parallel} * 100000));
         }
         void close() {
@@ -90,6 +91,21 @@ namespace isolation {
     private:
         std::filesystem::path path_;
     };
+    auto delegated() -> std::filesystem::path {
+        auto line = cgroup::read("/proc/self/cgroup");
+        if (!line.starts_with("0::/") || line.find('\n') != line.size() - 1)
+            throw std::runtime_error("this process is not in a cgroup v2 hierarchy");
+        auto root = std::filesystem::path{"/sys/fs/cgroup"} / line.substr(4, line.size() - 5);
+        verify(root);
+        if (::access((root / "cgroup.subtree_control").c_str(), W_OK) != 0 || ::access((root / "cgroup.procs").c_str(), W_OK) != 0)
+            throw std::runtime_error(std::format("cgroup '{}' is not delegated to this user; start the Worker with `fug worker`, or under "
+                                                 "`systemd-run --user --scope -p Delegate=yes`",
+                                                 root.string()));
+        std::filesystem::create_directory(root / "service");
+        write(root / "service" / "cgroup.procs", "0");
+        write(root / "cgroup.subtree_control", "+cpu +memory");
+        return root;
+    }
     scope::scope(std::filesystem::path path, std::optional<std::uint64_t> memory, std::optional<std::uint32_t> cpu)
         : state_(std::make_unique<state>(std::move(path), memory, cpu)) {}
     scope::~scope() = default;

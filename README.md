@@ -1,8 +1,18 @@
 # fughetta-service
 
-Source and file tools for coding agents, exposed over MCP. The
-`fughetta-service` executable runs a gateway process that manages one source
-process and a worker pool for one workspace. The hosted platform places
+A remote development service for coding agents, exposed over MCP.
+
+The first release serves builds, tests, and runs: agents edit files on their
+own machine, [fug](../fughetta-cli) sends them, and several agents share one
+queue of deduplicated, cached jobs on warm workers. Behind that sits the
+longer-term layer the service is built on: worldlines that hold each project's
+code and let agents work on it together, and language analysis that reads
+symbols and scopes from those versions. Its file and worldline tools serve
+clients that sync code (`fug`, `agent-cloud`); they are not yet the main agent
+interface.
+
+The `fughetta-service` executable runs a gateway process that manages one
+source process and a worker pool for one workspace. The hosted platform places
 `cloud-gateway` in front of each workspace for accounts, sign-in, and billing.
 
 The front ends are separate repositories beside this one, each a static app on
@@ -12,7 +22,7 @@ the component library `@fantasticfugue/components` (`../components`):
 | --- | --- |
 | `console` | The customers' console: workspaces, projects, settings, history, insights |
 | `admin` | The operators' console: users, workspaces and the gateway across every tenant |
-| `pwa-coding-agent` | A coding agent as an installable web app, working on a synced copy of a worldline |
+| `agent-cloud` | A coding agent as an installable web app, working on a synced copy of a worldline |
 | `landing` | Marketing pages, docs, blog, pricing and legal, prerendered |
 
 ## Dependencies and build
@@ -76,6 +86,8 @@ also terminate when their parent dies.
 The checked-in configuration listens at `127.0.0.1:18100`. Connect an HTTP MCP
 client to `http://127.0.0.1:18100/mcp` with `Authorization: Bearer <token>`.
 REST routes use the same token under `/api/v1`; `/healthz` is public.
+Workspace subscriptions use `GET /api/v1/events`; the event contract and shared
+validation record are in the [hosted gateway guide](../cloud-gateway/README.md#workspace-events).
 `--help` prints the public commands. The `--role` arguments are internal process
 entry points used by the supervisor and process tests.
 
@@ -84,13 +96,11 @@ Hosted cores use `server.auth.mode: "trusted"` and must set
 request must carry the matching `x-fughetta-workspace`, including requests with
 the host role. See the gateway's [core configuration](../cloud-gateway/README.md#cells-where-each-core-listens).
 
-Worker transport accepts a `wss://` gateway URL with the public
-`/w/{workspace}/workers/tunnel` path. The URL must use a DNS hostname; userinfo,
-query strings, and fragments are rejected. `ca_file` selects a PEM trust store;
-an empty value uses system roots. TLS verifies the certificate chain and
-hostname, sends SNI, and requires TLS 1.2 or later. DNS and TCP connection share
-a 30-second deadline; TLS and the HTTP upgrade have a separate 30-second
-deadline. The managed workers continue to use their loopback TCP endpoints.
+A registered Worker speaks plain TCP to its `gateway` endpoint (`host:port`).
+On a self-hosted machine that endpoint is the loopback relay run by `fug worker`,
+which holds TLS, DNS, and OAuth and relays each connection over the public
+`/w/{workspace}/workers/tunnel` WebSocket. The managed workers continue to use
+their loopback TCP endpoints.
 
 `native::context` and `runtime::context` select `concurrent::queue` from the
 `mpmc` core module for native submissions and blocking file work. Native TCP,
@@ -111,40 +121,81 @@ The `websocket` stream presents opaque bytes to the existing jobs channel,
 splits output into 16 KiB binary messages, handles ping/pong and close, and
 waits for transport writes to apply backpressure. `resolver` drives cancellable
 c-ares queries on the native scheduler. `httpant.tls` wraps `web::stream` over a
-native socket and bounds pending ciphertext at 128 KiB. Worker and enrollment
-sessions send `close_notify` after a normal end. Certificate rejection uses
+native socket and bounds pending ciphertext at 128 KiB; cloud-gateway uses
+these modules for its public tunnels and sends `close_notify` after a normal end. Certificate rejection uses
 `http::tls::verification_failure`; the local `tls` module retains URL parsing. Tree coordination state is released after its last active
 or waiting build; Core scheduling retains at most 256 recent tree hints per
 Worker. The hosted transport and its deployment limits are documented in the
 gateway's [Worker tunnel entry](../cloud-gateway/README.md#worker-tunnels).
 
+## Clients and hosts
+
+The `fug` command line client lives in its own repository,
+[fughetta-cli](../fughetta-cli). It talks to a core directly or through a host that fronts
+several cores. This is the whole contract a host offers to clients:
+
+* **Workspace prefix.** `{origin}/w/{workspace}/...` reaches `/...` on that
+  workspace's core: `/api/v1`, `/mcp`, `/mcp/config` and `/healthz`. A core
+  reached directly has no prefix.
+* **Bearer tokens.** Every request sends `Authorization: Bearer sk_...`.
+  A core issues its own tokens (`fughetta-service token`); a host issues
+  account tokens and authorizes each request before it reaches the core.
+* **Sign-in.** `GET {origin}/.well-known/oauth-authorization-server` returns
+  RFC 8414 metadata. Clients use the authorization code grant with PKCE
+  (`S256`, `client_id=fug`, no client secret) and a loopback redirect
+  `http://127.0.0.1:{port}/...`. The authorization request includes
+  `response_type=code`, `code_challenge`, `code_challenge_method=S256`,
+  `redirect_uri` and `state`. `POST {token_endpoint}` with a form body
+  (`grant_type=authorization_code`, `code`, `code_verifier`, `redirect_uri`,
+  `client_id`) returns `{"access_token": "sk_...", "token_type": "Bearer"}`.
+* **Workspaces.** `GET {origin}/api/v1/workspaces` returns a JSON array of the
+  workspaces the token may use, each with its `name` (the slug used in the prefix),
+  `workspace_id` and `role`.
+
+A core alone offers no sign-in or workspace listing; clients take its token
+from the user and use no prefix.
+
+A client whose write lost its reply settles it with
+`POST /api/v1/projects/{project}/operations/{operation_id}/abandon`. The
+answer is `{"outcome": "applied", "version", "receipt"}` when the operation
+ran, or `{"outcome": "abandoned"}`, after which the operation never runs: its
+request, arriving later, fails with `identity_conflict`, and so does a
+`receipt` for it. Agents recover with
+the worldline tool's `receipt` instead; this route is not one of their tools.
+
 ## Connect a self-hosted Worker
 
-Owners create a five-minute, single-use pairing code with
-`POST /api/v1/worker-enrollments`. The public gateway exposes these Core routes
-under `/w/{workspace}`. On the execution machine, run:
+The execution machine runs the Worker through `fug`, the Fughetta CLI:
 
 ```sh
-fughetta-service worker join --gateway https://gateway.example --workspace acme --code '<pairing-code>' --name my-machine --run
-fughetta-service worker run --config /absolute/path/to/credentials.json
+fug login --server https://gateway.example
+fug worker --server https://gateway.example --workspace acme
 ```
 
-`join --run` saves credentials before starting the outbound connection. The
-long-term secret appears only in the owner-protected configuration, never in
-command arguments or join output. The default Linux location is
-`$XDG_STATE_HOME/fughetta/workers/<workspace>/credentials.json`, or
-`$HOME/.local/state/fughetta/workers/<workspace>/credentials.json` when
-`XDG_STATE_HOME` is unset. Windows uses
-`%LOCALAPPDATA%/Fughetta/workers/<workspace>/credentials.json`. Existing files
-are refused. `--config`, `--ca-file`, `--data-root`, `--work-root`,
-`--compute-threads`, `--parallel`, `--max-inflight`, and repeatable
-`--tool NAME=PATH` set machine-local resources. Saved paths are absolute.
+`fug worker` registers the machine with `POST /api/v1/workers` (owner only,
+body `{"name": "..."}`), which answers 201 with
+`{"workspace_id", "worker_id", "secret"}` exactly once and `cache-control:
+no-store`. The Core stores only the secret's hash. `fug` keeps the credential in
+an owner-only file, downloads this binary from the GitHub release, writes a
+private Worker configuration, and starts:
 
-Credential files must belong to the current user and have mode 0600 on Linux;
-Windows uses an owner-only ACL. Keep them outside source repositories. Linux
-execution needs the cgroup delegation described below. Work and data roots are
-partitioned by immutable Workspace ID and Worker ID. The Worker opens no
-inbound listener.
+```sh
+fughetta-service worker run --config /absolute/path/to/worker.json
+```
+
+The configuration names `gateway` (the loopback relay), `worker_id`,
+`workspace_id`, `token` (the secret), `name`, `data_root`, `work_root`,
+`compute_threads`, `parallel`, `max_inflight`, and `tools`. It must belong to
+the current user with mode 0600 on Linux; Windows uses an owner-only ACL. Work
+and data roots are partitioned by immutable Workspace ID and Worker ID. The
+Worker opens no inbound listener.
+
+On Linux a registered Worker isolates builds under the cgroup it starts in.
+`fug` starts it with `systemd-run --user --scope -p Delegate=yes`; the Worker
+moves itself into a `service` child, enables `cpu` and `memory` for its
+children, and refuses to start when the cgroup is not delegated to the user.
+Exit status 2 means the Core refused the identity (revoked, unknown, or for
+another Workspace); `fug` does not restart a Worker that exits with it.
 
 The Core uses a separate private listener for registered Workers:
 
@@ -157,10 +208,10 @@ The Core uses a separate private listener for registered Workers:
 }
 ```
 
-Point the gateway's private Worker address at this listener. Enable enrollment
-on the Core and tunnels on the gateway to admit remote identities. Turning
-`remote_worker_enrollment` off prevents new pairing and admission while
-retaining the registry and existing sessions. The managed listener and its
+Point the gateway's private Worker address at this listener. Enable
+`remote_worker_enrollment` on the Core and tunnels on the gateway to register
+and admit remote identities. Turning `remote_worker_enrollment` off refuses new
+registration and admission while retaining the registry and existing sessions. The managed listener and its
 shared token remain separate.
 
 The registry lives at `server.storage/worker-registry/registry.json`; include
@@ -169,13 +220,14 @@ metadata, and recent connection times. Quiesce and stop the Core and its source 
 and source state as one recovery set, preserve owner-only permissions, and
 restore it under the same immutable Workspace ID. Credentials active in that
 backup remain valid; recorded revocations remain denied. A backup taken before
-a revocation lacks it: keep enrollment disabled until the current
-revocations are restored or affected identities are revoked and paired again.
+a revocation lacks it: keep `remote_worker_enrollment` disabled until the
+current revocations are restored or affected identities are revoked and
+registered again.
 The local recovery drill copies a registry backup into a fresh directory and
 checks active and revoked credentials plus Workspace binding. Production
 storage snapshots and full source recovery still require a deployment drill.
 
-Core logs record enrollment creation/redemption/revocation and authenticated
+Core logs record registration, revocation, and authenticated
 Worker connection metadata without credential material. `GET /api/v1/workers` is member-readable
 and includes offline and revoked identities. Owners rename with
 `POST /api/v1/workers/{worker_id}/rename` and revoke with
@@ -183,9 +235,9 @@ and includes offline and revoked identities. Owners rename with
 immediately and shuts down active sessions. Execution results and build ledger
 events take their Worker identity from the Core's authenticated connection.
 
-Execution results and build events retain the immutable Workspace ID, Project,
-Worldline, opaque Version, content snapshot, operation, actor, and registered
-Worker ID. Equal content on different Worldlines retains separate execution
+Build events retain the immutable Workspace ID, Project, Worldline, opaque
+Version, content snapshot, operation, actor, and registered Worker ID. The
+agent's build, test, and run results leave these out. Equal content on different Worldlines retains separate execution
 identity. Sync rejects a Worker that substitutes another content snapshot.
 Interrupted execution returns `outcome_unknown`; cancellation and failure
 before dispatch remain distinct. Unknown and cancelled builds count toward
@@ -198,17 +250,17 @@ Language preparation persists its completed, failed, cancelled, or unknown
 receipt in a bounded interval even when its caller cancels. Repeating its
 operation retrieves that receipt instead of rerunning the command.
 
-Remote defaults are a 15-second application heartbeat, a 30-second WebSocket
-ping, and a 90-second Core stale threshold. `heartbeat_seconds` and
-`ping_seconds` accept 1–30 seconds. Temporary connection failures use bounded
+Remote defaults are a 15-second application heartbeat and a 90-second Core
+stale threshold. `heartbeat_seconds` accepts 1–30 seconds. Temporary connection failures use bounded
 exponential backoff with jitter; `reconnect_attempts` defaults to 30 and accepts
-1–120 attempts, resetting after a stable session. Credential refusal,
-revocation, protocol refusal, and certificate verification failure stop the
-Worker. Reconnection does not replay interrupted jobs. Pair again after
-revocation using a new configuration path. Local validation and remaining
+1–120 attempts, resetting after a stable session. Disabled admission and a
+protocol mismatch are retried the same way, since the identity stays valid.
+Credential refusal and revocation stop the Worker with exit status 2.
+Reconnection does not replay interrupted jobs. Register again after
+revocation. Local validation and remaining
 limits are recorded in the gateway's [verification entry](../cloud-gateway/README.md#verification).
 
-## C++ and Python toolchains
+## C++, Python, TypeScript and Bun toolchains
 
 Projects store build graphs and language-service configurations. Create one with
 `PUT /api/v1/projects/{project}` and a revisioned settings value; source-file
@@ -217,12 +269,40 @@ build manifests before executing its tasks.
 
 | Component | Execution and configuration |
 | --- | --- |
-| CMake / CTest | Configure and build with explicit directories, presets, compilers, variables, and targets. The CMake builder's `test` object controls CTest selection, parallelism, timeout, reports, and failure behavior. An empty test selection fails by default. |
+| CMake / CTest | Configure and build with explicit directories, presets, compilers, variables, and targets. The CMake builder's `test` object controls CTest selection, parallelism, timeout, and failure behavior. An empty test selection fails by default. |
 | vcpkg | Install a manifest into `install_dir`; the task exports the installed directory. Point CMake at the selected checkout's `scripts/buildsystems/vcpkg.cmake`, bind `VCPKG_INSTALLED_DIR` to that output, and set `VCPKG_MANIFEST_INSTALL=OFF` when the graph already performs installation. |
 | clice | Read compilation-database outputs from the preparation graph, with explicit cache, compile-flag additions/removals, executable, and environment settings. |
+| TypeScript / tsc | Check a selected `tsconfig.json` without emitting, or compile into an explicit output directory. Compiler options are typed fields; terminal diagnostics remain available without being parsed as a structured report. |
+| typescript-language-server | Analyze TypeScript, TSX, JavaScript, and JSX through LSP. Configure tsserver, inlay/completion preferences, implicit-project settings, locale, and memory through initialization options. |
+| Bun | Build and test only. Every operation automatically performs a frozen-lockfile `bun install` first, with lifecycle scripts disabled by default. Build entrypoints, output, bundler options, test paths, and name filters are typed; there is no `run` operation or arbitrary command argument field. Tests use Bun's native JUnit reporter. |
 | uv | Lock, sync, build distributions, and run a command. Environment and distribution directories are explicit; dependency groups, extras, interpreter selection, and offline execution are modeled separately. |
 | ty | Run type checks with import environments and rule severity settings; warnings fail by default. Its language server has independent diagnostic, completion, inlay-hint, and configuration settings. |
 | Ruff | Check lint and formatting without rewriting source. The language server has independent rules, formatting, code-action, and configuration settings. |
+
+Results come from reports in fixed protocols, never from the text a tool prints
+for people, so a new tool version does not break them. A step writes its reports
+to `${reports}`, a directory outside the tree that is empty when the step
+starts, and the worker reads them after the step, failed or not:
+
+| Protocol | Written by | Gives |
+| --- | --- | --- |
+| `junit` | CTest (`--output-junit`), pytest (`--junit-xml`), Bun (`--reporter=junit`) | total, failed, failed test names |
+| `bep` | `bazel test` (`--build_event_json_file`) | the same, from each target's test summary |
+| `codequality` | ty and Ruff (`--output-format gitlab`) | diagnostics with file, line, column, and severity |
+
+Adapters add these flags and declare their reports themselves. A task that
+starts a program its adapter does not know adds the report: a `uv run` or
+`command` task that runs `pytest --junit-xml=${reports}/pytest.xml` sets
+`"reports": [{"protocol": "junit", "file": "pytest.xml"}]`. Reports of every
+step in a result are merged, so a configuration that compiles an extension with
+CMake and tests it with pytest reports both. Compiler messages are not parsed:
+they stay in the step's output for the agent to read. A new tool joins with its
+own adapter module, and a new protocol only when no existing one fits.
+
+Agents configure projects with the `project`, `schema`, and `save_project` tools of
+the configuration MCP. `schema` returns the settings schema with the options of
+every adapter and language server, so the tool list stays small; a refused save
+names the field.
 
 Language services negotiate symbol and diagnostic capabilities, collect pull or
 push diagnostics, and publish them into the semantic outline. Diagnostics retain
@@ -285,8 +365,9 @@ and source preparation; `src/worker/` executes tasks. Shared domain models live
 in `src/model/`, execution helpers in `src/core/`, and I/O and platform providers
 in `src/io/` and `src/platform/`. Tests live in `tests/`.
 
-Development rules are in [AGENTS.md](AGENTS.md). The agent's worldline protocol
-is documented in `../pwa-coding-agent/.work/worldline-protocol.md`.
+Development rules are in [AGENTS.md](AGENTS.md). Clients that sync files, `fug`
+and `agent-cloud`, use the `worldline` MCP tool; its `tools/list` schema is the
+contract.
 
 The local debug preset configured and generated successfully. Release
 configuration and Windows execution remain unverified. Automatic self-hosted

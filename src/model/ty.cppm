@@ -38,6 +38,7 @@ namespace builds {
         static auto expand(const options& o, std::string_view operation, const parameters& p) -> std::vector<step>;
     };
     static_assert(system<adapter<"ty">>);
+
 } // namespace builds
 
 namespace language {
@@ -98,7 +99,8 @@ namespace {
     }
     auto bound(const std::string& python) -> std::string { return std::filesystem::path(python).is_absolute() ? python : "${tree}/" + python; }
     void version(const std::string& value) {
-        if (!value.starts_with("3.") || value.size() < 3 || value.size() > 4 || !std::ranges::all_of(value.substr(2), [](char c) { return c >= '0' && c <= '9'; }))
+        if (!value.starts_with("3.") || value.size() < 3 || value.size() > 4 ||
+            !std::ranges::all_of(value.substr(2), [](char c) { return c >= '0' && c <= '9'; }))
             throw std::invalid_argument("python_version is a version such as 3.12: " + value);
     }
     void pattern(const std::string& value, std::string_view field) {
@@ -136,8 +138,11 @@ namespace builds {
     auto adapter<"ty">::expand(const options& o, std::string_view operation, const parameters& p) -> std::vector<step> {
         if (operation != "check")
             throw std::out_of_range("no such operation");
-        step out{.name = "check", .cwd = o.project_dir};
-        out.argv = {tool(o.executable), "check", "--no-progress", "--color", "never"};
+        // ty prints its Code Quality report on standard output, with paths relative to CI_PROJECT_DIR when it is set; pinning it to
+        // the step's directory keeps them relative to where the report is read from.
+        step out{.name = "check", .cwd = o.project_dir, .reports = {{"codequality", "ty.json"}}, .standard_output = "ty.json"};
+        out.env["CI_PROJECT_DIR"] = "${tree}/" + o.project_dir;
+        out.argv = {tool(o.executable), "check", "--no-progress", "--color", "never", "--output-format", "gitlab"};
         auto& argv = out.argv;
         if (o.python)
             argv.insert(argv.end(), {"--python", bound(*o.python)});
@@ -158,6 +163,7 @@ namespace builds {
 
         return {std::move(out)};
     }
+
 } // namespace builds
 
 namespace language {

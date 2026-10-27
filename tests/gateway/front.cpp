@@ -44,13 +44,14 @@ namespace {
         routing::router router{rt};
         execution::thread_pool pool{2};
         front::config_hub hub{rt,
-                                   config::store{config::parse(std::format(R"({{
+                              config::store{config::parse(std::format(R"({{
       "server": {{ "allowed_origins": ["http://ok.example"], "max_request_bytes": 4096, "storage": "{}",
                    "auth": {{ "mode": "{}", "workspace": "{}", "tokens": [{{ "name": "tester", "hash": "{}" }}] }} }}
     }})",
-                                                                           (tmp.dir / "storage").generic_string(), mode, mode == "trusted" ? "acme-id" : "", keyring::hash("sk_test"))),
-                                                 tmp.dir / "gateway.json"},
-                                   pool};
+                                                                      (tmp.dir / "storage").generic_string(), mode, mode == "trusted" ? "acme-id" : "",
+                                                                      keyring::hash("sk_test"))),
+                                            tmp.dir / "gateway.json"},
+                              pool};
         test::source_service source{tmp.dir / "source"};
         storage::registry files{rt, tmp.dir / "storage", hub, pool, source.endpoint()};
         tools::services services{hub.slot(0), router, files, 0};
@@ -59,10 +60,12 @@ namespace {
         explicit harness(std::string mode = "token") : mode(std::move(mode)) { services.queue = &queue; }
         std::uint16_t port = 0;
 
-        auto ask(ctx& io, http::method method, std::string target, std::string body = {}, std::vector<http::header> fields = {}, bool authenticated = true) -> coroutine::task<answer> {
+        auto ask(ctx& io, http::method method, std::string target, std::string body = {}, std::vector<http::header> fields = {}, bool authenticated = true)
+            -> coroutine::task<answer> {
             auto s = co_await io::connect(io, {net::ip::address_v4{{127, 0, 0, 1}}, port});
             web::stream<socket> transport{s};
-            if (authenticated) fields.push_back({"authorization", "Bearer sk_test"});
+            if (authenticated)
+                fields.push_back({"authorization", "Bearer sk_test"});
             http::request req{.method = method, .target = std::move(target), .scheme = "http", .authority = "localhost", .fields = std::move(fields)};
             http::v1::client client{transport};
             auto got = co_await http::coroutine::fetch(client, std::move(req), std::string_view{body});
@@ -92,14 +95,81 @@ namespace {
 
     static constexpr auto front_suite = [] {
         "trusted authentication requires a configured workspace identity"_test = [] {
-            expect(throws<std::invalid_argument>([] {
-                config::parse(R"({"server":{"auth":{"mode":"trusted"}}})");
-            })) << "trusted mode must name the workspace it serves";
-            expect(throws<std::invalid_argument>([] {
-                config::parse(R"({"server":{"auth":{"mode":"trusted","workspace":""}}})");
-            })) << "an empty workspace identity is refused";
+            expect(throws<std::invalid_argument>([] { config::parse(R"({"server":{"auth":{"mode":"trusted"}}})"); }))
+                << "trusted mode must name the workspace it serves";
+            expect(throws<std::invalid_argument>([] { config::parse(R"({"server":{"auth":{"mode":"trusted","workspace":""}}})"); }))
+                << "an empty workspace identity is refused";
             auto configured = config::parse(R"({"server":{"auth":{"mode":"trusted","workspace":"acme-id"}}})");
             expect(configured.server.auth.workspace == "acme-id") << "a configured workspace identity is accepted";
+        };
+        "Workspace event subscriptions reset, coalesce and bound slow consumers"_test = [] {
+            cores::io_context<native::context> rt{1};
+            front::workspace_events events{rt, "workspace-id"};
+            rt.run([&](ctx& io, std::size_t) -> coroutine::task<> {
+                auto first = events.listen(0);
+                expect(first->body.take().contains(R"("workspace_id":"workspace-id","changes":15)"));
+                events.publish(1);
+                events.publish(6);
+                co_await execution::schedule_after(io, std::chrono::milliseconds{1});
+                expect(first->body.take().contains(R"("changes":7)"));
+                auto second = events.listen(0);
+                expect(second->body.take().contains("event: reset")) << "every reconnect rereads current state";
+                first->send(std::string(65537, 'x'));
+                expect(first->closed && first->body.pending_bytes() == 0u) << "slow subscribers have bounded memory";
+                std::vector<std::shared_ptr<front::workspace_events::subscription>> held{first, second};
+                while (auto sub = events.listen(0))
+                    held.push_back(std::move(sub));
+                expect(held.size() == 64u);
+                held.clear();
+                first.reset();
+                second.reset();
+                expect(static_cast<bool>(events.listen(0))) << "closed connections release their slots";
+            });
+        };
+        "Workspace SSE streams committed configuration changes before the response ends"_test = [] {
+            harness h;
+            h.rt.run([&](ctx& io, std::size_t) -> coroutine::task<> {
+                auto l = native::listener{io, {net::ip::address_v4::loopback(), 0}};
+                h.port = l.local_endpoint().port();
+                co_await coroutine::with_scope([&](coroutine::scope& children) -> coroutine::task<> {
+                    children.spawn([](harness& h, native::listener& l, coroutine::scope& children) -> coroutine::task<> {
+                        for (;;)
+                            children.spawn(h.server.serve(co_await execution::then(net::async_accept(l), [](auto socket, auto) { return std::move(socket); })));
+                    }(h, l, children));
+                    auto denied = co_await h.ask(io, GET, "/api/v1/events", {}, {}, false);
+                    expect(denied.status == 401);
+                    auto socket = co_await io::connect(io, l.local_endpoint());
+                    web::stream<decltype(socket)> transport{socket};
+                    http::v1::client client{transport};
+                    http::request req{.method = GET,
+                                      .target = "/api/v1/events",
+                                      .scheme = "http",
+                                      .authority = "localhost",
+                                      .fields = {{"authorization", "Bearer sk_test"}, {"origin", "http://ok.example"}, {"last-event-id", "old-process"}}};
+                    req.fields.push_back({"host", "localhost"});
+                    http::span_body empty{std::span<const std::byte>{}};
+                    auto response = co_await http::coroutine::request(client, std::move(req), empty);
+                    expect(response.head.status == 200);
+                    expect(http::find_header(response.head.fields, "content-type") == std::optional<std::string_view>{"text/event-stream"});
+                    expect(http::find_header(response.head.fields, "x-accel-buffering") == std::optional<std::string_view>{"no"});
+                    expect(http::find_header(response.head.fields, "access-control-allow-origin") == std::optional<std::string_view>{"http://ok.example"});
+                    std::array<std::byte, 4096> buffer;
+                    auto n = co_await http::coroutine::read(response.body, buffer);
+                    std::string first{reinterpret_cast<const char*>(buffer.data()), n};
+                    expect(first.contains("event: reset"));
+                    auto saved = co_await h.save(io, "/api/v1/projects/sse", "{}");
+                    expect(saved.status == 200) << saved.body;
+                    std::string update;
+                    while (!update.contains("event: change")) {
+                        auto count = co_await coroutine::deadline(io, std::chrono::seconds{2}, http::coroutine::read(response.body, buffer));
+                        if (!count || !*count)
+                            break;
+                        update.append(reinterpret_cast<const char*>(buffer.data()), *count);
+                    }
+                    expect(update.contains(R"("changes":8)")) << update;
+                    socket.close();
+                });
+            });
         };
         "a trusted front names the caller and its role in headers"_test = [] {
             harness h{"trusted"};
@@ -109,7 +179,9 @@ namespace {
                     h.port = l.local_endpoint().port();
                     co_await coroutine::with_scope([&](coroutine::scope& children) -> coroutine::task<> {
                         children.spawn([](harness& h, native::listener& l, coroutine::scope& children) -> coroutine::task<> {
-                            for (;;) children.spawn(h.server.serve(co_await execution::then(net::async_accept(l), [](auto socket, auto) { return std::move(socket); })));
+                            for (;;)
+                                children.spawn(
+                                    h.server.serve(co_await execution::then(net::async_accept(l), [](auto socket, auto) { return std::move(socket); })));
                         }(h, l, children));
                         auto anonymous = co_await h.ask(io, GET, "/api/v1/me");
                         expect(anonymous.status == 401) << "a bearer token means nothing behind a trusted front: " << anonymous.body;
@@ -128,18 +200,25 @@ namespace {
                             expect(matched.status == 200 && matched.body.contains(std::format(R"("role":"{}")", role)))
                                 << role << " with the configured workspace identity: " << matched.body;
                         }
-                        std::vector<http::header> member{{"x-fughetta-workspace", "acme-id"}, {"x-fughetta-user", "user-2"}, {"x-fughetta-role", "member"}, {"x-fughetta-issuer", "cloud"}};
+                        std::vector<http::header> member{
+                            {"x-fughetta-workspace", "acme-id"}, {"x-fughetta-user", "user-2"}, {"x-fughetta-role", "member"}, {"x-fughetta-issuer", "cloud"}};
                         auto me = co_await h.ask(io, GET, "/api/v1/me", {}, member, false);
-                        expect(me.status == 200 && me.body.contains(R"("user":"user-2")") && me.body.contains(R"("role":"member")") && me.body.contains(R"("issuer":"cloud")")) << me.body;
+                        expect(me.status == 200 && me.body.contains(R"("user":"user-2")") && me.body.contains(R"("role":"member")") &&
+                               me.body.contains(R"("issuer":"cloud")"))
+                            << me.body;
                         auto limited = co_await h.ask(io, PUT, "/api/v1/config/limits", R"({"revision":0,"value":{}})", member, false);
                         expect(limited.status == 403) << limited.body;
                         auto config = co_await h.ask(io, GET, "/api/v1/config", {}, member, false);
                         expect(config.status == 200 && !config.body.contains(keyring::hash("sk_test"))) << "a member sees no token hashes";
-                        auto owner = co_await h.ask(io, PUT, "/api/v1/config/limits", R"({"revision":0,"value":{}})", {{"x-fughetta-workspace", "acme-id"}, {"x-fughetta-user", "user-1"}, {"x-fughetta-role", "owner"}}, false);
+                        auto owner = co_await h.ask(io, PUT, "/api/v1/config/limits", R"({"revision":0,"value":{}})",
+                                                    {{"x-fughetta-workspace", "acme-id"}, {"x-fughetta-user", "user-1"}, {"x-fughetta-role", "owner"}}, false);
                         expect(owner.status == 200) << owner.body;
-                        auto unknown = co_await h.ask(io, GET, "/api/v1/me", {}, {{"x-fughetta-workspace", "acme-id"}, {"x-fughetta-user", "user-3"}, {"x-fughetta-role", "operator"}}, false);
+                        auto unknown =
+                            co_await h.ask(io, GET, "/api/v1/me", {},
+                                           {{"x-fughetta-workspace", "acme-id"}, {"x-fughetta-user", "user-3"}, {"x-fughetta-role", "operator"}}, false);
                         expect(unknown.status == 401) << unknown.body;
-                        std::vector<http::header> owner_headers{{"x-fughetta-workspace", "acme-id"}, {"x-fughetta-user", "user-1"}, {"x-fughetta-role", "owner"}};
+                        std::vector<http::header> owner_headers{
+                            {"x-fughetta-workspace", "acme-id"}, {"x-fughetta-user", "user-1"}, {"x-fughetta-role", "owner"}};
                         std::vector<http::header> host_headers{{"x-fughetta-workspace", "acme-id"}, {"x-fughetta-user", "cloud"}, {"x-fughetta-role", "host"}};
                         auto grant = R"({"revision":0,"value":{"max_projects":3}})";
                         auto by_owner = co_await h.ask(io, PUT, "/api/v1/config/granted", grant, owner_headers, false);
@@ -149,15 +228,18 @@ namespace {
                         auto by_host = co_await h.ask(io, PUT, "/api/v1/config/granted", grant, host_headers, false);
                         expect(by_host.status == 200 && by_host.body.contains(R"("max_projects":3)")) << by_host.body;
                         auto stale = co_await h.ask(io, PUT, "/api/v1/config/granted", R"({"revision":0,"value":{"max_projects":9}})", host_headers, false);
-                        expect(stale.status == 409 && stale.body.contains(R"("max_projects":3)")) << "a stale grant is refused with the current one: " << stale.body;
+                        expect(stale.status == 409 && stale.body.contains(R"("max_projects":3)"))
+                            << "a stale grant is refused with the current one: " << stale.body;
                         expect(config::load(h.tmp.dir / "gateway.json").granted->max_projects == std::optional<std::uint32_t>{3}) << "a grant is saved";
                         auto server = co_await h.ask(io, GET, "/api/v1/config/server", {}, owner_headers, false);
                         auto server_revision = std::stoull(server.body.substr(server.body.find(R"("revision":)") + 11));
                         auto to_tokens = co_await h.ask(io, PUT, "/api/v1/config/server",
-                            std::format(R"({{"revision":{},"value":{{"storage":"{}","auth":{{"mode":"token"}}}}}})", server_revision, (h.tmp.dir / "storage").generic_string()),
-                            owner_headers, false);
+                                                        std::format(R"({{"revision":{},"value":{{"storage":"{}","auth":{{"mode":"token"}}}}}})",
+                                                                    server_revision, (h.tmp.dir / "storage").generic_string()),
+                                                        owner_headers, false);
                         expect(to_tokens.status == 403) << "no caller changes how callers are checked: " << to_tokens.body;
-                        auto effective = co_await h.ask(io, PUT, "/api/v1/config/limits", R"({"revision":1,"value":{"max_projects":50}})", owner_headers, false);
+                        auto effective =
+                            co_await h.ask(io, PUT, "/api/v1/config/limits", R"({"revision":1,"value":{"max_projects":50}})", owner_headers, false);
                         expect(effective.status == 200) << effective.body;
                         expect(config::resolve_limits(*h.hub.current(0)).max_projects == 3u) << "the grant caps the owner's own limit";
                         auto events = co_await h.ask(io, GET, "/api/v1/usage/events?after=0", {}, member, false);
@@ -166,11 +248,19 @@ namespace {
                         expect(events.status == 200 && events.body.contains(R"("oldest":)")) << events.body;
                         auto granted = co_await h.ask(io, GET, "/api/v1/config/granted", {}, member, false);
                         auto granted_revision = std::stoull(granted.body.substr(granted.body.find(R"("revision":)") + 11));
-                        auto cleared = co_await h.ask(io, PUT, "/api/v1/config/granted", std::format(R"({{"revision":{},"value":null}})", granted_revision), host_headers, false);
+                        auto cleared = co_await h.ask(io, PUT, "/api/v1/config/granted", std::format(R"({{"revision":{},"value":null}})", granted_revision),
+                                                      host_headers, false);
                         expect(cleared.status == 200 && !config::load(h.tmp.dir / "gateway.json").granted.has_value()) << cleared.body;
                         auto named = co_await h.ask(io, GET, "/api/v1/me", {},
-                            {{"x-fughetta-workspace", "acme-id"}, {"x-fughetta-user", "user-2"}, {"x-fughetta-role", "member"}, {"x-fughetta-caller", "agent-a"}, {"x-fughetta-email", "two@example.com"}}, false);
-                        expect(named.status == 200 && named.body.contains(R"("caller":"agent-a")") && named.body.contains(R"("email":"two@example.com")") && named.body.contains(R"("issuer":"front")")) << named.body;
+                                                    {{"x-fughetta-workspace", "acme-id"},
+                                                     {"x-fughetta-user", "user-2"},
+                                                     {"x-fughetta-role", "member"},
+                                                     {"x-fughetta-caller", "agent-a"},
+                                                     {"x-fughetta-email", "two@example.com"}},
+                                                    false);
+                        expect(named.status == 200 && named.body.contains(R"("caller":"agent-a")") && named.body.contains(R"("email":"two@example.com")") &&
+                               named.body.contains(R"("issuer":"front")"))
+                            << named.body;
                         children.request_stop();
                     });
                 }(h, io);
@@ -184,7 +274,9 @@ namespace {
                     h.port = l.local_endpoint().port();
                     co_await coroutine::with_scope([&](coroutine::scope& children) -> coroutine::task<> {
                         children.spawn([](harness& h, native::listener& l, coroutine::scope& children) -> coroutine::task<> {
-                            for (;;) children.spawn(h.server.serve(co_await execution::then(net::async_accept(l), [](auto socket, auto) { return std::move(socket); })));
+                            for (;;)
+                                children.spawn(
+                                    h.server.serve(co_await execution::then(net::async_accept(l), [](auto socket, auto) { return std::move(socket); })));
                         }(h, l, children));
                         auto forged = co_await h.ask(io, GET, "/api/v1/me", {}, {{"x-fughetta-user", "intruder"}, {"x-fughetta-role", "owner"}}, false);
                         expect(forged.status == 401) << forged.body;
@@ -207,11 +299,13 @@ namespace {
                     co_await coroutine::with_scope([&](coroutine::scope& children) -> coroutine::task<> {
                         children.spawn([](harness& h, native::listener& l, coroutine::scope& children) -> coroutine::task<> {
                             for (;;)
-                                children.spawn(h.server.serve(co_await execution::then(net::async_accept(l), [](auto socket, auto) { return std::move(socket); })));
+                                children.spawn(
+                                    h.server.serve(co_await execution::then(net::async_accept(l), [](auto socket, auto) { return std::move(socket); })));
                         }(h, l, children));
                         auto read = co_await h.ask(io, GET, "/api/v1/config/limits");
                         auto at = std::stoull(read.body.substr(read.body.find(R"("revision":)") + 11));
-                        a.push_back(co_await h.ask(io, PUT, "/api/v1/config/limits", std::format(R"({{"revision":{},"value":{{"max_file_bytes": 100}}}})", at)));
+                        a.push_back(
+                            co_await h.ask(io, PUT, "/api/v1/config/limits", std::format(R"({{"revision":{},"value":{{"max_file_bytes": 100}}}})", at)));
                         a.push_back(co_await h.ask(io, PUT, "/api/v1/projects/app", R"({"revision":0})"));
                         a.push_back(co_await h.ask(io, PUT, "/api/v1/projects/bad%20name", R"({"revision":0})"));
                         a.push_back(co_await h.ask(io, GET, "/api/v1/projects"));
@@ -249,68 +343,72 @@ namespace {
             expect(a[13].content_type.starts_with("text/plain") && a[13].body.contains("gateway_up 1\n") &&
                    a[13].body.contains("# TYPE gateway_tool_calls_total counter"))
                 << a[13].body;
-            expect(config::load(h.tmp.dir / "gateway.json").limits.max_file_bytes == std::optional<std::uint64_t>{100})
-                << "edits are saved";
+            expect(config::load(h.tmp.dir / "gateway.json").limits.max_file_bytes == std::optional<std::uint64_t>{100}) << "edits are saved";
         };
 
         "same-name registered workers have distinct metric series"_test = [] {
             harness h;
             enrollment::store registry{h.tmp.dir / "identities", "workspace-a"};
-            auto first_code=registry.create("owner");
-            auto first=registry.redeem(first_code.code,"same machine");
-            auto second_code=registry.create("owner");
-            auto second=registry.redeem(second_code.code,"same machine");
-            h.rt.run([&](ctx& io,std::size_t) -> coroutine::task<> {
-                auto listener=native::listener{io, {net::ip::address_v4::loopback(), 0}};
+            auto first = registry.add("same machine", "owner");
+            auto second = registry.add("same machine", "owner");
+            h.rt.run([&](ctx& io, std::size_t) -> coroutine::task<> {
+                auto listener = native::listener{io, {net::ip::address_v4::loopback(), 0}};
                 std::vector<socket> clients;
                 clients.reserve(2);
                 co_await coroutine::with_scope([&](coroutine::scope& children) -> coroutine::task<> {
-                    for (const auto& credential : {first,second}) {
-                        clients.push_back(co_await io::connect(io,{net::ip::address_v4{{127,0,0,1}},listener.local_endpoint().port()}));
-                        auto peer=co_await execution::then(net::async_accept(listener), [](auto socket, auto) { return std::move(socket); });
+                    for (const auto& credential : {first, second}) {
+                        clients.push_back(co_await io::connect(io, {net::ip::address_v4{{127, 0, 0, 1}}, listener.local_endpoint().port()}));
+                        auto peer = co_await execution::then(net::async_accept(listener), [](auto socket, auto) { return std::move(socket); });
                         transport::channel<socket> channel{clients.back()};
-                        co_await channel.post(jobs::hello{.name="same machine",.auth=credential.secret,.protocol=jobs::protocol_version,
-                            .worker_id=credential.worker_id,.workspace_id=credential.workspace_id,.heartbeat_seconds=15});
-                        children.spawn(h.router.workers(0).admit(io,std::move(peer),&registry,&h.pool,[]{return true;}));
-                        auto admitted=transport::decode<jobs::admission>(co_await channel.recv());
+                        co_await channel.post(jobs::hello{.name = "same machine",
+                                                          .auth = credential.secret,
+                                                          .protocol = jobs::protocol_version,
+                                                          .worker_id = credential.worker_id,
+                                                          .workspace_id = credential.workspace_id,
+                                                          .heartbeat_seconds = 15});
+                        children.spawn(h.router.workers(0).admit(io, std::move(peer), &registry, &h.pool, [] { return true; }));
+                        auto admitted = transport::decode<jobs::admission>(co_await channel.recv());
                         expect(admitted.accepted);
                     }
-                    const worlds::actor actor{.issuer="token",.user="tester",.role="owner"};
-                    front::context context{h.hub,h.files,h.router,h.rt,0,nullptr,&actor,&h.pool,&h.services};
-                    auto metrics=co_await front::route(context,"GET",web::target::parse("/metrics"),"");
-                    expect(metrics.head.status==200);
-                    for (const auto& credential : {first,second})
-                        expect(metrics.body.contains(std::format("gateway_worker_inflight{{worker=\"same machine\",worker_id=\"{}\"}} 0\n",credential.worker_id))) << metrics.body;
+                    const worlds::actor actor{.issuer = "token", .user = "tester", .role = "owner"};
+                    front::context context{h.hub, h.files, h.router, h.rt, 0, nullptr, &actor, &h.pool, &h.services};
+                    auto metrics = co_await front::route(context, "GET", web::target::parse("/metrics"), "");
+                    expect(metrics.head.status == 200);
+                    for (const auto& credential : {first, second})
+                        expect(
+                            metrics.body.contains(std::format("gateway_worker_inflight{{worker=\"same machine\",worker_id=\"{}\"}} 0\n", credential.worker_id)))
+                            << metrics.body;
                 });
             });
         };
 
         "same-name managed workers report one summed inflight series"_test = [] {
             harness h;
-            h.rt.run([&](ctx& io,std::size_t) -> coroutine::task<> {
-                auto listener=native::listener{io, {net::ip::address_v4::loopback(), 0}};
+            h.rt.run([&](ctx& io, std::size_t) -> coroutine::task<> {
+                auto listener = native::listener{io, {net::ip::address_v4::loopback(), 0}};
                 std::vector<socket> clients;
                 clients.reserve(2);
                 co_await coroutine::with_scope([&](coroutine::scope& children) -> coroutine::task<> {
-                    for (std::size_t n=0;n<2;++n) {
-                        clients.push_back(co_await io::connect(io,{net::ip::address_v4{{127,0,0,1}},listener.local_endpoint().port()}));
-                        auto peer=co_await execution::then(net::async_accept(listener), [](auto socket, auto) { return std::move(socket); });
+                    for (std::size_t n = 0; n < 2; ++n) {
+                        clients.push_back(co_await io::connect(io, {net::ip::address_v4{{127, 0, 0, 1}}, listener.local_endpoint().port()}));
+                        auto peer = co_await execution::then(net::async_accept(listener), [](auto socket, auto) { return std::move(socket); });
                         transport::channel<socket> channel{clients.back()};
-                        co_await channel.post(jobs::hello{.name="builder",.protocol=jobs::protocol_version});
-                        children.spawn(h.router.workers(0).admit(io,std::move(peer)));
-                        while (h.router.workers(0).describe(0).size()!=n+1)
-                            co_await execution::schedule_after(io,std::chrono::milliseconds{1});
+                        co_await channel.post(jobs::hello{.name = "builder", .protocol = jobs::protocol_version});
+                        children.spawn(h.router.workers(0).admit(io, std::move(peer)));
+                        while (h.router.workers(0).describe(0).size() != n + 1)
+                            co_await execution::schedule_after(io, std::chrono::milliseconds{1});
                     }
-                    const worlds::actor actor{.issuer="token",.user="tester",.role="owner"};
-                    front::context context{h.hub,h.files,h.router,h.rt,0,nullptr,&actor,&h.pool,&h.services};
-                    auto& fleet=h.router.workers(0);
-                    co_await fleet.with({},[&](auto&) -> coroutine::task<> {
-                        co_await fleet.with({},[&](auto&) -> coroutine::task<> {
-                            auto metrics=co_await front::route(context,"GET",web::target::parse("/metrics"),"");
-                            const std::string series="gateway_worker_inflight{worker=\"builder\",worker_id=\"\"} 2\n";
-                            auto at=metrics.body.find(series);
-                            expect(at!=std::string::npos) << metrics.body;
-                            expect(metrics.body.find("gateway_worker_inflight{worker=\"builder\"",at==std::string::npos ? 0 : at+series.size())==std::string::npos);
+                    const worlds::actor actor{.issuer = "token", .user = "tester", .role = "owner"};
+                    front::context context{h.hub, h.files, h.router, h.rt, 0, nullptr, &actor, &h.pool, &h.services};
+                    auto& fleet = h.router.workers(0);
+                    co_await fleet.with({}, [&](auto&) -> coroutine::task<> {
+                        co_await fleet.with({}, [&](auto&) -> coroutine::task<> {
+                            auto metrics = co_await front::route(context, "GET", web::target::parse("/metrics"), "");
+                            const std::string series = "gateway_worker_inflight{worker=\"builder\",worker_id=\"\"} 2\n";
+                            auto at = metrics.body.find(series);
+                            expect(at != std::string::npos) << metrics.body;
+                            expect(metrics.body.find("gateway_worker_inflight{worker=\"builder\"", at == std::string::npos ? 0 : at + series.size()) ==
+                                   std::string::npos);
                             expect(metrics.body.contains("gateway_workers 2\n"));
                         });
                     });
@@ -326,8 +424,10 @@ namespace {
                     project.build_configurations["Debug"] = fixture::commands({"python3", "-c", "print('built')"});
                     language::configuration analysis;
                     builds::config<"command"> command;
-                    command.operations["prepare"] = {.argv = {"python3", "-c",
-                        "import json; from pathlib import Path; p=Path('commands.json'); p.write_text(json.dumps([{'directory':str(Path.cwd()),'file':'main.c','arguments':['cc','-c','main.c']}]))"},
+                    command.operations["prepare"] = {
+                        .argv = {"python3", "-c",
+                                 "import json; from pathlib import Path; p=Path('commands.json'); "
+                                 "p.write_text(json.dumps([{'directory':str(Path.cwd()),'file':'main.c','arguments':['cc','-c','main.c']}]))"},
                         .outputs = {{"db", {"compilation_database", "commands.json"}}}};
                     analysis.build.builders["main"] = builds::with<"command">{.options = command};
                     analysis.build.tasks["db"] = {.builder = "main", .operation = "prepare"};
@@ -356,8 +456,8 @@ namespace {
                 expect(health.body.contains(R"("workers":0)"));
                 co_await h.files.with_ledger(0, [](usage::ledger& ledger, const config::document& doc) {
                     auto id = ledger.admit_build("app", config::resolve(doc, "app").limits);
-                    ledger.record(id, {.project = "app", .target = "Debug", .worker = "test-worker", .ok = true,
-                                                     .exit_code = 0, .seconds = 2.0, .bytes_sent = 7});
+                    ledger.record(id,
+                                  {.project = "app", .target = "Debug", .worker = "test-worker", .ok = true, .exit_code = 0, .seconds = 2.0, .bytes_sent = 7});
                 });
                 auto history = co_await request("GET", "/api/v1/builds?project=app&limit=1");
                 expect(history.head.status == 200 && history.body.contains("test-worker")) << history.body;
@@ -370,23 +470,24 @@ namespace {
                 expect(plan.head.status == 200 && plan.body.contains("commands.json")) << plan.body;
                 mcp::notifier note;
                 const worlds::actor actor{.issuer = "token", .user = "tester", .role = "owner"};
-                co_await tools::worldline::run(h.services, {.project = "app", .action = "lock", .scopes = std::vector<std::string>{"::"}},
-                                               note, actor);
-                co_await tools::write::run(h.services, {.project = "app", .path = "main.c", .content = "int main(void) { return 0; }", .operation_id = "write-25"}, note, actor);
+                co_await tools::worldline::run(h.services, {.project = "app", .action = "lock", .scopes = std::vector<std::string>{"::"}}, note, actor);
+                co_await tools::write::run(
+                    h.services, {.project = "app", .path = "main.c", .content = "int main(void) { return 0; }", .operation_id = "write-25"}, note, actor);
                 auto prepared = co_await request("POST", base + "/analysis/Cpp/prepare", R"({"operation_id":"rest-prepare"})");
                 expect(prepared.head.status == 200 && prepared.body.contains(R"("status":"prepared")")) << prepared.body;
                 auto repeated = co_await request("POST", base + "/analysis/Cpp/prepare", R"({"operation_id":"rest-prepare"})");
-                expect(repeated.head.status == 200 && repeated.body.contains(R"("replayed":true)")) << "a repeated preparation answers its receipt: " << repeated.body;
+                expect(repeated.head.status == 200 && repeated.body.contains(R"("replayed":true)"))
+                    << "a repeated preparation answers its receipt: " << repeated.body;
                 auto queued = co_await h.queue.list(0);
                 expect(std::ranges::any_of(queued, [](auto& v) { return v.operation == "prepare" && v.state == "done" && v.ok == std::optional<bool>{true}; }))
                     << "a preparation takes its turn in the build queue";
                 auto receipt = co_await request("GET", base + "/analysis/Cpp/receipt?operation_id=rest-prepare");
                 expect(receipt.head.status == 200 && receipt.body.contains(R"("status":"prepared")")) << receipt.body;
-                auto language = co_await tools::language_query::run(h.services,
-                    {.project = "app", .worldline = "", .configuration = "Cpp", .action = "prepare", .operation_id = "mcp-prepare"}, note, actor);
+                auto language = co_await tools::language_query::run(
+                    h.services, {.project = "app", .worldline = "", .configuration = "Cpp", .action = "prepare", .operation_id = "mcp-prepare"}, note, actor);
                 expect(language.preparation && language.preparation->status == "prepared");
-                auto again = co_await tools::language_query::run(h.services,
-                    {.project = "app", .worldline = "", .configuration = "Cpp", .action = "receipt", .operation_id = "mcp-prepare"}, note, actor);
+                auto again = co_await tools::language_query::run(
+                    h.services, {.project = "app", .worldline = "", .configuration = "Cpp", .action = "receipt", .operation_id = "mcp-prepare"}, note, actor);
                 expect(again.preparation && again.preparation->status == "prepared");
             });
         };
@@ -405,7 +506,8 @@ namespace {
                     co_await coroutine::with_scope([&](coroutine::scope& children) -> coroutine::task<> {
                         children.spawn([](harness& h, native::listener& listener, coroutine::scope& children) -> coroutine::task<> {
                             for (;;)
-                                children.spawn(h.server.serve(co_await execution::then(net::async_accept(listener), [](auto socket, auto) { return std::move(socket); })));
+                                children.spawn(
+                                    h.server.serve(co_await execution::then(net::async_accept(listener), [](auto socket, auto) { return std::move(socket); })));
                         }(h, listener, children));
                         co_await h.save(io, "/api/v1/projects/app", "{}");
                         std::string base = "/api/v1/projects/app/node";
@@ -419,7 +521,8 @@ namespace {
                         expect(bool(first) && bool(second) >> fatal);
                         expect(first->receipt == second->receipt);
                         expect(second->replayed);
-                        auto changed_capture = rfl::json::write(front::api::node_capture{content::hash_of("browser-capture").str(), {}, "Changed capture intent"});
+                        auto changed_capture =
+                            rfl::json::write(front::api::node_capture{content::hash_of("browser-capture").str(), {}, "Changed capture intent"});
                         auto rejected = co_await h.ask(io, http::method::POST, base + "/capture", changed_capture);
                         expect(rejected.status == 409 && rejected.body.contains("identity_conflict")) << rejected.body;
                         auto original = co_await h.ask(io, GET, base + "/source/file?revision=" + first->version + "&path=captured.txt");
@@ -451,14 +554,19 @@ namespace {
                         expect(bool(parsed) >> fatal) << accepted.body;
                         auto head_reply = co_await h.ask(io, GET, base + "/source");
                         auto head = rfl::json::read<front::api::node_source_head>(head_reply.body);
-                        expect(head_reply.status == 200 && bool(head) >> fatal); expect(head->node == parsed->node);
-                        auto concurrent = request; concurrent.operation = content::hash_of("browser-concurrent-save").str(); concurrent.expected = first->frontier;
+                        expect(head_reply.status == 200 && bool(head) >> fatal);
+                        expect(head->node == parsed->node);
+                        auto concurrent = request;
+                        concurrent.operation = content::hash_of("browser-concurrent-save").str();
+                        concurrent.expected = first->frontier;
                         concurrent.edits = {{.kind = "create", .path = "src/other.txt", .text = "other\n"}};
                         auto joined = co_await h.ask(io, http::method::POST, base, rfl::json::write(concurrent));
                         auto both = rfl::json::read<nodes::node_reply>(joined.body);
                         expect(joined.status == 200 && bool(both) >> fatal) << joined.body;
                         expect(both->frontier.size() == 2u) << "a save from an older state of the worldline joins it";
-                        auto outside = request; outside.operation = content::hash_of("browser-outside-save").str(); outside.expected = {content::hash_of("unknown-event").str()};
+                        auto outside = request;
+                        outside.operation = content::hash_of("browser-outside-save").str();
+                        outside.expected = {content::hash_of("unknown-event").str()};
                         auto refused = co_await h.ask(io, http::method::POST, base, rfl::json::write(outside));
                         expect(refused.status == 503 && refused.body.contains("missing_objects")) << refused.body;
                         auto revision = both->version;
@@ -497,7 +605,8 @@ namespace {
                     co_await coroutine::with_scope([&](coroutine::scope& children) -> coroutine::task<> {
                         children.spawn([](harness& h, native::listener& l, coroutine::scope& children) -> coroutine::task<> {
                             for (;;)
-                                children.spawn(h.server.serve(co_await execution::then(net::async_accept(l), [](auto socket, auto) { return std::move(socket); })));
+                                children.spawn(
+                                    h.server.serve(co_await execution::then(net::async_accept(l), [](auto socket, auto) { return std::move(socket); })));
                         }(h, l, children));
                         auto read = co_await h.ask(io, GET, "/api/v1/config/limits");
                         first = std::stoull(read.body.substr(read.body.find(R"("revision":)") + 11));
@@ -534,7 +643,8 @@ namespace {
                     co_await coroutine::with_scope([&](coroutine::scope& children) -> coroutine::task<> {
                         children.spawn([](harness& h, native::listener& l, coroutine::scope& children) -> coroutine::task<> {
                             for (;;)
-                                children.spawn(h.server.serve(co_await execution::then(net::async_accept(l), [](auto socket, auto) { return std::move(socket); })));
+                                children.spawn(
+                                    h.server.serve(co_await execution::then(net::async_accept(l), [](auto socket, auto) { return std::move(socket); })));
                         }(h, l, children));
                         co_await h.save(io, "/api/v1/config/limits", R"({"max_file_bytes": 100})");
                         co_await h.save(io, "/api/v1/projects/app", "{}");
@@ -542,8 +652,10 @@ namespace {
                         a.push_back(co_await h.mcp(io, R"({"jsonrpc":"2.0","id":1,"method":"tools/list"})"));
                         a.push_back(co_await h.mcp(io, call("worldline", std::format(R"({},"action":"lock","scopes":["::"]}})", at))));
                         a.push_back(co_await h.mcp(io, call("write", std::format(R"({},"path":"a.txt","content":"hi\n","operation_id":"op-a"}})", at))));
-                        a.push_back(co_await h.mcp(io, call("write", std::format(R"({},"path":"b.txt","content":"{}","operation_id":"op-b"}})", at, std::string(200, 'x')))));
-                        a.push_back(co_await h.mcp(io, call("edit", std::format(R"({},"path":"a.txt","old_string":"absent","new_string":"x","operation_id":"op-e"}})", at))));
+                        a.push_back(co_await h.mcp(
+                            io, call("write", std::format(R"({},"path":"b.txt","content":"{}","operation_id":"op-b"}})", at, std::string(200, 'x')))));
+                        a.push_back(co_await h.mcp(
+                            io, call("edit", std::format(R"({},"path":"a.txt","old_string":"absent","new_string":"x","operation_id":"op-e"}})", at))));
                         a.push_back(co_await h.ask(io, GET, "/mcp"));
                         a.push_back(co_await h.mcp(io, "{not json"));
                         a.push_back(co_await h.mcp(io, R"({"jsonrpc":"2.0","id":1,"method":"ping"})", {{"mcp-protocol-version", "1999-01-01"}}));
@@ -561,9 +673,13 @@ namespace {
                         a.push_back(co_await h.mcp(io, call("worldline", std::format(R"({},"action":"receipt","operation_id":"op-c"}})", at))));
                         a.push_back(co_await h.mcp(io, call("write", std::format(R"({},"path":"c.txt","content":"receipt\n","operation_id":"op-c"}})", at))));
                         a.push_back(co_await h.mcp(io, call("write", std::format(R"({},"path":"c.txt","content":"changed\n","operation_id":"op-c"}})", at))));
-                        a.push_back(co_await h.mcp(io, call("worldline", std::format(
-                            R"({},"action":"apply","observed":"{}","operation_id":"op-d","changes":[{{"kind":"create","path":"d.txt","text":"d\n"}}]}})", at,
-                            std::string(64, '0')))));
+                        a.push_back(co_await h.mcp(
+                            io,
+                            call(
+                                "worldline",
+                                std::format(
+                                    R"({},"action":"apply","observed":"{}","operation_id":"op-d","changes":[{{"kind":"create","path":"d.txt","text":"d\n"}}]}})",
+                                    at, std::string(64, '0')))));
                     });
                 }(h, io, a);
             });

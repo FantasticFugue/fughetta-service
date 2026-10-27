@@ -24,6 +24,7 @@ export namespace content {
             crypto_hash_sha256_final(&state_, out.data());
             return out;
         }
+
     private:
         crypto_hash_sha256_state state_{};
     };
@@ -212,5 +213,3 @@ template <> struct std::formatter<content::hash, char> : std::formatter<std::str
 template <> struct std::hash<content::hash> {
     auto operator()(const content::hash& h) const noexcept -> std::size_t { return std::hash<std::string_view>{}(h.view()); }
 };
-
-

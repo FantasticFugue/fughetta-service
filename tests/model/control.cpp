@@ -40,7 +40,7 @@ namespace {
             expect(restarted.observe(1, desired).phase == "ready");
         };
     };
-}
+} // namespace
 int main(int argc, const char** argv) {
     boost::ut::suite<"control">{cases};
     return boost::ut::cfg<>.run({.argc = argc, .argv = argv}) ? 1 : 0;

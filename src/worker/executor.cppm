@@ -18,6 +18,8 @@ export namespace replica {
         bool inherit_env = true;
         builds::toolset tools;
         bool isolate = false;
+        // Build groups go under this cgroup instead of the shared Worker root.
+        std::optional<std::filesystem::path> isolation_root;
         std::uint32_t parallel = 1;
     };
 
@@ -60,7 +62,7 @@ export namespace replica {
             if (!resources_)
                 resources_ = co_await io::blocking(rt_.get_scheduler(home_), pool_, [this] {
                     auto key = content::hash_of(std::filesystem::canonical(options_.root).string());
-                    return std::make_shared<isolation::pool>(key);
+                    return options_.isolation_root ? std::make_shared<isolation::pool>(*options_.isolation_root, key) : std::make_shared<isolation::pool>(key);
                 });
         }
 
@@ -105,34 +107,43 @@ export namespace replica {
             auto lock = tree_locks_[key].lock();
             if (!lock) {
                 lock = std::make_shared<coroutine::mutex>();
-                tree_locks_[key]=lock;
+                tree_locks_[key] = lock;
             }
             struct tree_lifetime {
-                std::unordered_map<std::string,std::weak_ptr<coroutine::mutex>>& locks;
+                std::unordered_map<std::string, std::weak_ptr<coroutine::mutex>>& locks;
                 std::string key;
                 std::shared_ptr<coroutine::mutex> lock;
-                ~tree_lifetime() { if (lock.use_count()==1) locks.erase(key); }
-            } lifetime{tree_locks_,key,std::move(lock)};
+                ~tree_lifetime() {
+                    if (lock.use_count() == 1)
+                        locks.erase(key);
+                }
+            } lifetime{tree_locks_, key, std::move(lock)};
             auto turn = co_await lifetime.lock->lock();
             struct holding {
                 std::map<std::string, int>& active;
                 std::string key;
-                ~holding() { if (!--active.at(key)) active.erase(key); }
+                ~holding() {
+                    if (!--active.at(key))
+                        active.erase(key);
+                }
             } hold{active_, key};
             ++active_[key];
             bool preparation = !r.replaced.empty() || !r.measure.empty() || r.survey;
             // A preparation keeps the snapshot's files, which the offer cache may let go while the steps run.
-            auto [dir, files] = co_await locked([project = r.project, snapshot = r.snapshot, tree = r.tree, preparation](store& s) {
+            auto [dir, reports, files] = co_await locked([project = r.project, snapshot = r.snapshot, tree = r.tree, key, preparation](store& s) {
                 auto dir = s.checkout(project, snapshot, tree);
-                return std::pair{dir, preparation ? s.files(project, snapshot) : std::vector<content::entry>{}};
+                return std::tuple{dir, s.reports(key), preparation ? s.files(project, snapshot) : std::vector<content::entry>{}};
             });
             if (!r.replaced.empty())
                 co_await io::blocking(rt_.get_scheduler(home_), pool_, [&] { replace(dir, r.replaced); });
             std::shared_ptr<isolation::scope> resources;
             if (options_.isolate) {
                 co_await prepare_resources();
-                resources =
-                    co_await io::blocking(rt_.get_scheduler(home_), pool_, [this, &r] { auto resource = resources_->start(r.max_memory_bytes, r.max_cpu_seconds); resource->concurrency(options_.parallel); return resource; });
+                resources = co_await io::blocking(rt_.get_scheduler(home_), pool_, [this, &r] {
+                    auto resource = resources_->start(r.max_memory_bytes, r.max_cpu_seconds);
+                    resource->concurrency(options_.parallel);
+                    return resource;
+                });
             } else if (r.max_memory_bytes || r.max_cpu_seconds) {
                 throw std::runtime_error("build resource limits require isolation; command not started");
             }
@@ -141,9 +152,8 @@ export namespace replica {
             std::optional<jobs::build_report> report;
             std::exception_ptr failed;
             try {
-                report = co_await coroutine::under(token, run_steps(r, dir, resources.get(), deadline));
-                if (report && report->ok() && preparation &&
-                    !co_await coroutine::under(token, afterwards(r, dir, files, *report, resources.get())))
+                report = co_await coroutine::under(token, run_steps(r, dir, reports, resources.get(), deadline));
+                if (report && report->ok() && preparation && !co_await coroutine::under(token, afterwards(r, dir, files, *report, resources.get())))
                     report.reset();
             } catch (...) {
                 failed = std::current_exception();
@@ -165,8 +175,8 @@ export namespace replica {
 
         // Once every step succeeded: the artifacts the request names are measured, and the language server it names surveys the tree's
         // documents. A survey that fails is reported, not thrown: the build itself succeeded.
-        auto afterwards(const jobs::build_request& r, const std::filesystem::path& dir, const std::vector<content::entry>& files, jobs::build_report& report, isolation::scope* resources)
-            -> coroutine::task<> {
+        auto afterwards(const jobs::build_request& r, const std::filesystem::path& dir, const std::vector<content::entry>& files, jobs::build_report& report,
+                        isolation::scope* resources) -> coroutine::task<> {
             co_await io::blocking(rt_.get_scheduler(home_), pool_, [&] {
                 for (auto& file : files)
                     if (!std::filesystem::is_regular_file(std::filesystem::symlink_status(dir / file.path)) || store::hash_of(dir / file.path) != file.digest)
@@ -211,9 +221,11 @@ export namespace replica {
                 });
                 for (auto& d : documents)
                     report.surveyed.push_back(d.path);
-                auto local = language::locate({.provider = r.survey->provider, .argv = r.survey->argv, .env = r.survey->env},
-                                              dir, options_.tools, options_.parallel);
-                io::command server{.argv = std::move(local.argv), .cwd = dir, .env = environment(r.env, local.env),
+                auto local =
+                    language::locate({.provider = r.survey->provider, .argv = r.survey->argv, .env = r.survey->env}, dir, options_.tools, options_.parallel);
+                io::command server{.argv = std::move(local.argv),
+                                   .cwd = dir,
+                                   .env = environment(r.env, local.env),
                                    .isolation = resources ? std::optional{resources->target()} : std::nullopt};
                 report.outline = co_await lsp::survey(rt_.get_scheduler(home_), std::move(server), r.survey->initialization, dir, std::move(documents), bounds);
             } catch (const std::exception& e) {
@@ -243,16 +255,19 @@ export namespace replica {
             co_await io::blocking(rt_.get_scheduler(home_), pool_, [resources] { resources->close(); });
         }
 
-        auto run_steps(const jobs::build_request& r, const std::filesystem::path& dir, isolation::scope* resources,
+        auto run_steps(const jobs::build_request& r, const std::filesystem::path& dir, const std::filesystem::path& reports, isolation::scope* resources,
                        std::chrono::steady_clock::time_point deadline) -> coroutine::task<jobs::build_report> {
             jobs::build_report report{.worker = options_.worker, .tree = dir.string()};
             for (auto& step : r.steps) {
                 if (step.argv.empty())
                     throw std::invalid_argument(std::format("step '{}' has no command", step.name));
-                auto local = builds::locate(step, dir, options_.tools, options_.parallel);
+                auto local = builds::locate(step, dir, options_.tools, options_.parallel, reports);
                 auto cwd = std::filesystem::path(local.cwd);
                 std::error_code ignored;
                 std::filesystem::create_directories(cwd, ignored);
+                // A report left by an earlier step or build is never taken for this step's.
+                std::filesystem::remove_all(reports);
+                std::filesystem::create_directories(reports);
                 auto left = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - std::chrono::steady_clock::now());
                 if (left <= std::chrono::milliseconds::zero()) {
                     report.steps.push_back({.name = step.name, .timed_out = true, .output = "not started: the build's time ran out"});
@@ -264,8 +279,13 @@ export namespace replica {
                                 .max_memory_bytes = r.max_memory_bytes,
                                 .max_cpu_seconds = r.max_cpu_seconds,
                                 .isolation = resources ? std::optional{resources->target()} : std::nullopt};
+                if (local.standard_output)
+                    cmd.standard_output = reports / *local.standard_output;
                 report.steps.push_back(co_await runner::run_step(rt_.get_scheduler(home_), std::move(cmd), left, r.output_limit, step.name, resources));
                 auto& last = report.steps.back();
+                auto found = co_await io::blocking(rt_.get_scheduler(home_), pool_, [&] { return builds::collect(local, reports, dir); });
+                last.diagnostics = std::move(found.diagnostics);
+                last.tests = std::move(found.tests);
                 if (last.exit_code != 0 || last.timed_out)
                     break;
                 co_await io::blocking(rt_.get_scheduler(home_), pool_, [&] {

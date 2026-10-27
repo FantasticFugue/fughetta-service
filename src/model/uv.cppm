@@ -72,9 +72,14 @@ namespace builds {
             name(group, "group");
         for (auto& extra : c.extras)
             name(extra, "extra");
-        for (auto& arg : c.run_command)
-            if (arg.empty() || arg.contains('\0') || arg.contains('\n') || arg.contains("${"))
-                throw std::invalid_argument("run_command holds arguments without line breaks or step references");
+        // ${reports} is the one step reference a program may take, to write a report there.
+        for (auto& arg : c.run_command) {
+            auto rest = arg;
+            for (std::size_t at; (at = rest.find("${reports}")) != std::string::npos;)
+                rest.erase(at, 10);
+            if (arg.empty() || arg.contains('\0') || arg.contains('\n') || rest.contains("${"))
+                throw std::invalid_argument("run_command holds arguments without line breaks or step references other than ${reports}");
+        }
         if (!c.run_command.empty() && c.run_command.front().starts_with('-'))
             throw std::invalid_argument("run_command names the program uv run starts: " + c.run_command.front());
     }
@@ -133,4 +138,5 @@ namespace builds {
         }
         return {std::move(out)};
     }
+
 } // namespace builds

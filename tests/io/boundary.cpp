@@ -162,16 +162,15 @@ namespace {
         co_return std::to_string(value);
     }
 
-    template <execution::sender Sender>
-    auto await_operation(Sender sender) -> coroutine::task<> { co_await std::move(sender); }
+    template <execution::sender Sender> auto await_operation(Sender sender) -> coroutine::task<> { co_await std::move(sender); }
 
     auto http_wait(native::scheduler scheduler, bool& entered) -> http::task<> {
         entered = true;
         using http::operator co_await;
         co_await scheduler.schedule_after(std::chrono::hours{1});
     }
-    auto application_wait(native::scheduler scheduler, bool& entered, observation& observed,
-                          coroutine::stop_source* stop_before_await = nullptr) -> coroutine::task<> {
+    auto application_wait(native::scheduler scheduler, bool& entered, observation& observed, coroutine::stop_source* stop_before_await = nullptr)
+        -> coroutine::task<> {
         cleanup guard{&observed};
         if (stop_before_await)
             stop_before_await->request_stop();
@@ -308,13 +307,16 @@ namespace {
             bool entered = false;
             observation observed;
             auto work = execution::when_all(application_wait(scheduler, entered, observed),
-                execution::then(scheduler.schedule_after(std::chrono::milliseconds{2}), [&] { source.request_stop(); }));
+                                            execution::then(scheduler.schedule_after(std::chrono::milliseconds{2}), [&] { source.request_stop(); }));
             auto root = await_operation(std::move(work));
             using receiver = destroying_receiver<coroutine::stop_token>;
             using operation = execution::connect_result_t<decltype(root), receiver>;
             std::unique_ptr<operation> state;
-            state.reset(new operation(execution::connect(std::move(root),
-                receiver{[&] { state.reset(); context.stop(); }, &observed, source.get_token()})));
+            state.reset(new operation(execution::connect(std::move(root), receiver{[&] {
+                                                                                       state.reset();
+                                                                                       context.stop();
+                                                                                   },
+                                                                                   &observed, source.get_token()})));
             execution::start(*state);
             context.run();
             expect(!state && entered);
@@ -331,8 +333,7 @@ namespace {
             using receiver = destroying_receiver<coroutine::stop_token>;
             using operation = execution::connect_result_t<decltype(work), receiver>;
             std::unique_ptr<operation> state;
-            state.reset(new operation(execution::connect(std::move(work),
-                receiver{[&] { state.reset(); }, &observed, source.get_token()})));
+            state.reset(new operation(execution::connect(std::move(work), receiver{[&] { state.reset(); }, &observed, source.get_token()})));
             execution::start(*state);
             expect(!state && !entered);
             expect(observed.result == channel::stopped);

@@ -21,12 +21,9 @@ export namespace web {
         }
     } // namespace detail
 
-    template <http::body_stream B> auto read_all(B& body, std::size_t limit = 1 << 20) -> http::task<std::string> {
-        return detail::read_body(body, limit);
-    }
+    template <http::body_stream B> auto read_all(B& body, std::size_t limit = 1 << 20) -> http::task<std::string> { return detail::read_body(body, limit); }
 
-    template <class Server, class Token>
-    auto respond(Server& server, Token token, http::response head, std::string text) -> http::task<> {
+    template <class Server, class Token> auto respond(Server& server, Token token, http::response head, std::string text) -> http::task<> {
         if (!http::find_header(head.fields, "content-length"))
             head.fields.push_back({"content-length", std::to_string(text.size())});
         auto bytes = std::as_bytes(std::span{text});
@@ -47,6 +44,8 @@ export namespace web {
 
     class event_stream {
     public:
+        auto pending_bytes() const -> std::size_t { return pending_.size(); }
+
         void push(std::string_view text) {
             pending_.append(text);
             wake();

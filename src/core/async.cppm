@@ -153,13 +153,15 @@ export namespace execution {
                     R receiver;
 
                     operation(thread_pool* owner, R out)
-                        : task{nullptr, [](task* work) noexcept {
+                        : task{nullptr,
+                               [](task* work) noexcept {
                                    auto& self = *static_cast<operation*>(work);
                                    if (get_stop_token(execution::get_env(self.receiver)).stop_requested())
                                        set_stopped(std::move(self.receiver));
                                    else
                                        set_value(std::move(self.receiver));
-                               }}, pool(owner), receiver(std::move(out)) {}
+                               }},
+                          pool(owner), receiver(std::move(out)) {}
 
                     void start() noexcept { pool->enqueue(this); }
                 };
@@ -168,9 +170,7 @@ export namespace execution {
             };
 
             auto schedule() const noexcept -> sender { return {pool}; }
-            auto query(get_forward_progress_guarantee_t) const noexcept -> forward_progress_guarantee {
-                return forward_progress_guarantee::parallel;
-            }
+            auto query(get_forward_progress_guarantee_t) const noexcept -> forward_progress_guarantee { return forward_progress_guarantee::parallel; }
         };
 
         auto get_scheduler() noexcept -> scheduler { return {this}; }
@@ -197,8 +197,7 @@ export namespace execution {
     };
 
     inline auto thread_pool::scheduler::sender::get_env() const noexcept {
-        return execution::env{prop{get_completion_scheduler<set_value_t>, scheduler{pool}},
-                              prop{get_completion_scheduler<set_stopped_t>, scheduler{pool}}};
+        return execution::env{prop{get_completion_scheduler<set_value_t>, scheduler{pool}}, prop{get_completion_scheduler<set_stopped_t>, scheduler{pool}}};
     }
 } // namespace execution
 
@@ -314,16 +313,22 @@ export namespace io {
         auto host = text;
         if (!port) {
             auto colon = text.rfind(':');
-            if (colon == text.npos) throw invalid();
-            unsigned value = 0; auto part = text.substr(colon + 1);
+            if (colon == text.npos)
+                throw invalid();
+            unsigned value = 0;
+            auto part = text.substr(colon + 1);
             auto [end, error] = std::from_chars(part.data(), part.data() + part.size(), value);
-            if (error != std::errc{} || end != part.data() + part.size() || value > 65535) throw invalid();
-            port = static_cast<std::uint16_t>(value); host = text.substr(0, colon);
+            if (error != std::errc{} || end != part.data() + part.size() || value > 65535)
+                throw invalid();
+            port = static_cast<std::uint16_t>(value);
+            host = text.substr(0, colon);
         }
-        if (host.starts_with('[') && host.ends_with(']')) host = host.substr(1, host.size() - 2);
+        if (host.starts_with('[') && host.ends_with(']'))
+            host = host.substr(1, host.size() - 2);
         std::error_code error;
         auto address = net::ip::make_address(host, error);
-        if (error) throw invalid();
+        if (error)
+            throw invalid();
         return {address, *port};
     }
 
@@ -341,6 +346,9 @@ export namespace io {
         // A conversation: this process writes the child's standard input, the child's standard output holds only its
         // replies, and its standard error is discarded.
         bool interactive = false;
+        // A file, created or truncated, that receives the child's standard output; its standard error alone is then what this
+        // process reads. Not for a conversation.
+        std::optional<std::filesystem::path> standard_output;
     };
 
     // The io layer specializes this for each scheduler that can start processes.
@@ -361,20 +369,20 @@ export namespace io {
     };
     inline constexpr async_wait_t async_wait{};
 
-    using http::io::net::async_connect;
     using http::io::net::async_accept;
-    using http::io::net::async_read_some;
-    using http::io::net::async_write_some;
-    using http::io::net::open_file;
+    using http::io::net::async_connect;
+    using http::io::net::async_read;
     using http::io::net::async_read_at;
-    using http::io::net::async_write_at;
+    using http::io::net::async_read_some;
     using http::io::net::async_receive;
     using http::io::net::async_receive_from;
     using http::io::net::async_send;
     using http::io::net::async_send_to;
-    using http::io::net::async_read;
     using http::io::net::async_write;
+    using http::io::net::async_write_at;
+    using http::io::net::async_write_some;
     using http::io::net::closed;
+    using http::io::net::open_file;
 
     template <class Scheduler> using process_t = decltype(spawn_process(std::declval<Scheduler>(), std::declval<const command&>()));
 
@@ -414,8 +422,7 @@ export namespace io {
         { l.local_endpoint().port() } -> std::same_as<std::uint16_t>;
     };
 
-    template <network_scheduler Scheduler>
-    auto connect(Scheduler scheduler, net::ip::tcp::endpoint to) {
+    template <network_scheduler Scheduler> auto connect(Scheduler scheduler, net::ip::tcp::endpoint to) {
         return execution::let_value(execution::just(), [scheduler, to] {
             return execution::let_value(execution::just(socket_t<Scheduler>{scheduler, to.protocol()}), [to](auto& socket) {
                 socket.set_option(net::ip::tcp::no_delay{true});
@@ -446,14 +453,12 @@ export namespace io {
     template <execution::scheduler Scheduler, class F> struct blocking_sender {
         using Value = std::invoke_result_t<F&>;
         using sender_concept = execution::sender_t;
-        using completion_signatures = execution::completion_signatures<typename blocking_value<Value>::signature,
-            execution::set_error_t(std::error_code), execution::set_error_t(std::exception_ptr), execution::set_stopped_t()>;
+        using completion_signatures = execution::completion_signatures<typename blocking_value<Value>::signature, execution::set_error_t(std::error_code),
+                                                                       execution::set_error_t(std::exception_ptr), execution::set_stopped_t()>;
         Scheduler scheduler;
         execution::thread_pool* pool;
         F work;
-        auto get_env() const noexcept {
-            return execution::prop{execution::get_completion_scheduler<execution::set_value_t>, scheduler};
-        }
+        auto get_env() const noexcept { return execution::prop{execution::get_completion_scheduler<execution::set_value_t>, scheduler}; }
 
         template <class R> struct operation {
             using operation_state_concept = execution::operation_state_t;
@@ -469,8 +474,14 @@ export namespace io {
                 operation* self;
                 auto get_env() const noexcept -> environment { return {execution::get_stop_token, execution::never_stop_token{}}; }
                 void set_value() noexcept { self->complete(); }
-                template <class E> void set_error(E e) noexcept { self->fail(std::move(e)); self->complete(); }
-                void set_stopped() noexcept { self->stopped = true; self->complete(); }
+                template <class E> void set_error(E e) noexcept {
+                    self->fail(std::move(e));
+                    self->complete();
+                }
+                void set_stopped() noexcept {
+                    self->stopped = true;
+                    self->complete();
+                }
             };
             struct running {
                 using receiver_concept = execution::receiver_t;
@@ -481,7 +492,10 @@ export namespace io {
                     self->fail(std::move(e));
                     execution::start(self->back);
                 }
-                void set_stopped() noexcept { self->stopped = true; execution::start(self->back); }
+                void set_stopped() noexcept {
+                    self->stopped = true;
+                    execution::start(self->back);
+                }
             };
             using back_sender = decltype(execution::schedule(std::declval<Scheduler>()));
             using pool_sender = decltype(execution::schedule(std::declval<execution::thread_pool::scheduler>()));
@@ -489,20 +503,25 @@ export namespace io {
             execution::connect_result_t<pool_sender, running> on_pool;
 
             operation(Scheduler scheduler, execution::thread_pool& pool, F function, R out)
-                : receiver(std::move(out)), work(std::move(function)),
-                  back(execution::connect(execution::schedule(scheduler), returning{this})),
+                : receiver(std::move(out)), work(std::move(function)), back(execution::connect(execution::schedule(scheduler), returning{this})),
                   on_pool(execution::connect(execution::schedule(pool.get_scheduler()), running{this})) {}
             operation(operation&&) = delete;
             void start() noexcept { execution::start(on_pool); }
             template <class E> void fail(E e) noexcept {
-                if constexpr (std::same_as<E, std::error_code>) error.template emplace<1>(e);
-                else if constexpr (std::same_as<E, std::exception_ptr>) error.template emplace<2>(std::move(e));
-                else error.template emplace<2>(std::make_exception_ptr(std::move(e)));
+                if constexpr (std::same_as<E, std::error_code>)
+                    error.template emplace<1>(e);
+                else if constexpr (std::same_as<E, std::exception_ptr>)
+                    error.template emplace<2>(std::move(e));
+                else
+                    error.template emplace<2>(std::make_exception_ptr(std::move(e)));
             }
             void run() noexcept {
                 try {
-                    if constexpr (std::is_void_v<Value>) { work(); value.emplace(); }
-                    else value.emplace(work());
+                    if constexpr (std::is_void_v<Value>) {
+                        work();
+                        value.emplace();
+                    } else
+                        value.emplace(work());
                 } catch (...) {
                     fail(std::current_exception());
                 }
@@ -510,16 +529,19 @@ export namespace io {
             }
             void complete() noexcept {
                 auto out = std::move(receiver);
-                if (error.index() == 1) execution::set_error(std::move(out), std::get<1>(error));
-                else if (error.index() == 2) execution::set_error(std::move(out), std::move(std::get<2>(error)));
-                else if (stopped) execution::set_stopped(std::move(out));
-                else if constexpr (std::is_void_v<Value>) execution::set_value(std::move(out));
-                else execution::set_value(std::move(out), std::move(*value));
+                if (error.index() == 1)
+                    execution::set_error(std::move(out), std::get<1>(error));
+                else if (error.index() == 2)
+                    execution::set_error(std::move(out), std::move(std::get<2>(error)));
+                else if (stopped)
+                    execution::set_stopped(std::move(out));
+                else if constexpr (std::is_void_v<Value>)
+                    execution::set_value(std::move(out));
+                else
+                    execution::set_value(std::move(out), std::move(*value));
             }
         };
-        template <class R> auto connect(R receiver) && -> operation<R> {
-            return {scheduler, *pool, std::move(work), std::move(receiver)};
-        }
+        template <class R> auto connect(R receiver) && -> operation<R> { return {scheduler, *pool, std::move(work), std::move(receiver)}; }
     };
 
     template <execution::scheduler Scheduler, class F>
@@ -589,9 +611,7 @@ export namespace cores {
             using completion_signatures = execution::completion_signatures<execution::set_value_t()>;
             Scheduler scheduler;
             F function;
-            auto get_env() const noexcept {
-                return execution::prop{execution::get_completion_scheduler<execution::set_value_t>, scheduler};
-            }
+            auto get_env() const noexcept { return execution::prop{execution::get_completion_scheduler<execution::set_value_t>, scheduler}; }
             template <class R> struct operation {
                 using operation_state_concept = execution::operation_state_t;
                 R receiver;
@@ -599,9 +619,7 @@ export namespace cores {
                 struct receiver_type {
                     using receiver_concept = execution::receiver_t;
                     operation* self;
-                    auto get_env() const noexcept {
-                        return execution::prop{execution::get_stop_token, execution::never_stop_token{}};
-                    }
+                    auto get_env() const noexcept { return execution::prop{execution::get_stop_token, execution::never_stop_token{}}; }
                     void set_value() noexcept { self->complete(); }
                     template <class E> void set_error(E e) noexcept { control_error{}(std::move(e)); }
                     void set_stopped() noexcept { std::terminate(); }
@@ -616,14 +634,15 @@ export namespace cores {
                 void complete() noexcept {
                     auto action = std::move(function);
                     auto out = std::move(receiver);
-                    try { action(); }
-                    catch (...) { control_error{}(std::current_exception()); }
+                    try {
+                        action();
+                    } catch (...) {
+                        control_error{}(std::current_exception());
+                    }
                     execution::set_value(std::move(out));
                 }
             };
-            template <class R> auto connect(R receiver) && -> operation<R> {
-                return {scheduler, std::move(function), std::move(receiver)};
-            }
+            template <class R> auto connect(R receiver) && -> operation<R> { return {scheduler, std::move(function), std::move(receiver)}; }
         };
 
         template <execution::scheduler Scheduler, class Function> class notification {
@@ -887,7 +906,7 @@ export namespace cores {
         auto get_scheduler(std::size_t core) noexcept -> Scheduler& {
             auto& slot = schedulers_[core];
             if (!slot)
-                std::terminate();   // core out of range or used before publish(): never deref an empty optional
+                std::terminate(); // core out of range or used before publish(): never deref an empty optional
             return *slot;
         }
 
@@ -906,8 +925,7 @@ export namespace cores {
 
         // Runs `f` on `core` later, from any core; a throw from it ends the process. Shutdown waits for it.
         template <std::invocable F> void post(std::size_t core, F f) {
-            execution::spawn(detail::control_sender<Scheduler, F>{get_scheduler(core), std::move(f)},
-                             operations_->get_token(),
+            execution::spawn(detail::control_sender<Scheduler, F>{get_scheduler(core), std::move(f)}, operations_->get_token(),
                              execution::env{execution::prop{execution::get_start_scheduler, get_scheduler(core)},
                                             execution::prop{execution::get_stop_token, execution::never_stop_token{}},
                                             execution::prop{execution::get_allocator, memory::frame_allocator<std::byte>{}}});

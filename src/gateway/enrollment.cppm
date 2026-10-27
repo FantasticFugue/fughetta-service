@@ -24,19 +24,9 @@ export namespace enrollment {
         std::int64_t created_at = 0, last_connected_at = 0;
         std::optional<std::int64_t> revoked_at;
     };
-    struct code {
-        std::string hash, created_by;
-        std::int64_t expires_at = 0;
-        bool consumed = false;
-    };
     struct document {
         std::string workspace_id;
         std::map<std::string, worker> workers;
-        std::map<std::string, code> codes;
-    };
-    struct invitation {
-        std::string code;
-        std::int64_t expires_at;
     };
     struct credential {
         std::string workspace_id, worker_id, secret;
@@ -44,6 +34,7 @@ export namespace enrollment {
 
     class store {
     public:
+        std::function<void()> changed;
         store(const std::filesystem::path& root, std::string workspace)
             : directory_(root / "worker-registry"), lock_(directory_, "Worker registry"), file_(directory_ / "registry.json") {
             data_.workspace_id = std::move(workspace);
@@ -62,44 +53,15 @@ export namespace enrollment {
             }
         }
 
-        auto create(std::string actor, std::int64_t at = now()) -> invitation {
-            auto plaintext = mint(16);
-            invitation result{plaintext, at + constants::worker_enrollment_seconds};
-            transact([&](document& next) {
-                std::erase_if(next.codes, [&](const auto& entry) { return entry.second.expires_at <= at; });
-                if (next.codes.size() >= constants::worker_enrollment_limit)
-                    throw refused(429, "enrollment_limit", "too many active Worker enrollments");
-                auto hash = content::hash_of(plaintext).str();
-                next.codes.emplace(hash, code{hash, std::move(actor), result.expires_at, false});
-            });
-            return result;
-        }
-
-        auto redeem(std::string_view plaintext, std::string name, std::int64_t at = now()) -> credential {
+        auto add(std::string name, std::string actor, std::int64_t at = now()) -> credential {
             check_name(name);
-            if (plaintext.size() != 32)
-                throw refused(400, "invalid_enrollment", "Worker enrollment is invalid");
             credential result;
             transact([&](document& next) {
-                if (at < rate_since_ || at - rate_since_ >= 60) {
-                    rate_since_ = at;
-                    rate_count_ = 0;
-                }
-                if (++rate_count_ > constants::worker_redeem_attempts_per_minute)
-                    throw refused(429, "enrollment_rate_limit", "Worker enrollment rate limit reached");
-                auto found = next.codes.find(content::hash_of(plaintext).str());
-                if (found == next.codes.end())
-                    throw refused(400, "invalid_enrollment", "Worker enrollment is invalid");
-                if (found->second.expires_at <= at)
-                    throw refused(410, "enrollment_expired", "Worker enrollment has expired");
-                if (found->second.consumed)
-                    throw refused(409, "enrollment_used", "Worker enrollment was already used");
                 if (next.workers.size() >= constants::worker_registry_limit)
                     throw refused(429, "worker_limit", "Worker registry is full");
                 result = {next.workspace_id, "worker_" + mint(16), mint(32)};
-                next.workers.emplace(result.worker_id, worker{result.worker_id, std::move(name), content::hash_of(result.secret).str(),
-                                                              found->second.created_by, at, 0, std::nullopt});
-                found->second.consumed = true;
+                next.workers.emplace(result.worker_id,
+                                     worker{result.worker_id, std::move(name), content::hash_of(result.secret).str(), std::move(actor), at, 0, std::nullopt});
             });
             return result;
         }
@@ -177,6 +139,8 @@ export namespace enrollment {
                 throw refused(503, "worker_registry_unavailable", "Worker registry persistence failed");
             }
             data_ = std::move(next);
+            if (changed)
+                changed();
         }
         std::filesystem::path directory_;
         durability::dir_lock lock_;
@@ -184,7 +148,5 @@ export namespace enrollment {
         mutable std::mutex mutex_;
         document data_;
         bool poisoned_ = false;
-        std::int64_t rate_since_ = 0;
-        std::uint32_t rate_count_ = 0;
     };
 } // namespace enrollment

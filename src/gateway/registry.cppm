@@ -25,6 +25,8 @@ export namespace storage {
                  net::ip::tcp::endpoint source)
             : rt_(rt), storage_(std::move(storage)), lock_(storage_, "storage"), config_(config), pool_(pool), source_(source) {}
 
+        std::function<void()> changed;
+
         auto node(std::size_t here, std::string project, nodes::node_request request, worlds::actor actor, bool reading) -> coroutine::task<nodes::node_reply> {
             // The source opens a repository for any project it is asked about, so only configured projects reach it.
             auto doc = config_.current(here);
@@ -35,7 +37,10 @@ export namespace storage {
             request.file_limit = limits.max_file_bytes;
             request.project_limit = limits.max_project_bytes;
             request.workspace_limit = limits.max_workspace_bytes;
-            co_return co_await remote(here, jobs::node_call{std::move(project), std::move(actor), std::move(request), reading});
+            auto out = co_await remote(here, jobs::node_call{std::move(project), std::move(actor), std::move(request), reading});
+            if (!reading && changed)
+                changed();
+            co_return out;
         }
 
         auto analysis(std::size_t here, std::string project, language::request request) -> coroutine::task<language::result> {
@@ -57,9 +62,12 @@ export namespace storage {
         auto capture(std::size_t here, std::string project, std::string operation, std::vector<std::string> expected, std::string intent, worlds::actor actor)
             -> coroutine::task<nodes::node_reply> {
             auto settings = config::resolve(*config_.current(here), project);
-            co_return co_await remote(here, jobs::node_capture{std::move(project), settings.ignore, std::move(actor), std::move(operation), std::move(expected),
-                                                               std::move(intent), settings.limits.max_file_bytes, settings.limits.max_project_bytes,
-                                                               settings.limits.max_workspace_bytes});
+            auto out = co_await remote(here, jobs::node_capture{std::move(project), settings.ignore, std::move(actor), std::move(operation),
+                                                                std::move(expected), std::move(intent), settings.limits.max_file_bytes,
+                                                                settings.limits.max_project_bytes, settings.limits.max_workspace_bytes});
+            if (changed)
+                changed();
+            co_return out;
         }
 
         template <class F>
@@ -118,6 +126,10 @@ export namespace storage {
             co_return co_await io::blocking(rt_.get_scheduler(0), pool_, [this, f = std::move(f), doc]() mutable {
                 if (!ledger_) {
                     ledger_ = std::make_unique<usage::ledger>(storage_ / constants::source_ledger_directory);
+                    ledger_->changed = [this] {
+                        if (changed)
+                            changed();
+                    };
                     if (auto& r = ledger_->recovery())
                         logging::warn("usage ledger: " + *r);
                 }

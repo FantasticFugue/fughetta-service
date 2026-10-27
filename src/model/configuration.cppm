@@ -89,9 +89,9 @@ export namespace config {
         std::uint16_t http_port = 8080;
         std::string worker_bind = "127.0.0.1";
         std::uint16_t worker_port = 9090;
-        std::string remote_worker_bind="127.0.0.1";
-        std::uint16_t remote_worker_port=0;
-        bool remote_worker_enrollment=false;
+        std::string remote_worker_bind = "127.0.0.1";
+        std::uint16_t remote_worker_port = 0;
+        bool remote_worker_enrollment = false;
         std::string source = "127.0.0.1:9091";
         std::string storage = "state";
         std::vector<std::string> allowed_origins;
@@ -367,7 +367,8 @@ export namespace config {
             check_name("token", t.name);
             if (!names.insert(t.name).second)
                 throw std::invalid_argument(std::format("server.auth.tokens: '{}' is named twice", t.name));
-            if (t.hash.size() != 64 || !std::ranges::all_of(t.hash, [](char c) { return std::isdigit(static_cast<unsigned char>(c)) || (c >= 'a' && c <= 'f'); }))
+            if (t.hash.size() != 64 ||
+                !std::ranges::all_of(t.hash, [](char c) { return std::isdigit(static_cast<unsigned char>(c)) || (c >= 'a' && c <= 'f'); }))
                 throw std::invalid_argument(std::format("server.auth.tokens: '{}' needs a lowercase hex SHA-256 hash", t.name));
             if (t.role != "owner" && t.role != "member")
                 throw std::invalid_argument(std::format("server.auth.tokens: '{}' has role '{}', not owner or member", t.name, t.role));
@@ -382,9 +383,10 @@ export namespace config {
         io::parse_endpoint(d.server.http_bind, d.server.http_port);
         io::parse_endpoint(d.server.worker_bind, d.server.worker_port);
         if (d.server.remote_worker_port) {
-            io::parse_endpoint(d.server.remote_worker_bind,d.server.remote_worker_port);
-            if (d.server.auth.workspace.empty()) throw std::invalid_argument("remote Worker listener needs a Core workspace identity");
-            if (d.server.remote_worker_port==d.server.worker_port || d.server.remote_worker_port==d.server.http_port)
+            io::parse_endpoint(d.server.remote_worker_bind, d.server.remote_worker_port);
+            if (d.server.auth.workspace.empty())
+                throw std::invalid_argument("remote Worker listener needs a Core workspace identity");
+            if (d.server.remote_worker_port == d.server.worker_port || d.server.remote_worker_port == d.server.http_port)
                 throw std::invalid_argument("remote Worker listener needs a separate port");
         }
         if (d.server.remote_worker_enrollment && !d.server.remote_worker_port)
@@ -438,12 +440,10 @@ export namespace config {
 
     struct worker {
         std::string gateway = "127.0.0.1:9090";
-        std::string ca_file;
         std::optional<std::string> worker_id;
         std::optional<std::string> workspace_id;
-        std::uint32_t heartbeat_seconds=15;
-        std::uint32_t ping_seconds=30;
-        std::uint32_t reconnect_attempts=30;
+        std::uint32_t heartbeat_seconds = 15;
+        std::uint32_t reconnect_attempts = 30;
         std::optional<std::string> token;
         std::string name;
         std::string data_root = std::string{host::default_data_root};
@@ -460,9 +460,12 @@ export namespace config {
 
     inline auto parse_worker(std::string_view text) -> worker {
         worker w;
-        try {w=parse_as<worker>(text,"Worker configuration");}
-        catch (const std::exception&) {throw std::invalid_argument("Worker configuration is invalid");}
-        if (!w.gateway.starts_with("wss://")) io::parse_endpoint(w.gateway);
+        try {
+            w = parse_as<worker>(text, "Worker configuration");
+        } catch (const std::exception&) {
+            throw std::invalid_argument("Worker configuration is invalid");
+        }
+        io::parse_endpoint(w.gateway);
         if (w.work_root.empty())
             throw std::invalid_argument("Worker work_root is empty");
         if (w.compute_threads == 0 || w.parallel == 0)
@@ -471,31 +474,31 @@ export namespace config {
             throw std::invalid_argument("Worker max_inflight must be positive");
         if (w.tree_ttl_days == 0)
             throw std::invalid_argument("Worker tree_ttl_days must be positive");
-        if (w.gateway.starts_with("wss://")) {
-            if (!w.worker_id || !w.workspace_id || !w.token || w.token->size()!=64)
-                throw std::invalid_argument("Remote Worker requires its joined identity and credentials");
-            check_name("Worker identity",*w.worker_id);
-            check_name("Workspace identity",*w.workspace_id);
-            if (!w.heartbeat_seconds || w.heartbeat_seconds>30 || !w.ping_seconds || w.ping_seconds>30 ||
-                !w.reconnect_attempts || w.reconnect_attempts>120 || w.max_inflight>64)
-                throw std::invalid_argument("Remote Worker heartbeat, ping, reconnect, or inflight limit is invalid");
-        } else if (w.worker_id || w.workspace_id) throw std::invalid_argument("Joined Worker identities require WSS");
+        if (w.worker_id || w.workspace_id) {
+            if (!w.worker_id || !w.workspace_id || !w.token || w.token->size() != 64)
+                throw std::invalid_argument("Registered Worker requires its identity and credentials");
+            check_name("Worker identity", *w.worker_id);
+            check_name("Workspace identity", *w.workspace_id);
+            if (!w.heartbeat_seconds || w.heartbeat_seconds > 30 || !w.reconnect_attempts || w.reconnect_attempts > 120 || w.max_inflight > 64)
+                throw std::invalid_argument("Registered Worker heartbeat, reconnect, or inflight limit is invalid");
+        }
         return w;
     }
 
-    inline auto load_worker(const std::filesystem::path& file,bool private_file=false) -> worker {
-        auto read=[&](bool secret) {
+    inline auto load_worker(const std::filesystem::path& file, bool private_file = false) -> worker {
+        auto read = [&](bool secret) {
             std::string text;
             try {
-                for (auto bytes : secret ? durability::read_private(file,1u<<20) : durability::read_plain(file,1u<<20))
-                    text.append(reinterpret_cast<const char*>(bytes.data()),bytes.size());
+                for (auto bytes : secret ? durability::read_private(file, 1u << 20) : durability::read_plain(file, 1u << 20))
+                    text.append(reinterpret_cast<const char*>(bytes.data()), bytes.size());
             } catch (const durability::unreadable&) {
                 throw std::runtime_error(secret ? "Worker credentials must be an owner-only regular file" : "cannot read Worker configuration");
             }
             return text;
         };
-        auto w=parse_worker(read(private_file));
-        if (!private_file && w.gateway.starts_with("wss://")) w=parse_worker(read(true));
+        auto w = parse_worker(read(private_file));
+        if (!private_file && w.worker_id)
+            w = parse_worker(read(true));
         return w;
     }
 
@@ -631,7 +634,8 @@ export namespace config {
             {"role", "owner or member."},
             {"ignore", "Nonempty source ignore patterns. Example: [build, *.o]."},
             {"env", "Environment variable map; names and values must pass environment validation. Example: {CC: clang}."},
-            {"build_configurations", "Named build configurations; names use 1-64 letters, digits, dots, underscores or hyphens, starting with a letter or digit. Example key: Debug. Query adapters for builder option schemas."},
+            {"build_configurations", "Named build configurations; names use 1-64 letters, digits, dots, underscores or hyphens, starting with a letter or "
+                                     "digit. Example key: Debug."},
             {"run_configurations", "Named run configurations selecting a build operation and configurations. Example key: app."},
             {"default_configurations", "Existing enabled build configuration names used when no selection is supplied. Example: [Debug]."},
             {"analysis", "Named language analysis configurations. Example key: Cpp."},
@@ -640,13 +644,14 @@ export namespace config {
             {"parameters", "Operation parameters; only parameters supported by the selected operation may be supplied."},
             {"limits", "Resource limits; omitted fields retain the configured default or parent value."},
             {"builders", "Named adapter instances. Example key: main."},
-            {"adapter", "Registered build adapter ID. Examples: command, cmake. Query adapters before choosing options."},
-            {"options", "Settings of the selected adapter or language server provider; query adapters for adapter schemas."},
+            {"adapter", "Registered build adapter ID. Examples: command, cmake."},
+            {"options", "Settings of the selected adapter or language server provider."},
             {"requires", "Required executable tools and operating system/architecture constraints."},
             {"tasks", "Named task graph or operation task names; dependencies must form an acyclic graph."},
             {"builder", "Existing builder name. Example: main."},
             {"after", "Existing task names to run before this task. Example: [configure]."},
-            {"inputs", "In a task, input names mapped to task output references, such as {binary_dir: {task: build, output: build_tree}}; in an analysis, the build outputs its language server reads, such as [compile_commands]."},
+            {"inputs", "In a task, input names mapped to task output references, such as {binary_dir: {task: build, output: build_tree}}; in an analysis, the "
+                       "build outputs its language server reads, such as [compile_commands]."},
             {"outputs", "Named output references. Example: {binary: {task: build, output: executable}}."},
             {"operations", "Named operations exposing graph tasks. Example: {build: {tasks: [build]}}."},
             {"receiver", "Task receiving operation parameters; must be in the selected operation graph."},
@@ -698,14 +703,13 @@ export namespace config {
         }
         if (auto array = value.to_array()) {
             auto out = *array;
-            for (auto& child : out) child = annotate(std::move(child));
+            for (auto& child : out)
+                child = annotate(std::move(child));
             return out;
         }
         return value;
     }
 
-    template <class T> auto schema() -> rfl::Generic {
-        return annotate(rfl::json::read<rfl::Generic>(rfl::json::to_schema<T>()).value());
-    }
+    template <class T> auto schema() -> rfl::Generic { return annotate(rfl::json::read<rfl::Generic>(rfl::json::to_schema<T>()).value()); }
 
 } // namespace config

@@ -83,30 +83,30 @@ namespace {
     }
 
     auto coalesced(native::scheduler& io) -> coroutine::task<> {
-        auto listener=native::listener{io, {net::ip::address_v4::loopback(), 0}};
-        auto socket=co_await io::connect(io,{net::ip::address_v4{{127,0,0,1}},listener.local_endpoint().port()});
-        auto peer=co_await execution::then(net::async_accept(listener), [](auto socket, auto) { return std::move(socket); });
+        auto listener = native::listener{io, {net::ip::address_v4::loopback(), 0}};
+        auto socket = co_await io::connect(io, {net::ip::address_v4{{127, 0, 0, 1}}, listener.local_endpoint().port()});
+        auto peer = co_await execution::then(net::async_accept(listener), [](auto socket, auto) { return std::move(socket); });
         web::stream server_transport{peer};
-        web::ws::stream server{server_transport,ws::side::server};
+        web::ws::stream server{server_transport, ws::side::server};
         transport::channel incoming{server};
         std::vector<std::byte> grouped;
-        for (std::uint64_t correlation=1;correlation<=2;++correlation) {
-            auto payload=transport::codec<jobs::hash_file>::encode({.path=std::format("file-{}",correlation)});
-            std::vector<std::byte> frame(transport::header_size+payload.size());
-            auto length=static_cast<std::uint32_t>(payload.size());
-            auto kind=jobs::code<jobs::hash_file>;
-            std::memcpy(frame.data(),&length,4);
-            std::memcpy(frame.data()+4,&kind,4);
-            std::memcpy(frame.data()+8,&correlation,8);
-            std::ranges::copy(payload,frame.begin()+transport::header_size);
-            grouped.insert(grouped.end(),frame.begin(),frame.end());
+        for (std::uint64_t correlation = 1; correlation <= 2; ++correlation) {
+            auto payload = transport::codec<jobs::hash_file>::encode({.path = std::format("file-{}", correlation)});
+            std::vector<std::byte> frame(transport::header_size + payload.size());
+            auto length = static_cast<std::uint32_t>(payload.size());
+            auto kind = jobs::code<jobs::hash_file>;
+            std::memcpy(frame.data(), &length, 4);
+            std::memcpy(frame.data() + 4, &kind, 4);
+            std::memcpy(frame.data() + 8, &correlation, 8);
+            std::ranges::copy(payload, frame.begin() + transport::header_size);
+            grouped.insert(grouped.end(), frame.begin(), frame.end());
         }
-        auto packet=ws::encode(ws::opcode::binary,grouped,true,web::ws::random_mask());
-        co_await io::async_write(socket,packet);
-        for (std::uint64_t correlation=1;correlation<=2;++correlation) {
-            auto frame=co_await incoming.recv();
-            expect(frame.corr==correlation);
-            expect(transport::decode<jobs::hash_file>(frame).path.value()==std::format("file-{}",correlation));
+        auto packet = ws::encode(ws::opcode::binary, grouped, true, web::ws::random_mask());
+        co_await io::async_write(socket, packet);
+        for (std::uint64_t correlation = 1; correlation <= 2; ++correlation) {
+            auto frame = co_await incoming.recv();
+            expect(frame.corr == correlation);
+            expect(transport::decode<jobs::hash_file>(frame).path.value() == std::format("file-{}", correlation));
         }
     }
 
@@ -128,10 +128,10 @@ namespace {
 
 int main(int argc, const char** argv) {
     suite<"websocket"> cases = [] {
-        "coalesced jobs frames share one WebSocket message"_test=[] {
+        "coalesced jobs frames share one WebSocket message"_test = [] {
             native::context io;
-            auto scheduler=io.get_scheduler();
-            expect(cores::run(io,coalesced(scheduler)));
+            auto scheduler = io.get_scheduler();
+            expect(cores::run(io, coalesced(scheduler)));
         };
         "jobs frame crosses many WebSocket messages"_test = [] {
             native::context io;

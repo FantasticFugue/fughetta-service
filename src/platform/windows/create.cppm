@@ -109,13 +109,20 @@ namespace native_process {
             input = winapi::handle{::CreateFileW(L"NUL", GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, &security, OPEN_EXISTING, 0, nullptr)};
         if (input.value == INVALID_HANDLE_VALUE)
             winapi::fail("open child stdin");
-        HANDLE inherited[]{input.value, write.value, errors.value};
-        attributes attr{inherited, cmd.interactive ? 3u : 2u};
+        winapi::handle file;
+        if (cmd.standard_output) {
+            file = winapi::handle{
+                ::CreateFileW(cmd.standard_output->c_str(), GENERIC_WRITE, FILE_SHARE_READ, &security, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr)};
+            if (file.value == INVALID_HANDLE_VALUE)
+                winapi::fail("open child standard output");
+        }
+        HANDLE inherited[]{input.value, write.value, cmd.interactive ? errors.value : file.value};
+        attributes attr{inherited, cmd.interactive || cmd.standard_output ? 3u : 2u};
         STARTUPINFOEXW start{};
         start.StartupInfo.cb = sizeof start;
         start.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
         start.StartupInfo.hStdInput = input.value;
-        start.StartupInfo.hStdOutput = write.value;
+        start.StartupInfo.hStdOutput = cmd.standard_output ? file.value : write.value;
         start.StartupInfo.hStdError = cmd.interactive ? errors.value : write.value;
         start.lpAttributeList = attr.list;
         std::wstring command;
@@ -144,8 +151,8 @@ namespace native_process {
         PROCESS_INFORMATION process{};
         auto cwd = cmd.cwd.empty() ? std::wstring{} : std::filesystem::absolute(cmd.cwd).wstring();
         if (!::CreateProcessW(nullptr, command.data(), nullptr, nullptr, TRUE,
-                              CREATE_SUSPENDED | CREATE_NEW_PROCESS_GROUP | CREATE_UNICODE_ENVIRONMENT | EXTENDED_STARTUPINFO_PRESENT, cmd.env ? env.data() : nullptr,
-                              cwd.empty() ? nullptr : cwd.c_str(), &start.StartupInfo, &process))
+                              CREATE_SUSPENDED | CREATE_NEW_PROCESS_GROUP | CREATE_UNICODE_ENVIRONMENT | EXTENDED_STARTUPINFO_PRESENT,
+                              cmd.env ? env.data() : nullptr, cwd.empty() ? nullptr : cwd.c_str(), &start.StartupInfo, &process))
             winapi::fail("CreateProcess");
         s->process = winapi::handle{process.hProcess};
         winapi::handle thread{process.hThread};
@@ -176,7 +183,10 @@ namespace native_process {
         state_->in = winapi::handle{};
     }
     auto child::reaped() const noexcept -> bool { return state_->reaped; }
-    void child::terminate() noexcept { if (!state_->reaped) ::GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, state_->pid); }
+    void child::terminate() noexcept {
+        if (!state_->reaped)
+            ::GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, state_->pid);
+    }
     void child::kill() noexcept {
         if (!state_->reaped)
             ::TerminateJobObject(state_->job.value, 1);

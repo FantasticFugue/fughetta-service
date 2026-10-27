@@ -36,11 +36,11 @@ export namespace jobs {
         std::vector<std::string> tools;
         std::optional<std::string> worker_id;
         std::optional<std::string> workspace_id;
-        std::uint32_t heartbeat_seconds=2;
+        std::uint32_t heartbeat_seconds = 2;
     };
 
     struct admission {
-        bool accepted=false;
+        bool accepted = false;
         std::string code;
         std::string worker_id;
     };
@@ -226,6 +226,9 @@ export namespace jobs {
         double seconds = 0;
         std::string output;
         bool truncated = false;
+        // What the step's reports say, read on the worker.
+        std::vector<builds::finding> diagnostics;
+        std::optional<builds::tally> tests;
     };
 
     struct build_report {
@@ -258,13 +261,14 @@ export namespace jobs {
         static constexpr std::uint32_t code = kind<Name>;
     };
 
-    using signals = meta::list<signal<"hello", hello>,signal<"worker.admission",admission>, signal<"heartbeat", heartbeat>, signal<"progress", progress>, signal<"cancel", cancel>>;
+    using signals = meta::list<signal<"hello", hello>, signal<"worker.admission", admission>, signal<"heartbeat", heartbeat>, signal<"progress", progress>,
+                               signal<"cancel", cancel>>;
 
-    using requests = meta::list<rpc<"node.call", node_call, nodes::node_reply>, rpc<"node.capture", node_capture, nodes::node_reply>,
-                                rpc<"node.usage", node_usage, node_usage_reply>,
-                                rpc<"analysis.prepare", language::request, language::result>,
-                                rpc<"analysis.finish", analysis_finish, language::result>, rpc<"hash_file", hash_file, digest>,
-                                rpc<"sync.offer", sync_offer, sync_plan>, rpc<"sync.parts", source_bytes, authority_ack>, rpc<"build", build_request, build_report>>;
+    using requests =
+        meta::list<rpc<"node.call", node_call, nodes::node_reply>, rpc<"node.capture", node_capture, nodes::node_reply>,
+                   rpc<"node.usage", node_usage, node_usage_reply>, rpc<"analysis.prepare", language::request, language::result>,
+                   rpc<"analysis.finish", analysis_finish, language::result>, rpc<"hash_file", hash_file, digest>, rpc<"sync.offer", sync_offer, sync_plan>,
+                   rpc<"sync.parts", source_bytes, authority_ack>, rpc<"build", build_request, build_report>>;
 
     inline constexpr std::uint32_t result = kind<"result">;
     inline constexpr std::uint32_t failure_code = kind<"failure">;
@@ -343,7 +347,7 @@ export namespace transport {
             std::vector<std::byte> out;
             auto put = [&](const void* p, std::size_t n) {
                 if (!n)
-                    return;   // avoid forming a range from a possibly-null pointer
+                    return; // avoid forming a range from a possibly-null pointer
                 auto* b = static_cast<const std::byte*>(p);
                 out.insert(out.end(), b, b + n);
             };
@@ -442,7 +446,7 @@ export namespace transport {
             co_await io::async_write(*peer_, out);
         }
 
-        auto recv(std::size_t limit=max_payload) -> coroutine::task<frame> {
+        auto recv(std::size_t limit = max_payload) -> coroutine::task<frame> {
             std::array<std::byte, header_size> head;
             co_await io::async_read(*peer_, head);
             std::uint32_t len;
@@ -450,7 +454,7 @@ export namespace transport {
             std::memcpy(&len, head.data(), 4);
             std::memcpy(&f.kind, head.data() + 4, 4);
             std::memcpy(&f.corr, head.data() + 8, 8);
-            if (len > max_payload || len>limit)
+            if (len > max_payload || len > limit)
                 throw std::length_error("frame too large");
             f.payload.resize(len);
             co_await io::async_read(*peer_, f.payload);

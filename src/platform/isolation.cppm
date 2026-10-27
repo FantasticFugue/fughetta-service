@@ -19,6 +19,9 @@ export namespace isolation {
         struct state;
         std::unique_ptr<state> state_;
     };
+    // The cgroup this process started in, prepared to hold build groups: the process moves into a leaf and the root delegates cpu and memory.
+    // On Windows it names the job root.
+    auto delegated() -> std::filesystem::path;
     class pool {
     public:
         explicit pool(std::string_view worker_key);

@@ -25,8 +25,22 @@ namespace language {
             std::vector<std::string> remove;
         };
         static constexpr std::array<std::pair<std::string_view, std::string_view>, 16> documents{{
-            {"c", "c"},     {"cc", "cpp"},   {"cpp", "cpp"}, {"cxx", "cpp"}, {"c++", "cpp"}, {"h", "cpp"},    {"hh", "cpp"},  {"hpp", "cpp"},
-            {"hxx", "cpp"}, {"h++", "cpp"}, {"ipp", "cpp"}, {"tpp", "cpp"}, {"cppm", "cpp"}, {"ixx", "cpp"}, {"mpp", "cpp"}, {"cu", "cpp"},
+            {"c", "c"},
+            {"cc", "cpp"},
+            {"cpp", "cpp"},
+            {"cxx", "cpp"},
+            {"c++", "cpp"},
+            {"h", "cpp"},
+            {"hh", "cpp"},
+            {"hpp", "cpp"},
+            {"hxx", "cpp"},
+            {"h++", "cpp"},
+            {"ipp", "cpp"},
+            {"tpp", "cpp"},
+            {"cppm", "cpp"},
+            {"ixx", "cpp"},
+            {"mpp", "cpp"},
+            {"cu", "cpp"},
         }};
         static constexpr std::array<std::string_view, 1> inputs{"compilation_database"};
 
@@ -61,18 +75,18 @@ namespace language {
             auto beside = first.kind == "directory" ? first.path : std::filesystem::path(first.path).parent_path().generic_string();
             rfl::Generic::Object rule, project, init;
             rule["compile_commands"] = std::move(paths);
-                if (!o.append.empty()) {
-                    rfl::Generic::Array flags;
-                    for (auto& flag : o.append)
-                        flags.push_back(flag);
-                    rule["append"] = std::move(flags);
-                }
-                if (!o.remove.empty()) {
-                    rfl::Generic::Array flags;
-                    for (auto& flag : o.remove)
-                        flags.push_back(flag);
-                    rule["remove"] = std::move(flags);
-                }
+            if (!o.append.empty()) {
+                rfl::Generic::Array flags;
+                for (auto& flag : o.append)
+                    flags.push_back(flag);
+                rule["append"] = std::move(flags);
+            }
+            if (!o.remove.empty()) {
+                rfl::Generic::Array flags;
+                for (auto& flag : o.remove)
+                    flags.push_back(flag);
+                rule["remove"] = std::move(flags);
+            }
             init["rules"] = rfl::Generic::Array{std::move(rule)};
             project["cache_dir"] = o.cache_dir ? *o.cache_dir : beside + "/clice";
             init["project"] = std::move(project);

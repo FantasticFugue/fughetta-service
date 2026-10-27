@@ -30,13 +30,23 @@ export namespace builds {
         std::string path;
         std::string kind = "file";
     };
-    // `${tree}` is the build tree, `${tool:name}` a mapped tool and `${jobs}` the parallel jobs the runner allows.
+    // A report a step writes in a fixed protocol: `file`, a plain name, in `${reports}`.
+    struct report {
+        std::string protocol;
+        std::string file;
+        friend auto operator==(const report&, const report&) -> bool = default;
+    };
+    // `${tree}` is the build tree, `${tool:name}` a mapped tool, `${jobs}` the parallel jobs the runner allows and `${reports}` the
+    // directory, empty when the step starts, that its reports go to. standard_output names a report file that receives the step's
+    // standard output, for a tool that prints its report there; the step's output is then its standard error alone.
     struct step {
         std::string name;
         std::vector<std::string> argv;
         std::string cwd;
         environment env;
         std::vector<context> outputs;
+        std::vector<report> reports;
+        std::optional<std::string> standard_output;
     };
     struct artifact {
         std::string type;
@@ -96,6 +106,32 @@ export namespace builds {
         { T::kind } -> std::convertible_to<std::string_view>;
         { T::max_bytes } -> std::convertible_to<std::uint64_t>;
         { T::check(text) } -> std::same_as<std::uint64_t>;
+    };
+
+    // What a step's reports say: its diagnostics, with paths relative to the tree, and the tests it ran.
+    struct finding {
+        std::string file;
+        std::uint32_t line = 0;
+        std::uint32_t column = 0;
+        std::string severity;
+        std::string message;
+    };
+    struct tally {
+        std::uint32_t total = 0;
+        std::uint32_t failed = 0;
+        std::vector<std::string> failed_tests;
+    };
+    struct reading {
+        std::vector<finding> diagnostics;
+        std::optional<tally> tests;
+    };
+
+    // A report protocol: a format that a build system, test runner or checker writes by its own contract, read the same way
+    // whatever version of the tool wrote it. Paths in a reading are as the report holds them.
+    template <meta::fixed_string Name> struct protocol;
+    template <class T>
+    concept parses = requires(std::string_view text) {
+        { T::read(text) } -> std::same_as<reading>;
     };
 
     template <meta::fixed_string Name> using literal = rfl::Literal<rfl::internal::StringLiteral<sizeof(Name.chars)>{Name.chars}>;

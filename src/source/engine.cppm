@@ -29,7 +29,8 @@ export namespace nodes {
         bool causal_loaded = false;
         std::uint64_t causal_headers_read = 0, causal_effects_read = 0, file_histories_read = 0, file_payloads_read = 0, state_bytes_read = 0;
         std::string causal_scope = "none";
-        std::uint64_t sequence_pages_read = 0, sequence_pages_written = 0, insertion_payloads_read = 0, cache_evictions = 0, state_bytes_decoded = 0, causal_blocks_read = 0;
+        std::uint64_t sequence_pages_read = 0, sequence_pages_written = 0, insertion_payloads_read = 0, cache_evictions = 0, state_bytes_decoded = 0,
+                      causal_blocks_read = 0;
     };
     // Asked as each write transaction commits; a throw refuses the write.
     class commit_check {

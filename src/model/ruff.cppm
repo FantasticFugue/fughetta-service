@@ -38,6 +38,7 @@ namespace builds {
         static auto expand(const options& c, std::string_view operation, const parameters& p) -> std::vector<step>;
     };
     static_assert(system<adapter<"ruff">>);
+
 } // namespace builds
 
 namespace language {
@@ -136,14 +137,14 @@ namespace builds {
                 glob(pattern, std::string{what} + " exclude");
         }
         auto flags(const adapter<"ruff">::options& c, std::string_view operation) -> step {
-            step out{.name = std::string{operation}, .cwd = c.project_dir};
+            // Both operations print their Code Quality report on standard output; format has no --output-file. Its paths are relative
+            // to CI_PROJECT_DIR when it is set, so it names the step's directory.
+            step out{.name = std::string{operation}, .cwd = c.project_dir, .reports = {{"codequality", "ruff.json"}}, .standard_output = "ruff.json"};
             out.env["NO_COLOR"] = "1";
-            out.argv = {tool(c.executable), std::string{operation}};
+            out.env["CI_PROJECT_DIR"] = "${tree}/" + c.project_dir;
+            out.argv = {tool(c.executable), std::string{operation}, "--output-format", "gitlab"};
             auto& argv = out.argv;
-            if (operation == "check")
-                argv.insert(argv.end(), {"--no-fix", "--output-format", "concise"});
-            else
-                argv.push_back("--check");
+            argv.push_back(operation == "check" ? "--no-fix" : "--check");
             if (c.config_file)
                 argv.insert(argv.end(), {"--config", "${tree}/" + *c.config_file});
             if (c.target_version)
@@ -191,6 +192,7 @@ namespace builds {
 
         return {std::move(out)};
     }
+
 } // namespace builds
 
 namespace language {

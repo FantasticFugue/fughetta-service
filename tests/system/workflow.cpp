@@ -26,7 +26,10 @@ namespace {
             auto check = [&] {
                 auto stored = test::request(port, http::method::GET, std::string{test::project});
                 test::require(stored.status == 200, stored.body);
-                struct section { config::settings value; std::uint64_t revision; };
+                struct section {
+                    config::settings value;
+                    std::uint64_t revision;
+                };
                 auto parsed = test::decode<section>(stored.body);
                 const auto& build = parsed.value.build_configurations.at("npm");
                 expect(rfl::json::write(build.builders.at("main")) == rfl::json::write(workflow.builders.at("main")));
@@ -34,8 +37,12 @@ namespace {
                 expect(build.tasks.at("build").after == std::vector<std::string>{"prepare"});
                 auto effective = test::request(port, http::method::GET, std::string{test::project} + "/effective");
                 test::require(effective.status == 200, effective.body);
-                struct resolved { builds::configuration build; };
-                struct view { std::map<std::string, resolved> configs; };
+                struct resolved {
+                    builds::configuration build;
+                };
+                struct view {
+                    std::map<std::string, resolved> configs;
+                };
                 auto current = test::decode<view>(effective.body).configs.at("npm").build;
                 auto& commands = fixture::options<"command">(current.builders.at("main"));
                 expect(commands.operations.at("test").argv == std::vector<std::string>{"npm", "test"});
@@ -54,7 +61,7 @@ namespace {
             expect(process->stop() == 0);
         };
     };
-}
+} // namespace
 
 int main(int argc, const char** argv) {
     boost::ut::suite<"workflow">{cases};

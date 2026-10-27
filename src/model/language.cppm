@@ -5,6 +5,7 @@ import reflection;
 import content;
 export import build;
 export import clice;
+export import typescript;
 export import ty;
 export import ruff;
 
@@ -37,7 +38,7 @@ export namespace language {
             return out;
         }
     };
-    using providers = catalog<"clice", "ty", "ruff">;
+    using providers = catalog<"clice", "typescript", "ty", "ruff">;
     using provider = providers::choice;
 
     struct configuration {

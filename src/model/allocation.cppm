@@ -18,7 +18,8 @@ export namespace allocation {
     };
     inline auto distribute(budget b) -> plan {
         if (b.threads < 6 || !b.jobs || b.workers >= b.jobs || b.workers > (b.threads - 6) / 2)
-            throw std::invalid_argument("runtime requires threads >= 6 + 2 * workers, jobs >= 1, and workers < jobs (one job is reserved for source preparation)");
+            throw std::invalid_argument(
+                "runtime requires threads >= 6 + 2 * workers, jobs >= 1, and workers < jobs (one job is reserved for source preparation)");
         plan result;
         auto remaining = b.threads - 6 - 2 * b.workers;
         result.gateway_disk += remaining / 2;
@@ -48,26 +49,42 @@ export namespace allocation {
             std::lock_guard held{mutex_};
             --(administrative ? controls_ : active_);
         }
+
     public:
         control(budget applied, std::uint64_t revision) : applied_(applied), revision_(revision) {}
         class lease {
             control* owner_;
             bool administrative_;
+
         public:
             lease(control& owner, bool administrative) : owner_(&owner), administrative_(administrative) {}
             lease(const lease&) = delete;
             lease(lease&& other) noexcept : owner_(std::exchange(other.owner_, nullptr)), administrative_(other.administrative_) {}
-            ~lease() { if (owner_) owner_->leave(administrative_); }
+            ~lease() {
+                if (owner_)
+                    owner_->leave(administrative_);
+            }
         };
         auto enter(bool administrative) -> std::optional<lease> {
             std::lock_guard held{mutex_};
-            if (!administrative && phase_ != "ready") return {};
+            if (!administrative && phase_ != "ready")
+                return {};
             ++(administrative ? controls_ : active_);
             return lease{*this, administrative};
         }
-        void ready(std::uint64_t revision) { std::lock_guard held{mutex_}; revision_ = revision; phase_ = "ready"; }
-        void drain() { std::lock_guard held{mutex_}; phase_ = "draining"; }
-        auto idle() const -> bool { std::lock_guard held{mutex_}; return active_ == 0 && controls_ == 0; }
+        void ready(std::uint64_t revision) {
+            std::lock_guard held{mutex_};
+            revision_ = revision;
+            phase_ = "ready";
+        }
+        void drain() {
+            std::lock_guard held{mutex_};
+            phase_ = "draining";
+        }
+        auto idle() const -> bool {
+            std::lock_guard held{mutex_};
+            return active_ == 0 && controls_ == 0;
+        }
         auto observe(std::uint64_t revision, budget desired) const -> observation {
             std::lock_guard held{mutex_};
             auto phase = phase_ == "ready" && desired != applied_ ? "pending" : phase_;
@@ -75,4 +92,4 @@ export namespace allocation {
         }
     };
 
-}
+} // namespace allocation

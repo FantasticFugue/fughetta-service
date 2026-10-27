@@ -25,5 +25,6 @@ namespace front {
                 set(c, snap);
                 return execution::just(true);
             });
+        events_.publish(8);
     }
 } // namespace front

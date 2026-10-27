@@ -33,8 +33,13 @@ export namespace survey {
             for (std::size_t i = 0; i < anchored.spans.size(); ++i)
                 *spans[first + i] = std::move(anchored.spans[i]);
         }
-        semantic::generation out{.version = version, .environment = std::move(environment), .service = std::move(service), .service_version = "1",
-                                 .scopes = std::move(found.scopes), .symbols = std::move(found.symbols), .diagnostics = std::move(found.diagnostics)};
+        semantic::generation out{.version = version,
+                                 .environment = std::move(environment),
+                                 .service = std::move(service),
+                                 .service_version = "1",
+                                 .scopes = std::move(found.scopes),
+                                 .symbols = std::move(found.symbols),
+                                 .diagnostics = std::move(found.diagnostics)};
         // Every surveyed document is covered, with the digest of the text the server read.
         auto tree = node.call({.action = "tree", .worldline = worldline, .revision = version});
         if (tree.code != "ok" || tree.version != version)

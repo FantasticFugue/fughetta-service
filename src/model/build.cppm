@@ -4,10 +4,13 @@ import meta;
 import reflection;
 import content;
 export import provider;
+export import report;
 export import cmake;
 export import bazel;
 export import commands;
 export import vcpkg;
+export import typescript;
+export import bun;
 export import uv;
 export import ty;
 export import ruff;
@@ -34,8 +37,20 @@ export namespace builds {
         // Calls `f` with the format named `name`; false when no format has that name.
         template <class F> static auto find(std::string_view name, F&& f) -> bool { return ((name == Names.view() && (f(format<Names>{}), true)) || ...); }
     };
-    using adapters = catalog<"cmake", "bazel", "command", "vcpkg", "uv", "ty", "ruff">;
+    // The report protocols; a step's report names one of them.
+    template <meta::fixed_string... Names> struct protocols {
+        static_assert((parses<protocol<Names>> && ...));
+        static auto known(std::string_view name) -> bool { return ((name == Names.view()) || ...); }
+        static auto read(std::string_view name, std::string_view text) -> reading {
+            reading out;
+            (void)((name == Names.view() && (out = protocol<Names>::read(text), true)) || ...);
+            return out;
+        }
+        static constexpr std::array names{Names.view()...};
+    };
+    using adapters = catalog<"cmake", "bazel", "command", "vcpkg", "tsc", "bun", "uv", "ty", "ruff">;
     using artifacts = formats<"compilation_database">;
+    using report_protocols = protocols<"junit", "bep", "codequality">;
     using builder = adapters::builder;
 
     struct task {
@@ -44,6 +59,9 @@ export namespace builds {
         std::vector<std::string> after;
         std::map<std::string, reference> inputs;
         builds::parameters parameters;
+        // Reports the task's steps write besides the ones their adapter declares: a command or `uv run` that starts pytest with
+        // --junit-xml=${reports}/pytest.xml names {"protocol": "junit", "file": "pytest.xml"}.
+        std::vector<report> reports;
     };
     struct operation {
         std::vector<std::string> tasks;
@@ -69,7 +87,10 @@ export namespace builds {
     auto schemas() -> const std::map<std::string, rfl::Generic>&;
     void validate(const configuration& c);
     auto prepare(const configuration& c, const request& request) -> plan;
-    // Binds a step to a tree on this machine, its mapped tools and the parallel jobs it may use.
-    auto locate(step value, const std::filesystem::path& tree, const toolset& tools, std::uint32_t jobs) -> step;
+    // Binds a step to a tree on this machine, its mapped tools, the parallel jobs it may use and the directory of its reports.
+    auto locate(step value, const std::filesystem::path& tree, const toolset& tools, std::uint32_t jobs, const std::filesystem::path& reports = {}) -> step;
+    // What the reports a bound step left in `reports` say, with paths made relative to `tree`; a missing report adds nothing,
+    // and one that cannot be read says so as a diagnostic.
+    auto collect(const step& bound, const std::filesystem::path& reports, const std::filesystem::path& tree) -> reading;
     auto inspect(const context& artifact, const std::filesystem::path& tree) -> artifact_result;
 } // namespace builds

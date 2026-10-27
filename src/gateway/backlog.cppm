@@ -18,9 +18,8 @@ namespace tools {
         auto shared = std::make_shared<runner>(std::move(r));
         if (here == 0)
             co_return enqueue(std::move(e), std::move(shared));
-        co_return co_await cores::call(rt_.get_scheduler(here), rt_.get_scheduler(0), [this, e, shared]() -> coroutine::task<std::shared_ptr<ticket>> {
-            co_return enqueue(e, shared);
-        });
+        co_return co_await cores::call(rt_.get_scheduler(here), rt_.get_scheduler(0),
+                                       [this, e, shared]() -> coroutine::task<std::shared_ptr<ticket>> { co_return enqueue(e, shared); });
     }
 
     auto backlog::list(std::size_t here) -> coroutine::task<std::vector<view>> {
@@ -32,9 +31,8 @@ namespace tools {
     auto backlog::cancel(std::size_t here, std::uint64_t id, worlds::actor who) -> coroutine::task<std::string> {
         if (here == 0)
             co_return withdraw(id, who);
-        co_return co_await cores::call(rt_.get_scheduler(here), rt_.get_scheduler(0), [this, id, who]() -> coroutine::task<std::string> {
-            co_return withdraw(id, who);
-        });
+        co_return co_await cores::call(rt_.get_scheduler(here), rt_.get_scheduler(0),
+                                       [this, id, who]() -> coroutine::task<std::string> { co_return withdraw(id, who); });
     }
 
     auto backlog::serve(native::scheduler& io) -> coroutine::task<> {
@@ -191,8 +189,13 @@ namespace tools {
                 cache_.pop_back();
         }
         auto ok = built ? built->ok : std::get<language::result>(r).status == "prepared";
-        finished_.push_front({.id = j->id, .project = j->what.project, .configuration = j->what.configuration, .operation = j->what.operation,
-                              .state = std::move(state), .ok = ok, .waiting = j->tickets.size()});
+        finished_.push_front({.id = j->id,
+                              .project = j->what.project,
+                              .configuration = j->what.configuration,
+                              .operation = j->what.operation,
+                              .state = std::move(state),
+                              .ok = ok,
+                              .waiting = j->tickets.size()});
         if (finished_.size() > finished_shown)
             finished_.pop_back();
         for (auto& t : j->tickets) {
@@ -207,8 +210,13 @@ namespace tools {
         std::vector<view> out;
         std::size_t ahead = 0;
         for (auto& j : jobs_) {
-            out.push_back({.id = j->id, .project = j->what.project, .configuration = j->what.configuration, .operation = j->what.operation,
-                           .state = j->running ? "running" : "queued", .waiting = j->tickets.size(), .ahead = j->running ? 0 : ahead});
+            out.push_back({.id = j->id,
+                           .project = j->what.project,
+                           .configuration = j->what.configuration,
+                           .operation = j->what.operation,
+                           .state = j->running ? "running" : "queued",
+                           .waiting = j->tickets.size(),
+                           .ahead = j->running ? 0 : ahead});
             if (!j->running)
                 ++ahead;
         }

@@ -59,7 +59,8 @@ export namespace fixture {
     }
     inline void launcher(builds::configuration& build, std::string executable) {
         build.builders["launcher"] = builds::with<"command">{
-            .options = {.operations = {{"run", {.argv = {"${input:binary_dir}/" + executable}, .inputs = {{"binary_dir", "directory"}}, .append_args = true}}}}};
+            .options = {
+                .operations = {{"run", {.argv = {"${input:binary_dir}/" + executable}, .inputs = {{"binary_dir", "directory"}}, .append_args = true}}}}};
         build.tasks["run"] = {.builder = "launcher", .operation = "run", .inputs = {{"binary_dir", {"build", "build_tree"}}}};
         build.operations["run"] = {.tasks = {"run"}};
     }

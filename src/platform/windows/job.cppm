@@ -59,7 +59,8 @@ namespace isolation {
     }
     void scope::concurrency(std::uint32_t parallel) {
         auto processors = ::GetActiveProcessorCount(ALL_PROCESSOR_GROUPS);
-        if (!parallel || !processors) throw std::invalid_argument("CPU concurrency must be positive");
+        if (!parallel || !processors)
+            throw std::invalid_argument("CPU concurrency must be positive");
         JOBOBJECT_CPU_RATE_CONTROL_INFORMATION limit{};
         limit.ControlFlags = JOB_OBJECT_CPU_RATE_CONTROL_ENABLE | JOB_OBJECT_CPU_RATE_CONTROL_HARD_CAP;
         limit.CpuRate = static_cast<DWORD>(std::clamp<std::uint64_t>(std::uint64_t{parallel} * 10000 / processors, 1, 10000));
@@ -91,7 +92,8 @@ namespace isolation {
                 throw std::invalid_argument("invalid worker isolation key");
         }
     };
-    pool::pool(std::string_view key) : pool(std::filesystem::path{"workers"}, key) {}
+    auto delegated() -> std::filesystem::path { return "workers"; }
+    pool::pool(std::string_view key) : pool(delegated(), key) {}
     pool::pool(const std::filesystem::path& root, std::string_view key) : state_(std::make_unique<state>(root, key)) {}
     pool::~pool() = default;
     auto pool::start(std::optional<std::uint64_t> memory, std::optional<std::uint32_t> cpu) -> std::shared_ptr<scope> {

@@ -2,8 +2,8 @@ module;
 #include <errno.h>
 #include <fcntl.h>
 #include <signal.h>
-#include <sys/resource.h>
 #include <sys/prctl.h>
+#include <sys/resource.h>
 #include <sys/socket.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -63,12 +63,12 @@ namespace native_process {
     namespace {
         constexpr long open_pid_call = 434;
         constexpr long close_range_call = 436;
-        [[noreturn]] void exec_child(char** args, char** envp, const char* dir, int out, int in, const io::command& cmd, int join, int parent) {
+        [[noreturn]] void exec_child(char** args, char** envp, const char* dir, int out, int in, int file, const io::command& cmd, int join, int parent) {
             if (::prctl(PR_SET_PDEATHSIG, SIGKILL) != 0 || ::getppid() != parent)
                 ::_exit(126);
             ::setpgid(0, 0);
             ::dup2(in, 0);
-            ::dup2(out, 1);
+            ::dup2(file >= 0 ? file : out, 1);
             // A conversation keeps stdout for replies and discards its diagnostics, as on Windows.
             if (cmd.interactive) {
                 int null = ::open("/dev/null", O_WRONLY);
@@ -152,6 +152,18 @@ namespace native_process {
             ::close(out[1]);
             throw std::system_error(err, std::system_category(), "open /dev/null");
         }
+        int file = -1;
+        if (cmd.standard_output) {
+            file = ::open(cmd.standard_output->c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+            if (file < 0) {
+                auto err = errno;
+                ::close(out[0]);
+                ::close(out[1]);
+                if (!cmd.interactive)
+                    ::close(in);
+                throw std::system_error(err, std::system_category(), "open child standard output");
+            }
+        }
         auto parent = ::getpid();
         auto pid = ::fork();
         if (pid < 0) {
@@ -160,14 +172,18 @@ namespace native_process {
             ::close(out[1]);
             if (!cmd.interactive)
                 ::close(in);
+            if (file >= 0)
+                ::close(file);
             throw std::system_error(err, std::system_category(), "fork");
         }
         if (pid == 0)
-            exec_child(args.data(), envp, dir.c_str(), out[1], in, cmd, control ? control->join_fd() : -1, parent);
+            exec_child(args.data(), envp, dir.c_str(), out[1], in, file, cmd, control ? control->join_fd() : -1, parent);
         ::setpgid(pid, pid);
         ::close(out[1]);
         if (!cmd.interactive)
             ::close(in);
+        if (file >= 0)
+            ::close(file);
         int pidfd = static_cast<int>(::syscall(open_pid_call, pid, 0));
         if (pidfd < 0) {
             auto err = errno;
@@ -193,7 +209,10 @@ namespace native_process {
             ::shutdown(state_->out, SHUT_WR);
     }
     auto child::reaped() const noexcept -> bool { return state_->reaped; }
-    void child::terminate() noexcept { if (!state_->reaped) ::kill(state_->pid, SIGTERM); }
+    void child::terminate() noexcept {
+        if (!state_->reaped)
+            ::kill(state_->pid, SIGTERM);
+    }
     void child::kill() noexcept {
         if (state_->control)
             state_->control->kill();

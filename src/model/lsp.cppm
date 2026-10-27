@@ -92,12 +92,30 @@ namespace lsp::detail {
     // LSP symbol kinds folded into the neutral kinds: namespace, type, function, variable, module and other.
     inline auto kind_name(int kind) -> std::string_view {
         switch (kind) {
-        case 2: case 4: return "module";
-        case 3: return "namespace";
-        case 5: case 10: case 11: case 23: case 26: return "type";
-        case 6: case 9: case 12: case 25: return "function";
-        case 7: case 8: case 13: case 14: case 22: return "variable";
-        default: return "other";
+        case 2:
+        case 4:
+            return "module";
+        case 3:
+            return "namespace";
+        case 5:
+        case 10:
+        case 11:
+        case 23:
+        case 26:
+            return "type";
+        case 6:
+        case 9:
+        case 12:
+        case 25:
+            return "function";
+        case 7:
+        case 8:
+        case 13:
+        case 14:
+        case 22:
+            return "variable";
+        default:
+            return "other";
         }
     }
     // Kinds whose extent other declarations live in, and so make a scope.
@@ -105,10 +123,14 @@ namespace lsp::detail {
     // LSP severities (1 error to 4 hint) by their number; a diagnostic without one is an error, as the specification says.
     inline auto severity_name(const std::optional<generic>& severity) -> std::string {
         switch (number(severity).value_or(1)) {
-        case 2: return "warning";
-        case 3: return "information";
-        case 4: return "hint";
-        default: return "error";
+        case 2:
+            return "warning";
+        case 3:
+            return "information";
+        case 4:
+            return "hint";
+        default:
+            return "error";
         }
     }
     // A diagnostic's message, with the code the server gave it when that code is text.
@@ -148,7 +170,8 @@ namespace lsp::detail {
         for (std::size_t i = 0; i < encoded.size(); ++i) {
             if (encoded[i] == '%') {
                 unsigned byte = 0;
-                if (i + 3 > encoded.size()) return std::nullopt;
+                if (i + 3 > encoded.size())
+                    return std::nullopt;
                 auto* end = encoded.data() + i + 3;
                 auto [last, error] = std::from_chars(encoded.data() + i + 1, end, byte, 16);
                 if (error != std::errc{} || last != end)
@@ -292,22 +315,23 @@ export namespace lsp {
                 if (auto found = detail::field_of(*fields, "settings"))
                     settings_ = *found;
             auto uri = detail::uri(root_);
-            auto reply = co_await call("initialize", object({
-                // No process ID: a server that watches it outlive the client would leave, and is killed with its session.
-                {"processId", detail::null},
-                {"clientInfo", object({{"name", text("fughetta-service")}})},
-                {"rootUri", text(uri)},
-                {"initializationOptions", std::move(initialization)},
-                {"workspaceFolders", detail::generic::Array{object({{"uri", text(uri)}, {"name", text(root_.filename().string())}})}},
-                {"capabilities", object({
-                    {"general", object({{"positionEncodings", detail::generic::Array{text("utf-32"), text("utf-16")}}})},
-                    {"workspace", object({{"configuration", detail::generic{true}}, {"workspaceFolders", detail::generic{true}}})},
-                    // Diagnostics are pulled where the server offers it, and pushed otherwise; the pull is announced, since servers
-                    // such as ty and ruff pull only for a client that says it can.
-                    {"textDocument", object({{"synchronization", object({{"dynamicRegistration", detail::generic{false}}})},
-                                             {"documentSymbol", object({{"hierarchicalDocumentSymbolSupport", detail::generic{true}}})},
-                                             {"diagnostic", object({{"dynamicRegistration", detail::generic{false}}})},
-                                             {"publishDiagnostics", object({})}})}})}}));
+            auto reply = co_await call(
+                "initialize",
+                object({// No process ID: a server that watches it outlive the client would leave, and is killed with its session.
+                        {"processId", detail::null},
+                        {"clientInfo", object({{"name", text("fughetta-service")}})},
+                        {"rootUri", text(uri)},
+                        {"initializationOptions", std::move(initialization)},
+                        {"workspaceFolders", detail::generic::Array{object({{"uri", text(uri)}, {"name", text(root_.filename().string())}})}},
+                        {"capabilities",
+                         object({{"general", object({{"positionEncodings", detail::generic::Array{text("utf-32"), text("utf-16")}}})},
+                                 {"workspace", object({{"configuration", detail::generic{true}}, {"workspaceFolders", detail::generic{true}}})},
+                                 // Diagnostics are pulled where the server offers it, and pushed otherwise; the pull is announced, since servers
+                                 // such as ty and ruff pull only for a client that says it can.
+                                 {"textDocument", object({{"synchronization", object({{"dynamicRegistration", detail::generic{false}}})},
+                                                          {"documentSymbol", object({{"hierarchicalDocumentSymbolSupport", detail::generic{true}}})},
+                                                          {"diagnostic", object({{"dynamicRegistration", detail::generic{false}}})},
+                                                          {"publishDiagnostics", object({})}})}})}}));
             auto parsed = rfl::from_generic<detail::initialized, rfl::DefaultIfMissing>(reply);
             if (!parsed)
                 throw std::runtime_error("language server answered initialize with an unreadable result: " + std::string{parsed.error().what()});
@@ -370,7 +394,8 @@ export namespace lsp {
         // the diagnostics it pushes are kept, and its other notifications are left out.
         auto call(std::string method, detail::generic params) -> coroutine::task<detail::generic> {
             auto id = ++next_;
-            co_await send(detail::object({{"jsonrpc", detail::text("2.0")}, {"id", detail::generic{id}}, {"method", detail::text(method)}, {"params", std::move(params)}}));
+            co_await send(detail::object(
+                {{"jsonrpc", detail::text("2.0")}, {"id", detail::generic{id}}, {"method", detail::text(method)}, {"params", std::move(params)}}));
             for (;;) {
                 auto incoming = co_await receive();
                 if (incoming.method) {
@@ -400,7 +425,8 @@ export namespace lsp {
                         count = items->items.size();
                 reply = object({{"jsonrpc", text("2.0")}, {"id", *request.id}, {"result", detail::generic::Array(count, settings_)}});
             } else if (method != "client/registerCapability" && method != "client/unregisterCapability" && method != "window/workDoneProgress/create")
-                reply = object({{"jsonrpc", text("2.0")}, {"id", *request.id},
+                reply = object({{"jsonrpc", text("2.0")},
+                                {"id", *request.id},
                                 {"error", object({{"code", detail::generic{std::int64_t{-32601}}}, {"message", text("method not supported")}})}});
             co_await send(reply);
         }
@@ -467,8 +493,10 @@ export namespace lsp {
                     throw std::runtime_error("language server diagnostic range is outside the document");
                 auto first = *begin, last = *end;
                 if (first == last && text) {
-                    if (last < text) ++last;
-                    else --first;
+                    if (last < text)
+                        ++last;
+                    else
+                        --first;
                 }
                 out.push_back({.range = semantic::span{.place = semantic::place{d.path, first, last}},
                                .severity = detail::severity_name(item.severity),
@@ -536,14 +564,17 @@ export namespace lsp {
             if (!started_)
                 throw std::logic_error("language server session was not started");
             if (!symbols_ && !pull_)
-                throw std::runtime_error(std::format("the language server declares neither documentSymbolProvider nor diagnosticProvider, so {} cannot be described", d.path));
+                throw std::runtime_error(
+                    std::format("the language server declares neither documentSymbolProvider nor diagnosticProvider, so {} cannot be described", d.path));
             using detail::object, detail::text;
             open_ = root_ / d.path;
             pushed_.clear();
             auto uri = text(detail::uri(*open_));
             auto identifier = object({{"textDocument", object({{"uri", uri}})}});
-            co_await notify("textDocument/didOpen", object({{"textDocument", object({{"uri", uri}, {"languageId", text(d.language)},
-                                                                                     {"version", detail::generic{std::int64_t{1}}}, {"text", text(d.text)}})}}));
+            co_await notify(
+                "textDocument/didOpen",
+                object({{"textDocument",
+                         object({{"uri", uri}, {"languageId", text(d.language)}, {"version", detail::generic{std::int64_t{1}}}, {"text", text(d.text)}})}}));
             semantic::outline out;
             try {
                 if (symbols_)
@@ -592,7 +623,9 @@ export namespace lsp {
         semantic::outline out;
         std::exception_ptr failed;
         auto until = std::chrono::steady_clock::now() + bounds.total;
-        auto left = [&] { return std::max(std::chrono::seconds{1}, std::chrono::duration_cast<std::chrono::seconds>(until - std::chrono::steady_clock::now())); };
+        auto left = [&] {
+            return std::max(std::chrono::seconds{1}, std::chrono::duration_cast<std::chrono::seconds>(until - std::chrono::steady_clock::now()));
+        };
         try {
             if (!co_await coroutine::deadline(io, std::min(bounds.per_document, left()), session.start(tree, std::move(initialization))))
                 throw std::runtime_error("the language server did not start in time");
@@ -617,8 +650,8 @@ export namespace lsp {
         co_return out;
     }
 
-    auto bounded_survey(native::scheduler io, io::command server, rfl::Generic initialization, std::filesystem::path tree,
-                        std::vector<document> documents, limits bounds, isolation::pool& pool) -> coroutine::task<semantic::outline> {
+    auto bounded_survey(native::scheduler io, io::command server, rfl::Generic initialization, std::filesystem::path tree, std::vector<document> documents,
+                        limits bounds, isolation::pool& pool) -> coroutine::task<semantic::outline> {
         auto resource = pool.start({}, {});
         resource->concurrency(1);
         server.isolation = resource->target();
@@ -627,10 +660,14 @@ export namespace lsp {
         std::exception_ptr error;
         try {
             result = co_await coroutine::under(token, survey(io, std::move(server), std::move(initialization), std::move(tree), std::move(documents), bounds));
-        } catch (...) { error = std::current_exception(); }
+        } catch (...) {
+            error = std::current_exception();
+        }
         resource->close();
-        if (error) std::rethrow_exception(error);
-        if (!result) co_await coroutine::stop;
+        if (error)
+            std::rethrow_exception(error);
+        if (!result)
+            co_await coroutine::stop;
         co_return std::move(*result);
     }
 

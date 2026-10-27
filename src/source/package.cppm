@@ -258,9 +258,8 @@ export namespace package {
     // Writes `version` of `worldline` as package `root`; a package that exists is replaced only when asked.
     // `admit` sees the staged package before it takes its name and may refuse it; nothing it refuses is kept.
     template <class Admit = accept>
-    auto write(nodes::local_node& node, const std::filesystem::path& root, const std::string& project, const std::string& worldline,
-                      const std::string& version, bool overwrite, const std::string& configuration = {},
-                      Admit admit = {}) -> manifest {
+    auto write(nodes::local_node& node, const std::filesystem::path& root, const std::string& project, const std::string& worldline, const std::string& version,
+               bool overwrite, const std::string& configuration = {}, Admit admit = {}) -> manifest {
         unlinked(root.parent_path());
         recover(root);
         unlinked(root);
@@ -269,7 +268,10 @@ export namespace package {
         auto tree = node.call({.action = "tree", .worldline = worldline, .revision = version});
         if (tree.code != "ok")
             nodes::fail(tree.code, tree.reason);
-        manifest out{.format = format, .project = project, .worldline = worldline, .version = tree.version,
+        manifest out{.format = format,
+                     .project = project,
+                     .worldline = worldline,
+                     .version = tree.version,
                      .exported_at = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count()};
         auto staging = scratch(root.parent_path(), "staging");
         // A failed export leaves nothing behind to count against the workspace; a crashed one is swept on the next call.
@@ -361,6 +363,8 @@ export namespace package {
             done.configuration = std::move(kept->configuration);
             return done;
         }
+        if (done.code != nodes::code::outcome_unknown)
+            return done;
         auto [kept, blobs, configuration] = read(root, [&in](const manifest& m) {
             std::uint64_t total = 0;
             for (auto& f : m.files) {
@@ -369,24 +373,40 @@ export namespace package {
                 total = f.size > std::numeric_limits<std::uint64_t>::max() - total ? std::numeric_limits<std::uint64_t>::max() : total + f.size;
             }
             if (in.project_limit && total > in.project_limit)
-                nodes::fail(nodes::code::resource_limit, std::format("the package holds {} bytes, more than the {} byte project limit", total, in.project_limit));
+                nodes::fail(nodes::code::resource_limit,
+                            std::format("the package holds {} bytes, more than the {} byte project limit", total, in.project_limit));
         });
         // An empty package is restored by its fork alone, which then holds the caller's operation and the restore's record.
         auto record = rfl::json::write(restored{in.target, kept.version, configuration});
         bool empty = kept.files.empty();
-        auto fork = node.call({.action = "fork", .worldline = in.worldline, .operation = empty ? in.operation : content::hash_of(in.operation + ":fork").str(),
-                               .owner = node.node_id(), .actor = in.actor, .caller_operation = in.caller_operation,
-                               .intent = "restore package of " + kept.worldline + " at " + kept.version, .result = empty ? record : std::string{}});
+        auto fork = node.call({.action = "fork",
+                               .worldline = in.worldline,
+                               .operation = empty ? in.operation : content::hash_of(in.operation + ":fork").str(),
+                               .owner = node.node_id(),
+                               .actor = in.actor,
+                               .caller_operation = in.caller_operation,
+                               .intent = "restore package of " + kept.worldline + " at " + kept.version,
+                               .result = empty ? record : std::string{}});
         if (fork.code != "ok")
             return fork;
-        nodes::node_request files{.action = "apply", .worldline = in.worldline, .operation = in.operation, .owner = node.node_id(), .actor = in.actor,
-                                  .holder = in.holder, .caller_operation = in.caller_operation, .expected = fork.frontier,
+        nodes::node_request files{.action = "apply",
+                                  .worldline = in.worldline,
+                                  .operation = in.operation,
+                                  .owner = node.node_id(),
+                                  .actor = in.actor,
+                                  .holder = in.holder,
+                                  .caller_operation = in.caller_operation,
+                                  .expected = fork.frontier,
                                   .intent = "restore package " + in.target,
                                   .result = record,
-                                  .scopes = {"::"}, .file_limit = in.file_limit, .project_limit = in.project_limit};
+                                  .scopes = {"::"},
+                                  .file_limit = in.file_limit,
+                                  .project_limit = in.project_limit};
         for (auto& f : kept.files) {
             auto& bytes = blobs.at(f.digest);
-            files.edits.push_back({.kind = f.kind == "text" ? "create" : "binary_create", .path = f.path, .text = f.kind == "text" ? bytes : nodes::hex(bytes),
+            files.edits.push_back({.kind = f.kind == "text" ? "create" : "binary_create",
+                                   .path = f.path,
+                                   .text = f.kind == "text" ? bytes : nodes::hex(bytes),
                                    .executable = f.executable});
         }
         auto out = files.edits.empty() ? fork : node.call(files);

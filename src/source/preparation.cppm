@@ -19,24 +19,29 @@ export namespace preparation {
             // A preparation a worker runs is preparing until this time (Unix seconds), interrupted after it.
             std::int64_t until = 0;
         };
-        static auto now() -> std::int64_t { return std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count(); }
+        static auto now() -> std::int64_t {
+            return std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+        }
 
     public:
         service(cores::context<native::scheduler>& rt, std::filesystem::path root, execution::thread_pool& pool, builds::toolset tools = {})
             : rt_(rt), pool_(pool), store_(std::move(root)), tools_(std::move(tools)) {}
 
         // A preparation a worker ran: `after` publishes what it found; then its receipt, written as preparing by `begin`, is final.
-        template <class After> auto finish(std::size_t core, language::request request, language::result result, After after) -> coroutine::task<language::result> {
+        template <class After>
+        auto finish(std::size_t core, language::request request, language::result result, After after) -> coroutine::task<language::result> {
             if (core == 0)
                 co_return co_await completed(std::move(request), std::move(result), std::move(after));
-            co_return co_await cores::call(rt_.get_scheduler(core), rt_.get_scheduler(0), [this, request = std::move(request), result = std::move(result), after]() mutable {
-                return completed(std::move(request), std::move(result), std::move(after));
-            });
+            co_return co_await cores::call(rt_.get_scheduler(core), rt_.get_scheduler(0),
+                                           [this, request = std::move(request), result = std::move(result), after]() mutable {
+                                               return completed(std::move(request), std::move(result), std::move(after));
+                                           });
         }
 
         // `gather` stages the source; `after` runs once the preparation succeeded, before its receipt is final. Action `begin` only writes
         // the preparing receipt of a preparation a worker will run, or answers the receipt there is.
-        template <class Gather, class After> auto run(std::size_t core, language::request request, Gather gather, After after) -> coroutine::task<language::result> {
+        template <class Gather, class After>
+        auto run(std::size_t core, language::request request, Gather gather, After after) -> coroutine::task<language::result> {
             if (core == 0)
                 co_return co_await serial(std::move(request), std::move(gather), std::move(after));
             co_return co_await cores::call(rt_.get_scheduler(core), rt_.get_scheduler(0), [this, request = std::move(request), gather, after]() mutable {
@@ -145,9 +150,7 @@ export namespace preparation {
                 auto key = std::tuple{path, artifact.type, artifact.kind};
                 auto found = inspected.find(key);
                 if (found == inspected.end())
-                    found =
-                        inspected.emplace(std::move(key), builds::inspect({artifact.name, artifact.type, path, artifact.kind}, result.tree))
-                            .first;
+                    found = inspected.emplace(std::move(key), builds::inspect({artifact.name, artifact.type, path, artifact.kind}, result.tree)).first;
                 return found->second.digest == artifact.digest && found->second.units == artifact.units;
             };
             return !result.inputs.empty() && std::ranges::all_of(result.artifacts, matches) && std::ranges::all_of(result.inputs, matches);
@@ -219,8 +222,11 @@ export namespace preparation {
                 throw std::invalid_argument("analysis configuration is disabled");
             auto plan = language::prepare(request.config);
             receipt record{.input = input,
-                           .result = {.operation_id = request.operation_id, .status = "preparing", .worldline = request.worldline,
-                                      .revision = request.revision, .configuration = plan.fingerprint}};
+                           .result = {.operation_id = request.operation_id,
+                                      .status = "preparing",
+                                      .worldline = request.worldline,
+                                      .revision = request.revision,
+                                      .configuration = plan.fingerprint}};
             auto persist = [&] {
                 durability::durable_directories(path.parent_path());
                 durability::durable_write(path, rfl::json::write(record));
@@ -254,14 +260,22 @@ export namespace preparation {
                     auto left = std::chrono::seconds{language::timeout(request.config)} - (std::chrono::steady_clock::now() - started);
                     if (left <= std::chrono::steady_clock::duration::zero())
                         throw std::runtime_error("analysis preparation timed out");
-                    auto local = builds::locate(step, record.result.tree, tools_, 1);
+                    // A preparation keeps no report, but its steps write them as anywhere else.
+                    auto reports = store_.root() / "reports" / std::filesystem::path(record.result.tree).filename();
+                    co_await disk([&] {
+                        std::filesystem::remove_all(reports);
+                        std::filesystem::create_directories(reports);
+                    });
+                    auto local = builds::locate(step, record.result.tree, tools_, 1, reports);
                     auto step_env = env;
                     for (auto& [key, value] : local.env)
                         step_env[key] = value;
                     step_env["OMP_NUM_THREADS"] = "1";
                     io::command command{.argv = std::move(local.argv), .cwd = local.cwd, .env = std::move(step_env)};
+                    if (local.standard_output)
+                        command.standard_output = reports / *local.standard_output;
                     auto report = co_await runner::prepared_step(io, std::move(command), std::chrono::duration_cast<std::chrono::milliseconds>(left),
-                                                             language::output_limit(request.config), step.name, *resources_);
+                                                                 language::output_limit(request.config), step.name, *resources_);
                     record.result.steps.push_back({report.name, report.exit_code, report.timed_out, report.seconds, report.output, report.truncated});
                     if (report.exit_code || report.timed_out)
                         throw std::runtime_error("analysis preparation command failed");

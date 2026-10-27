@@ -1,6 +1,7 @@
 module;
 #include <rfl.hpp>
 #include <rfl/json.hpp>
+#include <rfl/xml.hpp>
 
 export module reflection;
 
@@ -27,4 +28,8 @@ export namespace rfl {
         using rfl::json::to_schema;
         using rfl::json::write;
     } // namespace json
+
+    namespace xml {
+        using rfl::xml::read;
+    } // namespace xml
 } // namespace rfl

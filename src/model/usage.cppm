@@ -8,7 +8,7 @@ export namespace usage {
     inline auto now() -> std::int64_t { return std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count(); }
     inline auto day_of(std::int64_t t) -> std::int64_t {
         auto q = t / 86400;
-        return q - (t % 86400 < 0);   // floor division without t - 86399, which overflows near INT64_MIN
+        return q - (t % 86400 < 0); // floor division without t - 86399, which overflows near INT64_MIN
     }
     inline auto month_start(std::int64_t day) -> std::int64_t {
         std::chrono::year_month_day ymd{std::chrono::sys_days{std::chrono::days{day}}};
@@ -30,7 +30,7 @@ export namespace usage {
         std::uint64_t blobs_sent = 0;
         std::uint64_t bytes_sent = 0;
         std::string error;
-        std::string workspace_id,worldline,version,snapshot,operation,actor;
+        std::string workspace_id, worldline, version, snapshot, operation, actor;
         std::string error_code;
     };
 
@@ -75,7 +75,7 @@ export namespace usage {
         std::uint64_t builds_ok = 0;
         std::uint64_t builds_failed = 0;
         std::uint64_t builds_not_run = 0;
-        std::uint64_t builds_unknown=0,builds_cancelled=0;
+        std::uint64_t builds_unknown = 0, builds_cancelled = 0;
         double build_seconds = 0;
         std::uint64_t bytes_synced = 0;
     };
@@ -95,6 +95,8 @@ export namespace usage {
             replay();
         }
 
+        std::function<void()> changed;
+
         // Admits a build within the rate and time quotas; how many run at once is the backlog's to keep.
         auto admit_build(const std::string& project, const config::effective_limits& limits) -> std::uint64_t {
             if (auto n = builds_last_hour(project); n >= limits.builds_per_hour)
@@ -105,10 +107,15 @@ export namespace usage {
                 throw quota_exceeded(std::format("{:.0f} build seconds used this month (limit {})", s, limits.build_seconds_per_month));
             auto ticket = next_ticket_++;
             running_.emplace(ticket, project);
+            if (changed)
+                changed();
             return ticket;
         }
 
-        void release(std::uint64_t ticket) { running_.erase(ticket); }
+        void release(std::uint64_t ticket) {
+            if (running_.erase(ticket) && changed)
+                changed();
+        }
 
         void record(std::uint64_t ticket, build_event e) {
             running_.erase(ticket);
@@ -116,6 +123,8 @@ export namespace usage {
                 e.at = now();
             append(event{.seq = next_seq_++, .build = e}, e.at);
             apply(e);
+            if (changed)
+                changed();
         }
 
         void record(tool_event e) {
@@ -123,6 +132,8 @@ export namespace usage {
                 e.at = now();
             append(event{.seq = next_seq_++, .tool = e}, e.at);
             apply(e);
+            if (changed)
+                changed();
         }
 
         auto running() const -> std::uint32_t { return static_cast<std::uint32_t>(running_.size()); }
@@ -131,7 +142,7 @@ export namespace usage {
             auto since = now() - 3600;
             std::uint32_t n = 0;
             for (auto it = builds_.rbegin(); it != builds_.rend() && it->at >= since; ++it)
-                if (it->project == project && (it->error.empty() || it->error_code=="outcome_unknown" || it->error_code=="cancelled"))
+                if (it->project == project && (it->error.empty() || it->error_code == "outcome_unknown" || it->error_code == "cancelled"))
                     ++n;
             return n;
         }
@@ -319,9 +330,12 @@ export namespace usage {
             d.build_seconds += e.seconds;
             d.bytes_synced += e.bytes_sent;
             auto& t = totals_.projects[e.project];
-            if (e.error_code=="outcome_unknown") ++t.builds_unknown;
-            else if (e.error_code=="cancelled") ++t.builds_cancelled;
-            else (e.ok ? t.builds_ok : !e.error.empty() ? t.builds_not_run : t.builds_failed) += 1;
+            if (e.error_code == "outcome_unknown")
+                ++t.builds_unknown;
+            else if (e.error_code == "cancelled")
+                ++t.builds_cancelled;
+            else
+                (e.ok ? t.builds_ok : !e.error.empty() ? t.builds_not_run : t.builds_failed) += 1;
             t.build_seconds += e.seconds;
             t.bytes_synced += e.bytes_sent;
         }

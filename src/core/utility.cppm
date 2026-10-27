@@ -15,11 +15,9 @@ export namespace util {
     // (__cpp_lib_move_only_function is undefined), and the two core modules used
     // to export their own identical copy of this class, which is a redefinition
     // waiting for one translation unit to import both.
-    template <class Signature>
-    class move_only_function;
+    template <class Signature> class move_only_function;
 
-    template <class R, class... A>
-    class move_only_function<R(A...)> {
+    template <class R, class... A> class move_only_function<R(A...)> {
         static constexpr std::size_t buffer_size = 3 * sizeof(void*);
 
     public:
@@ -27,8 +25,7 @@ export namespace util {
         move_only_function(std::nullptr_t) noexcept {}
 
         template <class F>
-            requires(!std::same_as<std::remove_cvref_t<F>, move_only_function> &&
-                     std::invocable<std::decay_t<F>&, A...>)
+            requires(!std::same_as<std::remove_cvref_t<F>, move_only_function> && std::invocable<std::decay_t<F>&, A...>)
         move_only_function(F&& function) {
             emplace<std::decay_t<F>>(std::forward<F>(function));
         }
@@ -66,12 +63,9 @@ export namespace util {
             void (*destroy)(void*) noexcept;
         };
 
-        template <class F, bool Inline>
-        static auto table_for() noexcept -> const table* {
+        template <class F, bool Inline> static auto table_for() noexcept -> const table* {
             static constexpr table value{
-                .call = [](void* object, A&&... args) -> R {
-                    return std::invoke(*static_cast<F*>(object), std::forward<A>(args)...);
-                },
+                .call = [](void* object, A&&... args) -> R { return std::invoke(*static_cast<F*>(object), std::forward<A>(args)...); },
                 .move = [](void* source, void* buffer) noexcept -> void* {
                     if constexpr (Inline) {
                         auto* moved = ::new (buffer) F(std::move(*static_cast<F*>(source)));
@@ -81,21 +75,19 @@ export namespace util {
                         return source;
                     }
                 },
-                .destroy = [](void* object) noexcept {
-                    if constexpr (Inline)
-                        static_cast<F*>(object)->~F();
-                    else
-                        delete static_cast<F*>(object);
-                },
+                .destroy =
+                    [](void* object) noexcept {
+                        if constexpr (Inline)
+                            static_cast<F*>(object)->~F();
+                        else
+                            delete static_cast<F*>(object);
+                    },
             };
             return &value;
         }
 
-        template <class F, class... Args>
-        void emplace(Args&&... args) {
-            constexpr bool inline_stored =
-                sizeof(F) <= buffer_size && alignof(F) <= alignof(std::max_align_t) &&
-                std::is_nothrow_move_constructible_v<F>;
+        template <class F, class... Args> void emplace(Args&&... args) {
+            constexpr bool inline_stored = sizeof(F) <= buffer_size && alignof(F) <= alignof(std::max_align_t) && std::is_nothrow_move_constructible_v<F>;
             if constexpr (inline_stored) {
                 object_ = ::new (static_cast<void*>(buffer_.data())) F(std::forward<Args>(args)...);
                 table_ = table_for<F, true>();
@@ -106,7 +98,8 @@ export namespace util {
         }
 
         void move_into(move_only_function& destination) noexcept {
-            if (table_ == nullptr) return;
+            if (table_ == nullptr)
+                return;
             destination.table_ = table_;
             destination.object_ = table_->move(object(), destination.buffer_.data());
             // The callable now belongs to |destination|: this one owns nothing,
@@ -125,11 +118,9 @@ export namespace util {
 
     // A borrowed callable for a call that finishes before the callable goes away: two pointers, no allocation. It is for a
     // callback that crosses a module implementation unit, where a template cannot go; libc++ has no std::function_ref.
-    template <class Signature>
-    class function_ref;
+    template <class Signature> class function_ref;
 
-    template <class R, class... A>
-    class function_ref<R(A...)> {
+    template <class R, class... A> class function_ref<R(A...)> {
     public:
         template <class F>
             requires(!std::same_as<std::remove_cvref_t<F>, function_ref> && std::invocable<F&, A...>)
@@ -147,8 +138,7 @@ export namespace util {
     // C++23 std::generator<Ref, V> without the allocator parameter and ranges::elements_of, which libc++ does not ship yet.
     // The body runs only while the caller iterates, so a reader that `co_yield`s a span of its own buffer hands each piece
     // over without copying it; an exception from the body propagates out of the iterator step that ran it.
-    template <class Ref, class V = void>
-    class generator : public std::ranges::view_interface<generator<Ref, V>> {
+    template <class Ref, class V = void> class generator : public std::ranges::view_interface<generator<Ref, V>> {
         using value = std::conditional_t<std::is_void_v<V>, std::remove_cvref_t<Ref>, V>;
         using reference = std::conditional_t<std::is_void_v<V>, Ref&&, Ref>;
 
@@ -166,8 +156,7 @@ export namespace util {
             }
             // An lvalue yielded through an rvalue reference is copied into the frame for the suspension.
             auto yield_value(const std::remove_reference_t<yielded>& value)
-                requires std::is_rvalue_reference_v<yielded> &&
-                         std::constructible_from<std::remove_cvref_t<yielded>, const std::remove_reference_t<yielded>&>
+                requires std::is_rvalue_reference_v<yielded> && std::constructible_from<std::remove_cvref_t<yielded>, const std::remove_reference_t<yielded>&>
             {
                 struct copy {
                     std::remove_cvref_t<yielded> value;
@@ -177,8 +166,7 @@ export namespace util {
                 };
                 return copy{value};
             }
-            template <class U>
-            auto await_transform(U&&) -> std::suspend_never = delete;
+            template <class U> auto await_transform(U&&) -> std::suspend_never = delete;
             void return_void() const noexcept {}
             void unhandled_exception() { throw; }
         };

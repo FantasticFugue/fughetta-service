@@ -61,6 +61,8 @@ namespace builds {
             argv.push_back(op.command);
             argv.push_back("--repo_contents_cache=");
             argv.push_back("--jobs=${jobs}");
+            if (op.command == "test")
+                argv.push_back("--build_event_json_file=${reports}/bep.json");
             argv.insert(argv.end(), op.options.begin(), op.options.end());
             if (p.filter)
                 argv.push_back("--test_filter=" + *p.filter);
@@ -75,8 +77,12 @@ namespace builds {
                 argv.insert(argv.end(), op.args.begin(), op.args.end());
                 argv.insert(argv.end(), p.args.begin(), p.args.end());
             }
-            return {{std::string{operation}, std::move(argv), c.source_dir, {}}};
+            step out{.name = std::string{operation}, .argv = std::move(argv), .cwd = c.source_dir};
+            if (op.command == "test")
+                out.reports = {{"bep", "bep.json"}};
+            return {std::move(out)};
         }
     };
     static_assert(system<adapter<"bazel">>);
+
 } // namespace builds

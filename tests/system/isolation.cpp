@@ -99,7 +99,8 @@ namespace {
             doc.projects["lib"] = {};
             auto file = tmp.dir / "config.json";
             test::spit(file, rfl::json::write(doc));
-            test::child source{test::source_command(SERVICE_EXECUTABLE, tmp.dir, {"--port", std::to_string(source_port), "--storage", (tmp.dir / "source").string()})};
+            test::child source{
+                test::source_command(SERVICE_EXECUTABLE, tmp.dir, {"--port", std::to_string(source_port), "--storage", (tmp.dir / "source").string()})};
             test::ready(source, source_port);
             test::child gateway{test::gateway_command(SERVICE_EXECUTABLE, tmp.dir, {file.string()})};
             test::ready(gateway, http_port);
@@ -119,7 +120,9 @@ namespace {
 
             {
                 writer_lock held{repository};
-                auto blocked = std::async(std::launch::async, [&] { return call("write", "app", R"("path":"blocked.txt","content":"committed later","operation_id":"blocked-write")"); });
+                auto blocked = std::async(std::launch::async, [&] {
+                    return call("write", "app", R"("path":"blocked.txt","content":"committed later","operation_id":"blocked-write")");
+                });
                 issued("blocked.txt");
                 auto began = std::chrono::steady_clock::now();
                 auto other = call("read", "lib", R"("path":"independent.txt")");
@@ -132,15 +135,23 @@ namespace {
                 expect(call("read", "app", R"("path":"blocked.txt")").contains("committed later"));
             }
 
-            struct stored_project { std::string name; std::uint64_t bytes = 0; };
-            struct stored { std::uint64_t bytes = 0; std::vector<stored_project> per_project; };
+            struct stored_project {
+                std::string name;
+                std::uint64_t bytes = 0;
+            };
+            struct stored {
+                std::uint64_t bytes = 0;
+                std::vector<stored_project> per_project;
+            };
             auto usage = test::decode<stored>(test::request(http_port, http::method::GET, "/api/v1/usage").body);
             expect(usage.bytes > 0u && usage.per_project.size() == 2u) << "usage counts the node repositories";
             for (auto& p : usage.per_project)
                 expect(p.bytes > 0u) << p.name;
 
             auto source_view = test::request(http_port, http::method::GET, "/api/v1/projects/app/source");
-            struct main_version { std::string version; };
+            struct main_version {
+                std::string version;
+            };
             auto main = test::decode<main_version>(call("worldline", "app", R"("action":"inspect")"));
             expect(source_view.status == 200 && source_view.body.contains("hello.txt") && source_view.body.contains(main.version))
                 << "the console's source view is main: " << source_view.body;
@@ -163,8 +174,10 @@ namespace {
             auto replayed = call("generate", "app", R"("action":"apply","operation_id":"generate-class",)" + parameters);
             expect(replayed.contains(R"("replayed":true)")) << replayed;
             call("worldline", "app", R"("action":"unlock","scopes":["::"])");
-            auto refused = call("generate", "app", R"("action":"apply","operation_id":"generate-other",)" +
-                                std::string{R"("parameters":{"template_id":"cpp-class","name":"Other","directory":"src"})"}, true);
+            auto refused = call("generate", "app",
+                                R"("action":"apply","operation_id":"generate-other",)" +
+                                    std::string{R"("parameters":{"template_id":"cpp-class","name":"Other","directory":"src"})"},
+                                true);
             expect(refused.contains("scope_locked")) << "generation without the global scope: " << refused;
 
             // Projects come from their settings, and generation only writes files into a project that already exists.
@@ -184,21 +197,23 @@ namespace {
             auto again = test::request(http_port, http::method::POST, path, body);
             expect(again.status == 200 && again.body.contains(R"("replayed":true)")) << again.body;
             expect(call("worldline", "demo", R"("action":"locks")").contains(R"("locks":[])")) << "a console generation leaves no lock behind";
-            test::require(test::request(http_port, http::method::PUT, "/api/v1/projects/small", R"({"revision":0,"value":{}})").status == 200, "small project saved");
+            test::require(test::request(http_port, http::method::PUT, "/api/v1/projects/small", R"({"revision":0,"value":{}})").status == 200,
+                          "small project saved");
             test::require(test::save(http_port, "/api/v1/config/limits", R"({"max_file_bytes":8})").status == 200, "limits saved");
-            auto oversized = test::request(http_port, http::method::POST, "/api/v1/projects/small/generate",
-                R"({"parameters":{"template_id":"cpp-class","name":"Small","directory":"src"},"preview":false,"operation_id":"small-class"})");
+            auto oversized =
+                test::request(http_port, http::method::POST, "/api/v1/projects/small/generate",
+                              R"({"parameters":{"template_id":"cpp-class","name":"Small","directory":"src"},"preview":false,"operation_id":"small-class"})");
             expect(oversized.status == 400 && oversized.body.contains("resource_limit")) << oversized.body;
             test::require(test::save(http_port, "/api/v1/config/limits", "{}").status == 200, "limits restored");
-
 
             lock("app");
             auto kept = test::request(http_port, http::method::POST, "/api/v1/projects/app/generate",
                                       R"({"parameters":{"template_id":"cpp-class","name":"Kept","directory":"src"},"preview":false,"operation_id":"kept"})");
             expect(kept.status == 200) << kept.body;
             expect(call("worldline", "app", R"("action":"locks")").contains(R"("scope":"::")")) << "the console keeps a global scope its caller already held";
-            auto taken = test::request(http_port, http::method::POST, "/api/v1/projects/app/generate",
-                                       R"({"parameters":{"template_id":"cpp-class","name":"Kept","directory":"src"},"preview":false,"operation_id":"kept-again"})");
+            auto taken =
+                test::request(http_port, http::method::POST, "/api/v1/projects/app/generate",
+                              R"({"parameters":{"template_id":"cpp-class","name":"Kept","directory":"src"},"preview":false,"operation_id":"kept-again"})");
             expect(taken.status == 409 && taken.body.contains("source_conflict")) << taken.body;
             expect(call("build", "app", R"("worldline":"main")", true).size() > 0u) << "a build with no worker fails";
             expect(call("write", "app", R"("path":"../escape","content":"x","operation_id":"escape")", true).contains("invalid_record"));
@@ -217,7 +232,7 @@ namespace {
             expect(source.stop() == 0);
         };
     };
-}
+} // namespace
 
 int main(int argc, const char** argv) {
     boost::ut::suite<"isolation">{cases};

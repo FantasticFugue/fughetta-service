@@ -29,8 +29,8 @@ namespace {
         test::scratch tmp{"executor"};
         cores::io_context<native::context> rt{2};
         execution::thread_pool disk{2};
-        replica::service service{rt, {.root = tmp.dir / "cache", .worker = "worker-test", .env = {{"VALUE", "worker"}},
-                                          .inherit_env = false, .isolate = isolate}, disk, 1};
+        replica::service service{
+            rt, {.root = tmp.dir / "cache", .worker = "worker-test", .env = {{"VALUE", "worker"}}, .inherit_env = false, .isolate = isolate}, disk, 1};
         rt.run([&](ctx& io, std::size_t core) -> coroutine::task<> {
             if (core != 0)
                 co_return;
@@ -146,9 +146,11 @@ namespace {
             std::string text(4096, 'p');
             auto plan = s.offer({"app", {{entry("a", text)}}});
             auto frame = nodes::archive::pack(text);
-            jobs::source_part packed{.digest = content::hash_of(text), .total = text.size(),
-                                     .bytes = {reinterpret_cast<const std::byte*>(frame.data()), reinterpret_cast<const std::byte*>(frame.data()) + frame.size()},
-                                     .packed = true};
+            jobs::source_part packed{
+                .digest = content::hash_of(text),
+                .total = text.size(),
+                .bytes = {reinterpret_cast<const std::byte*>(frame.data()), reinterpret_cast<const std::byte*>(frame.data()) + frame.size()},
+                .packed = true};
             expect(s.put({{packed}}).stored == 1u);
             expect(test::slurp(s.checkout("app", plan.snapshot) / "a") == text);
             auto damaged = packed;
@@ -227,9 +229,11 @@ namespace {
                 expect(first.has_value() && first->stored == 0u);
                 auto last = co_await channel.call(jobs::source_bytes{{part("hello", 2, 3, "hello")}});
                 expect(last.has_value() && last->stored == 1u);
-                jobs::build_request request{.project = "app", .tree = "debug", .snapshot = tree.id(),
-                    .steps = {{.name = "first", .argv = {"/bin/sh", "-c", "cat input.txt; echo $VALUE; echo output > artifact"},
-                               .env = {{"VALUE", "step"}}},
+                jobs::build_request request{
+                    .project = "app",
+                    .tree = "debug",
+                    .snapshot = tree.id(),
+                    .steps = {{.name = "first", .argv = {"/bin/sh", "-c", "cat input.txt; echo $VALUE; echo output > artifact"}, .env = {{"VALUE", "step"}}},
                               {.name = "fail", .argv = {"/bin/sh", "-c", "exit 3"}},
                               {.name = "unreached", .argv = {"/bin/sh", "-c", "echo bad > unreached"}}},
                     .env = {{"VALUE", "build"}}};
@@ -284,9 +288,13 @@ int main(int argc, const char** argv) {
                 content::manifest tree;
                 auto offered = co_await channel.call(jobs::sync_offer{"app", tree});
                 expect(offered.has_value() >> fatal);
-                jobs::build_request request{.project = "app", .snapshot = tree.id(),
-                    .steps = {{.name = "budget", .argv = {"/bin/sh", "-c",
-                        "group=$(sed -n 's/^0:://p' /proc/self/cgroup); cat /sys/fs/cgroup$group/cpu.max; printf '%s\\n' \"$OMP_NUM_THREADS\""}}},
+                jobs::build_request request{
+                    .project = "app",
+                    .snapshot = tree.id(),
+                    .steps =
+                        {{.name = "budget",
+                          .argv = {"/bin/sh", "-c",
+                                   "group=$(sed -n 's/^0:://p' /proc/self/cgroup); cat /sys/fs/cgroup$group/cpu.max; printf '%s\\n' \"$OMP_NUM_THREADS\""}}},
                     .env = {{"OMP_NUM_THREADS", "99"}}};
                 auto result = co_await channel.call(request);
                 expect(result.has_value() >> fatal);
@@ -298,10 +306,14 @@ int main(int argc, const char** argv) {
                 content::manifest tree;
                 auto offered = co_await channel.call(jobs::sync_offer{"app", tree});
                 expect(offered.has_value() >> fatal);
-                jobs::build_request request{.project = "app", .snapshot = tree.id(),
-                    .steps = {{.name = "limit", .argv = {"/bin/sh", "-c",
-                        "group=$(sed -n 's/^0:://p' /proc/self/cgroup); cat /sys/fs/cgroup$group/memory.max /sys/fs/cgroup$group/memory.swap.max /sys/fs/cgroup$group/cpu.max"}}},
-                    .max_memory_bytes = 512ull << 20, .max_cpu_seconds = 7};
+                jobs::build_request request{.project = "app",
+                                            .snapshot = tree.id(),
+                                            .steps = {{.name = "limit",
+                                                       .argv = {"/bin/sh", "-c",
+                                                                "group=$(sed -n 's/^0:://p' /proc/self/cgroup); cat /sys/fs/cgroup$group/memory.max "
+                                                                "/sys/fs/cgroup$group/memory.swap.max /sys/fs/cgroup$group/cpu.max"}}},
+                                            .max_memory_bytes = 512ull << 20,
+                                            .max_cpu_seconds = 7};
                 auto result = co_await channel.call(request);
                 expect(result.has_value() >> fatal);
                 expect(result->ok() && result->steps[0].output == "536870912\n0\n100000 100000\n");
@@ -310,8 +322,9 @@ int main(int argc, const char** argv) {
                 for (const auto& child : std::filesystem::directory_iterator(group))
                     expect(!child.is_directory());
                 request.max_cpu_seconds = 1;
-                request.steps = {{.name = "first", .argv = {"python3", "-c", "import time; end=time.process_time()+0.65\nwhile time.process_time()<end: pass"}},
-                                 {.name = "second", .argv = {"python3", "-c", "import time; end=time.process_time()+0.65\nwhile time.process_time()<end: pass"}}};
+                request.steps = {
+                    {.name = "first", .argv = {"python3", "-c", "import time; end=time.process_time()+0.65\nwhile time.process_time()<end: pass"}},
+                    {.name = "second", .argv = {"python3", "-c", "import time; end=time.process_time()+0.65\nwhile time.process_time()<end: pass"}}};
                 auto exhausted = co_await channel.call(request);
                 expect(exhausted.has_value() >> fatal);
                 expect(exhausted->steps.size() == 2u && exhausted->steps[0].exit_code == 0);

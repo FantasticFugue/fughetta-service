@@ -105,10 +105,8 @@ namespace {
             reject([](auto& c) { c.tasks.at("package").operation = "missing"; });
             reject([](auto& c) { fixture::needs(c.builders.at("bazel")).platform.os = "windows"; });
             reject([](auto& c) { c.outputs.at("archive").output = "missing"; });
-            expect(throws<std::invalid_argument>(
-                [&] { builds::prepare(baseline, {.operation = "prepare", .parameters = {.targets = {"app"}}}); }));
-            expect(throws<std::invalid_argument>(
-                [&] { builds::prepare(baseline, {.operation = "build", .parameters = {.labels = "unit"}}); }));
+            expect(throws<std::invalid_argument>([&] { builds::prepare(baseline, {.operation = "prepare", .parameters = {.targets = {"app"}}}); }));
+            expect(throws<std::invalid_argument>([&] { builds::prepare(baseline, {.operation = "build", .parameters = {.labels = "unit"}}); }));
             expect(throws<std::invalid_argument>([&] { language::prepare({.build = baseline, .inputs = {"archive"}}); })) << "clice reads no archive";
             expect(throws<std::invalid_argument>([&] { language::prepare({.build = baseline}); })) << "clice needs a compilation database";
             expect(!rfl::json::read<builds::builder>(R"({"adapter":"missing","options":{}})")) << "an unknown adapter is refused when parsed";
@@ -189,13 +187,12 @@ namespace {
             o.test.labels = "fast";
             o.test.exclude_labels = "network";
             o.test.timeout = 30;
-            o.test.output_junit = "build/cmake/results.xml";
             auto p = builds::prepare(c, {.operation = "test", .parameters = {.filter = "^gateway", .parallel = 3}});
             auto& configure = p.steps.front().argv;
             expect(std::ranges::contains(configure, "--preset"));
             expect(std::ranges::contains(configure, "-DCMAKE_TOOLCHAIN_FILE=/opt/vcpkg/scripts/buildsystems/vcpkg.cmake"));
             expect(!std::ranges::contains(configure, "-G"));
-            auto local = builds::locate(p.steps.back(), "/work/project", {{"ctest", "/opt/cmake/bin/ctest"}}, 2);
+            auto local = builds::locate(p.steps.back(), "/work/project", {{"ctest", "/opt/cmake/bin/ctest"}}, 2, "/work/reports");
             auto after = [&](std::string_view flag) {
                 auto at = std::ranges::find(local.argv, flag);
                 return at == local.argv.end() || ++at == local.argv.end() ? std::string{} : *at;
@@ -204,18 +201,18 @@ namespace {
             expect(after("--test-dir") == "/work/project/build/cmake" && after("-R") == "^gateway");
             expect(after("-L") == "fast" && after("-LE") == "network" && after("-j") == "3");
             expect(after("--timeout") == "30" && after("-C") == "Release");
-            expect(after("--output-junit") == "/work/project/build/cmake/results.xml");
+            expect(after("--output-junit") == "/work/reports/ctest.xml" && local.reports == std::vector<builds::report>{{"junit", "ctest.xml"}});
             expect(std::ranges::contains(local.argv, "--no-tests=error"));
             expect(local.env.at("CTEST_PARALLEL_LEVEL") == "2");
         };
         "extra CMake and CTest options cannot replace structured settings"_test = [] {
-            for (auto option : {"-Belsewhere", "-Selsewhere", "-GMakefiles", "--preset=other", "-DCMAKE_C_COMPILER=other",
-                                "-DCMAKE_BUILD_TYPE:STRING=Release", "-DCMAKE_EXPORT_COMPILE_COMMANDS=ON"}) {
+            for (auto option : {"-Belsewhere", "-Selsewhere", "-GMakefiles", "--preset=other", "-DCMAKE_C_COMPILER=other", "-DCMAKE_BUILD_TYPE:STRING=Release",
+                                "-DCMAKE_EXPORT_COMPILE_COMMANDS=ON"}) {
                 auto c = fixture::cmake("build/cmake");
                 fixture::options<"cmake">(c.builders.at("main")).configure_options = {option};
                 expect(throws<std::invalid_argument>([&] { builds::validate(c); })) << option;
             }
-            for (auto option : {"--no-tests=ignore", "-j4", "--tests-regex=skip", "--test-dir=elsewhere", "-N"}) {
+            for (auto option : {"--no-tests=ignore", "-j4", "--tests-regex=skip", "--test-dir=elsewhere", "-N", "--output-junit=other.xml"}) {
                 auto c = fixture::cmake("build/cmake");
                 expect(throws<std::invalid_argument>([&] { builds::prepare(c, {.operation = "test", .parameters = {.args = {option}}}); })) << option;
             }
@@ -228,11 +225,75 @@ namespace {
             o.test.parallel = 0;
             expect(throws<std::invalid_argument>([&] { builds::validate(c); }));
         };
+        "CTest and Bazel tests report in JUnit and the Build Event Protocol"_test = [] {
+            auto c = fixture::cmake("build/cmake");
+            auto p = builds::prepare(c, {.operation = "test"});
+            expect(p.steps.front().reports.empty() && p.steps.back().reports.size() == 1u) << "only the test step writes a report";
+
+            auto ctest = builds::report_protocols::read("junit", R"(<?xml version="1.0" encoding="UTF-8"?>
+<testsuite name="Linux-c++" tests="3" failures="1" disabled="0" skipped="1" hostname="" time="0" timestamp="2026-10-27T10:00:00">
+	<testcase name="unit" classname="unit" time="0.01" status="run"><system-out>ok</system-out></testcase>
+	<testcase name="gateway" classname="gateway" time="0.2" status="fail"><failure message="Failed"/><system-out>assert</system-out></testcase>
+	<testcase name="network" classname="network" time="0" status="notrun"><skipped message="Disabled"/></testcase>
+</testsuite>)");
+            expect((ctest.tests.has_value()) >> fatal);
+            expect(ctest.tests->total == 3 && ctest.tests->failed == 1 && ctest.tests->failed_tests == std::vector<std::string>{"gateway"});
+
+            auto bazel = builds::report_protocols::read(
+                "bep", R"({"id":{"started":{}},"started":{"uuid":"1"}})"
+                       "\n"
+                       R"({"id":{"testSummary":{"label":"//pkg:unit","configuration":{"id":"k8"}}},"testSummary":{"overallStatus":"PASSED","totalRunCount":1}})"
+                       "\n"
+                       R"({"id":{"testSummary":{"label":"//pkg:slow","configuration":{"id":"k8"}}},"testSummary":{"overallStatus":"TIMEOUT"}})"
+                       "\n"
+                       R"({"id":{"testSummary":{"label":"//pkg:flaky","configuration":{"id":"k8"}}},"testSummary":{"overallStatus":"FLAKY"}})"
+                       "\n"
+                       R"({"id":{"testSummary":{"label":"//pkg:broken","configuration":{"id":"k8"}}},"testSummary":{"totalRunCount":0}})"
+                       "\n");
+            expect((bazel.tests.has_value()) >> fatal);
+            expect(bazel.tests->total == 4 && bazel.tests->failed == 2);
+            expect(bazel.tests->failed_tests == std::vector<std::string>{"//pkg:slow", "//pkg:broken"});
+            auto suites = builds::report_protocols::read("junit", R"(<testsuites><testsuite name="unit"><testcase name="t" classname="m"/></testsuite>
+<testsuite name="integration"><testcase name="t" classname="m"><failure/></testcase></testsuite></testsuites>)");
+            expect(suites.tests->total == 2 && suites.tests->failed_tests == std::vector<std::string>{"m.t"}) << "cases of two suites stay apart";
+            expect(throws([] { builds::report_protocols::read("junit", "<testsuite"); }));
+        };
+        "a worker reads the reports a step left, relative to the tree"_test = [] {
+            test::scratch tmp{"build-reports"};
+            auto c = fixture::cmake("build/cmake");
+            auto& o = fixture::options<"cmake">(c.builders.at("main"));
+            o.source_dir = "app";
+            auto p = builds::prepare(c, {.operation = "test"});
+            auto step = p.steps.back();
+            step.reports.push_back({"codequality", "lint.json"});
+            auto local = builds::locate(step, tmp.dir / "tree", {}, 1, tmp.dir / "reports");
+            test::spit(tmp.dir / "reports/ctest.xml", R"(<testsuite><testcase name="a" classname="a"><error message="crash"/></testcase></testsuite>)");
+            test::spit(tmp.dir / "reports/lint.json",
+                       R"([{"description":"F401: unused","check_name":"F401","severity":"major",)"
+                       R"("location":{"path":"src/m.py","positions":{"begin":{"line":1,"column":8}}}},)"
+                       R"({"description":"outside","severity":"minor","location":{"path":"../../elsewhere.py","lines":{"begin":3}}}])");
+            auto found = builds::collect(local, tmp.dir / "reports", tmp.dir / "tree");
+            expect((found.tests && found.diagnostics.size() == 2u) >> fatal);
+            expect(found.tests->failed_tests == std::vector<std::string>{"a"});
+            expect(found.diagnostics[0].file == "app/src/m.py" && found.diagnostics[0].column == 8 && found.diagnostics[0].severity == "error");
+            expect(found.diagnostics[1].file == "../../elsewhere.py" && found.diagnostics[1].line == 3 && found.diagnostics[1].severity == "warning");
+            test::spit(tmp.dir / "reports/ctest.xml", "not xml");
+            std::filesystem::remove(tmp.dir / "reports/lint.json");
+            found = builds::collect(local, tmp.dir / "reports", tmp.dir / "tree");
+            expect((found.diagnostics.size() == 1u && !found.tests) >> fatal) << "a missing report adds no result";
+            expect(found.diagnostics[0].message.starts_with("the junit report ctest.xml could not be read"));
+        };
+        "a step's report is a plain file name of a known protocol"_test = [] {
+            for (auto r : std::vector<builds::report>{{"junit", "../x.xml"}, {"junit", "a/b.xml"}, {"junit", ""}, {"tap", "t.tap"}, {"junit", "ctest.xml"}}) {
+                auto c = fixture::cmake("build/cmake");
+                c.tasks.at("test").reports = {r};
+                expect(throws<std::invalid_argument>([&] { builds::validate(c); })) << r.file;
+            }
+        };
         "worker reports carry language diagnostics to source publication"_test = [] {
             jobs::build_report report;
             report.outline = semantic::outline{};
-            report.outline->diagnostics.push_back({.range = {.place = semantic::place{"app.py", 2, 5}},
-                                                   .severity = "error", .message = "invalid assignment"});
+            report.outline->diagnostics.push_back({.range = {.place = semantic::place{"app.py", 2, 5}}, .severity = "error", .message = "invalid assignment"});
             auto decoded = transport::codec<jobs::build_report>::decode(transport::encode(report));
             expect((decoded.outline.has_value()) >> fatal);
             expect(decoded.outline->diagnostics.size() == 1u);

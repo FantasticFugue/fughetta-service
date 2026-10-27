@@ -82,8 +82,7 @@ export namespace runtime {
 
     public:
         // Starts the source and the workers in `tasks`, returning once each is ready; a stop of `tasks` ends them.
-        auto start(native::scheduler& io, coroutine::scope& tasks, const std::filesystem::path& executable,
-                   const config::document& doc) -> coroutine::task<> {
+        auto start(native::scheduler& io, coroutine::scope& tasks, const std::filesystem::path& executable, const config::document& doc) -> coroutine::task<> {
             auto plan = allocation::distribute(doc.runtime);
             auto root = std::filesystem::absolute(doc.server.storage);
             auto directory = root / "runtime";
@@ -93,8 +92,9 @@ export namespace runtime {
             // Managed links stay on loopback; deployment changes only the public HTTP listener.
             if (doc.server.source != std::format("127.0.0.1:{}", endpoint.port()) || doc.server.worker_bind != "127.0.0.1")
                 throw std::invalid_argument("managed source and worker listeners must use 127.0.0.1");
-            io::command source_command{.argv = {executable.string(), "--role", "source", "--port", std::to_string(endpoint.port()),
-                                               "--storage", (root / "source").string(), "--threads", std::to_string(plan.source_disk)}, .cwd = std::filesystem::current_path()};
+            io::command source_command{.argv = {executable.string(), "--role", "source", "--port", std::to_string(endpoint.port()), "--storage",
+                                                (root / "source").string(), "--threads", std::to_string(plan.source_disk)},
+                                       .cwd = std::filesystem::current_path()};
             for (auto& [name, tool] : doc.tools)
                 source_command.argv.insert(source_command.argv.end(), {"--tool", name + "=" + tool});
             auto& source = launch(io, tasks, std::move(source_command), "source");
@@ -116,12 +116,12 @@ export namespace runtime {
                 out.close();
                 if (!out)
                     throw std::runtime_error("cannot write worker configuration: " + file.string());
-                auto& process = launch(io, tasks, {.argv = {executable.string(), "--role", "worker", file.string()},
-                                                 .cwd = std::filesystem::current_path()}, "worker");
+                auto& process =
+                    launch(io, tasks, {.argv = {executable.string(), "--role", "worker", file.string()}, .cwd = std::filesystem::current_path()}, "worker");
                 co_await ready(io, process);
             }
-            std::cerr << std::format("service budget: {} execution threads, {} build jobs, {} workers\n",
-                                     doc.runtime.threads, doc.runtime.jobs, plan.workers.size());
+            std::cerr << std::format("service budget: {} execution threads, {} build jobs, {} workers\n", doc.runtime.threads, doc.runtime.jobs,
+                                     plan.workers.size());
         }
 
         // Lasts until stopped, and fails as soon as a child exits unasked.
@@ -135,4 +135,4 @@ export namespace runtime {
             }
         }
     };
-}
+} // namespace runtime

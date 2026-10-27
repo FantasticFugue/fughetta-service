@@ -28,7 +28,8 @@ int main() {
             threads.emplace_back([&, p] {
                 start.arrive_and_wait();
                 for (unsigned i = 0; i < count; ++i)
-                    while (!queue.push(p * count + i)) std::this_thread::yield();
+                    while (!queue.push(p * count + i))
+                        std::this_thread::yield();
                 finished.fetch_add(1, std::memory_order_release);
             });
         for (unsigned c = 0; c < consumers; ++c)
@@ -37,17 +38,21 @@ int main() {
                 for (;;) {
                     unsigned value;
                     if (queue.try_pop(value)) {
-                        if (value < seen.size()) seen[value].fetch_add(1, std::memory_order_relaxed);
-                        else invalid.fetch_add(1, std::memory_order_relaxed);
+                        if (value < seen.size())
+                            seen[value].fetch_add(1, std::memory_order_relaxed);
+                        else
+                            invalid.fetch_add(1, std::memory_order_relaxed);
                         consumed.fetch_add(1, std::memory_order_relaxed);
-                    } else if (finished.load(std::memory_order_acquire) == producers &&
-                               consumed.load(std::memory_order_relaxed) == producers * count) break;
-                    else std::this_thread::yield();
+                    } else if (finished.load(std::memory_order_acquire) == producers && consumed.load(std::memory_order_relaxed) == producers * count)
+                        break;
+                    else
+                        std::this_thread::yield();
                 }
             });
         threads.clear();
         expect(consumed.load() == producers * count);
         expect(invalid.load() == 0_u);
-        for (auto& value : seen) expect(value.load() == 1_u);
+        for (auto& value : seen)
+            expect(value.load() == 1_u);
     };
 }

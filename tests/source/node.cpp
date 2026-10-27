@@ -117,25 +117,58 @@ namespace {
             std::string restored{std::istreambuf_iterator<char>{input.stream}, {}};
             expect(restored == raw);
         };
-        "persistent Merkle indexes and sparse causal sets preserve exact states"_test=[] {
-            nodes::persistent_index<std::string> forward,backward;
-            for(int i=0;i<128;++i){auto key=std::format("key/{:03}",i);forward.set(key,key,nodes::digest_of(key));}
-            for(int i=127;i>=0;--i){auto key=std::format("key/{:03}",i);backward.set(key,key,nodes::digest_of(key));}
-            expect(forward.digest()==backward.digest());auto original=forward;auto root=original.digest();
-            forward.set("key/050","changed",nodes::digest_of("changed"));forward.erase("key/090");forward.set("key/new","added",nodes::digest_of("added"));
+        "persistent Merkle indexes and sparse causal sets preserve exact states"_test = [] {
+            nodes::persistent_index<std::string> forward, backward;
+            for (int i = 0; i < 128; ++i) {
+                auto key = std::format("key/{:03}", i);
+                forward.set(key, key, nodes::digest_of(key));
+            }
+            for (int i = 127; i >= 0; --i) {
+                auto key = std::format("key/{:03}", i);
+                backward.set(key, key, nodes::digest_of(key));
+            }
+            expect(forward.digest() == backward.digest());
+            auto original = forward;
+            auto root = original.digest();
+            forward.set("key/050", "changed", nodes::digest_of("changed"));
+            forward.erase("key/090");
+            forward.set("key/new", "added", nodes::digest_of("added"));
             std::vector<std::string> changed;
-            original.difference(forward,[&](const std::string& key,const auto*,const auto*){changed.push_back(key);});
-            expect(changed==std::vector<std::string>{"key/050","key/090","key/new"});expect(original.digest()==root);expect(original.find("key/050")->second=="key/050");
-            nodes::causal_set a,b;std::set<std::size_t> expected_a,expected_b;
-            for(std::size_t i=0;i<512;++i){if(i%3!=0){a.add(i);expected_a.insert(i);}if(i%5<2){b.add(i);expected_b.insert(i);}}
-            auto merged=a;merged.unite(b);auto difference=a.without(b);
-            for(std::size_t i=0;i<512;++i){expect(merged.contains(i)==(expected_a.contains(i)||expected_b.contains(i)));expect(difference.contains(i)==(expected_a.contains(i)&&!expected_b.contains(i)));}
-            nodes::causal_set serial;for(std::size_t i=0;i<10000;++i)serial.add(i);expect(serial.ranges.size()==1u);expect(serial.contains(9999u));expect(!serial.contains(10000u));
+            original.difference(forward, [&](const std::string& key, const auto*, const auto*) { changed.push_back(key); });
+            expect(changed == std::vector<std::string>{"key/050", "key/090", "key/new"});
+            expect(original.digest() == root);
+            expect(original.find("key/050")->second == "key/050");
+            nodes::causal_set a, b;
+            std::set<std::size_t> expected_a, expected_b;
+            for (std::size_t i = 0; i < 512; ++i) {
+                if (i % 3 != 0) {
+                    a.add(i);
+                    expected_a.insert(i);
+                }
+                if (i % 5 < 2) {
+                    b.add(i);
+                    expected_b.insert(i);
+                }
+            }
+            auto merged = a;
+            merged.unite(b);
+            auto difference = a.without(b);
+            for (std::size_t i = 0; i < 512; ++i) {
+                expect(merged.contains(i) == (expected_a.contains(i) || expected_b.contains(i)));
+                expect(difference.contains(i) == (expected_a.contains(i) && !expected_b.contains(i)));
+            }
+            nodes::causal_set serial;
+            for (std::size_t i = 0; i < 10000; ++i)
+                serial.add(i);
+            expect(serial.ranges.size() == 1u);
+            expect(serial.contains(9999u));
+            expect(!serial.contains(10000u));
         };
         "cold counted sequence edits match an independent complete archive renderer"_test = [] {
             peers p;
             std::string initial;
-            for (int i = 0; i < 800; ++i) initial += "a😀é\r\n";
+            for (int i = 0; i < 800; ++i)
+                initial += "a😀é\r\n";
             auto current = p.seed("x", initial);
             for (int i = 0; i < 32; ++i) {
                 nodes::local_node cold{p.tmp.dir / "a"};
@@ -145,8 +178,10 @@ namespace {
                 auto count = i % 4 && offset < old.size() ? std::min<std::uint64_t>(3, old.size() - offset) : 0;
                 auto inserted = i % 3 ? std::string{"界😀é\n"} : std::string{};
                 auto stats = cold.statistics();
-                current = good(cold, {.action = "apply", .operation = op("demand-unicode-" + std::to_string(i)), .expected = before.frontier,
-                    .edits = {{.kind = "edit", .path = "x", .text = inserted, .offset = offset, .count = count}}});
+                current = good(cold, {.action = "apply",
+                                      .operation = op("demand-unicode-" + std::to_string(i)),
+                                      .expected = before.frontier,
+                                      .edits = {{.kind = "edit", .path = "x", .text = inserted, .offset = offset, .count = count}}});
                 auto work = cold.statistics();
                 expect(work.projected_files - stats.projected_files <= 1u);
                 expect(work.file_histories_read == stats.file_histories_read);
@@ -163,60 +198,98 @@ namespace {
             }
         };
         "a cold edit never reads the large causal append tail"_test = [] {
-            test::scratch tmp{"demand-append-tail"}; std::vector<std::string> frontier;
-            { nodes::local_node node{tmp.dir / "a"}; good(node, {.action = "initialize"});
-              std::vector<nodes::edit> files{{.kind = "create", .path = "target", .text = "a"}};
-              for (int i = 0; i < 64; ++i) files.push_back({.kind = "create", .path = "unrelated/" + std::to_string(i), .text = std::string(1024, 'u')});
-              frontier = good(node, {.action = "apply", .operation = op("append-tail-seed"), .edits = std::move(files)}).frontier; }
-            nodes::local_node cold{tmp.dir / "a"}; auto before = cold.statistics();
-            auto edited = change(cold, "append-tail-edit", frontier, {.kind = "edit", .path = "target", .text = "z"}); auto after = cold.statistics();
-            expect(after.causal_blocks_read == before.causal_blocks_read); expect(after.projected_files - before.projected_files == 1u);
-            expect(after.file_payloads_read - before.file_payloads_read == 1u); expect(after.file_histories_read == before.file_histories_read);
-            nodes::local_node reopened{tmp.dir / "a"}; expect(text(inspect(reopened), "target") == "za");
+            test::scratch tmp{"demand-append-tail"};
+            std::vector<std::string> frontier;
+            {
+                nodes::local_node node{tmp.dir / "a"};
+                good(node, {.action = "initialize"});
+                std::vector<nodes::edit> files{{.kind = "create", .path = "target", .text = "a"}};
+                for (int i = 0; i < 64; ++i)
+                    files.push_back({.kind = "create", .path = "unrelated/" + std::to_string(i), .text = std::string(1024, 'u')});
+                frontier = good(node, {.action = "apply", .operation = op("append-tail-seed"), .edits = std::move(files)}).frontier;
+            }
+            nodes::local_node cold{tmp.dir / "a"};
+            auto before = cold.statistics();
+            auto edited = change(cold, "append-tail-edit", frontier, {.kind = "edit", .path = "target", .text = "z"});
+            auto after = cold.statistics();
+            expect(after.causal_blocks_read == before.causal_blocks_read);
+            expect(after.projected_files - before.projected_files == 1u);
+            expect(after.file_payloads_read - before.file_payloads_read == 1u);
+            expect(after.file_histories_read == before.file_histories_read);
+            nodes::local_node reopened{tmp.dir / "a"};
+            expect(text(inspect(reopened), "target") == "za");
             expect(good(reopened, {.action = "receipt", .target = edited.receipt}).receipt == edited.receipt);
         };
         "cold metadata changes reuse authenticated file content and sequence roots"_test = [] {
-            test::scratch tmp{"demand-metadata"}; std::vector<std::string> head;
-            { nodes::local_node node{tmp.dir / "a"}; good(node, {.action = "initialize"});
-              head = change(node, "metadata-seed", {}, {.kind = "create", .path = "x", .text = std::string(8192, 'a')}).frontier; }
-            nodes::local_node cold{tmp.dir / "a"}; auto before = cold.statistics();
+            test::scratch tmp{"demand-metadata"};
+            std::vector<std::string> head;
+            {
+                nodes::local_node node{tmp.dir / "a"};
+                good(node, {.action = "initialize"});
+                head = change(node, "metadata-seed", {}, {.kind = "create", .path = "x", .text = std::string(8192, 'a')}).frontier;
+            }
+            nodes::local_node cold{tmp.dir / "a"};
+            auto before = cold.statistics();
             auto mode = change(cold, "metadata-mode", head, {.kind = "mode", .path = "x", .executable = true});
             auto moved = change(cold, "metadata-move", mode.frontier, {.kind = "move", .path = "x", .target = "y"});
             auto removed = change(cold, "metadata-remove", moved.frontier, {.kind = "remove", .path = "y"});
-            auto after = cold.statistics(); expect(after.file_payloads_read == before.file_payloads_read);
-            expect(after.file_histories_read == before.file_histories_read); expect(after.sequence_pages_read == before.sequence_pages_read);
+            auto after = cold.statistics();
+            expect(after.file_payloads_read == before.file_payloads_read);
+            expect(after.file_histories_read == before.file_histories_read);
+            expect(after.sequence_pages_read == before.sequence_pages_read);
             expect(good(cold, {.action = "tree"}).files.empty());
-            nodes::local_node complete{tmp.dir / "a", {}, true}; expect(inspect(complete).source_digest == removed.source_digest);
+            nodes::local_node complete{tmp.dir / "a", {}, true};
+            expect(inspect(complete).source_digest == removed.source_digest);
         };
         "historical queries restore activation effects from an authenticated current base"_test = [] {
-            test::scratch tmp{"demand-history-control"}; std::string version; std::vector<std::string> restored;
-            { nodes::local_node node{tmp.dir / "a"}; good(node, {.action = "initialize"});
-              auto seed = change(node, "history-control-seed", {}, {.kind = "create", .path = "x", .text = "ab"});
-              auto edited = change(node, "history-control-edit", seed.frontier, {.kind = "edit", .path = "x", .text = "X", .offset = 1}); version = edited.version;
-              restored = good(node, {.action = "reverse", .operation = op("history-control-reverse"), .expected = edited.frontier, .target = edited.frontier.front()}).frontier; }
+            test::scratch tmp{"demand-history-control"};
+            std::string version;
+            std::vector<std::string> restored;
+            {
+                nodes::local_node node{tmp.dir / "a"};
+                good(node, {.action = "initialize"});
+                auto seed = change(node, "history-control-seed", {}, {.kind = "create", .path = "x", .text = "ab"});
+                auto edited = change(node, "history-control-edit", seed.frontier, {.kind = "edit", .path = "x", .text = "X", .offset = 1});
+                version = edited.version;
+                restored =
+                    good(node,
+                         {.action = "reverse", .operation = op("history-control-reverse"), .expected = edited.frontier, .target = edited.frontier.front()})
+                        .frontier;
+            }
             nodes::local_node cold{tmp.dir / "a"};
             expect(text(good(cold, {.action = "read", .revision = version, .target = "x"}), "x") == "aXb");
-            expect(text(inspect(cold), "x") == "ab"); expect(inspect(cold).frontier == restored);
+            expect(text(inspect(cold), "x") == "ab");
+            expect(inspect(cold).frontier == restored);
         };
         "cold remote delta validation does not project unrelated files"_test = [] {
-            peers p; std::vector<nodes::edit> files;
-            for (int i = 0; i < 64; ++i) files.push_back({.kind = "create", .path = std::to_string(i), .text = "v"});
+            peers p;
+            std::vector<nodes::edit> files;
+            for (int i = 0; i < 64; ++i)
+                files.push_back({.kind = "create", .path = std::to_string(i), .text = "v"});
             auto seed = good(p.a, {.action = "apply", .operation = op("delta-seed"), .edits = std::move(files)});
-            exchange(p.a, *p.b); good(*p.b, {.action = "integrate", .operation = op("delta-fork"), .source = seed.frontier});
+            exchange(p.a, *p.b);
+            good(*p.b, {.action = "integrate", .operation = op("delta-fork"), .source = seed.frontier});
             auto local = change(p.a, "delta-local", seed.frontier, {.kind = "edit", .path = "0", .text = "A", .offset = 1});
             auto remote = change(*p.b, "delta-remote", seed.frontier, {.kind = "edit", .path = "1", .text = "B", .offset = 1});
-            nodes::local_node cold{p.tmp.dir / "a"}; auto before = cold.statistics(); exchange(*p.b, cold); auto after = cold.statistics();
+            nodes::local_node cold{p.tmp.dir / "a"};
+            auto before = cold.statistics();
+            exchange(*p.b, cold);
+            auto after = cold.statistics();
             expect(after.projected_files - before.projected_files <= 4u);
             expect(inspect(cold).frontier == local.frontier);
             auto merged = good(cold, {.action = "integrate", .operation = op("delta-integrate"), .expected = local.frontier, .source = remote.frontier});
-            expect(text(inspect(cold), "0") == "vA"); expect(text(inspect(cold), "1") == "vB");
-            nodes::local_node complete{p.tmp.dir / "a", {}, true}; expect(inspect(complete).source_digest == merged.source_digest);
+            expect(text(inspect(cold), "0") == "vA");
+            expect(text(inspect(cold), "1") == "vB");
+            nodes::local_node complete{p.tmp.dir / "a", {}, true};
+            expect(inspect(complete).source_digest == merged.source_digest);
         };
         "cold branch integration and contribution reversal retain the complete renderer result"_test = [] {
-            peers p; auto seed = p.seed("x", "a😀bcé");
+            peers p;
+            auto seed = p.seed("x", "a😀bcé");
             auto a = change(p.a, "demand-branch-a", seed.frontier, {.kind = "edit", .path = "x", .text = "审", .offset = 1});
             auto b = change(*p.b, "demand-branch-b", seed.frontier, {.kind = "edit", .path = "x", .text = "尾", .offset = 5});
-            nodes::local_node cold{p.tmp.dir / "a"}; exchange(*p.b, cold);
+            nodes::local_node cold{p.tmp.dir / "a"};
+            exchange(*p.b, cold);
             auto merged = good(cold, {.action = "integrate", .operation = op("demand-integrate"), .expected = a.frontier, .source = b.frontier});
             auto reversed = good(cold, {.action = "reverse", .operation = op("demand-reverse"), .expected = merged.frontier, .target = a.frontier.front()});
             expect(text(inspect(cold), "x") == "a😀bcé尾");
@@ -231,14 +304,22 @@ namespace {
         "equal text on different worldlines retains distinct authenticated sequence roots"_test = [] {
             test::scratch tmp{"demand-equal-text"};
             std::vector<std::string> branch, main;
-            { nodes::local_node node{tmp.dir / "a"}; good(node, {.action = "initialize"});
-              auto seed = change(node, "equal-seed", {}, {.kind = "create", .path = "x", .text = "a"});
-              auto fork = good(node, {.action = "fork", .worldline = "branch", .operation = op("equal-fork"), .source = seed.frontier}); branch = fork.frontier;
-              auto changed = change(node, "equal-change", seed.frontier, {.kind = "write", .path = "x", .text = "b"});
-              auto restored = change(node, "equal-restore", changed.frontier, {.kind = "write", .path = "x", .text = "a"}); main = restored.frontier; }
+            {
+                nodes::local_node node{tmp.dir / "a"};
+                good(node, {.action = "initialize"});
+                auto seed = change(node, "equal-seed", {}, {.kind = "create", .path = "x", .text = "a"});
+                auto fork = good(node, {.action = "fork", .worldline = "branch", .operation = op("equal-fork"), .source = seed.frontier});
+                branch = fork.frontier;
+                auto changed = change(node, "equal-change", seed.frontier, {.kind = "write", .path = "x", .text = "b"});
+                auto restored = change(node, "equal-restore", changed.frontier, {.kind = "write", .path = "x", .text = "a"});
+                main = restored.frontier;
+            }
             nodes::local_node cold{tmp.dir / "a"};
-            auto b = good(cold, {.action = "apply", .worldline = "branch", .operation = op("equal-branch-edit"), .expected = branch,
-                .edits = {{.kind = "edit", .path = "x", .text = "Q", .offset = 1}}});
+            auto b = good(cold, {.action = "apply",
+                                 .worldline = "branch",
+                                 .operation = op("equal-branch-edit"),
+                                 .expected = branch,
+                                 .edits = {{.kind = "edit", .path = "x", .text = "Q", .offset = 1}}});
             auto m = change(cold, "equal-main-edit", main, {.kind = "edit", .path = "x", .text = "W", .offset = 1});
             expect(text(good(cold, {.action = "read", .worldline = "branch", .target = "x"}), "x") == "aQ");
             expect(text(inspect(cold), "x") == "aW");
@@ -250,21 +331,33 @@ namespace {
             test::scratch tmp{"placing"};
             nodes::local_node node{tmp.dir / "a"};
             good(node, {.action = "initialize"});
-            auto seed = good(node, {.action = "apply", .operation = op("placing-seed"),
-                                    .edits = {{.kind = "create", .path = "a", .text = "A"}, {.kind = "create", .path = "b", .text = "B"},
-                                              {.kind = "create", .path = "c", .text = "C"}, {.kind = "create", .path = "d/e", .text = "E"}}});
-            auto onto = attempt(node, {.action = "apply", .operation = op("onto"), .expected = seed.frontier, .edits = {{.kind = "move", .path = "a", .target = "b"}}});
+            auto seed = good(node, {.action = "apply",
+                                    .operation = op("placing-seed"),
+                                    .edits = {{.kind = "create", .path = "a", .text = "A"},
+                                              {.kind = "create", .path = "b", .text = "B"},
+                                              {.kind = "create", .path = "c", .text = "C"},
+                                              {.kind = "create", .path = "d/e", .text = "E"}}});
+            auto onto =
+                attempt(node, {.action = "apply", .operation = op("onto"), .expected = seed.frontier, .edits = {{.kind = "move", .path = "a", .target = "b"}}});
             expect(onto.code == "source_conflict") << onto.reason;
-            auto both = attempt(node, {.action = "apply", .operation = op("both"), .expected = seed.frontier,
+            auto both = attempt(node, {.action = "apply",
+                                       .operation = op("both"),
+                                       .expected = seed.frontier,
                                        .edits = {{.kind = "move", .path = "a", .target = "z"}, {.kind = "move", .path = "c", .target = "z"}}});
             expect(both.code == "source_conflict") << "two files of one batch never land on one path: " << both.reason;
-            auto created = attempt(node, {.action = "apply", .operation = op("created"), .expected = seed.frontier,
+            auto created = attempt(node, {.action = "apply",
+                                          .operation = op("created"),
+                                          .expected = seed.frontier,
                                           .edits = {{.kind = "create", .path = "z", .text = "Z"}, {.kind = "move", .path = "a", .target = "z"}}});
             expect(created.code == "source_conflict") << created.reason;
-            auto inward = attempt(node, {.action = "apply", .operation = op("inward"), .expected = seed.frontier,
+            auto inward = attempt(node, {.action = "apply",
+                                         .operation = op("inward"),
+                                         .expected = seed.frontier,
                                          .edits = {{.kind = "directory_move", .path = "d", .target = "x"}, {.kind = "move", .path = "a", .target = "x/e"}}});
             expect(inward.code == "source_conflict") << inward.reason;
-            auto swapped = good(node, {.action = "apply", .operation = op("swapped"), .expected = seed.frontier,
+            auto swapped = good(node, {.action = "apply",
+                                       .operation = op("swapped"),
+                                       .expected = seed.frontier,
                                        .edits = {{.kind = "remove", .path = "b"}, {.kind = "move", .path = "a", .target = "b"}}});
             expect(text(good(node, {.action = "inspect"}), "b") == "A") << "a path the batch empties takes another file";
             expect(inspect(node).frontier == swapped.frontier);
@@ -274,47 +367,105 @@ namespace {
             nodes::local_node node{tmp.dir / "a"};
             good(node, {.action = "initialize"});
             auto seed = change(node, "scope-seed", {}, {.kind = "create", .path = "x", .text = "abcd"});
-            auto unlocked = attempt(node, {.action = "apply", .operation = op("unlocked"), .holder = "console", .expected = seed.frontier,
+            auto unlocked = attempt(node, {.action = "apply",
+                                           .operation = op("unlocked"),
+                                           .holder = "console",
+                                           .expected = seed.frontier,
                                            .edits = {{.kind = "create", .path = "y", .text = "y"}}});
             expect(unlocked.code == "scope_locked");
-            auto own = good(node, {.action = "apply", .operation = op("own"), .holder = "console", .expected = seed.frontier,
-                                   .edits = {{.kind = "create", .path = "y", .text = "y"}}, .scopes = {"::"}});
+            auto own = good(node, {.action = "apply",
+                                   .operation = op("own"),
+                                   .holder = "console",
+                                   .expected = seed.frontier,
+                                   .edits = {{.kind = "create", .path = "y", .text = "y"}},
+                                   .scopes = {"::"}});
             expect(good(node, {.action = "locks", .holder = "console"}).locks.empty()) << "nothing stays held after the batch";
             good(node, {.action = "lock", .holder = "agent", .scopes = {"::"}});
-            auto blocked = attempt(node, {.action = "apply", .operation = op("blocked"), .holder = "console", .expected = own.frontier,
-                                          .edits = {{.kind = "create", .path = "z", .text = "z"}}, .scopes = {"::"}});
+            auto blocked = attempt(node, {.action = "apply",
+                                          .operation = op("blocked"),
+                                          .holder = "console",
+                                          .expected = own.frontier,
+                                          .edits = {{.kind = "create", .path = "z", .text = "z"}},
+                                          .scopes = {"::"}});
             expect(blocked.code == "scope_locked" && blocked.reason.contains("agent")) << blocked.reason;
-            auto narrow = attempt(node, {.action = "apply", .operation = op("narrow"), .holder = "agent", .expected = own.frontier,
-                                         .edits = {{.kind = "create", .path = "z", .text = "z"}}, .scopes = {"some-function"}});
+            auto narrow = attempt(node, {.action = "apply",
+                                         .operation = op("narrow"),
+                                         .holder = "agent",
+                                         .expected = own.frontier,
+                                         .edits = {{.kind = "create", .path = "z", .text = "z"}},
+                                         .scopes = {"some-function"}});
             expect(narrow.code == "invalid_record");
         };
         "size limits hold for the state a publication leaves, reversals included"_test = [] {
             test::scratch tmp{"limits"};
             nodes::local_node node{tmp.dir / "a"};
             good(node, {.action = "initialize"});
-            auto seed = good(node, {.action = "apply", .operation = op("limit-seed"), .edits = {{.kind = "create", .path = "a", .text = std::string(60, 'a')}},
-                                    .file_limit = 64, .project_limit = 100});
-            auto grown = attempt(node, {.action = "apply", .operation = op("grown"), .expected = seed.frontier,
-                                        .edits = {{.kind = "edit", .path = "a", .text = std::string(5, 'g'), .offset = 0}}, .file_limit = 64, .project_limit = 100});
+            auto seed = good(node, {.action = "apply",
+                                    .operation = op("limit-seed"),
+                                    .edits = {{.kind = "create", .path = "a", .text = std::string(60, 'a')}},
+                                    .file_limit = 64,
+                                    .project_limit = 100});
+            auto grown = attempt(node, {.action = "apply",
+                                        .operation = op("grown"),
+                                        .expected = seed.frontier,
+                                        .edits = {{.kind = "edit", .path = "a", .text = std::string(5, 'g'), .offset = 0}},
+                                        .file_limit = 64,
+                                        .project_limit = 100});
             expect(grown.code == "resource_limit") << grown.reason;
-            auto dropped = good(node, {.action = "apply", .operation = op("dropped"), .expected = seed.frontier, .edits = {{.kind = "remove", .path = "a"}},
-                                       .file_limit = 64, .project_limit = 100});
-            auto other = good(node, {.action = "apply", .operation = op("other"), .expected = dropped.frontier,
-                                     .edits = {{.kind = "create", .path = "b", .text = std::string(60, 'b')}}, .file_limit = 64, .project_limit = 100});
-            auto restored = attempt(node, {.action = "reverse", .operation = op("restored"), .expected = other.frontier, .target = dropped.frontier.front(),
-                                           .file_limit = 64, .project_limit = 100});
+            auto dropped = good(node, {.action = "apply",
+                                       .operation = op("dropped"),
+                                       .expected = seed.frontier,
+                                       .edits = {{.kind = "remove", .path = "a"}},
+                                       .file_limit = 64,
+                                       .project_limit = 100});
+            auto other = good(node, {.action = "apply",
+                                     .operation = op("other"),
+                                     .expected = dropped.frontier,
+                                     .edits = {{.kind = "create", .path = "b", .text = std::string(60, 'b')}},
+                                     .file_limit = 64,
+                                     .project_limit = 100});
+            auto restored = attempt(node, {.action = "reverse",
+                                           .operation = op("restored"),
+                                           .expected = other.frontier,
+                                           .target = dropped.frontier.front(),
+                                           .file_limit = 64,
+                                           .project_limit = 100});
             expect(restored.code == "resource_limit") << "a reversal cannot bring the project past its limit: " << restored.reason;
-            auto shrunk = good(node, {.action = "apply", .operation = op("shrunk"), .expected = other.frontier,
-                                      .edits = {{.kind = "edit", .path = "b", .text = "", .offset = 0, .count = 30}}, .file_limit = 10, .project_limit = 10});
+            auto shrunk = good(node, {.action = "apply",
+                                      .operation = op("shrunk"),
+                                      .expected = other.frontier,
+                                      .edits = {{.kind = "edit", .path = "b", .text = "", .offset = 0, .count = 30}},
+                                      .file_limit = 10,
+                                      .project_limit = 10});
             expect(text(good(node, {.action = "inspect"}), "b").size() == 30u) << "a file or project already past its limit may still shrink";
             expect(inspect(node).frontier == shrunk.frontier);
+        };
+        "rewriting a text longer than one collection erases it as ranges"_test = [] {
+            peers p;
+            auto seed = p.seed();
+            auto length = nodes::codec::collection_limit + 1024;
+            auto long_text = change(*p.b, "long-create", seed.frontier, {.kind = "create", .path = "long", .text = std::string(length, 'a')});
+            auto middle = change(*p.b, "long-middle", long_text.frontier, {.kind = "edit", .path = "long", .text = "m", .offset = 10, .count = 10});
+            auto rewritten = change(*p.b, "long-rewrite", middle.frontier, {.kind = "write", .path = "long", .text = std::string(length, 'b')});
+            expect(text(good(*p.b, {.action = "inspect"}), "long") == std::string(length, 'b'));
+            auto reversed =
+                good(*p.b, {.action = "reverse", .operation = op("long-reverse"), .expected = rewritten.frontier, .target = rewritten.frontier.front()});
+            auto restored = std::string(length - 9, 'a');
+            restored[10] = 'm';
+            expect(text(good(*p.b, {.action = "inspect"}), "long") == restored);
+            exchange(*p.b, p.a);
+            good(p.a, {.action = "integrate", .operation = op("long-join"), .expected = seed.frontier, .source = reversed.frontier});
+            expect(text(good(p.a, {.action = "inspect"}), "long") == restored) << "a peer replays the range erasures";
+            nodes::local_node reopened{p.tmp.dir / "a"};
+            expect(text(good(reopened, {.action = "inspect"}), "long") == restored);
         };
         "an integration is held to the size limits of the worldline it joins"_test = [] {
             peers p;
             auto seed = p.seed();
             auto big = change(*p.b, "big", seed.frontier, {.kind = "create", .path = "big", .text = std::string(60, 'b')});
             exchange(*p.b, p.a);
-            auto refused = attempt(p.a, {.action = "integrate", .operation = op("join-big"), .expected = seed.frontier, .source = big.frontier, .file_limit = 10});
+            auto refused =
+                attempt(p.a, {.action = "integrate", .operation = op("join-big"), .expected = seed.frontier, .source = big.frontier, .file_limit = 10});
             expect(refused.code == "resource_limit") << refused.reason;
             good(p.a, {.action = "integrate", .operation = op("join-big-unlimited"), .expected = seed.frontier, .source = big.frontier});
         };
@@ -324,32 +475,50 @@ namespace {
             good(node, {.action = "initialize"});
             auto seed = change(node, "shared-seed", {}, {.kind = "create", .path = "x", .text = "abcd"});
             auto halves = good(node, {.action = "anchor", .spans = {{.place = semantic::place{"x", 0, 2}}, {.place = semantic::place{"x", 2, 4}}}});
-            good(node, {.action = "semantic.publish", .generation = semantic::generation{.version = seed.version, .environment = "test", .service = "test",
-                                                                                         .service_version = "1",
-                                                                                         .scopes = {{.id = "left", .kind = "function", .range = halves.spans[0]},
-                                                                                                    {.id = "right", .kind = "function", .range = halves.spans[1]}}}});
+            good(node, {.action = "semantic.publish",
+                        .generation = semantic::generation{.version = seed.version,
+                                                           .environment = "test",
+                                                           .service = "test",
+                                                           .service_version = "1",
+                                                           .scopes = {{.id = "left", .kind = "function", .range = halves.spans[0]},
+                                                                      {.id = "right", .kind = "function", .range = halves.spans[1]}}}});
             good(node, {.action = "lock", .holder = "alice", .environment = "test", .scopes = {"left"}});
             auto taken = attempt(node, {.action = "lock", .holder = "bob", .environment = "test", .scopes = {"left"}});
             expect(taken.code == "scope_locked" && taken.reason.contains("alice")) << taken.reason;
             auto everything = attempt(node, {.action = "lock", .holder = "bob", .scopes = {"::"}});
             expect(everything.code == "scope_locked") << "the global namespace contains every scope";
             good(node, {.action = "lock", .holder = "bob", .environment = "test", .scopes = {"right"}});
-            auto trespass = attempt(node, {.action = "apply", .operation = op("shared-trespass"), .holder = "bob", .expected = seed.frontier,
+            auto trespass = attempt(node, {.action = "apply",
+                                           .operation = op("shared-trespass"),
+                                           .holder = "bob",
+                                           .expected = seed.frontier,
                                            .edits = {{.kind = "edit", .path = "x", .text = "!", .offset = 0, .count = 1}}});
             expect(trespass.code == "scope_locked" && trespass.reason.contains("alice")) << trespass.reason;
-            auto whole = attempt(node, {.action = "apply", .operation = op("shared-whole"), .holder = "bob", .expected = seed.frontier,
+            auto whole = attempt(node, {.action = "apply",
+                                        .operation = op("shared-whole"),
+                                        .holder = "bob",
+                                        .expected = seed.frontier,
                                         .edits = {{.kind = "write", .path = "x", .text = "gone"}}});
             expect(whole.code == "scope_locked") << "replacing a file needs the global namespace";
-            auto first = good(node, {.action = "apply", .operation = op("shared-first"), .actor = "alice", .holder = "alice", .expected = seed.frontier,
+            auto first = good(node, {.action = "apply",
+                                     .operation = op("shared-first"),
+                                     .actor = "alice",
+                                     .holder = "alice",
+                                     .expected = seed.frontier,
                                      .edits = {{.kind = "edit", .path = "x", .text = "1", .offset = 1}}});
-            auto second = good(node, {.action = "apply", .operation = op("shared-second"), .actor = "bob", .holder = "bob", .expected = seed.frontier,
+            auto second = good(node, {.action = "apply",
+                                      .operation = op("shared-second"),
+                                      .actor = "bob",
+                                      .holder = "bob",
+                                      .expected = seed.frontier,
                                       .edits = {{.kind = "edit", .path = "x", .text = "2", .offset = 3}}});
             expect(second.frontier.size() == 2u) << "both writers remain concurrent heads";
             expect(std::ranges::find(second.frontier, first.frontier.front()) != second.frontier.end());
             expect(text(inspect(node), "x") == "a1bc2d");
             auto history = good(node, {.action = "history"});
             std::set<std::string> actors;
-            for (auto& entry : history.history) actors.insert(entry.actor);
+            for (auto& entry : history.history)
+                actors.insert(entry.actor);
             expect(actors.contains("alice") && actors.contains("bob"));
             expect(std::ranges::all_of(history.history, [&](auto& entry) { return entry.line == node.project_id(); }));
             auto listed = good(node, {.action = "locks"});
@@ -361,7 +530,9 @@ namespace {
             expect(foreign.code == "permission_denied") << "a writer cannot release another writer's lock";
             good(node, {.action = "unlock", .holder = "bob", .target = std::to_string(listed.locks[0].id), .force = true});
             expect(good(node, {.action = "locks"}).locks.empty());
-            auto unrelated = attempt(node, {.action = "apply", .operation = op("shared-unrelated"), .expected = {op("missing-event")},
+            auto unrelated = attempt(node, {.action = "apply",
+                                            .operation = op("shared-unrelated"),
+                                            .expected = {op("missing-event")},
                                             .edits = {{.kind = "edit", .path = "x", .text = "3", .offset = 0}}});
             expect(unrelated.code == "missing_objects") << unrelated.code;
             auto blind = attempt(node, {.action = "apply", .operation = op("shared-blind"), .edits = {{.kind = "create", .path = "x", .text = "again"}}});
@@ -373,26 +544,38 @@ namespace {
             good(node, {.action = "initialize"});
             auto seed = change(node, "lost-seed", {}, {.kind = "create", .path = "x", .text = "abcd"});
             auto parts = good(node, {.action = "anchor", .spans = {{.place = semantic::place{"x", 0, 2}}, {.place = semantic::place{"x", 2, 4}}}});
-            good(node, {.action = "semantic.publish", .generation = semantic::generation{.version = seed.version, .environment = "test", .service = "test",
-                                                                                         .service_version = "1",
-                                                                                         .scopes = {{.id = "left", .kind = "function", .range = parts.spans[0]},
-                                                                                                    {.id = "data", .kind = "variable", .range = parts.spans[1]}}}});
+            good(node, {.action = "semantic.publish",
+                        .generation = semantic::generation{.version = seed.version,
+                                                           .environment = "test",
+                                                           .service = "test",
+                                                           .service_version = "1",
+                                                           .scopes = {{.id = "left", .kind = "function", .range = parts.spans[0]},
+                                                                      {.id = "data", .kind = "variable", .range = parts.spans[1]}}}});
             auto variable = attempt(node, {.action = "lock", .holder = "alice", .environment = "test", .scopes = {"data"}});
             expect(variable.code == "invalid_record") << "only enclosing scopes are locked";
             good(node, {.action = "lock", .holder = "alice", .environment = "test", .scopes = {"left"}});
-            auto emptied = good(node, {.action = "apply", .operation = op("lost-empty"), .holder = "alice", .expected = seed.frontier,
+            auto emptied = good(node, {.action = "apply",
+                                       .operation = op("lost-empty"),
+                                       .holder = "alice",
+                                       .expected = seed.frontier,
                                        .edits = {{.kind = "edit", .path = "x", .offset = 0, .count = 2}}});
-            auto stray = attempt(node, {.action = "apply", .operation = op("lost-stray"), .holder = "alice", .expected = emptied.frontier,
+            auto stray = attempt(node, {.action = "apply",
+                                        .operation = op("lost-stray"),
+                                        .holder = "alice",
+                                        .expected = emptied.frontier,
                                         .edits = {{.kind = "edit", .path = "x", .text = "z", .offset = 1, .count = 1}}});
             expect(stray.code == "scope_locked") << "a scope that lost its characters no longer covers the rest of the file";
             auto again = attempt(node, {.action = "lock", .holder = "alice", .environment = "test", .scopes = {"left"}});
             expect(again.code == "invalid_record") << again.reason;
-            auto joined = attempt(node, {.action = "integrate", .operation = op("lost-integrate"), .holder = "alice", .expected = emptied.frontier,
-                                         .source = emptied.frontier});
+            auto joined = attempt(
+                node, {.action = "integrate", .operation = op("lost-integrate"), .holder = "alice", .expected = emptied.frontier, .source = emptied.frontier});
             expect(joined.code == "scope_locked") << "a selection needs the global namespace";
             good(node, {.action = "unlock", .holder = "alice", .environment = "test", .scopes = {"left"}});
             good(node, {.action = "lock", .holder = "alice", .scopes = {"::"}});
-            good(node, {.action = "apply", .operation = op("lost-global"), .holder = "alice", .expected = emptied.frontier,
+            good(node, {.action = "apply",
+                        .operation = op("lost-global"),
+                        .holder = "alice",
+                        .expected = emptied.frontier,
                         .edits = {{.kind = "edit", .path = "x", .text = "z", .offset = 1, .count = 1}}});
         };
         "worldlines never take each other's source"_test = [] {
@@ -401,39 +584,52 @@ namespace {
             good(node, {.action = "initialize"});
             auto seed = change(node, "boundary-seed", {}, {.kind = "create", .path = "x", .text = "a"});
             auto fork = good(node, {.action = "fork", .worldline = "branch", .operation = op("boundary-fork"), .source = seed.frontier});
-            auto branch = good(node, {.action = "apply", .worldline = "branch", .operation = op("boundary-branch"), .expected = fork.frontier,
+            auto branch = good(node, {.action = "apply",
+                                      .worldline = "branch",
+                                      .operation = op("boundary-branch"),
+                                      .expected = fork.frontier,
                                       .edits = {{.kind = "write", .path = "x", .text = "b"}}});
             auto main = change(node, "boundary-main", seed.frontier, {.kind = "write", .path = "x", .text = "m"});
-            auto integrated = attempt(node, {.action = "integrate", .operation = op("boundary-integrate"), .expected = main.frontier, .source = branch.frontier});
+            auto integrated =
+                attempt(node, {.action = "integrate", .operation = op("boundary-integrate"), .expected = main.frontier, .source = branch.frontier});
             expect(integrated.code == "worldline_boundary") << integrated.code;
             auto read = attempt(node, {.action = "read", .source = branch.frontier, .target = "x"});
             expect(read.code == "worldline_boundary") << read.code;
-            auto mixed = attempt(node, {.action = "fork", .worldline = "mixed", .operation = op("boundary-mixed"),
-                                        .source = {branch.frontier.front(), main.frontier.front()}});
+            auto mixed = attempt(
+                node, {.action = "fork", .worldline = "mixed", .operation = op("boundary-mixed"), .source = {branch.frontier.front(), main.frontier.front()}});
             expect(mixed.code == "worldline_boundary") << mixed.code;
             expect(text(good(node, {.action = "read", .worldline = "branch", .source = seed.frontier, .target = "x"}), "x") == "a")
                 << "the fork base stays readable from the branch";
-            auto missing = attempt(node, {.action = "apply", .worldline = "absent", .operation = op("boundary-absent"),
-                                          .edits = {{.kind = "create", .path = "y", .text = "y"}}});
+            auto missing = attempt(
+                node, {.action = "apply", .worldline = "absent", .operation = op("boundary-absent"), .edits = {{.kind = "create", .path = "y", .text = "y"}}});
             expect(missing.code == "invalid_record") << missing.code;
         };
         "another node joins a branch only with its complete state and then writes in it"_test = [] {
             peers p;
             auto seed = p.seed();
             auto fork = good(p.a, {.action = "fork", .worldline = "branch", .operation = op("join-fork"), .source = seed.frontier});
-            auto first = good(p.a, {.action = "apply", .worldline = "branch", .operation = op("join-first"), .expected = fork.frontier,
+            auto first = good(p.a, {.action = "apply",
+                                    .worldline = "branch",
+                                    .operation = op("join-first"),
+                                    .expected = fork.frontier,
                                     .edits = {{.kind = "edit", .path = "x", .text = "A", .offset = 0}}});
             exchange(p.a, *p.b);
             auto empty = attempt(*p.b, {.action = "integrate", .worldline = "branch", .operation = op("join-empty")});
             expect(empty.code == "stale_frontier") << empty.code;
             auto joined = good(*p.b, {.action = "integrate", .worldline = "branch", .operation = op("join-branch"), .source = first.frontier});
-            auto second = good(*p.b, {.action = "apply", .worldline = "branch", .operation = op("join-second"), .expected = joined.frontier,
+            auto second = good(*p.b, {.action = "apply",
+                                      .worldline = "branch",
+                                      .operation = op("join-second"),
+                                      .expected = joined.frontier,
                                       .edits = {{.kind = "edit", .path = "x", .text = "B", .offset = 5}}});
-            auto other = good(p.a, {.action = "apply", .worldline = "branch", .operation = op("join-other"), .expected = first.frontier,
+            auto other = good(p.a, {.action = "apply",
+                                    .worldline = "branch",
+                                    .operation = op("join-other"),
+                                    .expected = first.frontier,
                                     .edits = {{.kind = "edit", .path = "x", .text = "C", .offset = 1}}});
             exchange(*p.b, p.a);
-            auto merged = good(p.a, {.action = "integrate", .worldline = "branch", .operation = op("join-back"), .expected = other.frontier,
-                                     .source = second.frontier});
+            auto merged =
+                good(p.a, {.action = "integrate", .worldline = "branch", .operation = op("join-back"), .expected = other.frontier, .source = second.frontier});
             expect(text(good(p.a, {.action = "read", .worldline = "branch", .target = "x"}), "x") == "ACabcdB");
             expect(text(inspect(p.a), "x") == "abcd") << "main stays apart";
             auto duplicate = attempt(*p.b, {.action = "fork", .worldline = "branch", .operation = op("join-duplicate"), .source = seed.frontier});
@@ -448,7 +644,8 @@ namespace {
             auto empty = attempt(*p.c, {.action = "integrate", .operation = op("late-empty")});
             expect(empty.code == "stale_frontier") << empty.code;
             auto joined = good(*p.c, {.action = "integrate", .operation = op("late-join"), .source = seed.frontier});
-            good(*p.c, {.action = "apply", .operation = op("late-after"), .expected = joined.frontier, .edits = {{.kind = "create", .path = "late", .text = "z"}}});
+            good(*p.c,
+                 {.action = "apply", .operation = op("late-after"), .expected = joined.frontier, .edits = {{.kind = "create", .path = "late", .text = "z"}}});
         };
         "forks made apart under one name leave the name to one worldline on every node"_test = [] {
             peers p;
@@ -458,7 +655,10 @@ namespace {
             exchange(p.a, *p.b);
             exchange(*p.b, p.a);
             auto edit = [&](nodes::local_node& node, const nodes::node_reply& fork, std::string name) {
-                return attempt(node, {.action = "apply", .worldline = "twin", .operation = op(name), .expected = fork.frontier,
+                return attempt(node, {.action = "apply",
+                                      .worldline = "twin",
+                                      .operation = op(name),
+                                      .expected = fork.frontier,
                                       .edits = {{.kind = "edit", .path = "x", .text = "!", .offset = 0}}});
             };
             auto left = edit(p.a, a, "twin-edit-a"), right = edit(*p.b, b, "twin-edit-b");
@@ -475,15 +675,21 @@ namespace {
             nodes::local_node node{tmp.dir / "a"};
             good(node, {.action = "initialize"});
             auto seed = change(node, "semantic-seed", {}, {.kind = "create", .path = "x.cpp", .text = "int f() { return 1; }\nint g();\n"});
-            auto located = good(node, {.action = "anchor", .revision = seed.version, .spans = {{.place = semantic::place{"x.cpp", 0, 21}}, {.place = semantic::place{"x.cpp", 4, 5}}}});
+            auto located = good(node, {.action = "anchor",
+                                       .revision = seed.version,
+                                       .spans = {{.place = semantic::place{"x.cpp", 0, 21}}, {.place = semantic::place{"x.cpp", 4, 5}}}});
             expect((located.spans.size() == 2u) >> fatal);
-            semantic::generation generation{.version = seed.version, .environment = "debug", .service = "test", .service_version = "1",
+            semantic::generation generation{.version = seed.version,
+                                            .environment = "debug",
+                                            .service = "test",
+                                            .service_version = "1",
                                             .scopes = {{.id = "f", .kind = "function", .symbol = "f", .range = located.spans[0]}},
                                             .symbols = {{.id = "f", .name = "f", .kind = "function", .scope = "", .definitions = {located.spans[1]}}}};
             good(node, {.action = "semantic.publish", .generation = generation});
             auto fresh = good(node, {.action = "semantic", .environment = "debug"});
             expect((fresh.semantic.has_value() && !fresh.stale) >> fatal);
-            expect(fresh.semantic->scopes[0].range.place && fresh.semantic->scopes[0].range.place->begin == 0u && fresh.semantic->scopes[0].range.place->end == 21u);
+            expect(fresh.semantic->scopes[0].range.place && fresh.semantic->scopes[0].range.place->begin == 0u &&
+                   fresh.semantic->scopes[0].range.place->end == 21u);
             auto edited = change(node, "semantic-edit", seed.frontier, {.kind = "edit", .path = "x.cpp", .text = "// head\n", .offset = 0});
             auto moved = good(node, {.action = "semantic", .environment = "debug"});
             expect((moved.semantic.has_value() && moved.stale) >> fatal) << "an older generation still answers, marked stale";
@@ -513,117 +719,200 @@ namespace {
             expect(attempt(node, {.action = "semantic.publish", .generation = bad}).code == "invalid_record");
             bad = generation;
             bad.version = removed.version;
-            expect(attempt(node, {.action = "semantic.publish", .generation = bad}).code == "invalid_record") << "spans must exist in the version they describe";
+            expect(attempt(node, {.action = "semantic.publish", .generation = bad}).code == "invalid_record")
+                << "spans must exist in the version they describe";
         };
         "missing causal and corrupt sequence pages refuse edits and explicit archive audit reconstructs them"_test = [] {
             for (bool missing : {false, true}) {
                 test::scratch tmp{"demand-damaged"};
-                std::vector<std::string> head; std::string receipt;
-                { nodes::local_node seed{tmp.dir / "a"}; good(seed, {.action = "initialize"});
-                  auto result = change(seed, "demand-damaged-seed", {}, {.kind = "create", .path = "x", .text = "a😀bc"}); head = result.frontier; receipt = result.receipt; }
+                std::vector<std::string> head;
+                std::string receipt;
+                {
+                    nodes::local_node seed{tmp.dir / "a"};
+                    good(seed, {.action = "initialize"});
+                    auto result = change(seed, "demand-damaged-seed", {}, {.kind = "create", .path = "x", .text = "a😀bc"});
+                    head = result.frontier;
+                    receipt = result.receipt;
+                }
                 sqlite3* raw = nullptr;
                 expect((sqlite3_open((tmp.dir / "a/repository.sqlite").string().c_str(), &raw) == SQLITE_OK) >> fatal);
                 std::unique_ptr<sqlite3, decltype(&sqlite3_close)> db{raw, sqlite3_close};
-                sqlite3_stmt* q = nullptr; expect((sqlite3_prepare_v2(raw, "SELECT id,data FROM state_values", -1, &q, nullptr) == SQLITE_OK) >> fatal);
+                sqlite3_stmt* q = nullptr;
+                expect((sqlite3_prepare_v2(raw, "SELECT id,data FROM state_values", -1, &q, nullptr) == SQLITE_OK) >> fatal);
                 std::vector<std::string> victims;
                 while (sqlite3_step(q) == SQLITE_ROW) {
                     auto ptr = static_cast<const char*>(sqlite3_column_blob(q, 1));
                     auto raw_value = nodes::archive::unpack(std::string_view{ptr, static_cast<std::size_t>(sqlite3_column_bytes(q, 1))});
-                    if (!raw_value.starts_with("DCN1")) continue;
+                    if (!raw_value.starts_with("DCN1"))
+                        continue;
                     auto v = nodes::codec::decode(raw_value);
                     auto& map = v.object();
-                    bool selected = missing ? map.find("ancestors") != map.end() : map.find("item") != map.end() &&
-                        std::holds_alternative<value::map>(v.at("item").data) && v.at("item").object().find("run") != v.at("item").object().end();
-                    if (selected) victims.emplace_back(reinterpret_cast<const char*>(sqlite3_column_text(q, 0)));
+                    bool selected = missing ? map.find("ancestors") != map.end()
+                                            : map.find("item") != map.end() && std::holds_alternative<value::map>(v.at("item").data) &&
+                                                  v.at("item").object().find("run") != v.at("item").object().end();
+                    if (selected)
+                        victims.emplace_back(reinterpret_cast<const char*>(sqlite3_column_text(q, 0)));
                 }
-                sqlite3_finalize(q); expect(!victims.empty() >> fatal);
+                sqlite3_finalize(q);
+                expect(!victims.empty() >> fatal);
                 for (auto& id : victims) {
                     auto sql = missing ? "DELETE FROM state_values WHERE id='" + id + "'" : "UPDATE state_values SET data=x'00' WHERE id='" + id + "'";
                     expect(sqlite3_exec(raw, sql.c_str(), nullptr, nullptr, nullptr) == SQLITE_OK);
                 }
                 db.reset();
-                { nodes::local_node damaged{tmp.dir / "a"};
-                  auto rejected = attempt(damaged, {.action = "apply", .operation = op("demand-damaged-edit"), .expected = head,
-                      .edits = {{.kind = "edit", .path = "x", .text = "z", .offset = 1}}});
-                  expect(rejected.code == "missing_objects" || rejected.code == "storage_failure" || rejected.code == "outcome_unknown") << rejected.code;
-                  expect(good(damaged, {.action = "tree"}).frontier == head); }
-                nodes::local_node audit{tmp.dir / "a", {}, true}; good(audit, {.action = "audit"});
+                {
+                    nodes::local_node damaged{tmp.dir / "a"};
+                    auto rejected = attempt(damaged, {.action = "apply",
+                                                      .operation = op("demand-damaged-edit"),
+                                                      .expected = head,
+                                                      .edits = {{.kind = "edit", .path = "x", .text = "z", .offset = 1}}});
+                    expect(rejected.code == "missing_objects" || rejected.code == "storage_failure" || rejected.code == "outcome_unknown") << rejected.code;
+                    expect(good(damaged, {.action = "tree"}).frontier == head);
+                }
+                nodes::local_node audit{tmp.dir / "a", {}, true};
+                good(audit, {.action = "audit"});
                 expect(text(inspect(audit), "x") == "a😀bc");
                 expect(good(audit, {.action = "receipt", .target = receipt}).receipt == receipt);
                 nodes::local_node repaired{tmp.dir / "a"};
                 auto edited = change(repaired, "demand-repaired-edit", head, {.kind = "edit", .path = "x", .text = "z", .offset = 1});
-                expect(!edited.receipt.empty()); expect(text(inspect(repaired), "x") == "az😀bc");
+                expect(!edited.receipt.empty());
+                expect(text(inspect(repaired), "x") == "az😀bc");
             }
         };
         "demand caches release reconstruction state between unrelated file edits"_test = [] {
             test::scratch tmp{"demand-cache"};
-            nodes::local_node node{tmp.dir / "a"}; good(node, {.action = "initialize"});
+            nodes::local_node node{tmp.dir / "a"};
+            good(node, {.action = "initialize"});
             std::vector<nodes::edit> files;
-            for (int i = 0; i < 24; ++i) files.push_back({.kind = "create", .path = std::to_string(i), .text = "a😀bc"});
+            for (int i = 0; i < 24; ++i)
+                files.push_back({.kind = "create", .path = std::to_string(i), .text = "a😀bc"});
             auto current = good(node, {.action = "apply", .operation = op("demand-cache-seed"), .edits = std::move(files)});
             auto before = node.statistics();
-            for (int i = 0; i < 24; ++i) current = change(node, "demand-cache-" + std::to_string(i), current.frontier,
-                {.kind = "edit", .path = std::to_string(i), .text = "z", .offset = 1});
+            for (int i = 0; i < 24; ++i)
+                current =
+                    change(node, "demand-cache-" + std::to_string(i), current.frontier, {.kind = "edit", .path = std::to_string(i), .text = "z", .offset = 1});
             expect(node.statistics().cache_evictions > before.cache_evictions);
-            nodes::local_node complete{tmp.dir / "a", {}, true}; expect(inspect(node).source_digest == inspect(complete).source_digest);
+            nodes::local_node complete{tmp.dir / "a", {}, true};
+            expect(inspect(node).source_digest == inspect(complete).source_digest);
             expect(good(node, {.action = "receipt", .target = current.receipt}).receipt == current.receipt);
         };
-        "sequential text projections match complete causal rendering"_test=[] {
-            for (bool replace : {false,true}) {
-                peers p;auto seed=p.seed();auto head=seed.frontier;
-                nodes::kernel incremental,complete;std::string expected="abcd";
-                auto add=[&](const std::string& id) {
-                    auto body=nodes::codec::decode(nodes::unhex(p.a.objects({id}).front().data)).at("body");
-                    incremental.add(id,body);complete.add(id,body);
+        "sequential text projections match complete causal rendering"_test = [] {
+            for (bool replace : {false, true}) {
+                peers p;
+                auto seed = p.seed();
+                auto head = seed.frontier;
+                nodes::kernel incremental, complete;
+                std::string expected = "abcd";
+                auto add = [&](const std::string& id) {
+                    auto body = nodes::codec::decode(nodes::unhex(p.a.objects({id}).front().data)).at("body");
+                    incremental.add(id, body);
+                    complete.add(id, body);
                 };
-                add(head.front());(void)incremental.project(head);
-                for (int i=0;i<64;++i) {
-                    auto offset=replace?std::size_t(i*3)%expected.size():std::size_t(i*7)%(expected.size()+1);
-                    auto text=std::string(1,static_cast<char>('a'+i%26));
-                    auto next=change(p.a,"sequential-oracle-"+std::to_string(i),head,{.kind="edit",.path="x",.text=text,.offset=offset,.count=replace?1u:0u});
-                    expected.replace(offset,replace?1:0,text);head=next.frontier;add(head.front());
-                    auto state=incremental.project(head);expect(state.path("x").content()==expected);
-                    if (i%8==7) {
-                        auto reference=complete.project(head);expect(state.digest==reference.digest);expect(reference.path("x").content()==expected);
-                        for (std::uint64_t point=0;point<state.path("x").size();++point)
-                            expect(state.path("x").at(point)==reference.path("x").at(point));
+                add(head.front());
+                (void)incremental.project(head);
+                for (int i = 0; i < 64; ++i) {
+                    auto offset = replace ? std::size_t(i * 3) % expected.size() : std::size_t(i * 7) % (expected.size() + 1);
+                    auto text = std::string(1, static_cast<char>('a' + i % 26));
+                    auto next = change(p.a, "sequential-oracle-" + std::to_string(i), head,
+                                       {.kind = "edit", .path = "x", .text = text, .offset = offset, .count = replace ? 1u : 0u});
+                    expected.replace(offset, replace ? 1 : 0, text);
+                    head = next.frontier;
+                    add(head.front());
+                    auto state = incremental.project(head);
+                    expect(state.path("x").content() == expected);
+                    if (i % 8 == 7) {
+                        auto reference = complete.project(head);
+                        expect(state.digest == reference.digest);
+                        expect(reference.path("x").content() == expected);
+                        for (std::uint64_t point = 0; point < state.path("x").size(); ++point)
+                            expect(state.path("x").at(point) == reference.path("x").at(point));
                     }
                 }
-                auto concurrent=change(*p.b,"sequential-oracle-concurrent",seed.frontier,{.kind="edit",.path="x",.text="B",.offset=2});
-                auto body=nodes::codec::decode(nodes::unhex(p.b->objects(concurrent.frontier).front().data)).at("body");
-                incremental.add(concurrent.frontier.front(),body);complete.add(concurrent.frontier.front(),body);
-                head.insert(head.end(),concurrent.frontier.begin(),concurrent.frontier.end());
-                expect(incremental.project(head).digest==complete.project(head).digest);
+                auto concurrent = change(*p.b, "sequential-oracle-concurrent", seed.frontier, {.kind = "edit", .path = "x", .text = "B", .offset = 2});
+                auto body = nodes::codec::decode(nodes::unhex(p.b->objects(concurrent.frontier).front().data)).at("body");
+                incremental.add(concurrent.frontier.front(), body);
+                complete.add(concurrent.frontier.front(), body);
+                head.insert(head.end(), concurrent.frontier.begin(), concurrent.frontier.end());
+                expect(incremental.project(head).digest == complete.project(head).digest);
             }
         };
-        "incremental edits and cold point reads avoid unrelated file work"_test=[] {
-            test::scratch tmp{"node-incremental"};nodes::local_node node{tmp.dir/"a"};good(node,{.action="initialize"});
-            std::vector<nodes::edit> files;for(int i=0;i<512;++i)files.push_back({.kind="create",.path=std::format("files/{:03}.txt",i),.text=std::string(1024,'x')});
-            auto seeded=good(node,{.action="apply",.operation=op("incremental-seed"),.edits=std::move(files)});auto before=node.statistics();
-            auto changed=change(node,"incremental-one",seeded.frontier,{.kind="edit",.path="files/001.txt",.text="z"});auto after=node.statistics();
-            expect(after.projected_files-before.projected_files==1u);expect(after.state_nodes_written-before.state_nodes_written<1024u);expect(after.state_bytes_written-before.state_bytes_written<512u*1024u);
+        "incremental edits and cold point reads avoid unrelated file work"_test = [] {
+            test::scratch tmp{"node-incremental"};
+            nodes::local_node node{tmp.dir / "a"};
+            good(node, {.action = "initialize"});
+            std::vector<nodes::edit> files;
+            for (int i = 0; i < 512; ++i)
+                files.push_back({.kind = "create", .path = std::format("files/{:03}.txt", i), .text = std::string(1024, 'x')});
+            auto seeded = good(node, {.action = "apply", .operation = op("incremental-seed"), .edits = std::move(files)});
+            auto before = node.statistics();
+            auto changed = change(node, "incremental-one", seeded.frontier, {.kind = "edit", .path = "files/001.txt", .text = "z"});
+            auto after = node.statistics();
+            expect(after.projected_files - before.projected_files == 1u);
+            expect(after.state_nodes_written - before.state_nodes_written < 1024u);
+            expect(after.state_bytes_written - before.state_bytes_written < 512u * 1024u);
             std::vector<nodes::edit> batch;
-            for (int i=3;i<19;++i) batch.push_back({.kind="edit",.path=std::format("files/{:03}.txt",i),.text="batch"});
-            batch.push_back({.kind="remove",.path="files/000.txt"});batch.push_back({.kind="remove",.path="files/002.txt"});
-            for (int i=0;i<8;++i) batch.push_back({.kind="create",.path=std::format("new/{:03}.txt",i),.text="new"});
-            changed=good(node,{.action="apply",.operation=op("incremental-batch"),.expected=changed.frontier,.edits=std::move(batch)});
-            nodes::local_node cold{tmp.dir/"a"};auto opened=cold.statistics();auto selected=good(cold,{.action="read",.target="files/001.txt"});auto read=cold.statistics();
-            expect(!read.causal_loaded);expect(read.projected_files==0u);expect(read.state_nodes_read-opened.state_nodes_read<128u);expect(read.state_values_read-opened.state_values_read<=8u);
-            expect(text(selected,"files/001.txt")=="z"+std::string(1024,'x'));expect(selected.source_digest==changed.source_digest);
-            nodes::local_node audited{tmp.dir/"a",{},true};expect(inspect(audited).source_digest==changed.source_digest);expect(inspect(audited).files.size()==518u);
-            sqlite3* raw=nullptr;if(sqlite3_open_v2((tmp.dir/"a/repository.sqlite").c_str(),&raw,SQLITE_OPEN_READONLY,nullptr)!=SQLITE_OK)throw std::runtime_error("open state evidence");
-            std::unique_ptr<sqlite3,decltype(&sqlite3_close)> database{raw,sqlite3_close};sqlite3_stmt* query=nullptr;
-            if(sqlite3_prepare_v2(raw,"SELECT (SELECT COUNT(*) FROM state_nodes WHERE refs<=0)+(SELECT COUNT(*) FROM state_values WHERE refs<=0)+(SELECT COUNT(*) FROM state_payloads WHERE refs<=0)",-1,&query,nullptr)!=SQLITE_OK)throw std::runtime_error("prepare state evidence");
-            expect(sqlite3_step(query)==SQLITE_ROW);expect(sqlite3_column_int64(query,0)==0);sqlite3_finalize(query);
+            for (int i = 3; i < 19; ++i)
+                batch.push_back({.kind = "edit", .path = std::format("files/{:03}.txt", i), .text = "batch"});
+            batch.push_back({.kind = "remove", .path = "files/000.txt"});
+            batch.push_back({.kind = "remove", .path = "files/002.txt"});
+            for (int i = 0; i < 8; ++i)
+                batch.push_back({.kind = "create", .path = std::format("new/{:03}.txt", i), .text = "new"});
+            changed = good(node, {.action = "apply", .operation = op("incremental-batch"), .expected = changed.frontier, .edits = std::move(batch)});
+            nodes::local_node cold{tmp.dir / "a"};
+            auto opened = cold.statistics();
+            auto selected = good(cold, {.action = "read", .target = "files/001.txt"});
+            auto read = cold.statistics();
+            expect(!read.causal_loaded);
+            expect(read.projected_files == 0u);
+            expect(read.state_nodes_read - opened.state_nodes_read < 128u);
+            expect(read.state_values_read - opened.state_values_read <= 8u);
+            expect(text(selected, "files/001.txt") == "z" + std::string(1024, 'x'));
+            expect(selected.source_digest == changed.source_digest);
+            nodes::local_node audited{tmp.dir / "a", {}, true};
+            expect(inspect(audited).source_digest == changed.source_digest);
+            expect(inspect(audited).files.size() == 518u);
+            sqlite3* raw = nullptr;
+            if (sqlite3_open_v2((tmp.dir / "a/repository.sqlite").c_str(), &raw, SQLITE_OPEN_READONLY, nullptr) != SQLITE_OK)
+                throw std::runtime_error("open state evidence");
+            std::unique_ptr<sqlite3, decltype(&sqlite3_close)> database{raw, sqlite3_close};
+            sqlite3_stmt* query = nullptr;
+            if (sqlite3_prepare_v2(raw,
+                                   "SELECT (SELECT COUNT(*) FROM state_nodes WHERE refs<=0)+(SELECT COUNT(*) FROM state_values WHERE refs<=0)+(SELECT COUNT(*) "
+                                   "FROM state_payloads WHERE refs<=0)",
+                                   -1, &query, nullptr) != SQLITE_OK)
+                throw std::runtime_error("prepare state evidence");
+            expect(sqlite3_step(query) == SQLITE_ROW);
+            expect(sqlite3_column_int64(query, 0) == 0);
+            sqlite3_finalize(query);
         };
-        "corrupted Merkle cache is refused and explicit audit repairs it"_test=[] {
-            test::scratch tmp{"node-state-integrity"};std::string digest,receipt;
-            {nodes::local_node node{tmp.dir/"a"};good(node,{.action="initialize"});auto seeded=change(node,"integrity-seed",{},{.kind="create",.path="x",.text="verified"});digest=seeded.source_digest;receipt=seeded.receipt;}
-            {sqlite3* raw=nullptr;if(sqlite3_open_v2((tmp.dir/"a/repository.sqlite").c_str(),&raw,SQLITE_OPEN_READWRITE,nullptr)!=SQLITE_OK)throw std::runtime_error("open state fixture");
-                std::unique_ptr<sqlite3,decltype(&sqlite3_close)> database{raw,sqlite3_close};expect(sqlite3_exec(raw,"UPDATE state_values SET data=x'00'",nullptr,nullptr,nullptr)==SQLITE_OK);}
-            expect(throws<nodes::error>([&]{nodes::local_node corrupted{tmp.dir/"a"};}));
-            {nodes::local_node audited{tmp.dir/"a",{},true};auto repaired=good(audited,{.action="audit"});expect(repaired.complete);}
-            nodes::local_node reopened{tmp.dir/"a"};auto restored=inspect(reopened);expect(restored.source_digest==digest);expect(text(restored,"x")=="verified");expect(good(reopened,{.action="receipt",.target=receipt}).receipt==receipt);
+        "corrupted Merkle cache is refused and explicit audit repairs it"_test = [] {
+            test::scratch tmp{"node-state-integrity"};
+            std::string digest, receipt;
+            {
+                nodes::local_node node{tmp.dir / "a"};
+                good(node, {.action = "initialize"});
+                auto seeded = change(node, "integrity-seed", {}, {.kind = "create", .path = "x", .text = "verified"});
+                digest = seeded.source_digest;
+                receipt = seeded.receipt;
+            }
+            {
+                sqlite3* raw = nullptr;
+                if (sqlite3_open_v2((tmp.dir / "a/repository.sqlite").c_str(), &raw, SQLITE_OPEN_READWRITE, nullptr) != SQLITE_OK)
+                    throw std::runtime_error("open state fixture");
+                std::unique_ptr<sqlite3, decltype(&sqlite3_close)> database{raw, sqlite3_close};
+                expect(sqlite3_exec(raw, "UPDATE state_values SET data=x'00'", nullptr, nullptr, nullptr) == SQLITE_OK);
+            }
+            expect(throws<nodes::error>([&] { nodes::local_node corrupted{tmp.dir / "a"}; }));
+            {
+                nodes::local_node audited{tmp.dir / "a", {}, true};
+                auto repaired = good(audited, {.action = "audit"});
+                expect(repaired.complete);
+            }
+            nodes::local_node reopened{tmp.dir / "a"};
+            auto restored = inspect(reopened);
+            expect(restored.source_digest == digest);
+            expect(text(restored, "x") == "verified");
+            expect(good(reopened, {.action = "receipt", .target = receipt}).receipt == receipt);
         };
         "incremental state pages retain offline CRDT anchors"_test = [] {
             peers p;
@@ -791,10 +1080,13 @@ namespace {
             peers p;
             auto seed = p.seed();
             auto before = inspect(p.a);
-            expect(before.files.size()==1u);auto& file=before.files.front();
-            auto leaf=nodes::digest_of(nodes::codec::encode(value::map{{"content",file.digest},{"executable",file.executable},{"file",file.id},{"kind",file.kind},{"path",file.path}}));
-            auto root=nodes::digest_of(nodes::codec::encode(value::map{{"key",file.id},{"left",""},{"right",""},{"value",leaf}}));
-            expect(before.source_digest==nodes::digest_of(nodes::codec::encode(value::map{{"conflicts",nodes::strings(before.conflicts)},{"files",root}})));
+            expect(before.files.size() == 1u);
+            auto& file = before.files.front();
+            auto leaf = nodes::digest_of(nodes::codec::encode(
+                value::map{{"content", file.digest}, {"executable", file.executable}, {"file", file.id}, {"kind", file.kind}, {"path", file.path}}));
+            auto root = nodes::digest_of(nodes::codec::encode(value::map{{"key", file.id}, {"left", ""}, {"right", ""}, {"value", leaf}}));
+            expect(before.source_digest ==
+                   nodes::digest_of(nodes::codec::encode(value::map{{"conflicts", nodes::strings(before.conflicts)}, {"files", root}})));
             auto evidence =
                 good(p.a, {.action = "apply", .operation = op("evidence"), .expected = seed.frontier, .intent = "Review only", .result = "Actual observation"});
             auto after = inspect(p.a);
@@ -888,6 +1180,23 @@ namespace {
             in.edits.front().text = "changed";
             expect(attempt(p.a, in).code == "identity_conflict");
             expect(inspect(p.a).frontier == seed.frontier);
+        };
+        "an abandoned operation never runs, and one that ran answers abandon with its receipt"_test = [] {
+            peers p;
+            auto seed = p.seed();
+            nodes::node_request lost{
+                .action = "apply", .operation = op("lost"), .expected = seed.frontier, .edits = {{.kind = "edit", .path = "x", .text = "A", .offset = 1}}};
+            expect(good(p.a, {.action = "abandon", .operation = lost.operation}).receipt.empty());
+            expect(attempt(p.a, lost).code == "identity_conflict");
+            expect(good(p.a, {.action = "abandon", .operation = lost.operation}).receipt.empty());
+            expect(attempt(p.a, {.action = "receipt", .operation = lost.operation}).code == "identity_conflict");
+            expect(inspect(p.a).frontier == seed.frontier);
+            auto ran = change(p.a, "ran", seed.frontier, {.kind = "edit", .path = "x", .text = "B", .offset = 1});
+            expect(good(p.a, {.action = "abandon", .operation = op("ran")}).receipt == ran.receipt);
+            expect(
+                good(p.a,
+                     {.action = "apply", .operation = op("ran"), .expected = seed.frontier, .edits = {{.kind = "edit", .path = "x", .text = "B", .offset = 1}}})
+                    .replayed);
         };
         "R04-R05 file and directory moves preserve another author's text"_test = [] {
             for (bool directory : {false, true}) {
@@ -1290,9 +1599,9 @@ namespace {
             auto retained = nodes::string_list(checkpoint_body.at("retained"));
             expect(std::ranges::find(retained, seed.receipt) != retained.end());
             expect(std::ranges::find(retained, evidence.receipt) != retained.end());
-            auto historical = good(p.a, {.action="checkpoint", .source=seed.frontier});
+            auto historical = good(p.a, {.action = "checkpoint", .source = seed.frontier});
             expect(historical.frontier == seed.frontier);
-            expect(good(p.a, {.action="checkpoint", .target=historical.checkpoint}).complete);
+            expect(good(p.a, {.action = "checkpoint", .target = historical.checkpoint}).complete);
             auto source = nodes::codec::decode(nodes::unhex(p.a.objects({binary.frontier.front()}).front().data)).at("body");
             std::string blob;
             for (auto& id : nodes::string_list(source.at("required"))) {
@@ -1335,46 +1644,72 @@ namespace {
             expect(!next.receipt.empty());
         };
         "native source reads remain available while the writer entry is occupied"_test = [] {
-            test::scratch tmp{"native-reader"}; storage::native_nodes registry;
+            test::scratch tmp{"native-reader"};
+            storage::native_nodes registry;
             auto seed = registry.with(tmp.dir / "node", [](nodes::local_node& node) {
-                node.initialize(); return node.call({.action = "apply", .operation = content::hash_of("reader-seed").str(), .owner = node.node_id(),
-                    .edits = {{.kind = "create", .path = "x", .text = "retained"}, {.kind = "create", .path = "y", .text = "retained"}}});
+                node.initialize();
+                return node.call({.action = "apply",
+                                  .operation = content::hash_of("reader-seed").str(),
+                                  .owner = node.node_id(),
+                                  .edits = {{.kind = "create", .path = "x", .text = "retained"}, {.kind = "create", .path = "y", .text = "retained"}}});
             });
             expect((seed.code == "ok") >> fatal);
-            std::promise<void> entered, finish; auto release = finish.get_future(); auto occupied = entered.get_future();
-            std::jthread writer([&] { registry.with(tmp.dir / "node", [&](nodes::local_node&) { entered.set_value(); release.wait(); }); });
+            std::promise<void> entered, finish;
+            auto release = finish.get_future();
+            auto occupied = entered.get_future();
+            std::jthread writer([&] {
+                registry.with(tmp.dir / "node", [&](nodes::local_node&) {
+                    entered.set_value();
+                    release.wait();
+                });
+            });
             occupied.wait();
-            auto read = std::async(std::launch::async, [&] { return registry.with(tmp.dir / "node", [](nodes::local_node& node) {
-                return node.call({.action = "read", .target = "x"});
-            }, true); });
+            auto read = std::async(std::launch::async, [&] {
+                return registry.with(tmp.dir / "node", [](nodes::local_node& node) { return node.call({.action = "read", .target = "x"}); }, true);
+            });
             auto available = read.wait_for(std::chrono::seconds(2)) == std::future_status::ready;
-            finish.set_value(); auto result = read.get();
-            expect(available); expect(result.version == seed.version); expect((result.files.size() == 1u) >> fatal); expect(result.files.front().text == "retained");
+            finish.set_value();
+            auto result = read.get();
+            expect(available);
+            expect(result.version == seed.version);
+            expect((result.files.size() == 1u) >> fatal);
+            expect(result.files.front().text == "retained");
             writer.join();
             std::atomic<bool> done = false, consistent = true;
             std::barrier start{2};
             std::jthread publications([&] {
                 try {
-                    auto frontier = seed.frontier; start.arrive_and_wait();
+                    auto frontier = seed.frontier;
+                    start.arrive_and_wait();
                     for (int i = 0; i < 32; ++i) {
                         auto accepted = registry.with(tmp.dir / "node", [&](nodes::local_node& node) {
-                            return node.call({.action = "apply", .operation = content::hash_of("reader-publication-" + std::to_string(i)).str(), .owner = node.node_id(), .expected = frontier,
-                                .edits = {{.kind = "edit", .path = "x", .text = std::to_string(i) + ":"}, {.kind = "edit", .path = "y", .text = std::to_string(i) + ":"}}});
+                            return node.call({.action = "apply",
+                                              .operation = content::hash_of("reader-publication-" + std::to_string(i)).str(),
+                                              .owner = node.node_id(),
+                                              .expected = frontier,
+                                              .edits = {{.kind = "edit", .path = "x", .text = std::to_string(i) + ":"},
+                                                        {.kind = "edit", .path = "y", .text = std::to_string(i) + ":"}}});
                         });
-                        if (accepted.code != "ok") consistent = false;
+                        if (accepted.code != "ok")
+                            consistent = false;
                         frontier = accepted.frontier;
                     }
-                } catch (...) { consistent = false; }
+                } catch (...) {
+                    consistent = false;
+                }
                 done = true;
             });
             start.arrive_and_wait();
             int observations = 0;
             do {
                 auto observed = registry.with(tmp.dir / "node", [](nodes::local_node& node) { return node.call({.action = "inspect"}); }, true);
-                if (observed.code != "ok" || observed.files.size() != 2 || observed.files[0].text != observed.files[1].text) consistent = false;
+                if (observed.code != "ok" || observed.files.size() != 2 || observed.files[0].text != observed.files[1].text)
+                    consistent = false;
                 ++observations;
             } while (!done || observations < 8);
-            publications.join(); expect(consistent.load()); expect(observations >= 8);
+            publications.join();
+            expect(consistent.load());
+            expect(observations >= 8);
         };
     };
 } // namespace

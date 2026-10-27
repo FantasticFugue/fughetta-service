@@ -39,7 +39,8 @@ namespace {
 
         // A job runs on core zero, as the backlog's own jobs do, whichever core asked for it.
         auto job(ctx&, std::string name, std::chrono::milliseconds takes = 30ms) -> tools::backlog::runner {
-            return [this, name, takes](tools::services&, jobs::progress_log& progress, std::string tree) -> coroutine::task<std::optional<tools::backlog::outcome>> {
+            return [this, name, takes](tools::services&, jobs::progress_log& progress,
+                                       std::string tree) -> coroutine::task<std::optional<tools::backlog::outcome>> {
                 ran.push_back(name);
                 trees.push_back(std::move(tree));
                 most = std::max(most, ++running);
@@ -51,11 +52,17 @@ namespace {
         }
 
         static auto entry(std::string key, std::string actor, std::string configuration = "Debug") -> tools::backlog::entry {
-            return {.key = std::move(key), .project = "app", .configuration = std::move(configuration), .operation = "build", .actor = std::move(actor),
+            return {.key = std::move(key),
+                    .project = "app",
+                    .configuration = std::move(configuration),
+                    .operation = "build",
+                    .actor = std::move(actor),
                     .cacheable = true};
         }
 
-        static auto built(const std::shared_ptr<tools::backlog::ticket>& t) -> const tools::config_result& { return std::get<tools::config_result>(t->result()); }
+        static auto built(const std::shared_ptr<tools::backlog::ticket>& t) -> const tools::config_result& {
+            return std::get<tools::config_result>(t->result());
+        }
 
         static auto done(ctx& io, const std::shared_ptr<tools::backlog::ticket>& t) -> coroutine::task<bool> {
             for (int i = 0; i < 400 && !t->done(); ++i)
@@ -166,7 +173,8 @@ namespace {
             harness h{4};
             int tries = 0;
             h.run([&](ctx& io) -> coroutine::task<> {
-                auto held = co_await h.queue.submit(0, harness::entry("busy", "x"),
+                auto held = co_await h.queue.submit(
+                    0, harness::entry("busy", "x"),
                     [&tries](tools::services&, jobs::progress_log&, std::string) -> coroutine::task<std::optional<tools::backlog::outcome>> {
                         if (++tries == 1)
                             co_return std::nullopt;

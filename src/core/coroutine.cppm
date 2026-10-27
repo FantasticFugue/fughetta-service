@@ -193,7 +193,6 @@ export namespace coroutine {
                     continuation.resume();
                 }
             }
-
         };
 
         template <class S, mode M> class sender_awaiter {
@@ -329,7 +328,7 @@ export namespace coroutine {
 
             auto await_suspend(std::coroutine_handle<> self) noexcept -> std::coroutine_handle<> {
                 if (!child_)
-                    return self;   // awaiting a moved-from/empty task: resume and let await_resume report
+                    return self; // awaiting a moved-from/empty task: resume and let await_resume report
                 auto& p = child_.promise();
                 p.continuation_ = self;
                 p.stop_ = token_ ? *token_ : parent_->stop_;
@@ -692,16 +691,14 @@ export namespace coroutine {
             std::exception_ptr failure;
             void fail(std::exception_ptr error) {
                 std::lock_guard lock(mutex);
-                if (!failure) failure = std::move(error);
+                if (!failure)
+                    failure = std::move(error);
             }
         };
 
-        inline auto deadline_branch(stop_token token, task<> work) -> task<> {
-            co_await under(token, std::move(work));
-        }
+        inline auto deadline_branch(stop_token token, task<> work) -> task<> { co_await under(token, std::move(work)); }
 
-        template <class Sender, class Value>
-        auto deadline_work(Sender work, deadline_state<Value>& race) -> task<> {
+        template <class Sender, class Value> auto deadline_work(Sender work, deadline_state<Value>& race) -> task<> {
             using winner = typename deadline_state<Value>::winner;
             try {
                 auto result = co_await stop_point(std::move(work));
@@ -724,13 +721,14 @@ export namespace coroutine {
             try {
                 auto result = co_await stop_point(execution::schedule_after(io, limit));
                 auto pending = winner::pending;
-                if (result) race.first.compare_exchange_strong(pending, winner::timer);
+                if (result)
+                    race.first.compare_exchange_strong(pending, winner::timer);
             } catch (...) {
                 race.fail(std::current_exception());
             }
             race.source.request_stop();
         }
-    }
+    } // namespace detail
 
     template <execution::timed_scheduler Io, execution::sender Sender>
     auto deadline(Io& io, std::chrono::nanoseconds limit, Sender work)
@@ -757,7 +755,8 @@ export namespace coroutine {
             race.source.request_stop();
         }
         co_await under(stop_token{}, children.join());
-        if (race.failure) std::rethrow_exception(race.failure);
+        if (race.failure)
+            std::rethrow_exception(race.failure);
         if (race.first.load(std::memory_order_acquire) == winner::pending)
             co_await coroutine::stop;
         co_return std::move(race.out);

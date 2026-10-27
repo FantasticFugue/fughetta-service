@@ -89,7 +89,8 @@ while True:
     };
 
     // Starts a server on `tree`, describes one document, and stops the server. A document that fails is an error of the outcome.
-    auto describe(const std::vector<std::string>& argv, const std::filesystem::path& tree, std::string_view settings, const lsp::document& document) -> outcome {
+    auto describe(const std::vector<std::string>& argv, const std::filesystem::path& tree, std::string_view settings, const lsp::document& document)
+        -> outcome {
         native::context context;
         auto ran = cores::run(context, [&]() -> coroutine::task<outcome> {
             lsp::session session{context.get_scheduler(), {.argv = argv, .cwd = tree}};
@@ -124,7 +125,8 @@ while True:
                              "children": [{"name": "twice", "kind": 12,
                                            "range": {"start": {"line": 1, "character": 0}, "end": {"line": 1, "character": 30}},
                                            "selectionRange": {"start": {"line": 1, "character": 14}, "end": {"line": 1, "character": 19}}}]}]})"};
-            auto done = describe(m.argv, m.tmp.dir, "{}", {.path = "a.cpp", .language = "cpp", .text = "namespace demo {\nint twice(int x) { return x; }\n}\n"});
+            auto done =
+                describe(m.argv, m.tmp.dir, "{}", {.path = "a.cpp", .language = "cpp", .text = "namespace demo {\nint twice(int x) { return x; }\n}\n"});
             expect((done.report.has_value()) >> fatal) << done.error;
             expect(done.code == 0) << "the server exits after shutdown";
             auto& outline = *done.report;
@@ -154,7 +156,8 @@ while True:
             expect(is(found.range.place, "s.py", 13, 14));
             auto sent = m.sent();
             expect(sent.contains("textDocument/diagnostic") && !sent.contains("textDocument/documentSymbol"));
-            expect(sent.contains(R"(response [{"diagnosticMode": "workspace"}, {"diagnosticMode": "workspace"}])")) << "settings answer workspace/configuration";
+            expect(sent.contains(R"(response [{"diagnosticMode": "workspace"}, {"diagnosticMode": "workspace"}])"))
+                << "settings answer workspace/configuration";
         };
 
         "diagnostics a server pushes while its symbols are awaited are kept"_test = [] {
@@ -190,8 +193,9 @@ while True:
                 "pull": [[0, 0, 1, 1, "E3", "bad"]]})"};
             native::context context;
             auto ran = cores::run(context, [&]() -> coroutine::task<semantic::outline> {
-                co_return co_await lsp::survey(context.get_scheduler(), {.argv = m.argv, .cwd = m.tmp.dir}, *rfl::json::read<rfl::Generic>("{}"), m.tmp.dir,
-                                               {{.path = "a.py", .language = "python", .text = "x = 1\n"}, {.path = "b.py", .language = "python", .text = "y = 2\n"}});
+                co_return co_await lsp::survey(
+                    context.get_scheduler(), {.argv = m.argv, .cwd = m.tmp.dir}, *rfl::json::read<rfl::Generic>("{}"), m.tmp.dir,
+                    {{.path = "a.py", .language = "python", .text = "x = 1\n"}, {.path = "b.py", .language = "python", .text = "y = 2\n"}});
             }());
             expect((ran.has_value()) >> fatal);
             expect((ran->diagnostics.size() == 2u) >> fatal);
@@ -205,11 +209,13 @@ while True:
                 return;
             }
             test::scratch tmp{"lsp-clice"};
-            std::string text = "namespace demo {\r\n// é😀\r\nstruct shape {\n    int area() const { return 1; }\n};\n/*é😀*/ int twice(int x) { return x * 2; }\n}\n";
+            std::string text =
+                "namespace demo {\r\n// é😀\r\nstruct shape {\n    int area() const { return 1; }\n};\n/*é😀*/ int twice(int x) { return x * 2; }\n}\n";
             test::spit(tmp.dir / "a b#1.cpp", text);
             test::spit(tmp.dir / "compile_commands.json",
                        std::format(R"([{{"directory":"{}","file":"a b#1.cpp","arguments":["clang++","-std=c++23","-c","a b#1.cpp"]}}])", tmp.dir.string()));
-            auto done = describe({clice, "serve", "--log-level", "off"}, tmp.dir, R"({"rules":[{"compile_commands":["compile_commands.json"]}],"project":{"cache_dir":"clice"}})",
+            auto done = describe({clice, "serve", "--log-level", "off"}, tmp.dir,
+                                 R"({"rules":[{"compile_commands":["compile_commands.json"]}],"project":{"cache_dir":"clice"}})",
                                  {.path = "a b#1.cpp", .language = "cpp", .text = text});
             expect((done.report.has_value()) >> fatal) << done.error;
             expect(done.code == 0) << "the server exits after shutdown";
@@ -262,8 +268,8 @@ while True:
             auto done = describe({ruff, "server"}, tmp.dir, R"({"settings": {}})", {.path = "tool.py", .language = "python", .text = text});
             expect((done.report.has_value()) >> fatal) << done.error;
             expect(has(*done.report, "F401")) << "ruff's default rules report an import that is not used";
-            auto ignored = describe({ruff, "server"}, tmp.dir, R"({"settings":{"lint":{"ignore":["F401"]}}})",
-                                    {.path = "tool.py", .language = "python", .text = text});
+            auto ignored =
+                describe({ruff, "server"}, tmp.dir, R"({"settings":{"lint":{"ignore":["F401"]}}})", {.path = "tool.py", .language = "python", .text = text});
             expect((ignored.report.has_value()) >> fatal) << ignored.error;
             expect(!has(*ignored.report, "F401")) << "the configured rule changes the real server's diagnostics";
         };

@@ -34,6 +34,8 @@ export namespace replica {
             return std::format("{}/{}", checked_project(project), content::checked_name(target.empty() ? "default" : target));
         }
         auto tree(std::string_view key) const -> std::filesystem::path { return root_ / "trees" / key; }
+        // Where the steps on a tree write their reports, outside the tree so they never become part of it.
+        auto reports(std::string_view key) const -> std::filesystem::path { return root_ / "reports" / key; }
 
         auto offer(const jobs::sync_offer& o) -> jobs::sync_plan {
             checked_project(o.project);

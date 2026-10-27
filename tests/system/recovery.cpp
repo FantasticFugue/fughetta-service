@@ -51,8 +51,8 @@ namespace {
             auto file = tmp.dir / "config.json";
             test::spit(file, rfl::json::write(doc));
             auto start_source = [&] {
-                auto process = std::make_unique<test::child>(test::source_command(SERVICE_EXECUTABLE, tmp.dir,
-                    {"--port", std::to_string(source_port), "--storage", (tmp.dir / "source").string()}));
+                auto process = std::make_unique<test::child>(
+                    test::source_command(SERVICE_EXECUTABLE, tmp.dir, {"--port", std::to_string(source_port), "--storage", (tmp.dir / "source").string()}));
                 test::ready(*process, source_port);
                 return process;
             };
@@ -67,23 +67,27 @@ namespace {
             test::require(saved.status == 200, saved.body);
             test::tool(http_port, "worldline", R"({"project":"app","action":"lock","scopes":["::"]})");
             // The source commits but its answer is lost; the gateway learns the outcome from the receipt the write left.
-            auto lost = test::tool(http_port, "write", R"({"project":"app","path":"ambiguous.txt","content":"committed without ack","operation_id":"lost-ack"})");
+            auto lost =
+                test::tool(http_port, "write", R"({"project":"app","path":"ambiguous.txt","content":"committed without ack","operation_id":"lost-ack"})");
             expect(lost.contains(R"("replayed":true)")) << "a lost answer is recovered from the receipt: " << lost;
             expect(mutations == 1 && dropped == 1);
-            auto receipt = [&] {
-                return test::tool(http_port, "worldline", R"({"project":"app","action":"receipt","operation_id":"lost-ack"})");
-            };
+            auto receipt = [&] { return test::tool(http_port, "worldline", R"({"project":"app","action":"receipt","operation_id":"lost-ack"})"); };
             auto original = receipt();
-            struct entry { std::string path, digest; std::uint64_t size = 0; };
-            struct outcome { std::string version, receipt; std::vector<entry> files; };
+            struct entry {
+                std::string path, digest;
+                std::uint64_t size = 0;
+            };
+            struct outcome {
+                std::string version, receipt;
+                std::vector<entry> files;
+            };
             auto published = test::decode<outcome>(original);
             expect(published.files.size() == 1u && published.files[0].path == "ambiguous.txt" && published.files[0].size == 21u);
             expect(published.files[0].digest == content::hash_of("committed without ack") && content::is_hash(published.version));
-            auto read = [&] {
-                return test::tool(http_port, "read", R"({"project":"app","path":"ambiguous.txt"})");
-            };
+            auto read = [&] { return test::tool(http_port, "read", R"({"project":"app","path":"ambiguous.txt"})"); };
             expect(read().contains("committed without ack"));
-            auto replayed = test::tool(http_port, "write", R"({"project":"app","path":"ambiguous.txt","content":"committed without ack","operation_id":"lost-ack"})");
+            auto replayed =
+                test::tool(http_port, "write", R"({"project":"app","path":"ambiguous.txt","content":"committed without ack","operation_id":"lost-ack"})");
             expect(replayed.contains(R"("replayed":true)")) << replayed;
             expect(source->stop() == 0);
             auto unavailable = test::tool(http_port, "write", R"({"project":"app","path":"unavailable.txt","content":"x","operation_id":"unavailable"})", true);
@@ -91,17 +95,23 @@ namespace {
             expect(!std::filesystem::exists(tmp.dir / "state/app"));
             source = start_source();
             test::eventually([&] {
-                try { return test::decode<outcome>(receipt()).receipt == published.receipt; }
-                catch (const std::runtime_error&) { return false; }
+                try {
+                    return test::decode<outcome>(receipt()).receipt == published.receipt;
+                } catch (const std::runtime_error&) {
+                    return false;
+                }
             });
             expect(read().contains("committed without ack"));
-            test::tool(http_port, "edit", R"({"project":"app","path":"ambiguous.txt","old_string":"committed","new_string":"recovered","operation_id":"edit"})");
+            test::tool(http_port, "edit",
+                       R"({"project":"app","path":"ambiguous.txt","old_string":"committed","new_string":"recovered","operation_id":"edit"})");
             expect(gateway->stop() == 0);
             gateway = start_gateway();
             expect(read().contains("recovered without ack"));
             expect(test::decode<outcome>(receipt()).receipt == published.receipt);
             auto limits = test::request(http_port, http::method::GET, "/api/v1/config");
-            struct configuration { config::limits limits; };
+            struct configuration {
+                config::limits limits;
+            };
             expect(limits.status == 200 && test::decode<configuration>(limits.body).limits.max_projects == 7u);
             auto builds = test::request(http_port, http::method::GET, "/api/v1/builds");
             expect(builds.status == 200 && builds.body == "[]");
@@ -110,7 +120,7 @@ namespace {
             expect(source->stop() == 0);
         };
     };
-}
+} // namespace
 
 int main(int argc, const char** argv) {
     boost::ut::suite<"recovery">{cases};

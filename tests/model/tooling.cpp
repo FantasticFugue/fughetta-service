@@ -23,7 +23,8 @@ namespace {
         "vcpkg installation feeds the CMake configuration on a worker"_test = [] {
             auto c = configured();
             auto& v = fixture::options<"vcpkg">(c.builders.at("deps"));
-            v.features = {"tls"}; v.default_features = false;
+            v.features = {"tls"};
+            v.default_features = false;
             v.buildtrees_dir = "build/trees";
             auto plan = builds::prepare(c, {.operation = "build"});
             expect(plan.steps.size() == 3u);
@@ -36,12 +37,16 @@ namespace {
             expect(plan.steps.front().outputs.size() == 1u);
             v.extra = {"--triplet=other"};
             expect(throws<std::invalid_argument>([&] { builds::validate(c); }));
-            v.extra.clear(); v.install_dir.clear();
+            v.extra.clear();
+            v.install_dir.clear();
             expect(throws<std::invalid_argument>([&] { builds::validate(c); }));
         };
         "clice initialization and executable mapping use the prepared project"_test = [] {
-            language::configuration c{.server = language::with<"clice">{.options = {.args = {"--log-level", "off"}, .cache_dir = "build/clice", .append = {"-std=c++23"}}},
-                                      .build = configured(), .operation = "prepare", .inputs = {"database"}};
+            language::configuration c{
+                .server = language::with<"clice">{.options = {.args = {"--log-level", "off"}, .cache_dir = "build/clice", .append = {"-std=c++23"}}},
+                .build = configured(),
+                .operation = "prepare",
+                .inputs = {"database"}};
             auto plan = language::prepare(c);
             auto json = rfl::json::write(plan.server.initialization);
             expect(json.contains("build/debug/compile_commands.json") && json.contains("-std=c++23"));
@@ -52,7 +57,7 @@ namespace {
             expect(throws<std::invalid_argument>([&] { language::prepare(c); }));
         };
     };
-}
+} // namespace
 auto main(int argc, const char** argv) -> int {
     boost::ut::suite<"tooling">{cases};
     return boost::ut::cfg<>.run({.argc = argc, .argv = argv}) ? 1 : 0;

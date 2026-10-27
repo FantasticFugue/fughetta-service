@@ -157,14 +157,16 @@ namespace front {
 
         struct get_runtime : endpoint<"GET", "/api/v1/config/runtime", access::host> {
             static auto handle(context& c, params, const web::target&, std::string_view) -> coroutine::task<web::reply> {
-                if (!c.runtime) throw coded_error(503, "runtime_unmanaged", "runtime control requires the managed service entry");
+                if (!c.runtime)
+                    throw coded_error(503, "runtime_unmanaged", "runtime control requires the managed service entry");
                 auto doc = c.config.current(c.core);
                 co_return ok(c.runtime->observe(doc->revisions.runtime, doc->runtime));
             }
         };
         struct put_runtime : endpoint<"PUT", "/api/v1/config/runtime", access::host> {
             static auto handle(context& c, params, const web::target&, std::string_view body) -> coroutine::task<web::reply> {
-                if (!c.runtime) throw coded_error(503, "runtime_unmanaged", "runtime control requires the managed service entry");
+                if (!c.runtime)
+                    throw coded_error(503, "runtime_unmanaged", "runtime control requires the managed service entry");
                 auto [revision, value] = read_save<allocation::budget>(body, "runtime");
                 co_await c.config.edit(c.core, [revision, value](config::store& st) { st.put_runtime(value, revision); });
                 auto doc = c.config.current(c.core);
@@ -231,10 +233,14 @@ namespace front {
 
         // The HTTP status of a worldline error code, for the node route and for console routes that act on worldlines.
         inline auto node_status(std::string_view code) -> http::status {
-            static const std::set<std::string_view, std::less<>> conflicts{"wrong_project", "stale_frontier", nodes::code::source_conflict, nodes::code::identity_conflict,
-                                                                            "dependency_conflict", "policy_conflict", "worldline_boundary", "scope_locked"};
-            return conflicts.contains(code) ? http::status{409} : code == nodes::code::policy_denied || code == nodes::code::permission_denied ? http::status{403} :
-                   code == nodes::code::missing_objects || code == nodes::code::outcome_unknown ? http::status{503} : code == nodes::code::storage_failure ? http::status{500} : http::status{400};
+            static const std::set<std::string_view, std::less<>> conflicts{
+                "wrong_project",       "stale_frontier",  nodes::code::source_conflict, nodes::code::identity_conflict,
+                "dependency_conflict", "policy_conflict", "worldline_boundary",         "scope_locked"};
+            return conflicts.contains(code)                                                       ? http::status{409}
+                   : code == nodes::code::policy_denied || code == nodes::code::permission_denied ? http::status{403}
+                   : code == nodes::code::missing_objects || code == nodes::code::outcome_unknown ? http::status{503}
+                   : code == nodes::code::storage_failure                                         ? http::status{500}
+                                                                                                  : http::status{400};
         }
         inline auto node_result(nodes::node_reply reply) -> nodes::node_reply {
             if (reply.code != nodes::code::ok) {
@@ -261,8 +267,7 @@ namespace front {
                 auto in = rfl::json::read<node_capture, rfl::DefaultIfMissing, rfl::NoExtraFields>(body);
                 if (!in)
                     throw coded_error(400, nodes::code::invalid_record, in.error().what());
-                auto reply = co_await c.files.capture(c.core, p[0], in->operation, in->expected, in->intent,
-                                                      *c.who);
+                auto reply = co_await c.files.capture(c.core, p[0], in->operation, in->expected, in->intent, *c.who);
                 co_return ok(node_result(std::move(reply)));
             }
         };
@@ -352,9 +357,7 @@ namespace front {
 
         // Only the templates that render files into an existing project are offered; projects are made with PUT /api/v1/projects/{project}.
         struct get_templates : endpoint<"GET", "/api/v1/templates", access::member> {
-            static auto handle(context&, params, const web::target&, std::string_view) -> coroutine::task<web::reply> {
-                co_return ok(templates::catalog());
-            }
+            static auto handle(context&, params, const web::target&, std::string_view) -> coroutine::task<web::reply> { co_return ok(templates::catalog()); }
         };
         struct generation_input {
             templates::parameters parameters;
@@ -389,9 +392,32 @@ namespace front {
             std::string revision;
         };
 
+        // Settles an operation whose reply was lost: it ran, or it never will. Clients call it, not agents, so it stays out of the tools.
+        struct abandon_operation : endpoint<"POST", "/api/v1/projects/{project}/operations/{operation}/abandon", access::member> {
+            struct settled {
+                std::string outcome;
+                std::optional<std::string> version;
+                std::optional<std::string> receipt;
+            };
+            static auto handle(context& c, params p, const web::target&, std::string_view) -> coroutine::task<web::reply> {
+                if (p[1].empty() || p[1].size() > 256)
+                    throw coded_error(400, nodes::code::invalid_record, "an operation_id of 1 through 256 characters is required");
+                auto r = node_result(co_await c.files.node(
+                    c.core, p[0], {.action = "abandon", .operation = tools::lines::operation_of(p[1]), .caller_operation = std::string{p[1]}}, *c.who, false));
+                if (r.receipt.empty())
+                    co_return ok(settled{.outcome = "abandoned"});
+                co_return ok(settled{.outcome = "applied", .version = r.version, .receipt = r.receipt});
+            }
+        };
+
         struct get_build_adapters : endpoint<"GET", "/api/v1/build-adapters", access::member> {
+            static auto handle(context&, params, const web::target&, std::string_view) -> coroutine::task<web::reply> { co_return ok(builds::schemas()); }
+        };
+
+        struct get_settings_schema : endpoint<"GET", "/api/v1/settings-schema", access::member> {
             static auto handle(context&, params, const web::target&, std::string_view) -> coroutine::task<web::reply> {
-                co_return ok(builds::schemas());
+                static const auto schema = config::schema<config::settings>();
+                co_return ok(schema);
             }
         };
 
@@ -403,7 +429,8 @@ namespace front {
             }
         };
 
-        auto analysis_call(context& c, const std::string& project, const std::string& name, std::string action, analysis_input input) -> coroutine::task<web::reply> {
+        auto analysis_call(context& c, const std::string& project, const std::string& name, std::string action, analysis_input input)
+            -> coroutine::task<web::reply> {
             auto settings = config::resolve(*c.config.current(c.core), project);
             auto found = settings.analysis.find(name);
             if (found == settings.analysis.end() && action != "receipt")
@@ -478,7 +505,8 @@ namespace front {
             static auto handle(context& c, params, const web::target& t, std::string_view) -> coroutine::task<web::reply> {
                 auto after = t.number("after", 0, std::numeric_limits<std::uint64_t>::max());
                 auto limit = t.number("limit", 1000, 10000);
-                co_return ok(co_await c.files.with_ledger(c.core, [after, limit](usage::ledger& ledger, const config::document&) { return ledger.events(after, limit); }));
+                co_return ok(co_await c.files.with_ledger(
+                    c.core, [after, limit](usage::ledger& ledger, const config::document&) { return ledger.events(after, limit); }));
             }
         };
 
@@ -507,89 +535,91 @@ namespace front {
             }
         };
 
-        auto all_workers(context& c) -> coroutine::task<std::vector<routing::worker_view>> {
-            co_return co_await c.workers.describe(c.core);
-        }
+        auto all_workers(context& c) -> coroutine::task<std::vector<routing::worker_view>> { co_return co_await c.workers.describe(c.core); }
 
-        inline auto identities(context& c,bool pairing=false) -> enrollment::store& {
-            auto doc=c.config.current(c.core);
-            if (!c.identities || !c.pool || (pairing && (!doc->server.remote_worker_enrollment || !c.remote_listener)))
-                throw coded_error(503,"worker_enrollment_disabled","Remote Worker enrollment is disabled");
+        inline auto identities(context& c, bool registering = false) -> enrollment::store& {
+            auto doc = c.config.current(c.core);
+            if (!c.identities || !c.pool || (registering && (!doc->server.remote_worker_enrollment || !c.remote_listener)))
+                throw coded_error(503, "worker_enrollment_disabled", "Remote Worker enrollment is disabled");
             return *c.identities;
         }
 
-        struct create_enrollment : endpoint<"POST","/api/v1/worker-enrollments"> {
-            static auto handle(context& c,params,const web::target&,std::string_view) -> coroutine::task<web::reply> {
-                auto& store=identities(c,true);
-                auto actor=worlds::identity_key(*c.who);
-                auto result=co_await io::blocking(c.rt.get_scheduler(c.core),*c.pool,[&store,actor]{return store.create(actor);});
-                logging::info(std::format("worker.enrollment created workspace_id={}",store.workspace_id()));
-                auto out=ok(result,201);
-                out.head.fields.push_back({"cache-control","no-store"});
-                co_return out;
-            }
-        };
-
-        struct redeem_enrollment : endpoint<"POST","/api/v1/worker-enrollments/redeem",access::open> {
-            struct request {std::string code,name;};
-            static auto handle(context& c,params,const web::target&,std::string_view body) -> coroutine::task<web::reply> {
-                auto& store=identities(c,true);
+        // An owner registers a machine; its client keeps the credential and connects the Worker through the tunnel.
+        struct register_worker : endpoint<"POST", "/api/v1/workers"> {
+            struct request {
+                std::string name;
+            };
+            static auto handle(context& c, params, const web::target&, std::string_view body) -> coroutine::task<web::reply> {
+                auto& store = identities(c, true);
                 std::optional<request> input;
-                try {input=config::parse_as<request>(body,"Worker enrollment");}
-                catch (const std::exception&) {throw coded_error(400,"invalid_enrollment","Worker enrollment request is invalid");}
-                auto result=co_await io::blocking(c.rt.get_scheduler(c.core),*c.pool,[&store,input=std::move(*input)]{
-                    return store.redeem(input.code,input.name);
-                });
-                logging::info(std::format("worker.enrollment redeemed workspace_id={} worker_id={}",store.workspace_id(),result.worker_id));
-                auto out=ok(result,201);
-                out.head.fields.push_back({"cache-control","no-store"});
-                out.head.fields.push_back({"pragma","no-cache"});
+                try {
+                    input = config::parse_as<request>(body, "Worker registration");
+                } catch (const std::exception&) {
+                    throw coded_error(400, "invalid_worker_name", "Worker registration request is invalid");
+                }
+                auto actor = worlds::identity_key(*c.who);
+                auto result = co_await io::blocking(c.rt.get_scheduler(c.core), *c.pool,
+                                                    [&store, actor, name = std::move(input->name)] { return store.add(name, actor); });
+                logging::info(std::format("worker.identity registered workspace_id={} worker_id={}", store.workspace_id(), result.worker_id));
+                auto out = ok(result, 201);
+                out.head.fields.push_back({"cache-control", "no-store"});
                 co_return out;
             }
         };
 
-        struct delete_worker : endpoint<"DELETE","/api/v1/workers/{worker_id}"> {
-            static auto handle(context& c,params p,const web::target&,std::string_view) -> coroutine::task<web::reply> {
-                auto& store=identities(c);
-                auto id=p[0];
-                co_await io::blocking(c.rt.get_scheduler(c.core),*c.pool,[&store,id]{store.revoke(id);});
-                logging::info(std::format("worker.identity revoked workspace_id={} worker_id={}",store.workspace_id(),id));
-                co_await c.workers.update_identity(c.core,id);
+        struct delete_worker : endpoint<"DELETE", "/api/v1/workers/{worker_id}"> {
+            static auto handle(context& c, params p, const web::target&, std::string_view) -> coroutine::task<web::reply> {
+                auto& store = identities(c);
+                auto id = p[0];
+                co_await io::blocking(c.rt.get_scheduler(c.core), *c.pool, [&store, id] { store.revoke(id); });
+                logging::info(std::format("worker.identity revoked workspace_id={} worker_id={}", store.workspace_id(), id));
+                co_await c.workers.update_identity(c.core, id);
                 co_return ok(message{"Worker identity revoked"});
             }
         };
 
-        struct rename_worker : endpoint<"POST","/api/v1/workers/{worker_id}/rename"> {
-            struct request {std::string name;};
-            static auto handle(context& c,params p,const web::target&,std::string_view body) -> coroutine::task<web::reply> {
-                auto& store=identities(c);
+        struct rename_worker : endpoint<"POST", "/api/v1/workers/{worker_id}/rename"> {
+            struct request {
+                std::string name;
+            };
+            static auto handle(context& c, params p, const web::target&, std::string_view body) -> coroutine::task<web::reply> {
+                auto& store = identities(c);
                 std::optional<request> input;
-                try {input=config::parse_as<request>(body,"Worker name");}
-                catch (const std::exception&) {throw coded_error(400,"invalid_worker_name","Worker name request is invalid");}
-                auto id=p[0],name=input->name;
-                co_await io::blocking(c.rt.get_scheduler(c.core),*c.pool,[&store,id,name]{store.rename(id,name);});
-                co_await c.workers.update_identity(c.core,id,name);
+                try {
+                    input = config::parse_as<request>(body, "Worker name");
+                } catch (const std::exception&) {
+                    throw coded_error(400, "invalid_worker_name", "Worker name request is invalid");
+                }
+                auto id = p[0], name = input->name;
+                co_await io::blocking(c.rt.get_scheduler(c.core), *c.pool, [&store, id, name] { store.rename(id, name); });
+                co_await c.workers.update_identity(c.core, id, name);
                 co_return ok(message{"Worker identity renamed"});
             }
         };
 
-        struct get_workers : endpoint<"GET", "/api/v1/workers",access::member> {
+        struct get_workers : endpoint<"GET", "/api/v1/workers", access::member> {
             static auto handle(context& c, params, const web::target&, std::string_view) -> coroutine::task<web::reply> {
-                auto out=co_await all_workers(c);
-                for (auto& worker:out) worker.managed=!worker.worker_id;
+                auto out = co_await all_workers(c);
+                for (auto& worker : out)
+                    worker.managed = !worker.worker_id;
                 if (c.identities && c.pool) {
-                    auto records=co_await io::blocking(c.rt.get_scheduler(c.core),*c.pool,[store=c.identities]{return store->list();});
-                    for (const auto& record:records) {
-                        auto found=std::ranges::find_if(out,[&](const auto& worker){return worker.worker_id==std::optional{record.worker_id};});
-                        if (found==out.end()) {
+                    auto records = co_await io::blocking(c.rt.get_scheduler(c.core), *c.pool, [store = c.identities] { return store->list(); });
+                    for (const auto& record : records) {
+                        auto found = std::ranges::find_if(out, [&](const auto& worker) { return worker.worker_id == std::optional{record.worker_id}; });
+                        if (found == out.end()) {
                             out.emplace_back();
-                            found=std::prev(out.end());
-                            found->online=false;
+                            found = std::prev(out.end());
+                            found->online = false;
                         }
-                        found->worker_id=record.worker_id;found->name=record.name;found->managed=false;
-                        found->created_by=record.created_by;found->created_at=record.created_at;
-                        found->last_connected_at=record.last_connected_at;found->revoked_at=record.revoked_at;
-                        if (record.revoked_at) found->online=false;
+                        found->worker_id = record.worker_id;
+                        found->name = record.name;
+                        found->managed = false;
+                        found->created_by = record.created_by;
+                        found->created_at = record.created_at;
+                        found->last_connected_at = record.last_connected_at;
+                        found->revoked_at = record.revoked_at;
+                        if (record.revoked_at)
+                            found->online = false;
                     }
                 }
                 co_return ok(out);
@@ -644,15 +674,16 @@ namespace front {
                 family(metric("workers"), "gauge", "Workers connected.");
                 out += std::format("{} {}\n", metric("workers"), workers.size());
                 family(metric("worker_inflight"), "gauge", "Requests served by workers with the same identity labels.");
-                std::map<std::pair<std::string,std::string>,std::uint64_t> inflight;
+                std::map<std::pair<std::string, std::string>, std::uint64_t> inflight;
                 for (const auto& w : workers)
-                    inflight[{w.name,w.worker_id.value_or("")}] += w.inflight;
-                for (const auto& [identity,count] : inflight)
-                    out += std::format("{}{{worker=\"{}\",worker_id=\"{}\"}} {}\n", metric("worker_inflight"), label(identity.first), label(identity.second), count);
+                    inflight[{w.name, w.worker_id.value_or("")}] += w.inflight;
+                for (const auto& [identity, count] : inflight)
+                    out += std::format("{}{{worker=\"{}\",worker_id=\"{}\"}} {}\n", metric("worker_inflight"), label(identity.first), label(identity.second),
+                                       count);
                 family(metric("builds_total"), "counter", "Builds, by result: ok, failed, not_run, unknown, cancelled.");
                 for (auto& [p, t] : ledger.totals.projects)
                     for (auto [result, n] : {std::pair{"ok", t.builds_ok}, std::pair{"failed", t.builds_failed}, std::pair{"not_run", t.builds_not_run},
-                                            std::pair{"unknown", t.builds_unknown}, std::pair{"cancelled", t.builds_cancelled}})
+                                             std::pair{"unknown", t.builds_unknown}, std::pair{"cancelled", t.builds_cancelled}})
                         out += std::format("{}{{project=\"{}\",result=\"{}\"}} {}\n", metric("builds_total"), p, result, n);
                 family(metric("build_seconds_total"), "counter", "Wall time spent in builds.");
                 for (auto& [p, t] : ledger.totals.projects)
@@ -729,7 +760,8 @@ namespace front {
             if (refused)
                 co_return std::move(*refused);
             if (!run)
-                co_return path_known ? coded_reply(coded_error{405, "method_not_allowed", "method not allowed"}) : coded_reply(coded_error{404, "not_found", "not found"});
+                co_return path_known ? coded_reply(coded_error{405, "method_not_allowed", "method not allowed"})
+                                     : coded_reply(coded_error{404, "not_found", "not found"});
 
             std::optional<web::reply> out;
             http::status status = 500;
@@ -747,7 +779,7 @@ namespace front {
                 out.emplace(coded_reply(coded_error{api::node_status(e.code), e.code, e.what()}));
             } catch (const transport::coded_error& e) {
                 http::status status = e.code == jobs::why::stale_head || e.code == jobs::why::receipt_conflict ? http::status{409}
-                                      : e.code == nodes::code::permission_denied                                          ? http::status{403}
+                                      : e.code == nodes::code::permission_denied                               ? http::status{403}
                                                                                                                : http::status{400};
                 out.emplace(coded_reply(coded_error{status, e.code, e.what()}));
             } catch (const transport::remote_error& e) {
@@ -756,7 +788,8 @@ namespace front {
                                                                                                                : api::node_status(e.code);
                 out.emplace(coded_reply(coded_error{status, e.code, e.what()}));
             } catch (const enrollment::refused& e) {
-                out.emplace(coded_reply(coded_error{http::status::from_number(static_cast<std::uint16_t>(e.status)).value_or(http::status{500}),e.code,e.what()}));
+                out.emplace(
+                    coded_reply(coded_error{http::status::from_number(static_cast<std::uint16_t>(e.status)).value_or(http::status{500}), e.code, e.what()}));
             } catch (const usage::quota_exceeded& e) {
                 status = 429;
                 why = e.what();
@@ -770,10 +803,10 @@ namespace front {
             }
             if (out)
                 co_return std::move(*out);
-            std::string_view code = status == http::status{404} ? std::string_view{"not_found"}
-                                 : status == http::status{400} ? std::string_view{"invalid_request"}
-                                 : status == http::status{429} ? nodes::code::resource_limit
-                                                              : std::string_view{"internal"};
+            std::string_view code = status == http::status{404}   ? std::string_view{"not_found"}
+                                    : status == http::status{400} ? std::string_view{"invalid_request"}
+                                    : status == http::status{429} ? nodes::code::resource_limit
+                                                                  : std::string_view{"internal"};
             co_return coded_reply(coded_error{status, code, why});
         }
 
@@ -788,19 +821,20 @@ namespace front {
         }
 
         static auto refusal(http::status status, std::string why) -> web::reply {
-            std::string_view code = status == http::status{401} ? std::string_view{"unauthenticated"}
-                                 : status == http::status{404} ? std::string_view{"not_found"}
-                                                              : nodes::code::permission_denied;
+            std::string_view code = status == http::status{401}   ? std::string_view{"unauthenticated"}
+                                    : status == http::status{404} ? std::string_view{"not_found"}
+                                                                  : nodes::code::permission_denied;
             return coded_reply(coded_error{status, code, std::move(why)});
         }
     };
 
     using admin_api =
-        routes<api::get_config, api::get_server, api::put_server, api::get_limits, api::put_limits, api::get_granted, api::put_granted, api::get_runtime, api::put_runtime, api::get_source, api::post_node, api::post_node_capture,
-               api::get_node_source, api::get_node_file, api::get_templates, api::post_generate, api::list_projects, api::get_project, api::put_project, api::delete_project, api::get_effective,
-               api::get_build_adapters, api::plan_build, api::plan_analysis, api::prepare_analysis, api::analysis_receipt,
-               api::get_builds, api::get_workers,api::create_enrollment,api::redeem_enrollment,api::delete_worker,api::rename_worker,
-               api::get_usage, api::get_events, api::get_stats, api::get_me, api::get_health, api::get_metrics>;
+        routes<api::get_config, api::get_server, api::put_server, api::get_limits, api::put_limits, api::get_granted, api::put_granted, api::get_runtime,
+               api::put_runtime, api::get_source, api::post_node, api::post_node_capture, api::get_node_source, api::get_node_file, api::get_templates,
+               api::post_generate, api::list_projects, api::get_project, api::put_project, api::delete_project, api::get_effective, api::get_build_adapters,
+               api::get_settings_schema, api::plan_build, api::plan_analysis, api::prepare_analysis, api::analysis_receipt, api::abandon_operation,
+               api::get_builds, api::get_workers, api::register_worker, api::delete_worker, api::rename_worker, api::get_usage, api::get_events, api::get_stats,
+               api::get_me, api::get_health, api::get_metrics>;
 
     auto route(context& c, std::string_view method, const web::target& target, std::string_view body) -> coroutine::task<web::reply> {
         co_return co_await admin_api::handle(c, method, target, body);

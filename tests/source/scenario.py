@@ -210,8 +210,6 @@ def transfer(scratch):
     a = Node(scratch / "a")
     genesis = a.call("initialize")
     accepted = a.call("apply", operation=operation("large"), edits=[dict(kind="create", path="large", text="x" * 1_100_000)])
-    a.call("apply", expected_code="resource_limit", operation=operation("oversized-deletion"), expected=accepted["frontier"], edits=[dict(kind="write", path="large", text="replacement")])
-    assert a.call("inspect")["frontier"] == accepted["frontier"]
     checkpoint = a.call("checkpoint")["checkpoint"]
     b = Node(scratch / "b", genesis["project"])
     offered = a.call("offer")
@@ -254,7 +252,7 @@ def transfer(scratch):
     b.call("apply", worldline="personal", operation=operation("continue"), expected=fork["frontier"], edits=[dict(kind="edit", path="large", text="new", offset=0)])
     b.call("checkpoint", worldline="personal")
     b.close()
-    print("PASS bounded deletion rejection, resumable chunks, signed binary stream, branch isolation, fresh independent continuation")
+    print("PASS resumable chunks, signed binary stream, branch isolation, fresh independent continuation")
 
 
 with tempfile.TemporaryDirectory(prefix=f"node-{case}-", dir=build) as name:

@@ -9,7 +9,7 @@ their own repositories and are not built here.
 | Question | File |
 | --- | --- |
 | Usage, build, and service layout | `README.md` |
-| The current worldline protocol | `../pwa-coding-agent/.work/worldline-protocol.md` |
+| The current worldline protocol | the `worldline` MCP tool's `tools/list` schema |
 | Per-directory conventions | the nearest `AGENTS.md` below this one |
 
 ## Dependencies
@@ -52,6 +52,10 @@ and the module registrations in `CMakeLists.txt` must agree.
 - Modules are `src/<layer>/<name>.cppm`; a single word, no `source_` prefix.
 - An implementation unit sits beside its interface and is named for what it
   implements (`database.cppm` implements `local_node`).
+- Each `src/<layer>/` directory is one CMake target (`cmake/modules.cmake`).
+  Layers depend in one direction: core, platform, io, model, then gateway,
+  source and worker, then service. A new import inside a layer needs no CMake
+  change; an import that goes against this order is a design error.
 - Runtime constants live in `src/core/constants.cppm`.
 - `src/fughetta-service.cpp` is the executable entry. `src/service/` holds
   `gateway`, `source`, `worker`, and the process `runtime`.
@@ -60,7 +64,7 @@ and the module registrations in `CMakeLists.txt` must agree.
 
 ## What is not here any more
 
-The front ends (console, admin, pwa-coding-agent, landing and the component
+The front ends (console, admin, agent-cloud, landing and the component
 library) are
 their own repositories beside this one; see `README.md`. Frontend work does not
 belong here. An API change a front end needs is a change to `/api/v1` or `/mcp`,

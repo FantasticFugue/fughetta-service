@@ -29,12 +29,11 @@ namespace {
             expect(plan.workers.empty());
         };
         "invalid budgets fail before launching processes"_test = [] {
-            for (auto budget : {allocation::budget{5, 1, 0}, allocation::budget{8, 0, 1},
-                                allocation::budget{8, 1, 1}, allocation::budget{9, 3, 2}})
+            for (auto budget : {allocation::budget{5, 1, 0}, allocation::budget{8, 0, 1}, allocation::budget{8, 1, 1}, allocation::budget{9, 3, 2}})
                 expect(throws<std::invalid_argument>([&] { allocation::distribute(budget); }));
         };
     };
-}
+} // namespace
 int main(int argc, const char** argv) {
     boost::ut::suite<"allocation">{cases};
     return boost::ut::cfg<>.run({.argc = argc, .argv = argv}) ? 1 : 0;

@@ -18,7 +18,6 @@ export namespace storage {
         explicit stale_blob(std::string_view hash) : std::runtime_error(std::format("blob {} is no longer in the project (files changed during sync)", hash)) {}
     };
 
-
     class project_files {
     public:
         project_files(std::string project, std::filesystem::path root, std::vector<std::string> ignore)
@@ -56,7 +55,8 @@ export namespace storage {
             std::string tool, request_digest, source_head;
         };
         auto capture_node(nodes::local_node& repository, std::string operation, std::string caller_operation, std::string actor, std::string holder,
-                          const std::vector<std::string>& expected, std::string intent, std::uint64_t file_limit, std::uint64_t project_limit) -> nodes::node_reply {
+                          const std::vector<std::string>& expected, std::string intent, std::uint64_t file_limit, std::uint64_t project_limit)
+            -> nodes::node_reply {
             if (!content::is_hash(operation))
                 return {.code = std::string{nodes::code::invalid_record}, .reason = "capture requires a 32-byte lowercase operation ID"};
             if (repository.project_id().empty()) {
@@ -64,8 +64,7 @@ export namespace storage {
                 if (initialized.code != "ok")
                     return initialized;
             }
-            auto request_digest =
-                nodes::object_id(nodes::value::map{{"expected", nodes::strings(expected)}, {"intent", intent}, {"operation", operation}});
+            auto request_digest = nodes::object_id(nodes::value::map{{"expected", nodes::strings(expected)}, {"intent", intent}, {"operation", operation}});
             auto retained = repository.call({.action = "receipt", .operation = operation});
             if (retained.code == "ok") {
                 auto record = rfl::json::read<capture_record, rfl::NoExtraFields>(retained.result);
@@ -74,13 +73,16 @@ export namespace storage {
                 retained.replayed = true;
                 return retained;
             }
+            if (retained.code != nodes::code::outcome_unknown)
+                return retained;
             auto state = repository.call({.action = "inspect"});
             if (state.code != "ok")
                 return state;
             if (state.frontier != expected)
                 return {.code = "stale_frontier", .reason = "selected main frontier changed"};
             if (!state.files.empty())
-                return {.code = std::string{nodes::code::source_conflict}, .reason = "capture requires an empty worldline; edit the existing worldline through the node API"};
+                return {.code = std::string{nodes::code::source_conflict},
+                        .reason = "capture requires an empty worldline; edit the existing worldline through the node API"};
             rescan(true);
             auto tree = manifest();
             nodes::archive::files input;
@@ -304,7 +306,8 @@ export namespace storage {
                     if (selected->node->project_id().empty())
                         selected->node->initialize();
                 }
-                if (reading && !selected->reader) selected->reader = std::make_unique<nodes::local_node>(root, std::string{}, false, true);
+                if (reading && !selected->reader)
+                    selected->reader = std::make_unique<nodes::local_node>(root, std::string{}, false, true);
             }
             return f(reading ? *selected->reader : *selected->node);
         }

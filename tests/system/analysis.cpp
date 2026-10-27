@@ -21,8 +21,12 @@ namespace {
     // A change in main as one batch that takes the global scope for itself.
     auto create(net::ip::tcp::endpoint endpoint, std::string path, std::string text) -> nodes::node_reply {
         auto tree = node(endpoint, {.action = "tree", .worldline = "main"}, true);
-        return node(endpoint, {.action = "apply", .worldline = "main", .operation = content::hash_of("create " + path).str(), .expected = tree.frontier,
-                               .edits = {{.kind = "create", .path = std::move(path), .text = std::move(text)}}, .scopes = {"::"}});
+        return node(endpoint, {.action = "apply",
+                               .worldline = "main",
+                               .operation = content::hash_of("create " + path).str(),
+                               .expected = tree.frontier,
+                               .edits = {{.kind = "create", .path = std::move(path), .text = std::move(text)}},
+                               .scopes = {"::"}});
     }
     auto start_source(const std::filesystem::path& root, std::uint16_t port, const builds::toolset& tools = {}) {
         std::vector<std::string> args{"--port", std::to_string(port), "--storage", (root / "source").string()};
@@ -77,12 +81,20 @@ namespace {
 
             node(endpoint, {.action = "lock", .worldline = "main", .environment = "test-environment", .scopes = {twice->id}});
             auto inside = static_cast<std::uint64_t>(code.find("x * 2"));
-            auto edited = node(endpoint, {.action = "apply", .worldline = "main", .operation = content::hash_of("inside").str(), .expected = prepared_at.frontier,
+            auto edited = node(endpoint, {.action = "apply",
+                                          .worldline = "main",
+                                          .operation = content::hash_of("inside").str(),
+                                          .expected = prepared_at.frontier,
                                           .edits = {{.kind = "edit", .path = "main.cpp", .text = "x + x", .offset = inside, .count = 5}}});
             auto outside = static_cast<std::uint64_t>(code.find("x * 3"));
-            auto refused = source::call(endpoint, jobs::node_call{.project = "app", .actor = actor, .request = {
-                .action = "apply", .worldline = "main", .operation = content::hash_of("outside").str(), .expected = edited.frontier,
-                .edits = {{.kind = "edit", .path = "main.cpp", .text = "x + x + x", .offset = outside, .count = 5}}}});
+            auto refused = source::call(
+                endpoint, jobs::node_call{.project = "app",
+                                          .actor = actor,
+                                          .request = {.action = "apply",
+                                                      .worldline = "main",
+                                                      .operation = content::hash_of("outside").str(),
+                                                      .expected = edited.frontier,
+                                                      .edits = {{.kind = "edit", .path = "main.cpp", .text = "x + x + x", .offset = outside, .count = 5}}}});
             expect(refused.code == "scope_locked") << "a change outside the locked function needs its scope: " << refused.reason;
             auto later = node(endpoint, {.action = "semantic", .worldline = "main", .environment = "test-environment"}, true);
             expect(later.stale) << "the analysis is older than the edited version";
@@ -91,14 +103,13 @@ namespace {
             expect(process->stop() == 0);
         };
 
-
         "interrupted preparation survives a source process restart"_test = [] {
             test::scratch tmp{"interruption"};
             auto port = test::port();
             auto endpoint = net::ip::tcp::endpoint{net::ip::address_v4{{127, 0, 0, 1}}, port};
             auto start = [&] {
-                auto process = std::make_unique<test::child>(test::source_command(SERVICE_EXECUTABLE, tmp.dir,
-                    {"--port", std::to_string(port), "--storage", (tmp.dir / "source").string()}));
+                auto process = std::make_unique<test::child>(
+                    test::source_command(SERVICE_EXECUTABLE, tmp.dir, {"--port", std::to_string(port), "--storage", (tmp.dir / "source").string()}));
                 test::eventually([&] {
                     test::require(!process->finished(), process->output());
                     return process->output().contains("source: internal file service");
@@ -123,8 +134,11 @@ execute_process(COMMAND ${CMAKE_COMMAND} -E sleep 30)
             config.server = fixture::clice("service-not-installed");
             language::request request{.project = "app", .operation_id = "interrupted", .config = config};
             auto pending = std::async(std::launch::async, [=] {
-                try { return source::call(endpoint, request).status; }
-                catch (const std::exception&) { return std::string{"disconnected"}; }
+                try {
+                    return source::call(endpoint, request).status;
+                } catch (const std::exception&) {
+                    return std::string{"disconnected"};
+                }
             });
             std::filesystem::path marker;
             test::eventually([&] {
@@ -171,14 +185,19 @@ execute_process(COMMAND ${CMAKE_COMMAND} -E sleep 30)
             net::ip::tcp::endpoint endpoint{net::ip::address_v4{{127, 0, 0, 1}}, port};
             builds::toolset tools{{"uv", uv}, {"ty", ty}, {"ruff", ruff}};
             auto process = start_source(tmp.dir, port, tools);
-            create(endpoint, "pyproject.toml", "[project]\nname = \"toolchain-probe\"\nversion = \"0\"\nrequires-python = \">=3.11\"\n"
-                                               "[build-system]\nrequires = [\"uv_build\"]\nbuild-backend = \"uv_build\"\n");
+            create(endpoint, "pyproject.toml",
+                   "[project]\nname = \"toolchain-probe\"\nversion = \"0\"\nrequires-python = \">=3.11\"\n"
+                   "[build-system]\nrequires = [\"uv_build\"]\nbuild-backend = \"uv_build\"\n");
             create(endpoint, "src/toolchain_probe/__init__.py", "def answer() -> int:\n    return 42\n");
             auto version = create(endpoint, "bad.py", "import os\nanswer: int = \"wrong\"\n").version;
             builds::configuration build;
-            build.builders["environment"] = builds::with<"uv">{.options = {
-                .env_dir = "build/env", .build_dir = "build/dist", .cache_dir = "build/cache", .python = "python3",
-                .run_command = {"python", "-c", "from toolchain_probe import answer; print(answer())"}, .locked = false}};
+            build.builders["environment"] =
+                builds::with<"uv">{.options = {.env_dir = "build/env",
+                                               .build_dir = "build/dist",
+                                               .cache_dir = "build/cache",
+                                               .python = "python3",
+                                               .run_command = {"python", "-c", "from toolchain_probe import answer; print(answer())"},
+                                               .locked = false}};
             build.builders["types"] = builds::with<"ty">{.options = {.python = "build/env", .paths = {"bad.py"}}};
             build.builders["lint"] = builds::with<"ruff">{.options = {.paths = {"bad.py"}, .select = {"F401"}}};
             build.tasks = {{"sync", {.builder = "environment", .operation = "sync"}},
@@ -189,17 +208,16 @@ execute_process(COMMAND ${CMAKE_COMMAND} -E sleep 30)
             build.operations = {{"prepare", {.tasks = {"run"}}}, {"check", {.tasks = {"check"}}}, {"lint", {.tasks = {"lint"}}}};
             build.limits.timeout_s = 90;
             language::configuration config{.server = language::with<"ty">{.options = {.python = "build/env"}}, .build = build};
-            language::request request{.project = "app", .operation_id = "python-prepare", .worldline = "main", .revision = version,
-                                      .config = config, .environment = "python-types"};
+            language::request request{
+                .project = "app", .operation_id = "python-prepare", .worldline = "main", .revision = version, .config = config, .environment = "python-types"};
             auto prepared = source::call(endpoint, request);
             expect((prepared.status == "prepared") >> fatal) << prepared.error << rfl::json::write(prepared.steps);
             expect(prepared.steps.size() == 3u && prepared.steps.back().output.contains("42"));
             expect((prepared.analysis == "analyzed") >> fatal) << prepared.analysis_error.value_or("");
             auto semantic = node(endpoint, {.action = "semantic", .worldline = "main", .environment = "python-types"}, true);
             expect((semantic.semantic.has_value() && !semantic.semantic->diagnostics.empty()) >> fatal);
-            expect(std::ranges::any_of(semantic.semantic->diagnostics, [](auto& d) {
-                return d.range.place && d.range.place->path == "bad.py" && !d.range.document.empty();
-            }));
+            expect(std::ranges::any_of(semantic.semantic->diagnostics,
+                                       [](auto& d) { return d.range.place && d.range.place->path == "bad.py" && !d.range.document.empty(); }));
             auto replay = source::call(endpoint, request);
             expect(replay.replayed && replay.tree == prepared.tree);
             for (auto operation : {"check", "lint"}) {
@@ -219,11 +237,12 @@ execute_process(COMMAND ${CMAKE_COMMAND} -E sleep 30)
             expect(process->stop() == 0);
             process = start_source(tmp.dir, port, tools);
             auto restored = node(endpoint, {.action = "semantic", .worldline = "main", .environment = "python-types"}, true);
-            expect(restored.semantic.has_value() && restored.semantic->version == version && restored.semantic->diagnostics.size() == semantic.semantic->diagnostics.size());
+            expect(restored.semantic.has_value() && restored.semantic->version == version &&
+                   restored.semantic->diagnostics.size() == semantic.semantic->diagnostics.size());
             expect(process->stop() == 0);
         };
     };
-}
+} // namespace
 
 int main(int argc, const char** argv) {
     boost::ut::suite<"analysis">{cases};

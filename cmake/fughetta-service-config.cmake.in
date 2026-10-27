@@ -1,12 +1,13 @@
 @PACKAGE_INIT@
 
-# fughetta-service's modules as sources: this config registers the same targets the
-# repository builds (async, coroutine, native, http, content, configuration, ...)
-# and the consumer's build compiles them, since module BMIs are not portable.
+# fughetta-service's modules as sources: this config registers the same layer
+# targets the repository builds (core, platform, io, model, gateway, source,
+# worker) and the consumer's build compiles them, since module BMIs are not
+# portable.
 include(CMakeFindDependencyMacro)
 find_dependency(xclang CONFIG)
 
-if(NOT TARGET content)
+if(NOT TARGET model)
   include("${CMAKE_CURRENT_LIST_DIR}/dependencies.cmake")
   set(FUGHETTA_SOURCE "${PACKAGE_PREFIX_DIR}/share/fughetta-service/src")
   set(FUGHETTA_PACKAGE ON)

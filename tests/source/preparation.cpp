@@ -40,7 +40,8 @@ namespace {
         builds::config<"command"> command;
         for (const auto& name : {"FIRST", "LAST"})
             command.operations[name] = {.argv = {"python3", "-c", code, "${tree}/build/commands.json", "${tree}", name},
-                                        .outputs = {{"db", {"compilation_database", "build/commands.json"}}}, .build_dirs = {"build"}};
+                                        .outputs = {{"db", {"compilation_database", "build/commands.json"}}},
+                                        .build_dirs = {"build"}};
         language::configuration config;
         config.build.builders["main"] = builds::with<"command">{.options = command};
         config.build.tasks["first"] = {.builder = "main", .operation = "FIRST"};
@@ -61,11 +62,16 @@ namespace {
             throw std::runtime_error(action + ": " + reply.code + ": " + reply.reason);
         return reply;
     }
-    auto write(net::ip::tcp::endpoint endpoint, std::string text, std::string operation, std::string path = "main.c", std::string worldline = "main") -> nodes::node_reply {
+    auto write(net::ip::tcp::endpoint endpoint, std::string text, std::string operation, std::string path = "main.c", std::string worldline = "main")
+        -> nodes::node_reply {
         auto tree = node(endpoint, {.action = "tree", .worldline = worldline}, true);
         bool exists = std::ranges::contains(tree.files, path, &nodes::file_view::path);
-        return node(endpoint, {.action = "apply", .worldline = worldline, .operation = content::hash_of(operation).str(), .expected = tree.frontier,
-                               .edits = {{.kind = exists ? "write" : "create", .path = std::move(path), .text = std::move(text)}}, .scopes = {"::"}});
+        return node(endpoint, {.action = "apply",
+                               .worldline = worldline,
+                               .operation = content::hash_of(operation).str(),
+                               .expected = tree.frontier,
+                               .edits = {{.kind = exists ? "write" : "create", .path = std::move(path), .text = std::move(text)}},
+                               .scopes = {"::"}});
     }
     auto source_text(net::ip::tcp::endpoint endpoint, std::string path, std::string worldline = "main") -> std::string {
         auto read = node(endpoint, {.action = "read", .worldline = std::move(worldline), .target = path}, true);
@@ -91,22 +97,30 @@ namespace {
             builds::config<"cmake"> cmake{.build_dir = "build/source-cmake", .c_compiler = "cc", .export_compile_commands = true};
             cmake.targets = {"app", "native_bazel"};
             cmake.inputs = {{"header", "cxx_header"}};
-            cmake.variables = {{"GENERATED_HEADER", "${input:header}"}, {"BAZEL", "${tool:bazel}"},
-                               {"BAZEL_BASE", "${tree}/build/source-bazel"}, {"NATIVE_PROOF", "${tree}/build/source-cmake/native-proof"}};
+            cmake.variables = {{"GENERATED_HEADER", "${input:header}"},
+                               {"BAZEL", "${tool:bazel}"},
+                               {"BAZEL_BASE", "${tree}/build/source-bazel"},
+                               {"NATIVE_PROOF", "${tree}/build/source-cmake/native-proof"}};
             cmake.outputs = {{"binary", {"executable", "build/source-cmake/app"}}, {"proof", {"marker", "build/source-cmake/native-proof"}}};
             builds::config<"bazel"> bazel_config{.build_dir = "build/source-bazel", .startup_options = {"--host_jvm_args=-Xmx512m"}};
             auto options = std::vector<std::string>{"--jobs=2", "--host_platform=//:local", "--platforms=//:local"};
-            bazel_config.operations["generate"] = {.command = "run", .targets = {"//:bridge"}, .options = options,
-                .args = {"generate", "${tree}/build/source-generated/generated.h"}, .outputs = {{"header", {"cxx_header", "build/source-generated/generated.h"}}}};
-            bazel_config.operations["package"] = {.command = "run", .targets = {"//:bridge"}, .options = options,
-                .args = {"package", "${input:binary}", "${tree}/build/source-package.bin"}, .inputs = {{"binary", "executable"}},
-                .outputs = {{"package", {"archive", "build/source-package.bin"}}}};
+            bazel_config.operations["generate"] = {.command = "run",
+                                                   .targets = {"//:bridge"},
+                                                   .options = options,
+                                                   .args = {"generate", "${tree}/build/source-generated/generated.h"},
+                                                   .outputs = {{"header", {"cxx_header", "build/source-generated/generated.h"}}}};
+            bazel_config.operations["package"] = {.command = "run",
+                                                  .targets = {"//:bridge"},
+                                                  .options = options,
+                                                  .args = {"package", "${input:binary}", "${tree}/build/source-package.bin"},
+                                                  .inputs = {{"binary", "executable"}},
+                                                  .outputs = {{"package", {"archive", "build/source-package.bin"}}}};
             config.build.builders["cmake"] = builds::with<"cmake">{.options = cmake, .needs = builds::requirements{.tools = {"bazel"}}};
             config.build.builders["bazel"] = builds::with<"bazel">{.options = bazel_config};
             config.build.tasks = {{"generate", {.builder = "bazel", .operation = "generate"}},
-                {"configure", {.builder = "cmake", .operation = "configure", .inputs = {{"header", {"generate", "header"}}}}},
-                {"compile", {.builder = "cmake", .operation = "build", .after = {"configure"}}},
-                {"package", {.builder = "bazel", .operation = "package", .inputs = {{"binary", {"compile", "binary"}}}}}};
+                                  {"configure", {.builder = "cmake", .operation = "configure", .inputs = {{"header", {"generate", "header"}}}}},
+                                  {"compile", {.builder = "cmake", .operation = "build", .after = {"configure"}}},
+                                  {"package", {.builder = "bazel", .operation = "package", .inputs = {{"binary", {"compile", "binary"}}}}}};
             config.build.operations["prepare"] = {.tasks = {"package"}};
             config.build.outputs["database"] = {.task = "configure", .output = "compilation_database"};
             config.build.env["BUILD_OWNER"] = "source";
@@ -140,7 +154,8 @@ esac
 """, is_executable=True)
     return [DefaultInfo(executable=output)]
 bridge = rule(implementation=_bridge_impl, executable=True)
-)bzl", "bridge", "bridge.bzl");
+)bzl",
+                      "bridge", "bridge.bzl");
                 write(endpoint, R"(cmake_minimum_required(VERSION 3.20)
 project(mixed C)
 if(NOT "$ENV{BUILD_OWNER}" STREQUAL "source")
@@ -153,11 +168,11 @@ add_custom_target(native_bazel
   COMMAND "${BAZEL}" --batch "--output_base=${BAZEL_BASE}" "--output_user_root=${BAZEL_BASE}/user"
     --host_jvm_args=-Xmx512m run --repo_contents_cache= --jobs=2 --host_platform=//:local --platforms=//:local //:bridge -- native-cmake "${NATIVE_PROOF}"
   WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}" VERBATIM)
-)", "cmake", "CMakeLists.txt");
+)",
+                      "cmake", "CMakeLists.txt");
                 write(endpoint, "#include <stdio.h>\n#include \"generated.h\"\nint main(void) { puts(GREETING); return 0; }\n", "main", "main.c");
                 prepared = call(endpoint, request);
-                expect((prepared.status == "prepared" && prepared.inputs.size() == 1u) >> fatal) << prepared.error
-                    << rfl::json::write(prepared.steps);
+                expect((prepared.status == "prepared" && prepared.inputs.size() == 1u) >> fatal) << prepared.error << rfl::json::write(prepared.steps);
                 expect(prepared.inputs[0].units == 1u && prepared.steps.size() == 4u);
                 expect(prepared.steps.back().output.contains("from bazel"));
                 auto tree = std::filesystem::path{prepared.tree};
@@ -196,9 +211,12 @@ if(NOT "$ENV{ANALYSIS_FLAG}" STREQUAL "registered")
 endif()
 add_executable(app main.c)
 add_custom_target(generated COMMAND ${CMAKE_COMMAND} -E touch ${CMAKE_BINARY_DIR}/generated.h)
-)", "cmake", "CMakeLists.txt");
-            write(endpoint, R"({"version":3,"configurePresets":[{"name":"analysis","generator":"Ninja","binaryDir":"${sourceDir}/build/preset-output","cacheVariables":{"ANALYSIS_PRESET":"loaded"}}]})",
-                  "preset", "CMakePresets.json");
+)",
+                  "cmake", "CMakeLists.txt");
+            write(
+                endpoint,
+                R"({"version":3,"configurePresets":[{"name":"analysis","generator":"Ninja","binaryDir":"${sourceDir}/build/preset-output","cacheVariables":{"ANALYSIS_PRESET":"loaded"}}]})",
+                "preset", "CMakePresets.json");
             write(endpoint, "set(ANALYSIS_TOOLCHAIN loaded CACHE STRING \"\")\n", "toolchain", "cmake/toolchain.cmake");
             language::configuration config;
             config.build = fixture::cmake("build/analysis", "cc");
@@ -234,7 +252,8 @@ add_custom_target(generated COMMAND ${CMAKE_COMMAND} -E touch ${CMAKE_BINARY_DIR
 project(mutation C)
 add_executable(app main.c)
 file(APPEND ${CMAKE_CURRENT_SOURCE_DIR}/main.c "// modified by preparation\n")
-)", "cmake", "CMakeLists.txt");
+)",
+                  "cmake", "CMakeLists.txt");
             language::configuration config;
             config.build = fixture::cmake("build/analysis", "cc");
             auto& options = fixture::options<"cmake">(config.build.builders.at("main"));
@@ -269,8 +288,9 @@ file(APPEND ${CMAKE_CURRENT_SOURCE_DIR}/main.c "// modified by preparation\n")
                 expect(original.contains("LAST") && !original.contains("FIRST"));
                 for (const auto& artifact : result.artifacts)
                     expect(artifact.digest == result.inputs[0].digest);
-                expect(result.inputs[0].units == 1u && result.snapshot == content::manifest{{
-                    {.path = "main.c", .digest = content::hash_of("int main(void) { return 0; }\n"), .size = 29}}}.id());
+                expect(result.inputs[0].units == 1u &&
+                       result.snapshot ==
+                           content::manifest{{{.path = "main.c", .digest = content::hash_of("int main(void) { return 0; }\n"), .size = 29}}}.id());
                 auto replayed = call(endpoint, request);
                 expect(replayed.status == "prepared" && replayed.replayed && replayed.tree == tree);
                 auto changed = request;
@@ -320,8 +340,8 @@ file(APPEND ${CMAKE_CURRENT_SOURCE_DIR}/main.c "// modified by preparation\n")
             auto branch = node(endpoint, {.action = "fork", .worldline = "analysis", .operation = content::hash_of("fork").str(), .source = main.frontier});
             node(endpoint, {.action = "unlock", .worldline = "main", .scopes = {"::"}});
             write(endpoint, "int changed;\n", "change");
-            language::request request{.project = "app", .operation_id = "branch", .worldline = "analysis", .revision = branch.version,
-                                        .config = configuration()};
+            language::request request{
+                .project = "app", .operation_id = "branch", .worldline = "analysis", .revision = branch.version, .config = configuration()};
             auto prepared = call(endpoint, request);
             expect((prepared.status == "prepared") >> fatal) << prepared.error;
             expect(prepared.worldline == "analysis" && prepared.revision == branch.version);
@@ -382,8 +402,12 @@ file(APPEND ${CMAKE_CURRENT_SOURCE_DIR}/main.c "// modified by preparation\n")
             std::filesystem::rename(tree, tmp.dir / "moved");
             std::filesystem::create_directory_symlink(outside, tree);
             auto main = node(endpoint, {.action = "tree", .worldline = "main"}, true);
-            node(endpoint, {.action = "apply", .worldline = "main", .operation = content::hash_of("swap").str(), .expected = main.frontier,
-                            .edits = {{.kind = "remove", .path = "lib"}}, .scopes = {"::"}});
+            node(endpoint, {.action = "apply",
+                            .worldline = "main",
+                            .operation = content::hash_of("swap").str(),
+                            .expected = main.frontier,
+                            .edits = {{.kind = "remove", .path = "lib"}},
+                            .scopes = {"::"}});
             write(endpoint, "int helper;\n", "lib-dir", "lib/helper.c");
             auto second = call(endpoint, language::request{.project = "app", .operation_id = "second", .config = configuration()});
             expect(second.status == "prepared") << second.error;
@@ -397,8 +421,8 @@ file(APPEND ${CMAKE_CURRENT_SOURCE_DIR}/main.c "// modified by preparation\n")
             auto endpoint = source.endpoint();
             write(endpoint, "int source;\n", "initial");
             auto config = configuration();
-            fixture::options<"command">(config.build.builders.at("main")).operations.at("FIRST").argv = {
-                "python3", "-c", "print('failed output'); raise SystemExit(3)"};
+            fixture::options<"command">(config.build.builders.at("main")).operations.at("FIRST").argv = {"python3", "-c",
+                                                                                                         "print('failed output'); raise SystemExit(3)"};
             language::request request{.project = "app", .operation_id = "failed", .config = config};
             auto failed = call(endpoint, request);
             expect(failed.status == "failed" && failed.steps.size() == 1u);

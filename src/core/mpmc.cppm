@@ -14,6 +14,7 @@ export namespace concurrent {
         std::unique_ptr<cell[]> cells_{std::make_unique<cell[]>(Capacity)};
         alignas(64) std::atomic<std::size_t> head_{0};
         alignas(64) std::atomic<std::size_t> tail_{0};
+
     public:
         queue() {
             for (std::size_t i = 0; i < Capacity; ++i)
@@ -27,9 +28,12 @@ export namespace concurrent {
                 auto sequence = slot->sequence.load(std::memory_order_acquire);
                 auto difference = std::bit_cast<std::make_signed_t<std::size_t>>(sequence - pos);
                 if (difference == 0) {
-                    if (tail_.compare_exchange_weak(pos, pos + 1, std::memory_order_relaxed)) break;
-                } else if (difference < 0) return false;
-                else pos = tail_.load(std::memory_order_relaxed);
+                    if (tail_.compare_exchange_weak(pos, pos + 1, std::memory_order_relaxed))
+                        break;
+                } else if (difference < 0)
+                    return false;
+                else
+                    pos = tail_.load(std::memory_order_relaxed);
             }
             slot->value = std::move(value);
             slot->sequence.store(pos + 1, std::memory_order_release);
@@ -43,13 +47,16 @@ export namespace concurrent {
                 auto sequence = slot->sequence.load(std::memory_order_acquire);
                 auto difference = std::bit_cast<std::make_signed_t<std::size_t>>(sequence - (pos + 1));
                 if (difference == 0) {
-                    if (head_.compare_exchange_weak(pos, pos + 1, std::memory_order_relaxed)) break;
-                } else if (difference < 0) return false;
-                else pos = head_.load(std::memory_order_relaxed);
+                    if (head_.compare_exchange_weak(pos, pos + 1, std::memory_order_relaxed))
+                        break;
+                } else if (difference < 0)
+                    return false;
+                else
+                    pos = head_.load(std::memory_order_relaxed);
             }
             value = std::move(slot->value);
             slot->sequence.store(pos + Capacity, std::memory_order_release);
             return true;
         }
     };
-}
+} // namespace concurrent

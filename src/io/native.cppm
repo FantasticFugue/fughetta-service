@@ -26,7 +26,12 @@ export namespace native {
         // Requires a process started with io::command::interactive.
         auto write_some(std::span<const std::byte> from) {
             return http::io::net::detail::sender<concurrent::queue, std::size_t, http::io::net::detail::count_result>{
-                {.kind = native_io::operation::write, .resource = {s_->engine}, .file = s_->child.input(), .buffer = const_cast<std::byte*>(from.data()), .size = from.size()}, {}};
+                {.kind = native_io::operation::write,
+                 .resource = {s_->engine},
+                 .file = s_->child.input(),
+                 .buffer = const_cast<std::byte*>(from.data()),
+                 .size = from.size()},
+                {}};
         }
         void close_input() noexcept { s_->child.close_input(); }
         auto wait() { return waiting{s_.get()}; }
@@ -45,7 +50,7 @@ export namespace native {
         struct waiting {
             using sender_concept = execution::sender_t;
             using completion_signatures = execution::completion_signatures<execution::set_value_t(int), execution::set_error_t(std::error_code),
-                                                                         execution::set_error_t(std::exception_ptr), execution::set_stopped_t()>;
+                                                                           execution::set_error_t(std::exception_ptr), execution::set_stopped_t()>;
             state* s;
             auto get_env() const noexcept;
             template <class R> struct op : native_io::request {

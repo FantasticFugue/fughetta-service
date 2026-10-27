@@ -24,10 +24,14 @@ namespace gateway {
         using listener = native::listener;
 
         node(config::document doc, std::optional<std::filesystem::path> file, cores::context<native::scheduler>& rt, std::filesystem::path executable = {})
-            : executable_(std::move(executable)), doc_(doc), server_(doc.server), rt_(rt), control_(doc.runtime, doc.revisions.runtime), io_pool_(allocation::distribute(doc.runtime).gateway_disk), hub_(rt, config::store(std::move(doc), std::move(file)), io_pool_),
-              identities_(server_.storage,server_.auth.workspace),
-              router_(rt, routing::stale_after, &hub_),
+            : executable_(std::move(executable)), doc_(doc), server_(doc.server), rt_(rt), control_(doc.runtime, doc.revisions.runtime),
+              io_pool_(allocation::distribute(doc.runtime).gateway_disk), hub_(rt, config::store(std::move(doc), std::move(file)), io_pool_),
+              identities_(server_.storage, server_.auth.workspace), router_(rt, routing::stale_after, &hub_),
               files_(rt, server_.storage, hub_, io_pool_, io::parse_endpoint(server_.source)) {
+            files_.changed = [this] { hub_.events().publish(6); };
+            identities_.changed = [this] { hub_.events().publish(1); };
+            for (std::size_t c = 0; c < rt.size(); ++c)
+                router_.workers(c).changed = [this] { hub_.events().publish(1); };
             if (server_.auth.mode == "token" && server_.auth.tokens.empty())
                 logging::warn("gateway: no bearer token is configured; create one with `fughetta-service token NAME owner`");
             for (std::size_t c = 0; c < rt.size(); ++c)
@@ -43,7 +47,8 @@ namespace gateway {
             auto http = native::listener{io, io::parse_endpoint(server_.http_bind, server_.http_port)};
             auto workers = native::listener{io, io::parse_endpoint(server_.worker_bind, server_.worker_port)};
             std::optional<listener> remote;
-            if (server_.remote_worker_port) remote.emplace(native::listener{io, io::parse_endpoint(server_.remote_worker_bind,server_.remote_worker_port)});
+            if (server_.remote_worker_port)
+                remote.emplace(native::listener{io, io::parse_endpoint(server_.remote_worker_bind, server_.remote_worker_port)});
             if (core == 0)
                 logging::info(std::format("gateway: source and language API on http://{}:{}/, source {}, metadata {}, {} cores", server_.http_bind,
                                           server_.http_port, server_.source, server_.storage, rt_.size()));
@@ -54,10 +59,12 @@ namespace gateway {
                 }
                 children.spawn(router_.workers(core).watch(io));
                 children.spawn(accept_workers(workers, core, children));
-                if (remote) children.spawn(accept_workers(*remote,core,children,true));
+                if (remote)
+                    children.spawn(accept_workers(*remote, core, children, true));
                 if (core == 0) {
                     children.spawn(queue_->serve(io));
-                    if (!executable_.empty()) children.spawn(watch_runtime(io));
+                    if (!executable_.empty())
+                        children.spawn(watch_runtime(io));
                 }
                 co_await accept_http(http, here, children);
             });
@@ -100,7 +107,8 @@ namespace gateway {
             per_core(node& n, std::size_t core)
                 : services{n.hub_.slot(core), n.router_, n.files_, core},
                   http(front::context{n.hub_, n.files_, n.router_, n.rt_, core, &n.requests_, nullptr, &n.io_pool_, &services,
-                    n.executable_.empty() ? nullptr : &n.control_,&n.identities_,n.server_.remote_worker_port!=0}, services) {}
+                                      n.executable_.empty() ? nullptr : &n.control_, &n.identities_, n.server_.remote_worker_port != 0},
+                       services) {}
             tools::services services;
             front::server http;
         };
@@ -110,10 +118,12 @@ namespace gateway {
                 children.spawn(here.http.serve(co_await execution::then(net::async_accept(l), [](auto socket, auto) { return std::move(socket); })));
         }
 
-        auto accept_workers(listener& l, std::size_t core, coroutine::scope& children,bool remote=false) -> coroutine::task<> {
+        auto accept_workers(listener& l, std::size_t core, coroutine::scope& children, bool remote = false) -> coroutine::task<> {
             for (;;)
-                children.spawn(router_.workers(core).admit(rt_.get_scheduler(core), co_await execution::then(net::async_accept(l), [](auto socket, auto) { return std::move(socket); }),remote ? &identities_ : nullptr,
-                    remote ? &io_pool_ : nullptr,[this,core]{return hub_.current(core)->server.remote_worker_enrollment;}));
+                children.spawn(router_.workers(core).admit(rt_.get_scheduler(core),
+                                                           co_await execution::then(net::async_accept(l), [](auto socket, auto) { return std::move(socket); }),
+                                                           remote ? &identities_ : nullptr, remote ? &io_pool_ : nullptr,
+                                                           [this, core] { return hub_.current(core)->server.remote_worker_enrollment; }));
         }
 
         std::filesystem::path executable_;
@@ -160,7 +170,8 @@ export int run_gateway(int argc, char** argv, bool managed) {
         std::atomic<bool> interrupted{false};
         for (;;) {
             config::document doc;
-            if (argc > 1 || std::filesystem::exists(file)) doc = config::load(file);
+            if (argc > 1 || std::filesystem::exists(file))
+                doc = config::load(file);
             if (managed) {
                 doc.worker_token = keyring::mint();
                 host::set_environment_if_absent("SOURCE_TOKEN", keyring::mint());
@@ -169,12 +180,16 @@ export int run_gateway(int argc, char** argv, bool managed) {
             struct shutdown {
                 cores::context<native::scheduler>& context;
                 std::atomic<bool>& interrupted;
-                void stop() noexcept { interrupted.store(true); context.stop(); }
+                void stop() noexcept {
+                    interrupted.store(true);
+                    context.stop();
+                }
             } stop{context, interrupted};
             cores::signal_watch signals{stop};
             gateway::node node{std::move(doc), file, context, managed ? host::executable() : std::filesystem::path{}};
             context.run([&](auto& io, std::size_t core) { return node.run(io, core); });
-            if (interrupted.load() || !node.reconfiguring()) break;
+            if (interrupted.load() || !node.reconfiguring())
+                break;
         }
     } catch (const std::exception& e) {
         logging::error(std::format("gateway: {}", e.what()));

@@ -8,8 +8,8 @@ namespace builds {
         static const auto out = [] {
             std::map<std::string, rfl::Generic> out;
             [&]<class... W>(std::type_identity<rfl::TaggedUnion<"adapter", W...>>) {
-                ((out[std::string{W::name}] = *rfl::json::read<rfl::Generic>(
-                      rfl::json::to_schema<typename W::implementation::options, rfl::DefaultIfMissing, rfl::NoExtraFields>())),
+                ((out[std::string{W::name}] =
+                      *rfl::json::read<rfl::Generic>(rfl::json::to_schema<typename W::implementation::options, rfl::DefaultIfMissing, rfl::NoExtraFields>())),
                  ...);
             }(std::type_identity<builder>{});
             return out;
@@ -169,6 +169,29 @@ namespace builds {
                 output(c, d, ref);
             }
         }
+        // A report file is a plain name in ${reports}, named once, read by a known protocol.
+        void reports(const step& value, const std::string& task) {
+            auto plain = [&](const std::string& file) {
+                if (file.empty() || file == "." || file == ".." || file.find_first_of("/\\:") != std::string::npos || file.contains('\0') ||
+                    file.contains("${"))
+                    throw std::invalid_argument("a report of task " + task + " is a plain file name in ${reports}: " + file);
+            };
+            for (std::size_t i = 0; i < value.reports.size(); ++i) {
+                auto& r = value.reports[i];
+                plain(r.file);
+                if (!report_protocols::known(r.protocol)) {
+                    std::string names;
+                    for (auto n : report_protocols::names)
+                        names += (names.empty() ? "" : ", ") + std::string{n};
+                    throw std::invalid_argument("unknown report protocol " + r.protocol + " of task " + task + " (protocols: " + names + ")");
+                }
+                for (std::size_t j = 0; j < i; ++j)
+                    if (value.reports[j].file == r.file)
+                        throw std::invalid_argument("task " + task + " names the report " + r.file + " twice");
+            }
+            if (value.standard_output)
+                plain(*value.standard_output);
+        }
         auto plan_of(const configuration& c, const descriptions& d, const request& request) -> plan {
             auto op = c.operations.find(request.operation);
             if (op == c.operations.end())
@@ -219,6 +242,8 @@ namespace builds {
                     steps.back().outputs.push_back({id + "/" + port, artifact.type, artifact.path, artifact.kind});
                 for (auto& step : steps) {
                     step.name = steps.size() == 1 ? id : id + "/" + step.name;
+                    step.reports.insert(step.reports.end(), t.reports.begin(), t.reports.end());
+                    reports(step, id);
                     if (step.argv.empty() || step.argv.front().empty())
                         throw std::invalid_argument("build step has no executable");
                     relative(step.cwd, true);
@@ -260,11 +285,13 @@ namespace builds {
         check(c, d);
         return plan_of(c, d, request);
     }
-    auto locate(step value, const std::filesystem::path& tree, const toolset& tools, std::uint32_t jobs) -> step {
+    auto locate(step value, const std::filesystem::path& tree, const toolset& tools, std::uint32_t jobs, const std::filesystem::path& reports) -> step {
         auto root = std::filesystem::absolute(tree);
         auto bind = [&](std::string& text) {
             replace_all(text, "${tree}", root.string());
             replace_all(text, "${jobs}", std::to_string(jobs));
+            if (!reports.empty())
+                replace_all(text, "${reports}", std::filesystem::absolute(reports).string());
             for (std::size_t at; (at = text.find("${tool:")) != std::string::npos;) {
                 auto end = text.find('}', at);
                 if (end == std::string::npos)
@@ -284,6 +311,43 @@ namespace builds {
         if (!value.argv.empty() && value.argv[0].find_first_of("/\\") != std::string::npos && !std::filesystem::path(value.argv[0]).is_absolute())
             value.argv[0] = (root / content::checked_path(value.argv[0])).string();
         return value;
+    }
+    auto collect(const step& bound, const std::filesystem::path& reports, const std::filesystem::path& tree) -> reading {
+        constexpr std::uintmax_t max_bytes = 16u << 20;
+        auto root = std::filesystem::absolute(tree);
+        reading out;
+        for (auto& r : bound.reports) {
+            auto path = reports / r.file;
+            std::error_code ec;
+            if (!std::filesystem::is_regular_file(std::filesystem::symlink_status(path, ec)))
+                continue;
+            reading found;
+            try {
+                if (std::filesystem::file_size(path) > max_bytes)
+                    throw std::runtime_error("larger than 16 MiB");
+                std::ifstream input{path, std::ios::binary};
+                found = report_protocols::read(r.protocol, std::string{std::istreambuf_iterator<char>{input}, {}});
+            } catch (const std::exception& e) {
+                out.diagnostics.push_back(
+                    {.severity = "error", .message = std::format("the {} report {} could not be read: {}", r.protocol, r.file, e.what())});
+                continue;
+            }
+            for (auto& d : found.diagnostics) {
+                std::filesystem::path file{d.file};
+                auto rel = (file.is_absolute() ? file : std::filesystem::path{bound.cwd} / file).lexically_normal().lexically_relative(root);
+                if (!rel.empty() && *rel.begin() != "..")
+                    d.file = rel.generic_string();
+                out.diagnostics.push_back(std::move(d));
+            }
+            if (found.tests) {
+                if (!out.tests)
+                    out.tests.emplace();
+                out.tests->total += found.tests->total;
+                out.tests->failed += found.tests->failed;
+                std::ranges::move(found.tests->failed_tests, std::back_inserter(out.tests->failed_tests));
+            }
+        }
+        return out;
     }
     auto inspect(const context& artifact, const std::filesystem::path& tree) -> artifact_result {
         relative(artifact.path);

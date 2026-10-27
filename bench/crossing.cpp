@@ -180,9 +180,7 @@ namespace {
         }
         co_return caught;
     }
-    auto application_http_stops(std::size_t n) -> coroutine::task<std::size_t> {
-        co_return co_await h_stops(n);
-    }
+    auto application_http_stops(std::size_t n) -> coroutine::task<std::size_t> { co_return co_await h_stops(n); }
 } // namespace
 
 int main(int argc, char** argv) {
@@ -223,7 +221,6 @@ int main(int argc, char** argv) {
     {
         native::context io;
         row("stop", "task: unhandled_stopped through 3 frames", measure(n, [&](std::size_t k) { cores::run(io, stops(k)); }));
-        row("stop", "http::task: throw http::stopped through 3 frames",
-            measure(n, [&](std::size_t k) { cores::run(io, application_http_stops(k)); }));
+        row("stop", "http::task: throw http::stopped through 3 frames", measure(n, [&](std::size_t k) { cores::run(io, application_http_stops(k)); }));
     }
 }

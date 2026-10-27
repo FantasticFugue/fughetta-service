@@ -27,8 +27,11 @@ export namespace keyring {
         if (auth.mode == "trusted") {
             if (auth.workspace.empty() || text("x-fughetta-workspace") != auth.workspace)
                 throw unauthorized("the front named a different workspace (x-fughetta-workspace)");
-            worlds::actor who{.issuer = text("x-fughetta-issuer"), .user = text("x-fughetta-user"), .caller = text("x-fughetta-caller"),
-                              .role = text("x-fughetta-role"), .email = text("x-fughetta-email")};
+            worlds::actor who{.issuer = text("x-fughetta-issuer"),
+                              .user = text("x-fughetta-user"),
+                              .caller = text("x-fughetta-caller"),
+                              .role = text("x-fughetta-role"),
+                              .email = text("x-fughetta-email")};
             if (who.user.empty())
                 throw unauthorized("the front named no caller (x-fughetta-user)");
             if (!worlds::rank(who.role))

@@ -86,8 +86,8 @@ export namespace runner {
                                     .truncated = truncated};
     }
 
-    auto prepared_step(native::scheduler& io, io::command command, std::chrono::milliseconds timeout,
-                       std::uint64_t output_limit, std::string name, isolation::pool& pool) -> coroutine::task<jobs::step_report> {
+    auto prepared_step(native::scheduler& io, io::command command, std::chrono::milliseconds timeout, std::uint64_t output_limit, std::string name,
+                       isolation::pool& pool) -> coroutine::task<jobs::step_report> {
         auto resource = pool.start({}, {});
         resource->concurrency(1);
         command.isolation = resource->target();
@@ -96,10 +96,14 @@ export namespace runner {
         std::exception_ptr error;
         try {
             result = co_await coroutine::under(token, run_step(io, std::move(command), timeout, output_limit, std::move(name), resource.get()));
-        } catch (...) { error = std::current_exception(); }
+        } catch (...) {
+            error = std::current_exception();
+        }
         resource->close();
-        if (error) std::rethrow_exception(error);
-        if (!result) co_await coroutine::stop;
+        if (error)
+            std::rethrow_exception(error);
+        if (!result)
+            co_await coroutine::stop;
         co_return std::move(*result);
     }
 } // namespace runner

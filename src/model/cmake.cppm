@@ -25,8 +25,6 @@ namespace builds {
             bool stop_on_failure = false;
             // `error` fails a run that ran no test; a suite is never reported passing because nothing ran.
             std::string no_tests_action = "error";
-            // --output-junit: a report named relative to the project; absent writes none.
-            std::optional<std::string> output_junit;
             // Arguments CTest itself has no typed field for; the flags a field composes are refused.
             std::vector<std::string> args;
         };

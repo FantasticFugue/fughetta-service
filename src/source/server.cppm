@@ -23,8 +23,8 @@ export namespace source_server {
         using socket = native::socket;
 
         service(cores::context<native::scheduler>& rt, std::filesystem::path storage, execution::thread_pool& pool, builds::toolset tools = {})
-            : rt_(rt), storage_(std::move(storage)), lock_(storage_, "source"), pool_(pool), cores_(rt.size()),
-              tools_(std::move(tools)), analysis_(rt, storage_ / ".analysis", pool, tools_), token_(jobs::source_token()) {}
+            : rt_(rt), storage_(std::move(storage)), lock_(storage_, "source"), pool_(pool), cores_(rt.size()), tools_(std::move(tools)),
+              analysis_(rt, storage_ / ".analysis", pool, tools_), token_(jobs::source_token()) {}
 
         auto serve(native::scheduler& io, socket peer, std::size_t core) -> coroutine::task<> {
             transport::channel<socket> chan{peer};
@@ -116,7 +116,8 @@ export namespace source_server {
         static auto stored(const std::filesystem::path& repository) -> std::uint64_t {
             std::uint64_t n = 0;
             std::error_code ec;
-            for (auto it = std::filesystem::recursive_directory_iterator(repository, ec); !ec && it != std::filesystem::recursive_directory_iterator(); it.increment(ec))
+            for (auto it = std::filesystem::recursive_directory_iterator(repository, ec); !ec && it != std::filesystem::recursive_directory_iterator();
+                 it.increment(ec))
                 if (it->is_regular_file(ec) && !it->is_symlink(ec))
                     if (auto size = it->file_size(ec); !ec)
                         n += size;
@@ -150,7 +151,8 @@ export namespace source_server {
                 if (storage_limit_) {
                     if (auto used = owner_.stored_all(); used >= storage_limit_)
                         nodes::fail(nodes::code::resource_limit, std::format("the workspace stores {} bytes of history (limit {}); history is kept, so only a "
-                                                                  "higher storage limit or removing a project makes room", used, storage_limit_));
+                                                                             "higher storage limit or removing a project makes room",
+                                                                             used, storage_limit_));
                 }
             }
 
@@ -180,7 +182,8 @@ export namespace source_server {
                 if (in.action == "export") {
                     // The staged package is measured as written, manifest and configuration included; the one it replaces is freed.
                     auto refuse = [&] {
-                        nodes::fail(nodes::code::resource_limit, std::format("the package would bring the workspace past its {} byte storage limit", in.workspace_limit));
+                        nodes::fail(nodes::code::resource_limit,
+                                    std::format("the package would bring the workspace past its {} byte storage limit", in.workspace_limit));
                     };
                     // The package this export replaces is freed by it. A new package is refused once the workspace is at its limit; a
                     // replacement only when it grows the workspace past it, so a smaller one is always possible.
@@ -227,7 +230,8 @@ export namespace source_server {
                     if (!entry.is_directory(ec) || entry.is_symlink(ec))
                         continue;
                     jobs::project_usage u{.project = entry.path().filename().string(), .storage_bytes = stored(entry.path())};
-                    auto tree = repositories_.with(entry.path(), [](nodes::local_node& node) { return node.call({.action = "tree", .worldline = "main"}); }, true);
+                    auto tree =
+                        repositories_.with(entry.path(), [](nodes::local_node& node) { return node.call({.action = "tree", .worldline = "main"}); }, true);
                     for (auto& file : tree.files)
                         u.source_bytes += file.size;
                     out.projects.push_back(std::move(u));
@@ -250,25 +254,28 @@ export namespace source_server {
                 // is derived and can be dropped, stay possible.
                 static const std::set<std::string, std::less<>> growing{"apply", "fork", "integrate", "admit", "resolve", "redo", "receive", "restore"};
                 auto stores = growing.contains(request.request.action) ? request.request.workspace_limit : 0;
-                return repositories_.with(root, [&](nodes::local_node& node) {
-                    confirmation confirmed{*this, node, request.actor, request.request.action == "unlock" && request.request.force, stores};
-                    if (request.request.owner.empty())
-                        request.request.owner = node.node_id();
-                    // History names the user; a lock is held by the exact caller, so two agents of one user do not share locks.
-                    request.request.actor = author_key(request.actor);
-                    request.request.holder = worlds::identity_key(request.actor) + request.actor.client.value_or("");
-                    request.request.capture = false;
-                    // The gateway may name the caller's own operation ID for display; the engine keys on the scoped identity.
-                    if (content::is_hash(request.request.operation)) {
-                        if (request.request.caller_operation.empty())
-                            request.request.caller_operation = request.request.operation;
-                        request.request.operation = scoped(request.actor, request.request.operation);
-                    } else
-                        request.request.caller_operation.clear();
-                    if (request.request.action == "export" || request.request.action == "restore")
-                        return packaged(node, request);
-                    return node.call(request.request);
-                }, request.reading);
+                return repositories_.with(
+                    root,
+                    [&](nodes::local_node& node) {
+                        confirmation confirmed{*this, node, request.actor, request.request.action == "unlock" && request.request.force, stores};
+                        if (request.request.owner.empty())
+                            request.request.owner = node.node_id();
+                        // History names the user; a lock is held by the exact caller, so two agents of one user do not share locks.
+                        request.request.actor = author_key(request.actor);
+                        request.request.holder = worlds::identity_key(request.actor) + request.actor.client.value_or("");
+                        request.request.capture = false;
+                        // The gateway may name the caller's own operation ID for display; the engine keys on the scoped identity.
+                        if (content::is_hash(request.request.operation)) {
+                            if (request.request.caller_operation.empty())
+                                request.request.caller_operation = request.request.operation;
+                            request.request.operation = scoped(request.actor, request.request.operation);
+                        } else
+                            request.request.caller_operation.clear();
+                        if (request.request.action == "export" || request.request.action == "restore")
+                            return packaged(node, request);
+                        return node.call(request.request);
+                    },
+                    request.reading);
             });
         }
 
@@ -281,8 +288,9 @@ export namespace source_server {
                 return repositories_.with(storage_ / ".nodes" / request.project, [&](nodes::local_node& node) {
                     confirmation confirmed{*this, node, request.actor, false, request.workspace_limit};
                     auto reply = files.capture_node(node, content::is_hash(request.operation) ? scoped(request.actor, request.operation) : request.operation,
-                                                    request.operation, author_key(request.actor), worlds::identity_key(request.actor) + request.actor.client.value_or(""),
-                                                    request.expected, request.intent, request.file_limit, request.project_limit);
+                                                    request.operation, author_key(request.actor),
+                                                    worlds::identity_key(request.actor) + request.actor.client.value_or(""), request.expected, request.intent,
+                                                    request.file_limit, request.project_limit);
                     reply.operation = request.operation;
                     return reply;
                 });
@@ -312,7 +320,8 @@ export namespace source_server {
             auto request = done.request;
             auto result = std::move(done.result);
             try {
-                co_return co_await analysis_.finish(core, std::move(request), std::move(result),
+                co_return co_await analysis_.finish(
+                    core, std::move(request), std::move(result),
                     [this, done = std::move(done)](language::result& result, const language::request& in, const language::plan&) -> coroutine::task<> {
                         if (done.survey_error) {
                             result.analysis = "failed";
@@ -336,14 +345,15 @@ export namespace source_server {
             content::manifest files;
             for (auto& f : tree.files)
                 files.files.push_back({f.path, f.digest, f.size, f.executable});
-            return preparation::service::stage(cache, in, tree.version, std::move(files), [&node, &in, version = tree.version](const content::hash& digest, std::uint64_t offset, std::uint64_t count) {
-                nodes::node_request ask{.action = "content", .worldline = in.worldline, .revision = version};
-                ask.parts.push_back({digest.str(), offset, count, {}});
-                auto read = node.call(ask);
-                if (read.code != "ok" || read.parts.size() != 1)
-                    throw std::runtime_error("reading the source to prepare failed: " + read.reason);
-                return nodes::unhex(read.parts[0].data);
-            });
+            return preparation::service::stage(cache, in, tree.version, std::move(files),
+                                               [&node, &in, version = tree.version](const content::hash& digest, std::uint64_t offset, std::uint64_t count) {
+                                                   nodes::node_request ask{.action = "content", .worldline = in.worldline, .revision = version};
+                                                   ask.parts.push_back({digest.str(), offset, count, {}});
+                                                   auto read = node.call(ask);
+                                                   if (read.code != "ok" || read.parts.size() != 1)
+                                                       throw std::runtime_error("reading the source to prepare failed: " + read.reason);
+                                                   return nodes::unhex(read.parts[0].data);
+                                               });
         }
         // Asks the configured language server about the prepared tree and publishes what it found for that version and environment.
         auto surveyed(language::result& result, const language::request& in, const language::plan& plan) -> coroutine::task<> {
@@ -354,9 +364,9 @@ export namespace source_server {
                     throw std::invalid_argument("the analysis request names no environment");
                 std::vector<lsp::document> documents;
                 auto tree = co_await io::blocking(rt_.get_scheduler(0), pool_, [this, &in, &result] {
-                    return repositories_.with(repository_of(in.project), [&](nodes::local_node& node) {
-                        return node.call({.action = "tree", .worldline = in.worldline, .revision = result.revision});
-                    }, true);
+                    return repositories_.with(
+                        repository_of(in.project),
+                        [&](nodes::local_node& node) { return node.call({.action = "tree", .worldline = in.worldline, .revision = result.revision}); }, true);
                 });
                 lsp::limits bounds{.total = std::chrono::seconds{language::timeout(in.config)}};
                 std::uint64_t bytes = 0;
@@ -388,7 +398,8 @@ export namespace source_server {
                     surveyed.push_back(d.path);
                 if (!survey_resources_)
                     survey_resources_ = std::make_unique<isolation::pool>(content::hash_of((std::filesystem::absolute(storage_) / "survey").string()).str());
-                auto found = co_await lsp::bounded_survey(rt_.get_scheduler(0), std::move(server), plan.server.initialization, result.tree, std::move(documents), bounds, *survey_resources_);
+                auto found = co_await lsp::bounded_survey(rt_.get_scheduler(0), std::move(server), plan.server.initialization, result.tree,
+                                                          std::move(documents), bounds, *survey_resources_);
                 co_await published(result, in, plan.server.provider, std::move(found), surveyed);
             } catch (const std::exception& e) {
                 result.analysis = "failed";
@@ -396,8 +407,8 @@ export namespace source_server {
             }
         }
         // Anchors an outline of the prepared version in the node and publishes it for the request's environment.
-        auto published(language::result& result, const language::request& in, std::string service, semantic::outline found,
-                       std::vector<std::string> surveyed) -> coroutine::task<> {
+        auto published(language::result& result, const language::request& in, std::string service, semantic::outline found, std::vector<std::string> surveyed)
+            -> coroutine::task<> {
             try {
                 if (in.environment.empty())
                     throw std::invalid_argument("the analysis request names no environment");
@@ -419,7 +430,6 @@ export namespace source_server {
                 result.analysis_error = e.what();
             }
         }
-
 
         storage::native_nodes repositories_;
         std::mutex packages_mutex_;

@@ -17,7 +17,9 @@ namespace {
         std::uint64_t projected_files = 0, state_nodes_read = 0, state_values_read = 0, state_nodes_written = 0, state_values_written = 0,
                       state_bytes_written = 0;
         bool causal_loaded = false;
-        std::uint64_t causal_headers_read = 0, causal_effects_read = 0, file_histories_read = 0, file_payloads_read = 0, state_bytes_read = 0, sequence_pages_read = 0, sequence_pages_written = 0, insertion_payloads_read = 0, cache_evictions = 0, state_bytes_decoded = 0, causal_blocks_read = 0;
+        std::uint64_t causal_headers_read = 0, causal_effects_read = 0, file_histories_read = 0, file_payloads_read = 0, state_bytes_read = 0,
+                      sequence_pages_read = 0, sequence_pages_written = 0, insertion_payloads_read = 0, cache_evictions = 0, state_bytes_decoded = 0,
+                      causal_blocks_read = 0;
         std::string causal_scope;
     };
     struct input_file {
@@ -93,11 +95,18 @@ namespace {
         output.state_values_written = work.state_values_written;
         output.state_bytes_written = work.state_bytes_written;
         output.causal_loaded = work.causal_loaded;
-        output.causal_headers_read = work.causal_headers_read; output.causal_effects_read = work.causal_effects_read;
-        output.file_histories_read = work.file_histories_read; output.file_payloads_read = work.file_payloads_read;
-        output.state_bytes_read = work.state_bytes_read; output.sequence_pages_read = work.sequence_pages_read;
-        output.sequence_pages_written = work.sequence_pages_written; output.insertion_payloads_read = work.insertion_payloads_read;
-        output.cache_evictions = work.cache_evictions; output.state_bytes_decoded = work.state_bytes_decoded; output.causal_blocks_read = work.causal_blocks_read; output.causal_scope = work.causal_scope;
+        output.causal_headers_read = work.causal_headers_read;
+        output.causal_effects_read = work.causal_effects_read;
+        output.file_histories_read = work.file_histories_read;
+        output.file_payloads_read = work.file_payloads_read;
+        output.state_bytes_read = work.state_bytes_read;
+        output.sequence_pages_read = work.sequence_pages_read;
+        output.sequence_pages_written = work.sequence_pages_written;
+        output.insertion_payloads_read = work.insertion_payloads_read;
+        output.cache_evictions = work.cache_evictions;
+        output.state_bytes_decoded = work.state_bytes_decoded;
+        output.causal_blocks_read = work.causal_blocks_read;
+        output.causal_scope = work.causal_scope;
     }
     void identities(const std::filesystem::path& root, nodes::local_node& a, nodes::local_node& b, nodes::local_node& c) {
         auto value = nodes::value::map{{"authors", nodes::strings({a.author_id(), b.author_id(), c.author_id()})},
@@ -234,7 +243,10 @@ int main(int argc, char** argv) {
                     std::cout << rfl::json::write(call(node, std::move(in))) << '\n' << std::flush;
                     continue;
                 }
-                if (in.action == "benchmark_work") { std::cout << rfl::json::write(node.statistics()) << '\n' << std::flush; continue; }
+                if (in.action == "benchmark_work") {
+                    std::cout << rfl::json::write(node.statistics()) << '\n' << std::flush;
+                    continue;
+                }
                 measured step{.mode = in.action};
                 auto start = clock_type::now();
                 if (in.action == "benchmark_export") {

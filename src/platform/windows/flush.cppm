@@ -1,6 +1,6 @@
 module;
-#include <windows.h>
 #include <aclapi.h>
+#include <windows.h>
 module durability;
 import std;
 import constants;
@@ -128,106 +128,132 @@ namespace durability {
     void durable_write(const std::filesystem::path& target, std::string_view text, bool executable, std::string_view suffix) {
         durable_write(target, std::as_bytes(std::span{text}), executable, suffix);
     }
-    void durable_private_write(const std::filesystem::path& target,std::string_view text) {
-        HANDLE token_value=nullptr;
-        if (!::OpenProcessToken(::GetCurrentProcess(),TOKEN_QUERY,&token_value)) winapi::fail("read credential owner");
+    void durable_private_write(const std::filesystem::path& target, std::string_view text) {
+        HANDLE token_value = nullptr;
+        if (!::OpenProcessToken(::GetCurrentProcess(), TOKEN_QUERY, &token_value))
+            winapi::fail("read credential owner");
         winapi::handle token{token_value};
-        DWORD size=0;
-        ::GetTokenInformation(token.value,TokenUser,nullptr,0,&size);
+        DWORD size = 0;
+        ::GetTokenInformation(token.value, TokenUser, nullptr, 0, &size);
         std::vector<std::byte> user(size);
-        if (!::GetTokenInformation(token.value,TokenUser,user.data(),size,&size)) winapi::fail("read credential owner SID");
-        auto sid=reinterpret_cast<TOKEN_USER*>(user.data())->User.Sid;
+        if (!::GetTokenInformation(token.value, TokenUser, user.data(), size, &size))
+            winapi::fail("read credential owner SID");
+        auto sid = reinterpret_cast<TOKEN_USER*>(user.data())->User.Sid;
         EXPLICIT_ACCESSW access{};
-        access.grfAccessPermissions=FILE_ALL_ACCESS;
-        access.grfAccessMode=SET_ACCESS;
-        access.grfInheritance=NO_INHERITANCE;
-        access.Trustee.TrusteeForm=TRUSTEE_IS_SID;
-        access.Trustee.TrusteeType=TRUSTEE_IS_USER;
-        access.Trustee.ptstrName=reinterpret_cast<LPWSTR>(sid);
-        PACL acl=nullptr;
-        auto status=::SetEntriesInAclW(1,&access,nullptr,&acl);
-        if (status!=ERROR_SUCCESS) winapi::fail("create credential ACL",status);
-        struct free_acl {PACL acl;~free_acl(){::LocalFree(acl);}} free{acl};
+        access.grfAccessPermissions = FILE_ALL_ACCESS;
+        access.grfAccessMode = SET_ACCESS;
+        access.grfInheritance = NO_INHERITANCE;
+        access.Trustee.TrusteeForm = TRUSTEE_IS_SID;
+        access.Trustee.TrusteeType = TRUSTEE_IS_USER;
+        access.Trustee.ptstrName = reinterpret_cast<LPWSTR>(sid);
+        PACL acl = nullptr;
+        auto status = ::SetEntriesInAclW(1, &access, nullptr, &acl);
+        if (status != ERROR_SUCCESS)
+            winapi::fail("create credential ACL", status);
+        struct free_acl {
+            PACL acl;
+            ~free_acl() { ::LocalFree(acl); }
+        } free{acl};
         SECURITY_DESCRIPTOR descriptor{};
-        if (!::InitializeSecurityDescriptor(&descriptor,SECURITY_DESCRIPTOR_REVISION) ||
-            !::SetSecurityDescriptorOwner(&descriptor,sid,FALSE) ||
-            !::SetSecurityDescriptorDacl(&descriptor,TRUE,acl,FALSE) ||
-            !::SetSecurityDescriptorControl(&descriptor,SE_DACL_PROTECTED,SE_DACL_PROTECTED)) winapi::fail("protect credential descriptor");
-        SECURITY_ATTRIBUTES attributes{sizeof(attributes),&descriptor,FALSE};
-        auto temporary=target;
-        temporary+=L".private-write";
+        if (!::InitializeSecurityDescriptor(&descriptor, SECURITY_DESCRIPTOR_REVISION) || !::SetSecurityDescriptorOwner(&descriptor, sid, FALSE) ||
+            !::SetSecurityDescriptorDacl(&descriptor, TRUE, acl, FALSE) || !::SetSecurityDescriptorControl(&descriptor, SE_DACL_PROTECTED, SE_DACL_PROTECTED))
+            winapi::fail("protect credential descriptor");
+        SECURITY_ATTRIBUTES attributes{sizeof(attributes), &descriptor, FALSE};
+        auto temporary = target;
+        temporary += L".private-write";
         try {
-            if (!::DeleteFileW(winapi::path(temporary).c_str()) && ::GetLastError()!=ERROR_FILE_NOT_FOUND) winapi::fail("remove credential temporary");
+            if (!::DeleteFileW(winapi::path(temporary).c_str()) && ::GetLastError() != ERROR_FILE_NOT_FOUND)
+                winapi::fail("remove credential temporary");
             {
-                winapi::handle file{::CreateFileW(winapi::path(temporary).c_str(),GENERIC_WRITE,0,&attributes,CREATE_NEW,FILE_FLAG_WRITE_THROUGH,nullptr)};
-                if (file.value==INVALID_HANDLE_VALUE) winapi::fail("create private credentials");
-                write(file.value,std::as_bytes(std::span{text}));
+                winapi::handle file{
+                    ::CreateFileW(winapi::path(temporary).c_str(), GENERIC_WRITE, 0, &attributes, CREATE_NEW, FILE_FLAG_WRITE_THROUGH, nullptr)};
+                if (file.value == INVALID_HANDLE_VALUE)
+                    winapi::fail("create private credentials");
+                write(file.value, std::as_bytes(std::span{text}));
                 flush(file.value);
             }
-            durable_rename(temporary,target);
-        } catch (...) {::DeleteFileW(winapi::path(temporary).c_str());throw;}
+            durable_rename(temporary, target);
+        } catch (...) {
+            ::DeleteFileW(winapi::path(temporary).c_str());
+            throw;
+        }
     }
     namespace {
-    auto owner_only(HANDLE file) -> bool {
-        PSID owner=nullptr;
-        PACL acl=nullptr;
-        PSECURITY_DESCRIPTOR descriptor=nullptr;
-        auto status=::GetSecurityInfo(file,SE_FILE_OBJECT,OWNER_SECURITY_INFORMATION|DACL_SECURITY_INFORMATION,&owner,nullptr,&acl,nullptr,&descriptor);
-        struct free_descriptor {PSECURITY_DESCRIPTOR value;~free_descriptor(){if(value)::LocalFree(value);}} free{descriptor};
-        if (status!=ERROR_SUCCESS || !owner || !acl || !::IsValidAcl(acl)) return false;
-        HANDLE value=nullptr;
-        if (!::OpenProcessToken(::GetCurrentProcess(),TOKEN_QUERY,&value)) return false;
-        winapi::handle token{value};
-        DWORD size=0;
-        ::GetTokenInformation(token.value,TokenUser,nullptr,0,&size);
-        std::vector<std::byte> user(size);
-        if (!::GetTokenInformation(token.value,TokenUser,user.data(),size,&size)) return false;
-        auto sid=reinterpret_cast<TOKEN_USER*>(user.data())->User.Sid;
-        if (!::EqualSid(owner,sid)) return false;
-        for (DWORD i=0;i<acl->AceCount;++i) {
-            void* entry=nullptr;
-            if (!::GetAce(acl,i,&entry)) return false;
-            auto header=static_cast<ACE_HEADER*>(entry);
-            if (header->AceType==ACCESS_DENIED_ACE_TYPE) continue;
-            if (header->AceType!=ACCESS_ALLOWED_ACE_TYPE || !::EqualSid(&static_cast<ACCESS_ALLOWED_ACE*>(entry)->SidStart,sid)) return false;
+        auto owner_only(HANDLE file) -> bool {
+            PSID owner = nullptr;
+            PACL acl = nullptr;
+            PSECURITY_DESCRIPTOR descriptor = nullptr;
+            auto status =
+                ::GetSecurityInfo(file, SE_FILE_OBJECT, OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION, &owner, nullptr, &acl, nullptr, &descriptor);
+            struct free_descriptor {
+                PSECURITY_DESCRIPTOR value;
+                ~free_descriptor() {
+                    if (value)
+                        ::LocalFree(value);
+                }
+            } free{descriptor};
+            if (status != ERROR_SUCCESS || !owner || !acl || !::IsValidAcl(acl))
+                return false;
+            HANDLE value = nullptr;
+            if (!::OpenProcessToken(::GetCurrentProcess(), TOKEN_QUERY, &value))
+                return false;
+            winapi::handle token{value};
+            DWORD size = 0;
+            ::GetTokenInformation(token.value, TokenUser, nullptr, 0, &size);
+            std::vector<std::byte> user(size);
+            if (!::GetTokenInformation(token.value, TokenUser, user.data(), size, &size))
+                return false;
+            auto sid = reinterpret_cast<TOKEN_USER*>(user.data())->User.Sid;
+            if (!::EqualSid(owner, sid))
+                return false;
+            for (DWORD i = 0; i < acl->AceCount; ++i) {
+                void* entry = nullptr;
+                if (!::GetAce(acl, i, &entry))
+                    return false;
+                auto header = static_cast<ACE_HEADER*>(entry);
+                if (header->AceType == ACCESS_DENIED_ACE_TYPE)
+                    continue;
+                if (header->AceType != ACCESS_ALLOWED_ACE_TYPE || !::EqualSid(&static_cast<ACCESS_ALLOWED_ACE*>(entry)->SidStart, sid))
+                    return false;
+            }
+            return true;
         }
-        return true;
-    }
-    auto read_checked(std::filesystem::path path, std::uint64_t limit, bool secret) -> util::generator<std::span<const std::byte>> {
-        winapi::handle file{::CreateFileW(winapi::path(path).c_str(), GENERIC_READ|(secret ? READ_CONTROL : 0), FILE_SHARE_READ, nullptr, OPEN_EXISTING,
-                                          FILE_FLAG_OPEN_REPARSE_POINT, nullptr)};
-        if (file.value == INVALID_HANDLE_VALUE)
-            throw unreadable{path.string()};
-        if (secret && !owner_only(file.value)) throw unreadable{path.string()};
-        BY_HANDLE_FILE_INFORMATION info{};
-        if (!::GetFileInformationByHandle(file.value, &info) || ::GetFileType(file.value) != FILE_TYPE_DISK ||
-            (info.dwFileAttributes & (FILE_ATTRIBUTE_REPARSE_POINT | FILE_ATTRIBUTE_DIRECTORY)))
-            throw unreadable{path.string()};
-        auto size = (std::uint64_t{info.nFileSizeHigh} << 32) | info.nFileSizeLow;
-        if (size > limit)
-            throw unreadable{path.string()};
-        std::array<std::byte, 1 << 16> buffer;
-        std::uint64_t total = 0;
-        for (;;) {
-            DWORD n = 0;
-            if (!::ReadFile(file.value, buffer.data(), static_cast<DWORD>(buffer.size()), &n, nullptr))
+        auto read_checked(std::filesystem::path path, std::uint64_t limit, bool secret) -> util::generator<std::span<const std::byte>> {
+            winapi::handle file{::CreateFileW(winapi::path(path).c_str(), GENERIC_READ | (secret ? READ_CONTROL : 0), FILE_SHARE_READ, nullptr, OPEN_EXISTING,
+                                              FILE_FLAG_OPEN_REPARSE_POINT, nullptr)};
+            if (file.value == INVALID_HANDLE_VALUE)
                 throw unreadable{path.string()};
-            if (n == 0)
-                break;
-            total += n;
-            if (total > size)
+            if (secret && !owner_only(file.value))
                 throw unreadable{path.string()};
-            co_yield std::span<const std::byte>{buffer.data(), n};
+            BY_HANDLE_FILE_INFORMATION info{};
+            if (!::GetFileInformationByHandle(file.value, &info) || ::GetFileType(file.value) != FILE_TYPE_DISK ||
+                (info.dwFileAttributes & (FILE_ATTRIBUTE_REPARSE_POINT | FILE_ATTRIBUTE_DIRECTORY)))
+                throw unreadable{path.string()};
+            auto size = (std::uint64_t{info.nFileSizeHigh} << 32) | info.nFileSizeLow;
+            if (size > limit)
+                throw unreadable{path.string()};
+            std::array<std::byte, 1 << 16> buffer;
+            std::uint64_t total = 0;
+            for (;;) {
+                DWORD n = 0;
+                if (!::ReadFile(file.value, buffer.data(), static_cast<DWORD>(buffer.size()), &n, nullptr))
+                    throw unreadable{path.string()};
+                if (n == 0)
+                    break;
+                total += n;
+                if (total > size)
+                    throw unreadable{path.string()};
+                co_yield std::span<const std::byte>{buffer.data(), n};
+            }
+            if (total != size)
+                throw unreadable{path.string()};
         }
-        if (total != size)
-            throw unreadable{path.string()};
+    } // namespace
+    auto read_plain(const std::filesystem::path& path, std::uint64_t limit) -> util::generator<std::span<const std::byte>> {
+        return read_checked(path, limit, false);
     }
-    }
-    auto read_plain(const std::filesystem::path& path,std::uint64_t limit) -> util::generator<std::span<const std::byte>> {
-        return read_checked(path,limit,false);
-    }
-    auto read_private(const std::filesystem::path& path,std::uint64_t limit) -> util::generator<std::span<const std::byte>> {
-        return read_checked(path,limit,true);
+    auto read_private(const std::filesystem::path& path, std::uint64_t limit) -> util::generator<std::span<const std::byte>> {
+        return read_checked(path, limit, true);
     }
     void durable_append(const std::filesystem::path& path, std::string_view record) {
         bool fresh = !std::filesystem::exists(path);

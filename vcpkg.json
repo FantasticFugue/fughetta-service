@@ -8,7 +8,12 @@
         "nghttp2",
         "nghttp3",
         "libsodium",
-        "reflectcpp",
+        {
+            "name": "reflectcpp",
+            "features": [
+                "xml"
+            ]
+        },
         "sqlite3",
         {
             "name": "stdexec"

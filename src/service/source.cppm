@@ -14,24 +14,11 @@ namespace {
     auto parse(int argc, char** argv) -> config::source {
         argparse::ArgumentParser program("source", "0.1.0");
         program.add_description("Hosted source file service.");
-        program.add_argument("--bind")
-            .default_value(std::string{"127.0.0.1"})
-            .metavar("ADDRESS")
-            .help("address of the internal listener");
-        program.add_argument("--port")
-            .default_value(9091)
-            .scan<'i', int>()
-            .metavar("PORT")
-            .help("port of the internal listener (1-65535)");
-        program.add_argument("--storage")
-            .default_value(std::string{"storage"})
-            .metavar("PATH")
-            .help("durable source state directory");
+        program.add_argument("--bind").default_value(std::string{"127.0.0.1"}).metavar("ADDRESS").help("address of the internal listener");
+        program.add_argument("--port").default_value(9091).scan<'i', int>().metavar("PORT").help("port of the internal listener (1-65535)");
+        program.add_argument("--storage").default_value(std::string{"storage"}).metavar("PATH").help("durable source state directory");
         program.add_argument("--threads").default_value(static_cast<int>(allocation::plan{}.source_disk)).scan<'i', int>().help("assigned disk thread budget");
-        program.add_argument("--tool")
-            .append()
-            .metavar("NAME=PATH")
-            .help("analysis preparation executable");
+        program.add_argument("--tool").append().metavar("NAME=PATH").help("analysis preparation executable");
         program.parse_args(argc, argv);
 
         auto port = program.get<int>("--port");
@@ -42,7 +29,8 @@ namespace {
             throw std::invalid_argument("source requires at least two disk threads");
         config::source cfg{.bind = program.get<std::string>("--bind"),
                            .port = static_cast<std::uint16_t>(port),
-                           .storage = program.get<std::string>("--storage"), .disk_threads = static_cast<std::uint32_t>(threads)};
+                           .storage = program.get<std::string>("--storage"),
+                           .disk_threads = static_cast<std::uint32_t>(threads)};
         if (auto tools = program.present<std::vector<std::string>>("--tool"))
             for (const auto& tool : *tools) {
                 auto equal = tool.find('=');
@@ -69,7 +57,8 @@ export int run_source(int argc, char** argv) {
             std::cerr << "service-ready:source\n";
             co_await coroutine::with_scope([&](coroutine::scope& children) -> coroutine::task<> {
                 for (;;)
-                    children.spawn(files.serve(io, co_await execution::then(net::async_accept(listener), [](auto socket, auto) { return std::move(socket); }), core));
+                    children.spawn(
+                        files.serve(io, co_await execution::then(net::async_accept(listener), [](auto socket, auto) { return std::move(socket); }), core));
             });
         });
     } catch (const std::exception& e) {

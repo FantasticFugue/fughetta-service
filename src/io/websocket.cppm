@@ -58,7 +58,8 @@ export namespace web::ws {
                     continue;
                 }
                 if (frame->kind == pong) {
-                    if (state_->ping_nonce_ && std::ranges::equal(frame->payload,*state_->ping_nonce_)) state_->ping_nonce_.reset();
+                    if (state_->ping_nonce_ && std::ranges::equal(frame->payload, *state_->ping_nonce_))
+                        state_->ping_nonce_.reset();
                     continue;
                 }
                 if (frame->kind == close) {
@@ -83,14 +84,14 @@ export namespace web::ws {
             std::array reason{std::byte(status >> 8), std::byte(status & 255)};
             co_await send(http::websocket::opcode::close, reason);
         }
-        auto awaiting_pong() const noexcept -> bool {return state_->ping_nonce_.has_value();}
+        auto awaiting_pong() const noexcept -> bool { return state_->ping_nonce_.has_value(); }
         auto ping() -> coroutine::task<> {
-            std::array<std::byte,8> nonce;
-            auto first=random_mask(),second=random_mask();
-            std::ranges::copy(first,nonce.begin());
-            std::ranges::copy(second,nonce.begin()+4);
-            state_->ping_nonce_=nonce;
-            co_await send(http::websocket::opcode::ping,nonce);
+            std::array<std::byte, 8> nonce;
+            auto first = random_mask(), second = random_mask();
+            std::ranges::copy(first, nonce.begin());
+            std::ranges::copy(second, nonce.begin() + 4);
+            state_->ping_nonce_ = nonce;
+            co_await send(http::websocket::opcode::ping, nonce);
         }
 
     private:
@@ -131,7 +132,7 @@ export namespace web::ws {
             std::vector<std::byte> payload_;
             std::size_t offset_ = 0;
             bool sent_close_ = false, received_close_ = false;
-            std::optional<std::array<std::byte,8>> ping_nonce_;
+            std::optional<std::array<std::byte, 8>> ping_nonce_;
             state(S& socket, http::websocket::side side, http::websocket::limits limits) : socket_(socket), side_(side), decoder_(side, limits) {}
         };
         std::unique_ptr<state> state_;

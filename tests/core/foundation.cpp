@@ -175,8 +175,7 @@ namespace {
 
     auto offload(ctx& io, execution::thread_pool& pool) -> coroutine::task<bool> {
         auto loop = std::this_thread::get_id();
-        auto worker =
-            co_await io::blocking(io, pool, [] { return std::this_thread::get_id(); });
+        auto worker = co_await io::blocking(io, pool, [] { return std::this_thread::get_id(); });
         co_return worker != loop&& std::this_thread::get_id() == loop;
     }
 
@@ -434,8 +433,7 @@ namespace {
         "deadlines join native senders on value error and stopped completion"_test = [] {
             native::context context;
             auto io = context.get_scheduler();
-            auto value = cores::run(context, coroutine::deadline(io, 1s,
-                execution::then(execution::schedule_after(io, 1ms), [] { return 31; })));
+            auto value = cores::run(context, coroutine::deadline(io, 1s, execution::then(execution::schedule_after(io, 1ms), [] { return 31; })));
             expect(value && *value == std::optional<int>{31});
             auto empty = cores::run(context, coroutine::deadline(io, 1s, execution::just()));
             expect(empty && empty->has_value());

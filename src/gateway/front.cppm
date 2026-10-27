@@ -21,10 +21,71 @@ import utility;
 
 export namespace front {
 
+    // Notifications carry invalidations, never credentials or mutable resource bodies.
+    // Publishers may run on the disk pool; each HTTP body belongs to one scheduler.
+    class workspace_events {
+    public:
+        struct subscription {
+            web::event_stream body;
+            bool closed = false;
+            void send(std::string text) {
+                if (closed)
+                    return;
+                if (body.pending_bytes() + text.size() > constants::workspace_event_buffer_bytes) {
+                    closed = true;
+                    body.take();
+                    body.close();
+                } else
+                    body.push(text);
+            }
+        };
+        workspace_events(cores::context<native::scheduler>& rt, std::string workspace)
+            : rt_(rt), workspace_(std::move(workspace)), local_(rt.size()), pending_(rt.size()) {}
+        auto listen(std::size_t core) -> std::shared_ptr<subscription> {
+            auto& listeners = local_[core];
+            std::erase_if(listeners, [](auto& item) { return item.expired(); });
+            if (listeners.size() >= constants::workspace_event_connections_per_core)
+                return {};
+            auto sub = std::make_shared<subscription>();
+            listeners.push_back(sub);
+            sub->send(message(15, "reset"));
+            return sub;
+        }
+        void publish(unsigned changes) {
+            for (std::size_t core = 0; core < local_.size(); ++core) {
+                if (pending_[core].fetch_or(changes) != 0)
+                    continue;
+                rt_.post(core, [this, core] {
+                    auto changes = pending_[core].exchange(0);
+                    auto text = message(changes, "change");
+                    // Copy strong references before resuming readers, which can close streams.
+                    std::vector<std::shared_ptr<subscription>> live;
+                    for (auto& weak : local_[core])
+                        if (auto sub = weak.lock())
+                            live.push_back(std::move(sub));
+                    for (auto& sub : live)
+                        sub->send(text);
+                    std::erase_if(local_[core], [](auto& item) { return item.expired(); });
+                });
+            }
+        }
+
+    private:
+        auto message(unsigned changes, std::string_view event) const -> std::string {
+            return std::format("event: {}\ndata: {{\"workspace_id\":{},\"changes\":{}}}\n\n", event, rfl::json::write(workspace_), changes);
+        }
+        cores::context<native::scheduler>& rt_;
+        std::string workspace_;
+        std::vector<std::vector<std::weak_ptr<subscription>>> local_;
+        std::vector<std::atomic<unsigned>> pending_;
+    };
+
     class config_hub : public config::slots {
     public:
         config_hub(cores::context<native::scheduler>& rt, config::store store, execution::thread_pool& pool)
-            : config::slots(rt.size(), store.current()), rt_(rt), store_(std::move(store)), pool_(pool) {}
+            : config::slots(rt.size(), store.current()), rt_(rt), store_(std::move(store)), pool_(pool), events_(rt, store_.current()->server.auth.workspace) {}
+
+        auto events() -> workspace_events& { return events_; }
 
         auto disk_pool() -> execution::thread_pool& { return pool_; }
 
@@ -43,6 +104,7 @@ export namespace front {
         config::store store_;
         execution::thread_pool& pool_;
         coroutine::mutex lock_;
+        workspace_events events_;
     };
 
     // Clients choose JSON-RPC IDs and repeat them, so a cancellation names a request of the same caller and endpoint.
@@ -109,16 +171,15 @@ export namespace front {
         // This core's tool services, which REST routes share with MCP.
         tools::services* services = nullptr;
         allocation::control* runtime = nullptr;
-        enrollment::store* identities=nullptr;
-        bool remote_listener=false;
+        enrollment::store* identities = nullptr;
+        bool remote_listener = false;
     };
 
     struct coded_error : std::runtime_error {
         http::status status;
         std::string code;
         std::vector<std::string> missing, conflicts, frontier;
-        coded_error(http::status status, std::string_view code, std::string message)
-            : std::runtime_error(std::move(message)), status(status), code(code) {}
+        coded_error(http::status status, std::string_view code, std::string message) : std::runtime_error(std::move(message)), status(status), code(code) {}
     };
 
     namespace api {
@@ -156,7 +217,8 @@ export namespace front {
 
     inline auto coded_reply(const coded_error& e) -> web::reply {
         return web::json_reply(e.status, std::format(R"({{"code":{},"message":{},"missing":{},"conflicts":{},"frontier":{}}})", rfl::json::write(e.code),
-                                                     rfl::json::write(std::string{e.what()}), rfl::json::write(e.missing), rfl::json::write(e.conflicts), rfl::json::write(e.frontier)));
+                                                     rfl::json::write(std::string{e.what()}), rfl::json::write(e.missing), rfl::json::write(e.conflicts),
+                                                     rfl::json::write(e.frontier)));
     }
 
     // Answers one REST request; the configuration MCP answers through it too.
@@ -178,8 +240,9 @@ export namespace front {
         using socket = native::socket;
         using toolset = tools::standard::bound;
 
-        server(context ctx, tools::services& services) : ctx_(ctx), mcp_{std::string{constants::mcp_server_name}, "0.1.0", toolset{services}},
-            settings_{"Fughetta configuration", "0.1.0", settings::bound{dispatch{ctx}}} {}
+        server(context ctx, tools::services& services)
+            : ctx_(ctx), mcp_{std::string{constants::mcp_server_name}, "0.1.0", toolset{services}},
+              settings_{"Fughetta configuration", "0.1.0", settings::bound{dispatch{ctx}}} {}
 
         auto serve(socket peer) -> coroutine::task<> {
             web::stream<socket> transport{peer};
@@ -195,7 +258,7 @@ export namespace front {
                     std::string body;
                     bool too_large = false;
                     try {
-                        body = co_await web::read_all(in.body,t.path=="/api/v1/worker-enrollments/redeem" ? 2048 : doc->server.max_request_bytes);
+                        body = co_await web::read_all(in.body, doc->server.max_request_bytes);
                     } catch (const std::length_error&) {
                         too_large = true;
                     }
@@ -216,16 +279,14 @@ export namespace front {
                     auto c = ctx_;
                     std::optional<worlds::actor> who;
                     std::optional<web::reply> refused;
-                    if (t.path=="/api/v1/worker-enrollments/redeem" &&
-                        (origin || doc->server.auth.workspace.empty() || web::header(in.head,"x-fughetta-workspace")!=std::optional<std::string_view>{doc->server.auth.workspace})) {
-                        refused=error(403,"Worker enrollment workspace was refused");
-                    } else if (!(method == "OPTIONS" && origin) && t.path != "/healthz" && t.path!="/api/v1/worker-enrollments/redeem") {
+                    if (!(method == "OPTIONS" && origin) && t.path != "/healthz") {
                         refused = authenticate(doc->server.auth, in.head, who);
                         if (who)
                             c.who = &*who;
                     }
                     std::optional<allocation::control::lease> admitted;
-                    bool control_read = method == "OPTIONS" || (method == "GET" && (t.path == "/healthz" || t.path == "/api/v1/config/runtime" || t.path == "/api/v1/builds"));
+                    bool control_read = method == "OPTIONS" || (method == "GET" && (t.path == "/healthz" || t.path == "/api/v1/config/runtime" ||
+                                                                                    t.path == "/api/v1/builds" || t.path == "/api/v1/events"));
                     // Status polling must not prevent a drained instance from rebuilding its processes.
                     if (!refused && c.runtime && !control_read) {
                         if (auto held = c.runtime->enter(t.path == "/api/v1/config/runtime"))
@@ -234,7 +295,8 @@ export namespace front {
                             auto kind = draining_rpc(t.path, body);
                             control_read = kind == drain_access::inspect;
                             if (kind == drain_access::cancel)
-                                if (auto held = c.runtime->enter(true)) admitted.emplace(std::move(*held));
+                                if (auto held = c.runtime->enter(true))
+                                    admitted.emplace(std::move(*held));
                         }
                         if (!admitted && !control_read)
                             refused = error(503, "runtime budget is being applied; retry after the service is ready");
@@ -244,8 +306,38 @@ export namespace front {
                     } else if (method == "OPTIONS" && origin) {
                         r = {.head = {.status = 204,
                                       .fields = {{"access-control-allow-methods", "GET, PUT, POST, DELETE, OPTIONS"},
-                                                 {"access-control-allow-headers", "authorization, content-type, accept, mcp-protocol-version"},
+                                                 {"access-control-allow-headers", "authorization, content-type, accept, mcp-protocol-version, last-event-id"},
                                                  {"access-control-max-age", "600"}}}};
+                    } else if (t.path == "/api/v1/events" && method == "GET") {
+                        auto sub = ctx_.config.events().listen(ctx_.core);
+                        if (!sub)
+                            r = error(503, "Workspace event connection limit reached");
+                        else {
+                            http::response head{.status = 200,
+                                                .fields = {{"content-type", "text/event-stream"},
+                                                           {"cache-control", "no-store, no-transform"},
+                                                           {"x-accel-buffering", "no"},
+                                                           {"transfer-encoding", "chunked"},
+                                                           {"connection", "close"}}};
+                            if (origin) {
+                                head.fields.push_back({"access-control-allow-origin", std::string{*origin}});
+                                head.fields.push_back({"vary", "origin"});
+                            }
+                            co_await coroutine::with_scope([&](coroutine::scope& children) -> coroutine::task<> {
+                                auto send = [&]() -> coroutine::task<> {
+                                    struct stop {
+                                        coroutine::scope& children;
+                                        ~stop() { children.request_stop(); }
+                                    } done{children};
+                                    co_await coroutine::deadline(ctx_.rt.get_scheduler(ctx_.core), constants::workspace_event_lifetime,
+                                                                 http::coroutine::respond(conn, std::move(in.token), std::move(head), sub->body));
+                                };
+                                children.spawn(send());
+                                children.spawn(heartbeat(*sub, in.head, *who, children));
+                                co_await children.join();
+                            });
+                            break;
+                        }
                     } else if (t.path == "/mcp" || t.path == "/mcp/config") {
                         if (method != "POST") {
                             r = error(405, "MCP takes POST; this server offers no GET stream");
@@ -270,39 +362,64 @@ export namespace front {
         }
 
     private:
+        auto heartbeat(workspace_events::subscription& sub, const http::request& head, const worlds::actor& initial, coroutine::scope& children)
+            -> coroutine::task<> {
+            for (;;) {
+                co_await execution::schedule_after(ctx_.rt.get_scheduler(ctx_.core), constants::workspace_event_heartbeat);
+                std::optional<worlds::actor> who;
+                if (sub.closed || authenticate(ctx_.config.current(ctx_.core)->server.auth, head, who) || !who ||
+                    worlds::identity_key(*who) != worlds::identity_key(initial) || who->role != initial.role) {
+                    sub.closed = true;
+                    sub.body.take();
+                    sub.body.close();
+                    children.request_stop();
+                    co_return;
+                }
+                sub.send(": heartbeat\n\n");
+            }
+        }
+
         enum class drain_access { work, inspect, cancel };
         static auto draining_rpc(std::string_view path, std::string_view body) -> drain_access {
             auto rpc = rfl::json::read<mcp::request>(std::string{body});
-            if (!rpc) return drain_access::work;
-            if (mcp::cancelled_request(*rpc)) return drain_access::cancel;
-            if (path != "/mcp" || rpc->method != "tools/call" || !rpc->params) return drain_access::work;
+            if (!rpc)
+                return drain_access::work;
+            if (mcp::cancelled_request(*rpc))
+                return drain_access::cancel;
+            if (path != "/mcp" || rpc->method != "tools/call" || !rpc->params)
+                return drain_access::work;
             auto params = rpc->params->to_object();
-            if (!params) return drain_access::work;
+            if (!params)
+                return drain_access::work;
             auto name = params->get("name");
-            if (!name) return drain_access::work;
+            if (!name)
+                return drain_access::work;
             auto text = name->to_string();
-            if (!text || *text != "jobs") return drain_access::work;
+            if (!text || *text != "jobs")
+                return drain_access::work;
             if (auto arguments = params->get("arguments"))
                 if (auto object = arguments->to_object())
                     if (auto action = object->get("action")) {
                         auto value = action->to_string();
-                        if (value && *value == "cancel") return drain_access::cancel;
+                        if (value && *value == "cancel")
+                            return drain_access::cancel;
                     }
             return drain_access::inspect;
         }
 
         static auto error(http::status status, std::string why) -> web::reply {
-            std::string_view code = status == http::status{401} ? std::string_view{"unauthenticated"}
-                                 : status == http::status{403} ? nodes::code::permission_denied
-                                 : status == http::status{404} ? std::string_view{"not_found"}
-                                 : status == http::status{405} ? std::string_view{"method_not_allowed"}
-                                 : status == http::status{413} ? std::string_view{"too_large"}
-                                 : status == http::status{503} ? std::string_view{"unavailable"}
-                                                              : std::string_view{"invalid_request"};
+            std::string_view code = status == http::status{401}   ? std::string_view{"unauthenticated"}
+                                    : status == http::status{403} ? nodes::code::permission_denied
+                                    : status == http::status{404} ? std::string_view{"not_found"}
+                                    : status == http::status{405} ? std::string_view{"method_not_allowed"}
+                                    : status == http::status{413} ? std::string_view{"too_large"}
+                                    : status == http::status{503} ? std::string_view{"unavailable"}
+                                                                  : std::string_view{"invalid_request"};
             return coded_reply(coded_error{status, code, std::move(why)});
         }
 
-        template <class Head> static auto authenticate(const config::auth& auth, const Head& head, std::optional<worlds::actor>& who) -> std::optional<web::reply> {
+        template <class Head>
+        static auto authenticate(const config::auth& auth, const Head& head, std::optional<worlds::actor>& who) -> std::optional<web::reply> {
             try {
                 who = keyring::authenticate(auth, [&head](std::string_view name) { return web::header(head, name); });
             } catch (const keyring::unauthorized& e) {
@@ -394,9 +511,13 @@ export namespace front {
                 entry.requests->enter(entry.core, entry.id, &source);
             std::optional<std::optional<mcp::response>> r;
             std::exception_ptr failure;
-            try { r = co_await coroutine::under(source.get_token(), handle(rpc, out, who, configuration)); }
-            catch (...) { failure = std::current_exception(); }
-            if (failure) std::rethrow_exception(failure);
+            try {
+                r = co_await coroutine::under(source.get_token(), handle(rpc, out, who, configuration));
+            } catch (...) {
+                failure = std::current_exception();
+            }
+            if (failure)
+                std::rethrow_exception(failure);
             if (!r) {
                 if (parent.stop_requested())
                     co_await coroutine::stop;

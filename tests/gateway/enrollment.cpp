@@ -15,17 +15,14 @@ namespace {
         return 0;
     }
     constexpr auto cases = [] {
-        "single-use enrollment persists hashed credentials and stable identities"_test = [] {
+        "registration persists hashed credentials and stable identities"_test = [] {
             test::scratch scratch{"worker-enrollment"};
             enrollment::credential first, second;
             {
                 enrollment::store store{scratch.dir, "workspace-a"};
-                auto code = store.create("owner", 100);
-                expect(code.expires_at == 400_i);
-                first = store.redeem(code.code, "same name", 101);
-                expect(status([&] { store.redeem(code.code, "again", 102); }) == 409_i);
-                auto another = store.create("owner", 102);
-                second = store.redeem(another.code, "same name", 103);
+                first = store.add("same name", "owner", 101);
+                second = store.add("same name", "owner", 103);
+                expect(status([&] { store.add("", "owner", 104); }) == 400_i);
                 expect(first.worker_id != second.worker_id);
                 expect(status([&] { store.authenticate("workspace-b", first.worker_id, first.secret); }) == 401_i);
                 expect(status([&] { store.authenticate("workspace-a", first.worker_id, "bad"); }) == 401_i);
@@ -37,7 +34,6 @@ namespace {
                 auto disk = test::slurp(scratch.dir / "worker-registry" / "registry.json");
                 expect(disk.find(first.secret) == std::string::npos);
                 expect(disk.find(second.secret) == std::string::npos);
-                expect(disk.find(code.code) == std::string::npos);
                 store.revoke(first.worker_id, 120);
                 expect(!store.active(first.worker_id));
                 expect(store.active(second.worker_id));
@@ -55,26 +51,14 @@ namespace {
             }
             expect(throws<std::runtime_error>([&] { enrollment::store wrong{recovery.dir, "workspace-b"}; }));
         };
-        "expiry and competing redemptions cannot create multiple identities"_test = [] {
+        "concurrent registrations create distinct identities"_test = [] {
             test::scratch scratch{"worker-enrollment-race"};
             enrollment::store store{scratch.dir, "workspace-a"};
-            auto expired = store.create("owner", 100);
-            expect(status([&] { store.redeem(expired.code, "machine", 400); }) == 410_i);
-            auto code = store.create("owner", 500);
-            std::atomic<unsigned> accepted = 0, used = 0;
             std::vector<std::jthread> attempts;
             for (int i = 0; i < 8; ++i)
-                attempts.emplace_back([&] {
-                    auto result = status([&] { store.redeem(code.code, "machine", 501); });
-                    if (!result)
-                        ++accepted;
-                    if (result == 409)
-                        ++used;
-                });
+                attempts.emplace_back([&] { store.add("machine", "owner", 501); });
             attempts.clear();
-            expect(accepted.load() == 1_u);
-            expect(used.load() == 7_u);
-            expect(store.list().size() == 1_u);
+            expect(store.list().size() == 8_u);
         };
         "credential files reject exposed permissions and symbolic links"_test = [] {
             test::scratch scratch{"worker-private-file"};

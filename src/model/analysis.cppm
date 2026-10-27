@@ -64,8 +64,8 @@ namespace language {
         return value;
     }
     void validate(const configuration& c) {
-        if (!c.build.builders.empty() || !c.build.tasks.empty() || !c.build.operations.empty() || !c.build.outputs.empty() ||
-            !c.inputs.empty() || c.operation != "prepare")
+        if (!c.build.builders.empty() || !c.build.tasks.empty() || !c.build.operations.empty() || !c.build.outputs.empty() || !c.inputs.empty() ||
+            c.operation != "prepare")
             prepare(c);
         else
             c.server.visit([](const auto& w) { std::remove_cvref_t<decltype(w)>::implementation::validate(w.options); });

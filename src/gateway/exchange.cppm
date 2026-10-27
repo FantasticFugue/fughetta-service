@@ -36,7 +36,8 @@ namespace source {
             if constexpr (std::same_as<Req, jobs::node_capture>)
                 node_write = true;
             auto unknown = [](std::string_view why) {
-                return transport::remote_error(std::format("the outcome of this change is unknown; ask for its receipt: {}", why), nodes::code::outcome_unknown);
+                return transport::remote_error(std::format("the outcome of this change is unknown; ask for its receipt: {}", why),
+                                               nodes::code::outcome_unknown);
             };
             try {
                 auto result = cores::run(resource, exchange(io, endpoint, std::move(request), issued), stop);

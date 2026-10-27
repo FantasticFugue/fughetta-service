@@ -19,7 +19,8 @@ namespace test {
                     ready.set_value(net::ip::tcp::endpoint{net::ip::address_v4{{127, 0, 0, 1}}, listener.local_endpoint().port()});
                     co_await coroutine::with_scope([&](coroutine::scope& tasks) -> coroutine::task<> {
                         for (;;)
-                            tasks.spawn(service.serve(io, co_await execution::then(net::async_accept(listener), [](auto socket, auto) { return std::move(socket); }), 0));
+                            tasks.spawn(service.serve(
+                                io, co_await execution::then(net::async_accept(listener), [](auto socket, auto) { return std::move(socket); }), 0));
                     });
                 });
             });
@@ -31,8 +32,7 @@ namespace test {
         }
     };
 
-    source_service::source_service(std::filesystem::path root, builds::toolset tools)
-        : state_(std::make_unique<state>(std::move(root), std::move(tools))) {}
+    source_service::source_service(std::filesystem::path root, builds::toolset tools) : state_(std::make_unique<state>(std::move(root), std::move(tools))) {}
     source_service::~source_service() = default;
     auto source_service::endpoint() const -> net::ip::tcp::endpoint { return state_->endpoint; }
 } // namespace test

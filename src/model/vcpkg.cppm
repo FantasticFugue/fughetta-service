@@ -109,19 +109,13 @@ namespace builds {
         }
         // The field that composes the option, empty when none does: extra states no setting twice.
         static auto field(std::string_view option) -> std::string_view {
-            for (auto [composed_by, option_name] : {std::pair{"manifest-root", "--x-manifest-root"},
-                                             std::pair{"install-root", "--x-install-root"},
-                                             std::pair{"triplet", "--triplet"},
-                                             std::pair{"host-triplet", "--host-triplet"},
-                                             std::pair{"overlay-ports", "--overlay-ports"},
-                                             std::pair{"overlay-triplets", "--overlay-triplets"},
-                                             std::pair{"buildtrees-root", "--x-buildtrees-root"},
-                                             std::pair{"packages-root", "--x-packages-root"},
-                                             std::pair{"downloads-root", "--downloads-root"},
-                                             std::pair{"vcpkg-root", "--vcpkg-root"},
-                                             std::pair{"feature", "--x-feature"},
-                                             std::pair{"no-default-features", "--x-no-default-features"},
-                                             std::pair{"no-downloads", "--no-downloads"}})
+            for (auto [composed_by, option_name] :
+                 {std::pair{"manifest-root", "--x-manifest-root"}, std::pair{"install-root", "--x-install-root"}, std::pair{"triplet", "--triplet"},
+                  std::pair{"host-triplet", "--host-triplet"}, std::pair{"overlay-ports", "--overlay-ports"},
+                  std::pair{"overlay-triplets", "--overlay-triplets"}, std::pair{"buildtrees-root", "--x-buildtrees-root"},
+                  std::pair{"packages-root", "--x-packages-root"}, std::pair{"downloads-root", "--downloads-root"}, std::pair{"vcpkg-root", "--vcpkg-root"},
+                  std::pair{"feature", "--x-feature"}, std::pair{"no-default-features", "--x-no-default-features"},
+                  std::pair{"no-downloads", "--no-downloads"}})
                 if (option == option_name || option.starts_with(std::string{option_name}))
                     return composed_by;
             return {};

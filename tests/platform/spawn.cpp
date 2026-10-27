@@ -38,7 +38,8 @@ namespace {
 
         "an interactive child reads its input and keeps stdout for replies"_test = [] {
             native::context context;
-            io::command command{.argv = {"sh", "-c", "read line; echo \"got $line\"; echo noise >&2; cat"}, .cwd = std::filesystem::current_path(), .interactive = true};
+            io::command command{
+                .argv = {"sh", "-c", "read line; echo \"got $line\"; echo noise >&2; cat"}, .cwd = std::filesystem::current_path(), .interactive = true};
             auto child = io::spawn_process(context.get_scheduler(), command);
             auto talk = [](native::process& child) -> coroutine::task<> {
                 std::string message = "hello\nrest\n";
@@ -50,6 +51,21 @@ namespace {
             auto result = cores::run(context, execution::when_all(talk(child), output(child), io::async_wait(child)));
             expect(std::get<0>(*result) == "got hello\nrest\n") << std::get<0>(*result);
             expect(std::get<1>(*result) == 0);
+        };
+
+        "a report on standard output goes to its file and the step output keeps standard error"_test = [] {
+            native::context context;
+            auto file = std::filesystem::temp_directory_path() / std::format("spawn-report-{}.json", ::getpid());
+            {
+                std::ofstream old{file};
+                old << "a longer report from an earlier step";
+            }
+            auto [text, code] = run(context, {"sh", "-c", "echo '[]'; echo progress >&2"}, {.standard_output = file});
+            std::ifstream in{file};
+            std::string report{std::istreambuf_iterator<char>{in}, {}};
+            std::filesystem::remove(file);
+            expect(code == 0 && text == "progress\n") << text;
+            expect(report == "[]\n") << report;
         };
 
         "missing executable exits with 127"_test = [] {
@@ -133,7 +149,7 @@ namespace {
             auto child = io::spawn_process(scheduler, {.argv = {"sh", "-c", "echo started; sleep 30"}, .cwd = std::filesystem::current_path()});
             auto start = std::chrono::steady_clock::now();
             auto result = cores::run(context, execution::when_all(output(child), io::async_wait(child),
-                execution::then(execution::schedule_after(scheduler, 100ms), [&] { child.kill(); })));
+                                                                  execution::then(execution::schedule_after(scheduler, 100ms), [&] { child.kill(); })));
             expect(result.has_value() >> fatal);
             expect(std::get<0>(*result) == "started\n" && std::get<1>(*result) == 137);
             expect(std::chrono::steady_clock::now() - start < 5s);
@@ -144,8 +160,9 @@ namespace {
             auto scheduler = context.get_scheduler();
             auto child = io::spawn_process(scheduler, {.argv = {"sleep", "30"}, .cwd = std::filesystem::current_path()});
             execution::inplace_stop_source stop;
-            auto result = cores::run(context, execution::when_all(io::async_wait(child),
-                execution::then(execution::schedule_after(scheduler, 20ms), [&] { stop.request_stop(); })), stop.get_token());
+            auto result = cores::run(
+                context, execution::when_all(io::async_wait(child), execution::then(execution::schedule_after(scheduler, 20ms), [&] { stop.request_stop(); })),
+                stop.get_token());
             expect(!result);
             expect(throws<std::system_error>([&] { cores::run(context, io::async_wait(child)); }));
         };
@@ -163,7 +180,7 @@ namespace {
             expect(::waitpid(pid, &status, WNOHANG) == -1);
         };
     };
-}
+} // namespace
 
 auto main(int argc, const char** argv) -> int {
     boost::ut::suite<"spawn">{spawn_suite};

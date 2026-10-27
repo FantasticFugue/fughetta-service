@@ -41,14 +41,14 @@ namespace {
         routing::router router{rt};
         execution::thread_pool pool{2};
         front::config_hub hub{rt,
-                                   config::store{config::parse(std::format(R"({{
+                              config::store{config::parse(std::format(R"({{
       "server": {{ "allowed_origins": ["http://ok.example"], "max_request_bytes": 1048576, "storage": "{}",
                    "auth": {{ "tokens": [{{ "name": "tester", "hash": "{}" }}, {{ "name": "owner", "hash": "{}" }}, {{ "name": "member", "hash": "{}", "role": "member" }}] }} }}
     }})",
-                                                                           (tmp.dir / "storage").generic_string(), keyring::hash("sk_test"), keyring::hash("sk_owner"),
-                                                                           keyring::hash("sk_member"))),
-                                                 tmp.dir / "gateway.json"},
-                                   pool};
+                                                                      (tmp.dir / "storage").generic_string(), keyring::hash("sk_test"),
+                                                                      keyring::hash("sk_owner"), keyring::hash("sk_member"))),
+                                            tmp.dir / "gateway.json"},
+                              pool};
         test::source_service source{tmp.dir / "source"};
         storage::registry files{rt, tmp.dir / "storage", hub, pool, source.endpoint()};
         tools::services services{hub.slot(0), router, files, 0};
@@ -57,10 +57,12 @@ namespace {
         harness() { services.queue = &queue; }
         std::uint16_t port = 0;
 
-        auto ask(ctx& io, http::method method, std::string target, std::string body = {}, std::vector<http::header> fields = {}, bool authenticated = true) -> coroutine::task<answer> {
+        auto ask(ctx& io, http::method method, std::string target, std::string body = {}, std::vector<http::header> fields = {}, bool authenticated = true)
+            -> coroutine::task<answer> {
             auto s = co_await io::connect(io, {net::ip::address_v4{{127, 0, 0, 1}}, port});
             web::stream<socket> transport{s};
-            if (authenticated) fields.push_back({"authorization", "Bearer sk_test"});
+            if (authenticated)
+                fields.push_back({"authorization", "Bearer sk_test"});
             http::request req{.method = method, .target = std::move(target), .scheme = "http", .authority = "localhost", .fields = std::move(fields)};
             http::v1::client client{transport};
             auto got = co_await http::coroutine::fetch(client, std::move(req), std::string_view{body});
@@ -87,7 +89,6 @@ namespace {
         }
     };
 
-
     auto result(const answer& response) -> mcp::tool_result {
         auto rpc = rfl::json::read<mcp::response>(response.body).value();
         return rfl::from_generic<mcp::tool_result>(rpc.result.value()).value();
@@ -95,10 +96,12 @@ namespace {
     auto arguments(std::string_view project, rfl::Generic body) -> rfl::Generic {
         return mcp::object({{"project", std::string{project}}, {"body", std::move(body)}});
     }
-    auto invoke(harness& h, ctx& io, std::string name, rfl::Generic args = rfl::Generic::Object{}, std::string token = "sk_test", std::string path = "/mcp/config")
-        -> coroutine::task<answer> {
-        auto rpc = rfl::json::write(mcp::request{.jsonrpc = "2.0", .method = "tools/call", .id = 1,
-            .params = rfl::to_generic(mcp::call_params{.name = std::move(name), .arguments = std::move(args)})});
+    auto invoke(harness& h, ctx& io, std::string name, rfl::Generic args = rfl::Generic::Object{}, std::string token = "sk_test",
+                std::string path = "/mcp/config") -> coroutine::task<answer> {
+        auto rpc = rfl::json::write(mcp::request{.jsonrpc = "2.0",
+                                                 .method = "tools/call",
+                                                 .id = 1,
+                                                 .params = rfl::to_generic(mcp::call_params{.name = std::move(name), .arguments = std::move(args)})});
         co_return co_await h.ask(io, http::method::POST, std::move(path), std::move(rpc), {{"authorization", "Bearer " + token}}, false);
     }
     auto rest(harness& h, ctx& io, http::method method, std::string path, std::string body = "", std::string token = "sk_test") -> coroutine::task<answer> {
@@ -115,7 +118,9 @@ namespace {
         auto configuration = co_await h.ask(io, http::method::POST, "/mcp/config", list);
         auto extract = [](const answer& a) {
             auto rpc = rfl::json::read<mcp::response>(a.body).value();
-            struct listing { std::vector<mcp::tool> tools; };
+            struct listing {
+                std::vector<mcp::tool> tools;
+            };
             return rfl::from_generic<listing>(rpc.result.value()).value().tools;
         };
         auto business_tools = extract(business);
@@ -125,7 +130,7 @@ namespace {
             expect(!std::ranges::contains(business_tools, tool.name, &mcp::tool::name)) << tool.name;
             if (tool.name == "save_project") {
                 auto schema = rfl::json::write(tool.inputSchema);
-                expect(schema.contains("default_configurations") && schema.contains("language server caches") && schema.contains("Revision returned"));
+                expect(schema.contains("default_configurations") && schema.contains("Revision returned") && schema.size() < 2000) << schema.size();
             }
         }
         expect(std::ranges::contains(business_tools, std::string{"configurations"}, &mcp::tool::name));
@@ -141,7 +146,8 @@ namespace {
         co_await compare("configuration", rfl::Generic::Object{}, "/api/v1/config", "sk_member");
         co_await compare("server", rfl::Generic::Object{}, "/api/v1/config/server");
         co_await compare("limits", rfl::Generic::Object{}, "/api/v1/config/limits");
-        co_await compare("adapters", rfl::Generic::Object{}, "/api/v1/build-adapters");
+        co_await compare("schema", rfl::Generic::Object{}, "/api/v1/settings-schema");
+        expect((co_await rest(h, io, GET, "/api/v1/settings-schema", "", "sk_member")).body.contains("language server caches"));
 
         auto server = h.hub.current(0)->server;
         server.max_request_bytes = 2u << 20;
@@ -185,12 +191,17 @@ namespace {
         auto analysis = mcp::object({{"project", "app"}, {"name", "Cpp"}});
         planned = result(co_await invoke(h, io, "analysis", analysis));
         rest_plan = co_await rest(h, io, http::method::POST, project + "/analysis/Cpp/plan", "{}");
-        expect(planned.isError && rest_plan.status == 400 && planned.content.front().text == rest_plan.body) << "the configuration names no language service: " << rest_plan.body;
+        expect(planned.isError && rest_plan.status == 400 && planned.content.front().text == rest_plan.body)
+            << "the configuration names no language service: " << rest_plan.body;
 
-        struct rejection { std::string tool, path, token; http::method method; rfl::Generic args, payload; };
-        for (const auto& check : std::vector<rejection>{
-            {"save_server", "/api/v1/config/server", "sk_member", PUT, mcp::object({{"body", body(1, server)}}), body(1, server)},
-            {"save_limits", "/api/v1/config/limits", "sk_member", PUT, mcp::object({{"body", body(0, limits)}}), body(0, limits)}}) {
+        struct rejection {
+            std::string tool, path, token;
+            http::method method;
+            rfl::Generic args, payload;
+        };
+        for (const auto& check :
+             std::vector<rejection>{{"save_server", "/api/v1/config/server", "sk_member", PUT, mcp::object({{"body", body(1, server)}}), body(1, server)},
+                                    {"save_limits", "/api/v1/config/limits", "sk_member", PUT, mcp::object({{"body", body(0, limits)}}), body(0, limits)}}) {
             auto rejected = co_await invoke(h, io, check.tool, check.args, check.token);
             auto denied = co_await rest(h, io, check.method, check.path, rfl::json::write(check.payload), check.token);
             auto rpc = rfl::json::read<mcp::response>(rejected.body).value();
@@ -209,9 +220,12 @@ namespace {
         auto invalid_project = settings;
         invalid_project.ignore = {""};
         for (const auto& check : std::vector<rejection>{
-            {"save_server", "/api/v1/config/server", "sk_test", PUT, mcp::object({{"body", body(h.hub.current(0)->revisions.server, invalid_server)}}), body(h.hub.current(0)->revisions.server, invalid_server)},
-            {"save_project", project, "sk_member", PUT, arguments("app", body(decoded.revision, invalid_project)), body(decoded.revision, invalid_project)},
-            {"save_limits", "/api/v1/config/limits", "sk_owner", PUT, mcp::object({{"body", mcp::object({{"value", rfl::to_generic(limits)}})}}), mcp::object({{"value", rfl::to_generic(limits)}})}}) {
+                 {"save_server", "/api/v1/config/server", "sk_test", PUT, mcp::object({{"body", body(h.hub.current(0)->revisions.server, invalid_server)}}),
+                  body(h.hub.current(0)->revisions.server, invalid_server)},
+                 {"save_project", project, "sk_member", PUT, arguments("app", body(decoded.revision, invalid_project)),
+                  body(decoded.revision, invalid_project)},
+                 {"save_limits", "/api/v1/config/limits", "sk_owner", PUT, mcp::object({{"body", mcp::object({{"value", rfl::to_generic(limits)}})}}),
+                  mcp::object({{"value", rfl::to_generic(limits)}})}}) {
             auto outcome = result(co_await invoke(h, io, check.tool, check.args, check.token));
             auto response = co_await rest(h, io, check.method, check.path, rfl::json::write(check.payload), check.token);
             expect(outcome.isError && response.status == 400 && outcome.content.front().text == response.body) << outcome.content.front().text;
@@ -238,7 +252,9 @@ namespace {
                     h.port = listener.local_endpoint().port();
                     co_await coroutine::with_scope([&](coroutine::scope& children) -> coroutine::task<> {
                         children.spawn([](harness& h, native::listener& listener, coroutine::scope& children) -> coroutine::task<> {
-                            for (;;) children.spawn(h.server.serve(co_await execution::then(net::async_accept(listener), [](auto socket, auto) { return std::move(socket); })));
+                            for (;;)
+                                children.spawn(
+                                    h.server.serve(co_await execution::then(net::async_accept(listener), [](auto socket, auto) { return std::move(socket); })));
                         }(h, listener, children));
                         co_await exercise(h, io);
                     });
@@ -246,7 +262,7 @@ namespace {
             });
         };
     };
-}
+} // namespace
 
 auto main(int argc, const char** argv) -> int {
     boost::ut::suite<"settings">{cases};

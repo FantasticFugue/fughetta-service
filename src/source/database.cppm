@@ -16,11 +16,15 @@ namespace nodes {
         struct database {
             sqlite3* handle = nullptr;
             std::map<std::string, std::vector<sqlite3_stmt*>, std::less<>> statements;
-            struct pending_value { std::string packed; std::vector<std::string> links; };
+            struct pending_value {
+                std::string packed;
+                std::vector<std::string> links;
+            };
             std::unordered_map<std::string, std::string> pending_nodes;
             std::unordered_map<std::string, pending_value> pending_values;
             nodes::commit_check* confirm = nullptr;
-            std::uint64_t state_nodes_read = 0, state_values_read = 0, state_nodes_written = 0, state_values_written = 0, state_bytes_written = 0, state_bytes_read = 0, state_bytes_decoded = 0, causal_blocks_read = 0;
+            std::uint64_t state_nodes_read = 0, state_values_read = 0, state_nodes_written = 0, state_values_written = 0, state_bytes_written = 0,
+                          state_bytes_read = 0, state_bytes_decoded = 0, causal_blocks_read = 0;
             explicit database(const std::filesystem::path& file) {
                 if (sqlite3_open_v2(file.string().c_str(), &handle, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_FULLMUTEX, nullptr) != SQLITE_OK) {
                     std::string why = handle ? sqlite3_errmsg(handle) : "allocation failed";
@@ -325,7 +329,11 @@ namespace nodes {
             void flush_updates() const {
                 if (updates_.empty())
                     return;
-                struct entry { const std::string* key; const std::optional<std::string>* value; content::sha256::digest priority; };
+                struct entry {
+                    const std::string* key;
+                    const std::optional<std::string>* value;
+                    content::sha256::digest priority;
+                };
                 std::vector<entry> entries;
                 entries.reserve(updates_.size());
                 for (auto& [key, id] : updates_)
@@ -349,14 +357,19 @@ namespace nodes {
                     std::shared_ptr<const node> old;
                     while (!id.empty()) {
                         old = load(id);
-                        if (lower && old->key <= *lower) id = old->right;
-                        else if (upper && old->key >= *upper) id = old->left;
-                        else break;
+                        if (lower && old->key <= *lower)
+                            id = old->right;
+                        else if (upper && old->key >= *upper)
+                            id = old->left;
+                        else
+                            break;
                     }
-                    if (id.empty()) old.reset();
+                    if (id.empty())
+                        old.reset();
                     auto middle = last;
                     for (auto index = first; index < last; ++index)
-                        if (*entries[index].value && (middle == last || std::tie(entries[index].priority, *entries[index].key) < std::tie(entries[middle].priority, *entries[middle].key)))
+                        if (*entries[index].value && (middle == last || std::tie(entries[index].priority, *entries[index].key) <
+                                                                            std::tie(entries[middle].priority, *entries[middle].key)))
                             middle = index;
                     if (middle != last && (!old || std::tie(entries[middle].priority, *entries[middle].key) < std::tie(old->priority, old->key))) {
                         auto& change = entries[middle];
@@ -367,7 +380,8 @@ namespace nodes {
                     if (!old)
                         return {};
                     auto split = std::lower_bound(entries.begin() + first, entries.begin() + last, old->key,
-                        [](const entry& item, const std::string& key) { return *item.key < key; }) - entries.begin();
+                                                  [](const entry& item, const std::string& key) { return *item.key < key; }) -
+                                 entries.begin();
                     bool replaced = split < last && *entries[split].key == old->key;
                     auto right_first = split + (replaced ? 1 : 0);
                     auto left = rewrite(old->left, first, split, lower, {});
@@ -394,7 +408,11 @@ namespace nodes {
                     db_.state_bytes_read += packed.size();
                 }
                 std::string out;
-                try { out = archive::unpack(packed); } catch (const error& e) { fail(nodes::code::storage_failure, "stored index payload is corrupt: " + std::string(e.what())); }
+                try {
+                    out = archive::unpack(packed);
+                } catch (const error& e) {
+                    fail(nodes::code::storage_failure, "stored index payload is corrupt: " + std::string(e.what()));
+                }
                 db_.state_bytes_decoded += out.size();
                 if (digest_of(out) != id)
                     fail(nodes::code::storage_failure, "state index value hash differs");
@@ -415,7 +433,10 @@ namespace nodes {
         public:
             explicit state_tree(database& db, bool owner = false) : db_(db), owner_(owner) {}
             void adopt(std::string root) {
-                if (owner_) { db_.pending_nodes.clear(); db_.pending_values.clear(); }
+                if (owner_) {
+                    db_.pending_nodes.clear();
+                    db_.pending_values.clear();
+                }
                 updates_.clear();
                 root_ = std::move(root);
                 saved_ = root_;
@@ -428,7 +449,10 @@ namespace nodes {
                 if (!root_.empty())
                     (void)load(root_);
             }
-            auto root() const -> const std::string& { flush_updates(); return root_; }
+            auto root() const -> const std::string& {
+                flush_updates();
+                return root_;
+            }
             void set(const std::string& key, std::string_view bytes, const std::vector<std::string>& links = {}) {
                 auto id = digest_of(bytes);
                 if (!db_.pending_values.contains(id))
@@ -438,14 +462,16 @@ namespace nodes {
             void erase(std::string_view key) { updates_[std::string{key}] = std::nullopt; }
             auto get(std::string_view key) const -> std::optional<std::string> {
                 if (auto queued = updates_.find(key); queued != updates_.end()) {
-                    if (queued->second && key.starts_with("k/")) ++db_.causal_blocks_read;
+                    if (queued->second && key.starts_with("k/"))
+                        ++db_.causal_blocks_read;
                     return queued->second ? std::optional{value(*queued->second)} : std::nullopt;
                 }
                 auto id = root_;
                 while (!id.empty()) {
                     auto p = load(id);
                     if (p->key == key) {
-                        if (key.starts_with("k/")) ++db_.causal_blocks_read;
+                        if (key.starts_with("k/"))
+                            ++db_.causal_blocks_read;
                         return value(p->value);
                     }
                     id = key < p->key ? p->left : p->right;
@@ -453,8 +479,17 @@ namespace nodes {
                 return {};
             }
             auto contains_range(std::string_view first, std::string_view last) const -> bool {
-                flush_updates(); auto id = root_; std::optional<std::string> candidate;
-                while (!id.empty()) { auto p = load(id); if (p->key >= first) { candidate = p->key; id = p->left; } else id = p->right; }
+                flush_updates();
+                auto id = root_;
+                std::optional<std::string> candidate;
+                while (!id.empty()) {
+                    auto p = load(id);
+                    if (p->key >= first) {
+                        candidate = p->key;
+                        id = p->left;
+                    } else
+                        id = p->right;
+                }
                 return candidate && *candidate < last;
             }
             template <class F> void each(std::string prefix, F f) const {
@@ -530,9 +565,11 @@ namespace nodes {
                 std::deque<std::string> node_queue, value_queue;
                 std::unordered_set<std::string> deleted_nodes, deleted_values;
                 for (auto& [id, delta] : node_refs_)
-                    if (delta < 0) node_queue.push_back(id);
+                    if (delta < 0)
+                        node_queue.push_back(id);
                 for (auto& [id, delta] : value_refs_)
-                    if (delta < 0) value_queue.push_back(id);
+                    if (delta < 0)
+                        value_queue.push_back(id);
                 auto unreferenced = [&](std::string_view table, const std::string& id, auto& deltas) {
                     auto found = deltas.find(id);
                     if (found == deltas.end() || found->second >= 0)
@@ -590,7 +627,8 @@ namespace nodes {
                     }
                 }
                 auto flush_refs = [&](std::string_view table, const auto& deltas) {
-                    statement q{db_, table == "state_nodes" ? "UPDATE state_nodes SET refs=refs+?2 WHERE id=?1" : "UPDATE state_values SET refs=refs+?2 WHERE id=?1"};
+                    statement q{db_, table == "state_nodes" ? "UPDATE state_nodes SET refs=refs+?2 WHERE id=?1"
+                                                            : "UPDATE state_values SET refs=refs+?2 WHERE id=?1"};
                     for (auto& [id, delta] : deltas)
                         if (delta) {
                             q.reset();
@@ -663,8 +701,8 @@ namespace nodes {
                               {"worldline", in.worldline}};
         }
         auto decode_request(const value& input, std::string intent, std::string result) -> node_request {
-            fields(input, {"action", "activation", "actor", "caller_operation", "configuration", "decisions", "dependencies", "edits", "expected", "intent", "operation", "owner", "project",
-                           "result", "source", "target", "tool", "worldline"});
+            fields(input, {"action", "activation", "actor", "caller_operation", "configuration", "decisions", "dependencies", "edits", "expected", "intent",
+                           "operation", "owner", "project", "result", "source", "target", "tool", "worldline"});
             node_request out;
             out.action = input.at("action").text();
             out.actor = input.at("actor").text();
@@ -746,7 +784,8 @@ namespace nodes {
         std::string state_snapshot;
         std::unique_ptr<state_tree> pages;
         bool snapshot_ready = false, kernel_loaded = true, status_loaded = true, pending_loaded = true, kernel_aliases = false;
-        std::uint64_t causal_headers_read = 0, causal_effects_read = 0, file_histories_read = 0, file_payloads_read = 0, projected_before_eviction = 0, sequence_pages_read = 0, sequence_pages_written = 0, insertion_payloads_read = 0;
+        std::uint64_t causal_headers_read = 0, causal_effects_read = 0, file_histories_read = 0, file_payloads_read = 0, projected_before_eviction = 0,
+                      sequence_pages_read = 0, sequence_pages_written = 0, insertion_payloads_read = 0;
         std::set<std::string> cached_payload_files;
         std::uint64_t cached_payload_bytes = 0, cache_evictions = 0;
         std::deque<std::pair<std::string, std::string>> projection_garbage;
@@ -762,28 +801,57 @@ namespace nodes {
             auto digest(const T& item) const -> std::string override { return Codec::hash(item); }
             auto load(std::string_view id) -> data override {
                 auto bytes = pages.get("j/" + std::string(name) + "/" + std::string(id));
-                if (!bytes) fail(nodes::code::missing_objects, "required projection branch is absent");
-                if (digest_of(*bytes) != id) fail(nodes::code::storage_failure, "projection object identity differs");
+                if (!bytes)
+                    fail(nodes::code::missing_objects, "required projection branch is absent");
+                if (digest_of(*bytes) != id)
+                    fail(nodes::code::storage_failure, "projection object identity differs");
                 auto v = codec::decode(*bytes);
-                fields(v, {"count", "item", "key", "left", "left_count", "left_mass", "left_object", "mass", "right", "right_count", "right_mass", "right_object", "value"});
-                return {.key = v.at("key").text(), .item = Codec::decode(self, v.at("item")), .value_digest = v.at("value").text(),
-                    .left = v.at("left").text(), .right = v.at("right").text(), .left_object = v.at("left_object").text(), .right_object = v.at("right_object").text(), .count = v.at("count").number(),
-                    .left_count = v.at("left_count").number(), .right_count = v.at("right_count").number(),
-                    .mass = v.at("mass").number(), .left_mass = v.at("left_mass").number(), .right_mass = v.at("right_mass").number(), .bound = true};
+                fields(v, {"count", "item", "key", "left", "left_count", "left_mass", "left_object", "mass", "right", "right_count", "right_mass",
+                           "right_object", "value"});
+                return {.key = v.at("key").text(),
+                        .item = Codec::decode(self, v.at("item")),
+                        .value_digest = v.at("value").text(),
+                        .left = v.at("left").text(),
+                        .right = v.at("right").text(),
+                        .left_object = v.at("left_object").text(),
+                        .right_object = v.at("right_object").text(),
+                        .count = v.at("count").number(),
+                        .left_count = v.at("left_count").number(),
+                        .right_count = v.at("right_count").number(),
+                        .mass = v.at("mass").number(),
+                        .left_mass = v.at("left_mass").number(),
+                        .right_mass = v.at("right_mass").number(),
+                        .bound = true};
             }
             auto store(const data& node) -> std::string override {
-                if (!node.bound || node.value_digest != Codec::hash(node.item)) fail(nodes::code::invalid_record, "projection value digest differs");
+                if (!node.bound || node.value_digest != Codec::hash(node.item))
+                    fail(nodes::code::invalid_record, "projection value digest differs");
                 auto item = Codec::encode(self, node.item);
-                auto bytes = codec::encode(value::map{{"key", node.key}, {"item", item}, {"value", node.value_digest},
-                    {"left", node.left}, {"right", node.right}, {"left_object", node.left_object}, {"right_object", node.right_object},
-                    {"count", static_cast<std::uint64_t>(node.count)}, {"left_count", static_cast<std::uint64_t>(node.left_count)},
-                    {"right_count", static_cast<std::uint64_t>(node.right_count)}, {"mass", node.mass}, {"left_mass", node.left_mass}, {"right_mass", node.right_mass}});
+                auto bytes = codec::encode(value::map{{"key", node.key},
+                                                      {"item", item},
+                                                      {"value", node.value_digest},
+                                                      {"left", node.left},
+                                                      {"right", node.right},
+                                                      {"left_object", node.left_object},
+                                                      {"right_object", node.right_object},
+                                                      {"count", static_cast<std::uint64_t>(node.count)},
+                                                      {"left_count", static_cast<std::uint64_t>(node.left_count)},
+                                                      {"right_count", static_cast<std::uint64_t>(node.right_count)},
+                                                      {"mass", node.mass},
+                                                      {"left_mass", node.left_mass},
+                                                      {"right_mass", node.right_mass}});
                 auto id = digest_of(bytes), key = "j/" + std::string(name) + "/" + id;
-                if (auto previous = pages.get(key)) { if (*previous != bytes) fail(nodes::code::identity_conflict, "projection object has differing content"); return id; }
+                if (auto previous = pages.get(key)) {
+                    if (*previous != bytes)
+                        fail(nodes::code::identity_conflict, "projection object has differing content");
+                    return id;
+                }
                 pages.set(key, bytes);
-                if (generated) ++*generated;
+                if (generated)
+                    ++*generated;
                 pages.set("jrefs/" + std::string(name) + "/" + id, codec::encode(value::map{{"refs", std::uint64_t{0}}}));
-                self.projection_reference(std::string(name), node.left_object, 1); self.projection_reference(std::string(name), node.right_object, 1);
+                self.projection_reference(std::string(name), node.left_object, 1);
+                self.projection_reference(std::string(name), node.right_object, 1);
                 if constexpr (name == "files" || name == "hidden") {
                     self.payload_reference(item.at("data").text(), 1);
                     auto& sequence = item.at("sequence");
@@ -793,7 +861,11 @@ namespace nodes {
                 return id;
             }
         };
-        struct anchor_span { std::string key; std::uint64_t first = 0, count = 0; auto operator==(const anchor_span&) const -> bool = default; };
+        struct anchor_span {
+            std::string key;
+            std::uint64_t first = 0, count = 0;
+            auto operator==(const anchor_span&) const -> bool = default;
+        };
         static auto fragment_value(const fragment& f) -> value { return value::map{{"count", f.count}, {"first", f.first}, {"run", f.run}}; }
         static auto span_value(const anchor_span& f) -> value { return value::map{{"count", f.count}, {"first", f.first}, {"key", f.key}}; }
         struct sequence_pages {
@@ -801,8 +873,11 @@ namespace nodes {
             static constexpr std::string_view name = "sequence";
             static auto encode(impl&, const fragment& f) -> value { return fragment_value(f); }
             static auto decode(impl& self, const value& v) -> fragment {
-                ++self.sequence_pages_read; fields(v, {"count", "first", "run"}); auto count = v.at("count").number();
-                if (!count || count > 1024) fail(nodes::code::invalid_record, "sequence scalar page bound differs");
+                ++self.sequence_pages_read;
+                fields(v, {"count", "first", "run"});
+                auto count = v.at("count").number();
+                if (!count || count > 1024)
+                    fail(nodes::code::invalid_record, "sequence scalar page bound differs");
                 return fragment{v.at("run").text(), v.at("first").number(), count};
             }
             static auto hash(const fragment& f) -> std::string { return digest_of(codec::encode(fragment_value(f))); }
@@ -812,7 +887,9 @@ namespace nodes {
             static constexpr std::string_view name = "anchors";
             static auto encode(impl&, const anchor_span& f) -> value { return span_value(f); }
             static auto decode(impl& self, const value& v) -> anchor_span {
-                ++self.sequence_pages_read; fields(v, {"count", "first", "key"}); return anchor_span{v.at("key").text(), v.at("first").number(), v.at("count").number()};
+                ++self.sequence_pages_read;
+                fields(v, {"count", "first", "key"});
+                return anchor_span{v.at("key").text(), v.at("first").number(), v.at("count").number()};
             }
             static auto hash(const anchor_span& f) -> std::string { return digest_of(codec::encode(span_value(f))); }
         };
@@ -825,14 +902,20 @@ namespace nodes {
             std::shared_ptr<projection_index<anchor_pages>> anchor_storage;
             static auto anchor_key(const std::string& run, std::uint64_t first) -> std::string { return run + "/" + std::format("{:016x}", first); }
             static auto between(const std::string& left, const std::string& right) -> std::string {
-                if (!right.empty() && left >= right) fail(nodes::code::invalid_record, "sequence ordering interval differs");
-                std::string out; bool bounded = !right.empty();
+                if (!right.empty() && left >= right)
+                    fail(nodes::code::invalid_record, "sequence ordering interval differs");
+                std::string out;
+                bool bounded = !right.empty();
                 for (std::size_t i = 0; i < 1024; ++i) {
                     unsigned lo = i < left.size() ? static_cast<unsigned char>(left[i]) : 32;
                     unsigned hi = bounded && i < right.size() ? static_cast<unsigned char>(right[i]) : 127;
-                    if (hi > lo + 1) { out.push_back(static_cast<char>((hi + lo) / 2)); return out; }
+                    if (hi > lo + 1) {
+                        out.push_back(static_cast<char>((hi + lo) / 2));
+                        return out;
+                    }
                     out.push_back(static_cast<char>(lo));
-                    if (lo < hi) bounded = false;
+                    if (lo < hi)
+                        bounded = false;
                 }
                 fail(nodes::code::resource_limit, "sequence ordering precision exhausted");
             }
@@ -842,145 +925,253 @@ namespace nodes {
                 return {it->second.run, it->second.first + relative};
             }
             auto position(const element& selected) const -> std::optional<std::uint64_t> override {
+                auto found = extent(selected);
+                if (!found)
+                    return {};
+                return found->first;
+            }
+            auto extent(const element& selected) const -> std::optional<std::pair<std::uint64_t, std::uint64_t>> override {
                 auto it = anchors.floor(anchor_key(selected.run, selected.offset));
                 auto prefix = selected.run + "/";
-                if (it == anchors.end() || !it->first.starts_with(prefix) || selected.offset < it->second.first || selected.offset - it->second.first >= it->second.count) return {};
+                if (it == anchors.end() || !it->first.starts_with(prefix) || selected.offset < it->second.first ||
+                    selected.offset - it->second.first >= it->second.count)
+                    return {};
                 auto piece = pieces.find(it->second.key);
-                if (piece == pieces.end() || piece->second.run != selected.run || piece->second.first != it->second.first || piece->second.count != it->second.count)
+                if (piece == pieces.end() || piece->second.run != selected.run || piece->second.first != it->second.first ||
+                    piece->second.count != it->second.count)
                     fail(nodes::code::storage_failure, "sequence anchor and counted piece differ");
-                return pieces.mass_before(piece->first) + selected.offset - piece->second.first;
+                auto inside = selected.offset - piece->second.first;
+                return std::pair{pieces.mass_before(piece->first) + inside, piece->second.count - inside};
             }
             void insert(const std::string& key, fragment f) {
-                if (!f.count || f.count > 1024) fail(nodes::code::invalid_record, "sequence piece scalar bound differs");
+                if (!f.count || f.count > 1024)
+                    fail(nodes::code::invalid_record, "sequence piece scalar bound differs");
                 pieces.set(key, f, digest_of(codec::encode(fragment_value(f))));
                 anchor_span span{key, f.first, f.count};
                 anchors.set(anchor_key(f.run, f.first), span, digest_of(codec::encode(span_value(span))));
             }
-            auto splice(std::uint64_t offset, std::uint64_t count, std::string run, std::uint64_t inserted) const -> std::shared_ptr<const sequence_state> override {
-                if (offset > size() || count > size() - offset || (inserted && run.empty())) fail(nodes::code::invalid_record, "sequence splice bounds differ");
+            auto splice(std::uint64_t offset, std::uint64_t count, std::string run, std::uint64_t inserted) const
+                -> std::shared_ptr<const sequence_state> override {
+                if (offset > size() || count > size() - offset || (inserted && run.empty()))
+                    fail(nodes::code::invalid_record, "sequence splice bounds differ");
                 auto next = std::make_shared<sequence_view>(*this);
-                std::vector<std::string> removed; std::vector<fragment> replacement;
+                std::vector<std::string> removed;
+                std::vector<fragment> replacement;
                 std::optional<fragment> suffix;
                 std::string left, right;
                 if (offset < size()) {
                     auto [it, first] = pieces.at_mass(offset);
-                    auto before = pieces.floor(it->first, true); if (before != pieces.end()) left = before->first;
+                    auto before = pieces.floor(it->first, true);
+                    if (before != pieces.end())
+                        left = before->first;
                     std::uint64_t remaining = count;
-                    if (first) replacement.push_back({it->second.run, it->second.first, first});
+                    if (first)
+                        replacement.push_back({it->second.run, it->second.first, first});
                     for (;;) {
-                        auto f = it->second; removed.push_back(it->first);
+                        auto f = it->second;
+                        removed.push_back(it->first);
                         auto taken = std::min(remaining, f.count - first);
-                        if (first + taken < f.count) suffix = fragment{f.run, f.first + first + taken, f.count - first - taken};
+                        if (first + taken < f.count)
+                            suffix = fragment{f.run, f.first + first + taken, f.count - first - taken};
                         remaining -= taken;
                         ++it;
-                        if (!remaining) { if (it != pieces.end()) right = it->first; break; }
-                        if (it == pieces.end()) fail(nodes::code::storage_failure, "sequence region is incomplete");
+                        if (!remaining) {
+                            if (it != pieces.end())
+                                right = it->first;
+                            break;
+                        }
+                        if (it == pieces.end())
+                            fail(nodes::code::storage_failure, "sequence region is incomplete");
                         first = 0;
                     }
                 } else {
-                    auto before = pieces.floor(std::string(1, static_cast<char>(127))); if (before != pieces.end()) left = before->first;
+                    auto before = pieces.floor(std::string(1, static_cast<char>(127)));
+                    if (before != pieces.end())
+                        left = before->first;
                 }
                 for (auto& key : removed) {
                     auto f = next->pieces.find(key)->second;
-                    next->anchors.erase(anchor_key(f.run, f.first)); next->pieces.erase(key);
+                    next->anchors.erase(anchor_key(f.run, f.first));
+                    next->pieces.erase(key);
                 }
                 for (std::uint64_t first = 0; first < inserted;) {
-                    auto length = std::min<std::uint64_t>(1024, inserted - first); replacement.push_back({run, first, length}); first += length;
+                    auto length = std::min<std::uint64_t>(1024, inserted - first);
+                    replacement.push_back({run, first, length});
+                    first += length;
                 }
-                if (suffix) replacement.push_back(*suffix);
-                for (auto& f : replacement) { auto key = between(left, right); next->insert(key, f); left = std::move(key); }
-                if (next->size() != size() - count + inserted) fail(nodes::code::storage_failure, "sequence splice scalar count differs");
+                if (suffix)
+                    replacement.push_back(*suffix);
+                for (auto& f : replacement) {
+                    auto key = between(left, right);
+                    next->insert(key, f);
+                    left = std::move(key);
+                }
+                if (next->size() != size() - count + inserted)
+                    fail(nodes::code::storage_failure, "sequence splice scalar count differs");
                 return next;
             }
-            auto all() const -> std::vector<fragment> override { std::vector<fragment> out; for (auto& [_, f] : pieces) out.push_back(f); return out; }
+            auto all() const -> std::vector<fragment> override {
+                std::vector<fragment> out;
+                for (auto& [_, f] : pieces)
+                    out.push_back(f);
+                return out;
+            }
+            auto span(std::uint64_t offset, std::uint64_t count) const -> std::vector<fragment> override {
+                std::vector<fragment> out;
+                if (!count)
+                    return out;
+                auto [it, first] = pieces.at_mass(offset);
+                for (; count; ++it, first = 0) {
+                    if (it == pieces.end())
+                        fail(nodes::code::storage_failure, "sequence region is incomplete");
+                    auto taken = std::min(count, it->second.count - first);
+                    out.push_back({it->second.run, it->second.first + first, taken});
+                    count -= taken;
+                }
+                return out;
+            }
             auto save() const -> value override {
-                pieces.persist(piece_storage); anchors.persist(anchor_storage);
-                auto root = [](const auto& index) -> value { return value::map{{"root", index.digest()}, {"object", index.object()}, {"count", static_cast<std::uint64_t>(index.size())}, {"mass", index.mass()}}; };
+                pieces.persist(piece_storage);
+                anchors.persist(anchor_storage);
+                auto root = [](const auto& index) -> value {
+                    return value::map{
+                        {"root", index.digest()}, {"object", index.object()}, {"count", static_cast<std::uint64_t>(index.size())}, {"mass", index.mass()}};
+                };
                 return value::map{{"pieces", root(pieces)}, {"anchors", root(anchors)}};
             }
         };
         void projection_reference(const std::string& type, const std::string& id, int delta) {
-            if (id.empty()) return;
+            if (id.empty())
+                return;
             auto key = "jrefs/" + type + "/" + id;
             auto bytes = pages->get(key);
-            if (!bytes) fail(nodes::code::missing_objects, "required projection reference state is absent");
+            if (!bytes)
+                fail(nodes::code::missing_objects, "required projection reference state is absent");
             auto count = codec::decode(*bytes).at("refs").number();
-            if (delta < 0 && !count) fail(nodes::code::storage_failure, "projection reference count underflow");
+            if (delta < 0 && !count)
+                fail(nodes::code::storage_failure, "projection reference count underflow");
             count = delta > 0 ? count + 1 : count - 1;
             pages->set(key, codec::encode(value::map{{"refs", count}}));
-            if (!count) projection_garbage.emplace_back(type, id);
+            if (!count)
+                projection_garbage.emplace_back(type, id);
         }
         void payload_reference(const std::string& id, int delta) {
-            statement q{*db, "SELECT refs FROM state_payloads WHERE id=?1"}; q.text(1, id);
-            if (!q.next()) fail(nodes::code::missing_objects, "required payload reference state is absent");
+            statement q{*db, "SELECT refs FROM state_payloads WHERE id=?1"};
+            q.text(1, id);
+            if (!q.next())
+                fail(nodes::code::missing_objects, "required payload reference state is absent");
             auto count = q.number(0);
-            if (delta < 0 && !count) fail(nodes::code::storage_failure, "payload reference count underflow");
+            if (delta < 0 && !count)
+                fail(nodes::code::storage_failure, "payload reference count underflow");
             count = delta > 0 ? count + 1 : count - 1;
             statement update{*db, count ? "UPDATE state_payloads SET refs=?2 WHERE id=?1" : "DELETE FROM state_payloads WHERE id=?1"};
-            update.text(1, id); if (count) update.number(2, count); update.next();
+            update.text(1, id);
+            if (count)
+                update.number(2, count);
+            update.next();
         }
         void projection_roots(const std::string& previous, const std::string& current) {
             auto before = previous.empty() ? value::map{} : codec::decode(previous).object();
             auto after = codec::decode(current);
-            for (auto name : {"files", "hidden", "paths", "file_conflicts", "path_conflicts", "control_conflicts", "identity_conflicts", "dependency_conflicts", "activation", "resolutions"}) {
-                std::string type = std::string(name).ends_with("conflicts") ? "conflicts" : std::string(name) == "activation" || std::string(name) == "resolutions" ? "booleans" : name;
+            for (auto name : {"files", "hidden", "paths", "file_conflicts", "path_conflicts", "control_conflicts", "identity_conflicts", "dependency_conflicts",
+                              "activation", "resolutions"}) {
+                std::string type = std::string(name).ends_with("conflicts")                                  ? "conflicts"
+                                   : std::string(name) == "activation" || std::string(name) == "resolutions" ? "booleans"
+                                                                                                             : name;
                 auto prior = before.find(name);
                 auto old = prior == before.end() ? std::string{} : prior->second.at("object").text();
                 auto next = after.at(name).at("object").text();
-                if (old != next) { projection_reference(type, next, 1); projection_reference(type, old, -1); }
+                if (old != next) {
+                    projection_reference(type, next, 1);
+                    projection_reference(type, old, -1);
+                }
             }
         }
         void collect_projection_garbage() {
             while (!projection_garbage.empty()) {
-                auto [type, id] = std::move(projection_garbage.front()); projection_garbage.pop_front();
+                auto [type, id] = std::move(projection_garbage.front());
+                projection_garbage.pop_front();
                 auto refs = pages->get("jrefs/" + type + "/" + id);
-                if (!refs || codec::decode(*refs).at("refs").number()) continue;
+                if (!refs || codec::decode(*refs).at("refs").number())
+                    continue;
                 auto bytes = pages->get("j/" + type + "/" + id);
-                if (!bytes || digest_of(*bytes) != id) fail(nodes::code::storage_failure, "projection collection object differs");
+                if (!bytes || digest_of(*bytes) != id)
+                    fail(nodes::code::storage_failure, "projection collection object differs");
                 auto v = codec::decode(*bytes);
-                projection_reference(type, v.at("left_object").text(), -1); projection_reference(type, v.at("right_object").text(), -1);
+                projection_reference(type, v.at("left_object").text(), -1);
+                projection_reference(type, v.at("right_object").text(), -1);
                 if (type == "files" || type == "hidden") {
-                    auto& item = v.at("item"); payload_reference(item.at("data").text(), -1);
+                    auto& item = v.at("item");
+                    payload_reference(item.at("data").text(), -1);
                     projection_reference("sequence", item.at("sequence").at("pieces").at("object").text(), -1);
                     projection_reference("anchors", item.at("sequence").at("anchors").at("object").text(), -1);
                 }
-                pages->erase("j/" + type + "/" + id); pages->erase("jrefs/" + type + "/" + id);
+                pages->erase("j/" + type + "/" + id);
+                pages->erase("jrefs/" + type + "/" + id);
             }
         }
         auto sequence_from(const value& roots) -> std::shared_ptr<sequence_view> {
-            projection_stores(); auto out = std::make_shared<sequence_view>(); out->piece_storage = sequence_index; out->anchor_storage = anchor_index;
+            projection_stores();
+            auto out = std::make_shared<sequence_view>();
+            out->piece_storage = sequence_index;
+            out->anchor_storage = anchor_index;
             fields(roots, {"anchors", "pieces"});
             auto load = [](auto& index, const value& v, auto storage) {
-                fields(v, {"count", "mass", "object", "root"}); index.adopt(v.at("root").text(), v.at("object").text(), v.at("count").number(), true, v.at("mass").number(), storage);
+                fields(v, {"count", "mass", "object", "root"});
+                index.adopt(v.at("root").text(), v.at("object").text(), v.at("count").number(), true, v.at("mass").number(), storage);
             };
-            load(out->pieces, roots.at("pieces"), sequence_index); load(out->anchors, roots.at("anchors"), anchor_index);
-            if (out->pieces.size() != out->anchors.size() || out->pieces.mass() != out->anchors.mass()) fail(nodes::code::storage_failure, "sequence and anchor root counts differ");
+            load(out->pieces, roots.at("pieces"), sequence_index);
+            load(out->anchors, roots.at("anchors"), anchor_index);
+            if (out->pieces.size() != out->anchors.size() || out->pieces.mass() != out->anchors.mass())
+                fail(nodes::code::storage_failure, "sequence and anchor root counts differ");
             return out;
         }
         auto sequence_for(const source_file& file) -> std::shared_ptr<const sequence_state> {
-            if (file.sequence) return file.sequence;
-            projection_stores(); auto out = std::make_shared<sequence_view>(); out->piece_storage = sequence_index; out->anchor_storage = anchor_index;
+            if (file.sequence)
+                return file.sequence;
+            projection_stores();
+            auto out = std::make_shared<sequence_view>();
+            out->piece_storage = sequence_index;
+            out->anchor_storage = anchor_index;
             std::uint64_t index = 0;
-            for (auto& f : file.fragments) for (std::uint64_t first = 0; first < f.count;) {
-                auto length = std::min<std::uint64_t>(1024, f.count - first);
-                out->insert(ordinal_key(++index), {f.run, f.first + first, length}); first += length;
-            }
-            file.sequence = out; return out;
+            for (auto& f : file.fragments)
+                for (std::uint64_t first = 0; first < f.count;) {
+                    auto length = std::min<std::uint64_t>(1024, f.count - first);
+                    out->insert(ordinal_key(++index), {f.run, f.first + first, length});
+                    first += length;
+                }
+            file.sequence = out;
+            return out;
         }
         auto retain_payload(std::string data) -> std::string {
             auto id = digest_of(data), packed = archive::pack(data);
-            statement q{*db, "INSERT OR IGNORE INTO state_payloads(id,data) VALUES(?1,?2)"}; q.text(1, id); q.bind(2, packed); q.next();
-            if (sqlite3_changes(db->handle)) { ++db->state_values_written; db->state_bytes_written += packed.size(); }
+            statement q{*db, "INSERT OR IGNORE INTO state_payloads(id,data) VALUES(?1,?2)"};
+            q.text(1, id);
+            q.bind(2, packed);
+            q.next();
+            if (sqlite3_changes(db->handle)) {
+                ++db->state_values_written;
+                db->state_bytes_written += packed.size();
+            }
             return id;
         }
         auto read_payload(const std::string& id) -> std::string {
-            statement q{*db, "SELECT data FROM state_payloads WHERE id=?1"}; q.text(1, id);
-            if (!q.next()) fail(nodes::code::missing_objects, "required content payload is absent");
-            auto packed = q.data(0); ++db->state_values_read; db->state_bytes_read += packed.size();
+            statement q{*db, "SELECT data FROM state_payloads WHERE id=?1"};
+            q.text(1, id);
+            if (!q.next())
+                fail(nodes::code::missing_objects, "required content payload is absent");
+            auto packed = q.data(0);
+            ++db->state_values_read;
+            db->state_bytes_read += packed.size();
             std::string data;
-            try { data = archive::unpack(packed); } catch (const error& e) { fail(nodes::code::storage_failure, "stored content payload is corrupt: " + std::string(e.what())); }
+            try {
+                data = archive::unpack(packed);
+            } catch (const error& e) {
+                fail(nodes::code::storage_failure, "stored content payload is corrupt: " + std::string(e.what()));
+            }
             db->state_bytes_decoded += data.size();
-            if (digest_of(data) != id) fail(nodes::code::storage_failure, "content payload hash differs");
+            if (digest_of(data) != id)
+                fail(nodes::code::storage_failure, "content payload hash differs");
             return data;
         }
         using projected_file = std::shared_ptr<const source_file>;
@@ -995,15 +1186,22 @@ namespace nodes {
         struct hidden_files : visible_files {
             static constexpr std::string_view name = "hidden";
             static auto decode(impl& self, const value& v) -> projected_file {
-                auto hidden = std::make_shared<source_file>(*visible_files::decode(self, v)); hidden->present = false; return hidden;
+                auto hidden = std::make_shared<source_file>(*visible_files::decode(self, v));
+                hidden->present = false;
+                return hidden;
             }
         };
         struct path_pages {
             using item = path_owners;
             static constexpr std::string_view name = "paths";
             static auto encode(impl&, const path_owners& owners) -> value { return strings({owners->begin(), owners->end()}); }
-            static auto decode(impl&, const value& v) -> path_owners { auto ids = string_list(v); return std::make_shared<const std::set<std::string>>(ids.begin(), ids.end()); }
-            static auto hash(const path_owners& owners) -> std::string { return digest_of(codec::encode(value::map{{"ids", strings({owners->begin(), owners->end()})}})); }
+            static auto decode(impl&, const value& v) -> path_owners {
+                auto ids = string_list(v);
+                return std::make_shared<const std::set<std::string>>(ids.begin(), ids.end());
+            }
+            static auto hash(const path_owners& owners) -> std::string {
+                return digest_of(codec::encode(value::map{{"ids", strings({owners->begin(), owners->end()})}}));
+            }
         };
         struct conflict_pages {
             using item = std::vector<std::string>;
@@ -1101,10 +1299,17 @@ namespace nodes {
             }
         }
         void trim_kernel() {
-            if (!kernel_loaded) { cached_payload_files.clear(); cached_payload_bytes = 0; return; }
+            if (!kernel_loaded) {
+                cached_payload_files.clear();
+                cached_payload_bytes = 0;
+                return;
+            }
             if (!dirty && snapshot_ready && kernel_loaded && source.size() == snapshot_events &&
                 (source.loaded_files() > 8 || source.loaded_events() > 512 || cached_payload_files.size() > 8 || cached_payload_bytes > 8 * 1024 * 1024)) {
-                ++cache_evictions; archive_audited = false; cached_payload_files.clear(); cached_payload_bytes = 0;
+                ++cache_evictions;
+                archive_audited = false;
+                cached_payload_files.clear();
+                cached_payload_bytes = 0;
                 projected_before_eviction += source.projected_files();
                 kernel_aliases = source.aliases();
                 source = kernel{};
@@ -1210,7 +1415,11 @@ namespace nodes {
                 object_watermark = static_cast<std::uint64_t>(sqlite3_last_insert_rowid(db->handle));
             }
             auto [stored, inserted] = objects.emplace(id, std::move(object));
-            if (inserted) { object_order.push_back(id); object_sizes.emplace(id, data.size()); cached_object_bytes += data.size(); }
+            if (inserted) {
+                object_order.push_back(id);
+                object_sizes.emplace(id, data.size());
+                cached_object_bytes += data.size();
+            }
             bodies.emplace(id, body_view{&stored->second.at("body")});
             queue_object(id);
         }
@@ -1227,7 +1436,11 @@ namespace nodes {
                 if (!is_validated(id))
                     check_schema(open(object));
                 auto [stored, inserted] = objects.emplace(id, std::move(object));
-                if (inserted) { object_order.push_back(id); object_sizes.emplace(id, data.size()); cached_object_bytes += data.size(); }
+                if (inserted) {
+                    object_order.push_back(id);
+                    object_sizes.emplace(id, data.size());
+                    cached_object_bytes += data.size();
+                }
                 it = bodies.emplace(id, body_view{&stored->second.at("body")}).first;
                 ++loaded_records;
                 queue_object(id);
@@ -1428,8 +1641,8 @@ namespace nodes {
                 if (!content::is_hash(target.at("owner").text()) || !content::is_hash(target.at("reviewer").text()))
                     fail(nodes::code::invalid_record, "invalid worldline ownership identity");
             }
-            for (auto name :
-                 {"project", "policy", "intent", "attempt", "input", "result", "admission", "configuration", "manifest", "inventory", "base", "review", "line"}) {
+            for (auto name : {"project", "policy", "intent", "attempt", "input", "result", "admission", "configuration", "manifest", "inventory", "base",
+                              "review", "line"}) {
                 auto it = b.object().find(name);
                 if (kind == "line" && std::string_view{name} == "base")
                     continue;
@@ -1725,8 +1938,8 @@ namespace nodes {
                 bool first = std::holds_alternative<std::monostate>(b.at("previous").data);
                 if (action == "fork") {
                     auto& created = get(line, "line");
-                    if (!first || !expected.empty() || string_list(created.at("base")) != vector_set(accepted) || created.at("operation") != b.at("operation") ||
-                        created.at("creator") != attempt.at("author"))
+                    if (!first || !expected.empty() || string_list(created.at("base")) != vector_set(accepted) ||
+                        created.at("operation") != b.at("operation") || created.at("creator") != attempt.at("author"))
                         fail(nodes::code::invalid_record, "fork acceptance does not bind its created worldline");
                 } else if (!first && get(b.at("previous").text(), "admission").at("line") != b.at("line"))
                     fail("worldline_boundary", "acceptance changes the worldline of its root");
@@ -2068,7 +2281,11 @@ namespace nodes {
                     if (row.failure)
                         std::rethrow_exception(row.failure);
                     auto [stored, inserted] = objects.emplace(std::move(row.id), std::move(row.object));
-                    if (inserted) { object_order.push_back(stored->first); object_sizes.emplace(stored->first, row.bytes); cached_object_bytes += row.bytes; }
+                    if (inserted) {
+                        object_order.push_back(stored->first);
+                        object_sizes.emplace(stored->first, row.bytes);
+                        cached_object_bytes += row.bytes;
+                    }
                     bodies.emplace(stored->first, body_view{&stored->second.at("body")});
                     ++loaded_records;
                     queue_object(stored->first);
@@ -2095,67 +2312,95 @@ namespace nodes {
             explicit causal_storage(impl& self) : self(self) {}
             auto header(std::size_t index) -> value override {
                 auto bytes = self.pages->get("q/header/" + self.ordinal_key(index));
-                if (!bytes) fail(nodes::code::missing_objects, "required causal proof is absent");
+                if (!bytes)
+                    fail(nodes::code::missing_objects, "required causal proof is absent");
                 ++self.causal_headers_read;
                 return codec::decode(*bytes);
             }
             auto text(const std::string& id) -> std::string override {
                 ++self.insertion_payloads_read;
-                auto v = codec::decode(self.read_payload(id)); fields(v, {"text"}); return v.at("text").raw();
+                auto v = codec::decode(self.read_payload(id));
+                fields(v, {"text"});
+                return v.at("text").raw();
             }
             auto file_text(const source_file& file) -> std::string override {
-                ++self.file_payloads_read; self.cached_payload_files.insert(file.id); self.cached_payload_bytes += file.stored_bytes;
-                auto v = codec::decode(self.read_payload(file.content_object)); fields(v, {"text"}); auto text = v.at("text").raw();
-                if (text.size() != file.stored_bytes || digest_of(text) != file.digest) fail(nodes::code::storage_failure, "state file content differs");
+                ++self.file_payloads_read;
+                self.cached_payload_files.insert(file.id);
+                self.cached_payload_bytes += file.stored_bytes;
+                auto v = codec::decode(self.read_payload(file.content_object));
+                fields(v, {"text"});
+                auto text = v.at("text").raw();
+                if (text.size() != file.stored_bytes || digest_of(text) != file.digest)
+                    fail(nodes::code::storage_failure, "state file content differs");
                 return text;
             }
             auto locate(const std::string& id) -> std::optional<std::size_t> override {
                 auto bytes = self.pages->get("q/id/" + id);
-                if (!bytes) return {};
+                if (!bytes)
+                    return {};
                 return codec::decode(*bytes).at("index").number();
             }
             auto records(const std::string& kind, const std::string& key) -> std::vector<value> override {
                 if (kind == "file") {
-                    if (!self.pages->get("q/file_state/" + key)) fail(nodes::code::missing_objects, "required file causal index is absent: " + key);
+                    if (!self.pages->get("q/file_state/" + key))
+                        fail(nodes::code::missing_objects, "required file causal index is absent: " + key);
                     ++self.file_histories_read;
                 }
                 std::vector<value> out;
                 self.pages->each("q/" + kind + "/" + key + "/", [&](const std::string&, std::string bytes) {
                     out.push_back(codec::decode(bytes));
-                    if (kind != "dependent" && kind != "identity") ++self.causal_effects_read;
+                    if (kind != "dependent" && kind != "identity")
+                        ++self.causal_effects_read;
                 });
                 if (kind == "file") {
                     auto count = codec::decode(*self.pages->get("q/file_state/" + key)).at("count").number();
-                    if (out.empty() || out.size() != count) fail(nodes::code::missing_objects, "file causal membership is incomplete");
+                    if (out.empty() || out.size() != count)
+                        fail(nodes::code::missing_objects, "file causal membership is incomplete");
                 }
                 return out;
             }
             auto projection(const std::vector<std::string>& heads) -> std::shared_ptr<const source_state> override {
-                if (auto name = self.matching_view(heads)) { auto& saved = self.views.at(*name); return self.restore_projection(saved.projection, saved.digest); }
+                if (auto name = self.matching_view(heads)) {
+                    auto& saved = self.views.at(*name);
+                    return self.restore_projection(saved.projection, saved.digest);
+                }
                 return {};
             }
             auto file_changed(const std::string& file, const causal_set& missing) -> bool override {
-                for (auto [first, last] : missing.ranges) for (auto kind : {"file", "file_control"}) {
-                    auto prefix = "q/" + std::string(kind) + "/" + file + "/";
-                    if (self.pages->contains_range(prefix + self.ordinal_key(first) + "/", prefix + self.ordinal_key(last) + "/")) return true;
-                }
+                for (auto [first, last] : missing.ranges)
+                    for (auto kind : {"file", "file_control"}) {
+                        auto prefix = "q/" + std::string(kind) + "/" + file + "/";
+                        if (self.pages->contains_range(prefix + self.ordinal_key(first) + "/", prefix + self.ordinal_key(last) + "/"))
+                            return true;
+                    }
                 return false;
             }
             auto base(const causal_set& wanted) -> std::pair<std::vector<std::string>, std::shared_ptr<const source_state>> override {
-                const saved_view* closest = nullptr; std::uint64_t score = std::numeric_limits<std::uint64_t>::max();
+                const saved_view* closest = nullptr;
+                std::uint64_t score = std::numeric_limits<std::uint64_t>::max();
                 for (auto& [_, saved] : self.views) {
-                    causal_set known; auto v = codec::decode(saved.projection);
-                    for (auto& range : v.at("causal").list()) known.ranges.emplace_back(range.at("first").number(), range.at("last").number());
-                    auto delta = known.without(wanted); delta.unite(wanted.without(known));
-                    std::uint64_t size = 0; for (auto [first, last] : delta.ranges) size += last - first;
-                    if (size < score) { score = size; closest = &saved; }
+                    causal_set known;
+                    auto v = codec::decode(saved.projection);
+                    for (auto& range : v.at("causal").list())
+                        known.ranges.emplace_back(range.at("first").number(), range.at("last").number());
+                    auto delta = known.without(wanted);
+                    delta.unite(wanted.without(known));
+                    std::uint64_t size = 0;
+                    for (auto [first, last] : delta.ranges)
+                        size += last - first;
+                    if (size < score) {
+                        score = size;
+                        closest = &saved;
+                    }
                 }
-                if (!closest) return {};
+                if (!closest)
+                    return {};
                 return {closest->frontier, self.restore_projection(closest->projection, closest->digest)};
             }
         } causal{*this};
         void ensure_kernel() {
-            if (kernel_loaded) return;
+            if (kernel_loaded)
+                return;
             // A missing derived index is an unavailable state, never an empty history.
             auto count = pages->get("q/count");
             if (!count || codec::decode(*count).at("count").number() != snapshot_events)
@@ -2182,7 +2427,9 @@ namespace nodes {
                     auto payload = retain_payload(codec::encode(value::map{{"text", bytes{text}}}));
                     payload_reference(payload, 1);
                     auto& input = std::get<value::map>(std::get<value::map>(record.data)["effect"].data);
-                    input.erase(input.find("text")); input["text_id"] = payload; input["scalars"] = static_cast<std::uint64_t>(scalars(text).size());
+                    input.erase(input.find("text"));
+                    input["text_id"] = payload;
+                    input["scalars"] = static_cast<std::uint64_t>(scalars(text).size());
                 }
                 auto ordinal = record.at("ordinal").number();
                 auto location = key + "/" + ordinal_key(ordinal);
@@ -2193,20 +2440,25 @@ namespace nodes {
                 if (type == "activate" || type == "resolve") {
                     for (auto& selected : string_list(effect.at("selections"))) {
                         pages->set("q/control/" + selected + "/" + location, bytes);
-                        if (type == "activate") for (auto& file : source.effect_files(selected)) pages->set("q/file_control/" + file + "/" + location, bytes);
+                        if (type == "activate")
+                            for (auto& file : source.effect_files(selected))
+                                pages->set("q/file_control/" + file + "/" + location, bytes);
                     }
                 } else {
                     auto file = effect.at("file").text();
                     std::uint64_t count = 0;
-                    if (auto prior = pages->get("q/file_state/" + file)) count = codec::decode(*prior).at("count").number();
+                    if (auto prior = pages->get("q/file_state/" + file))
+                        count = codec::decode(*prior).at("count").number();
                     pages->set("q/file_state/" + file, codec::encode(value::map{{"count", count + 1}}));
                     pages->set("q/file/" + file + "/" + location, bytes);
-                    if (type == "presence" || type == "path") pages->set("q/presence/" + file + "/" + location, bytes);
+                    if (type == "presence" || type == "path")
+                        pages->set("q/presence/" + file + "/" + location, bytes);
                 }
             }
         }
         void projection_stores() {
-            if (visible_index) return;
+            if (visible_index)
+                return;
             sequence_index = std::make_shared<projection_index<sequence_pages>>(*this, *pages);
             anchor_index = std::make_shared<projection_index<anchor_pages>>(*this, *pages);
             visible_index = std::make_shared<projection_index<visible_files>>(*this, *pages);
@@ -2214,67 +2466,109 @@ namespace nodes {
             path_index = std::make_shared<projection_index<path_pages>>(*this, *pages);
             conflict_index = std::make_shared<projection_index<conflict_pages>>(*this, *pages);
             boolean_index = std::make_shared<projection_index<boolean_pages>>(*this, *pages);
-            sequence_index->generated = &sequence_pages_written; anchor_index->generated = &sequence_pages_written;
+            sequence_index->generated = &sequence_pages_written;
+            anchor_index->generated = &sequence_pages_written;
         }
         auto persist_projection(const source_state& state) -> std::string {
             projection_stores();
             auto save = []<class T, class C>(const persistent_index<T>& index, const std::shared_ptr<projection_index<C>>& storage) -> value {
                 index.persist(storage);
-                return value::map{{"root", index.digest()}, {"object", index.object()}, {"count", static_cast<std::uint64_t>(index.size())}, {"mass", index.mass()}};
+                return value::map{
+                    {"root", index.digest()}, {"object", index.object()}, {"count", static_cast<std::uint64_t>(index.size())}, {"mass", index.mass()}};
             };
             value::array causal;
-            for (auto [first, last] : state.causal.ranges) causal.emplace_back(value::map{{"first", static_cast<std::uint64_t>(first)}, {"last", static_cast<std::uint64_t>(last)}});
-            return codec::encode(value::map{{"files", save(state.files, visible_index)}, {"hidden", save(state.hidden, hidden_index)}, {"paths", save(state.paths, path_index)},
-                {"file_conflicts", save(state.file_conflicts, conflict_index)}, {"path_conflicts", save(state.path_conflicts, conflict_index)},
-                {"control_conflicts", save(state.control_conflicts, conflict_index)}, {"identity_conflicts", save(state.identity_conflicts, conflict_index)},
-                {"dependency_conflicts", save(state.dependency_conflicts, conflict_index)}, {"activation", save(state.activation, boolean_index)},
-                {"resolutions", save(state.resolutions, boolean_index)}, {"causal", std::move(causal)}, {"conflicts", strings(state.conflicts)}});
+            for (auto [first, last] : state.causal.ranges)
+                causal.emplace_back(value::map{{"first", static_cast<std::uint64_t>(first)}, {"last", static_cast<std::uint64_t>(last)}});
+            return codec::encode(value::map{{"files", save(state.files, visible_index)},
+                                            {"hidden", save(state.hidden, hidden_index)},
+                                            {"paths", save(state.paths, path_index)},
+                                            {"file_conflicts", save(state.file_conflicts, conflict_index)},
+                                            {"path_conflicts", save(state.path_conflicts, conflict_index)},
+                                            {"control_conflicts", save(state.control_conflicts, conflict_index)},
+                                            {"identity_conflicts", save(state.identity_conflicts, conflict_index)},
+                                            {"dependency_conflicts", save(state.dependency_conflicts, conflict_index)},
+                                            {"activation", save(state.activation, boolean_index)},
+                                            {"resolutions", save(state.resolutions, boolean_index)},
+                                            {"causal", std::move(causal)},
+                                            {"conflicts", strings(state.conflicts)}});
         }
         auto restore_projection(const std::string& bytes, const std::string& expected_digest) -> std::shared_ptr<const source_state> {
             projection_stores();
-            auto state = std::make_shared<source_state>(); auto v = codec::decode(bytes);
-            fields(v, {"activation", "causal", "conflicts", "control_conflicts", "dependency_conflicts", "file_conflicts", "files", "hidden", "identity_conflicts", "path_conflicts", "paths", "resolutions"});
+            auto state = std::make_shared<source_state>();
+            auto v = codec::decode(bytes);
+            fields(v, {"activation", "causal", "conflicts", "control_conflicts", "dependency_conflicts", "file_conflicts", "files", "hidden",
+                       "identity_conflicts", "path_conflicts", "paths", "resolutions"});
             auto load = []<class T, class C>(persistent_index<T>& index, const value& root, const std::shared_ptr<projection_index<C>>& storage) {
-                fields(root, {"count", "mass", "object", "root"}); index.adopt(root.at("root").text(), root.at("object").text(), root.at("count").number(), true, root.at("mass").number(), storage);
+                fields(root, {"count", "mass", "object", "root"});
+                index.adopt(root.at("root").text(), root.at("object").text(), root.at("count").number(), true, root.at("mass").number(), storage);
             };
-            load(state->files, v.at("files"), visible_index); load(state->hidden, v.at("hidden"), hidden_index); load(state->paths, v.at("paths"), path_index);
-            load(state->file_conflicts, v.at("file_conflicts"), conflict_index); load(state->path_conflicts, v.at("path_conflicts"), conflict_index);
-            load(state->control_conflicts, v.at("control_conflicts"), conflict_index); load(state->identity_conflicts, v.at("identity_conflicts"), conflict_index);
-            load(state->dependency_conflicts, v.at("dependency_conflicts"), conflict_index); load(state->activation, v.at("activation"), boolean_index); load(state->resolutions, v.at("resolutions"), boolean_index);
+            load(state->files, v.at("files"), visible_index);
+            load(state->hidden, v.at("hidden"), hidden_index);
+            load(state->paths, v.at("paths"), path_index);
+            load(state->file_conflicts, v.at("file_conflicts"), conflict_index);
+            load(state->path_conflicts, v.at("path_conflicts"), conflict_index);
+            load(state->control_conflicts, v.at("control_conflicts"), conflict_index);
+            load(state->identity_conflicts, v.at("identity_conflicts"), conflict_index);
+            load(state->dependency_conflicts, v.at("dependency_conflicts"), conflict_index);
+            load(state->activation, v.at("activation"), boolean_index);
+            load(state->resolutions, v.at("resolutions"), boolean_index);
             for (auto& r : v.at("causal").list()) {
                 auto first = r.at("first").number(), last = r.at("last").number();
-                if (first >= last || last > snapshot_events || (!state->causal.ranges.empty() && first <= state->causal.ranges.back().second)) fail(nodes::code::invalid_record, "projection causal intervals differ");
+                if (first >= last || last > snapshot_events || (!state->causal.ranges.empty() && first <= state->causal.ranges.back().second))
+                    fail(nodes::code::invalid_record, "projection causal intervals differ");
                 state->causal.ranges.emplace_back(first, last);
             }
             state->conflicts = string_list(v.at("conflicts"));
             state->digest = digest_of(codec::encode(value::map{{"conflicts", strings(state->conflicts)}, {"files", state->files.digest()}}));
-            if (state->digest != expected_digest) fail(nodes::code::storage_failure, "projection digest differs from the selected revision");
+            if (state->digest != expected_digest)
+                fail(nodes::code::storage_failure, "projection digest differs from the selected revision");
             return state;
         }
         auto file_header(std::string_view encoded, const std::string& id) -> std::shared_ptr<const source_file> {
             auto body = codec::decode(encoded);
             fields(body, {"data", "digest", "executable", "file", "kind", "path", "scalars", "sequence", "size"});
-            if (body.at("file").text() != id) fail(nodes::code::invalid_record, "state file identity differs");
+            if (body.at("file").text() != id)
+                fail(nodes::code::invalid_record, "state file identity differs");
             auto file = std::make_shared<source_file>();
-            file->id = id; file->path = body.at("path").text(); file->kind = body.at("kind").text(); file->digest = body.at("digest").text();
-            file->executable = body.at("executable").boolean(); file->stored_bytes = body.at("size").number(); file->stored_scalars = body.at("scalars").number();
-            file->storage_header = std::string(encoded); file->content_object = body.at("data").text(); file->sequence = sequence_from(body.at("sequence")); file->fragments_ready = false;
-            if (file->sequence->size() != file->stored_scalars) fail(nodes::code::storage_failure, "sequence root scalar count differs");
-            auto payload = body.at("data").text(); checked_path(file->path);
-            if ((file->kind != "text" && file->kind != "binary") || !content::is_hash(file->digest) || !content::is_hash(payload)) fail(nodes::code::invalid_record, "state file metadata");
+            file->id = id;
+            file->path = body.at("path").text();
+            file->kind = body.at("kind").text();
+            file->digest = body.at("digest").text();
+            file->executable = body.at("executable").boolean();
+            file->stored_bytes = body.at("size").number();
+            file->stored_scalars = body.at("scalars").number();
+            file->storage_header = std::string(encoded);
+            file->content_object = body.at("data").text();
+            file->sequence = sequence_from(body.at("sequence"));
+            file->fragments_ready = false;
+            if (file->sequence->size() != file->stored_scalars)
+                fail(nodes::code::storage_failure, "sequence root scalar count differs");
+            auto payload = body.at("data").text();
+            checked_path(file->path);
+            if ((file->kind != "text" && file->kind != "binary") || !content::is_hash(file->digest) || !content::is_hash(payload))
+                fail(nodes::code::invalid_record, "state file metadata");
             file->stored = &causal;
             return file;
         }
         auto file_bytes(const source_file& file) -> std::string {
-            if (!file.storage_header.empty()) return file.storage_header;
+            if (!file.storage_header.empty())
+                return file.storage_header;
             if (file.content_object.empty()) {
-                cached_payload_files.insert(file.id); cached_payload_bytes += file.bytes();
+                cached_payload_files.insert(file.id);
+                cached_payload_bytes += file.bytes();
                 file.content_object = retain_payload(codec::encode(value::map{{"text", bytes{file.content()}}}));
             }
             auto data = file.content_object;
             auto sequence = sequence_for(file)->save();
-            file.storage_header = codec::encode(value::map{{"data", data}, {"digest", file.digest}, {"executable", file.executable}, {"file", file.id},
-                {"kind", file.kind}, {"path", file.path}, {"scalars", file.size()}, {"sequence", std::move(sequence)}, {"size", file.bytes()}});
+            file.storage_header = codec::encode(value::map{{"data", data},
+                                                           {"digest", file.digest},
+                                                           {"executable", file.executable},
+                                                           {"file", file.id},
+                                                           {"kind", file.kind},
+                                                           {"path", file.path},
+                                                           {"scalars", file.size()},
+                                                           {"sequence", std::move(sequence)},
+                                                           {"size", file.bytes()}});
             return file.storage_header;
         }
         auto matching_view(const std::vector<std::string>& heads) -> std::optional<std::string> {
@@ -2355,22 +2649,28 @@ namespace nodes {
                     files.set("f/" + id, file_bytes(file));
                 }
             });
-            saved_view saved{heads,          state->conflicts, root_admissions.contains(name) ? root_admissions.at(name) : std::string{},
-                             version(heads), state->digest,    files.root(), persist_projection(*state)};
+            saved_view saved{heads,
+                             state->conflicts,
+                             root_admissions.contains(name) ? root_admissions.at(name) : std::string{},
+                             version(heads),
+                             state->digest,
+                             files.root(),
+                             persist_projection(*state)};
             auto original = views.find(name);
             projection_roots(original == views.end() ? std::string{} : original->second.projection, saved.projection);
             auto bytes = codec::encode(value::map{{"admission", saved.admission},
-                                                 {"conflicts", strings(saved.conflicts)},
-                                                 {"digest", saved.digest},
-                                                 {"files", saved.files},
-                                                 {"frontier", strings(heads)},
-                                                 {"projection", nodes::bytes{saved.projection}},
-                                                 {"version", saved.version}});
+                                                  {"conflicts", strings(saved.conflicts)},
+                                                  {"digest", saved.digest},
+                                                  {"files", saved.files},
+                                                  {"frontier", strings(heads)},
+                                                  {"projection", nodes::bytes{saved.projection}},
+                                                  {"version", saved.version}});
             pages->set("r/" + name, bytes, saved.files.empty() ? std::vector<std::string>{} : std::vector<std::string>{saved.files});
             views[name] = std::move(saved);
         }
         void reset_state_storage() {
-            db->run("DELETE FROM state_links; DELETE FROM state_heads; DELETE FROM state_nodes; DELETE FROM state_values; DROP TABLE state_payloads; CREATE TABLE state_payloads(id TEXT PRIMARY KEY,data BLOB NOT NULL,refs INTEGER NOT NULL DEFAULT 0);");
+            db->run("DELETE FROM state_links; DELETE FROM state_heads; DELETE FROM state_nodes; DELETE FROM state_values; DROP TABLE state_payloads; CREATE "
+                    "TABLE state_payloads(id TEXT PRIMARY KEY,data BLOB NOT NULL,refs INTEGER NOT NULL DEFAULT 0);");
             pages->adopt({});
             views.clear();
             projection_garbage.clear();
@@ -2390,7 +2690,8 @@ namespace nodes {
                 persist_event(index);
                 auto frame = source.snapshot(index, 1);
                 if (kernel_tail.empty()) {
-                    if (snapshot_events) ++kernel_block;
+                    if (snapshot_events)
+                        ++kernel_block;
                     kernel_tail = "DCK1";
                     codec::integer(kernel_tail, index);
                 }
@@ -2445,7 +2746,8 @@ namespace nodes {
             source.discard_projections();
             collect_projection_garbage();
             pages->finish();
-            auto body = value::map{{"aliases", source.aliases()}, {"archive_bytes", archive_bytes},
+            auto body = value::map{{"aliases", source.aliases()},
+                                   {"archive_bytes", archive_bytes},
                                    {"events", static_cast<std::uint64_t>(source.size())},
                                    {"kernel_block", kernel_block},
                                    {"kind", "state_snapshot"},
@@ -2461,8 +2763,10 @@ namespace nodes {
             snapshot_events = source.size();
             snapshot_watermark = object_watermark;
             snapshot_ready = true;
-            if (kernel_tail.size() > 16 * 1024) kernel_tail.clear();
-            if (!source.has_reader()) source.attach_reader(&causal);
+            if (kernel_tail.size() > 16 * 1024)
+                kernel_tail.clear();
+            if (!source.has_reader())
+                source.attach_reader(&causal);
             dirty_status.clear();
             dirty_claims.clear();
             dirty_receipts.clear();
@@ -2505,8 +2809,8 @@ namespace nodes {
                 fields(saved, {"admission", "conflicts", "digest", "files", "frontier", "projection", "version"});
                 auto name = key.substr(2);
                 checked_name(name);
-                saved_view view{string_list(saved.at("frontier")), string_list(saved.at("conflicts")), saved.at("admission").text(),
-                                saved.at("version").text(),        saved.at("digest").text(),          saved.at("files").text(), saved.at("projection").raw()};
+                saved_view view{string_list(saved.at("frontier")), string_list(saved.at("conflicts")), saved.at("admission").text(), saved.at("version").text(),
+                                saved.at("digest").text(),         saved.at("files").text(),           saved.at("projection").raw()};
                 roots[name] = view.frontier;
                 if (!view.admission.empty())
                     root_admissions[name] = view.admission;
@@ -2517,9 +2821,19 @@ namespace nodes {
         }
         void reload(bool audit = false) {
             read_snapshot snapshot{*db};
-            { statement identity{*db, "SELECT data FROM metadata WHERE name='project'"};
-              if (identity.next()) { auto id = identity.data(0); if ((!project.empty() && id != project) || !content::is_hash(id)) fail("wrong_project", "durable project identity differs"); project = std::move(id); } }
-            { statement root{*db, "SELECT data FROM metadata WHERE name='state_snapshot'"}; observed_snapshot = root.next() ? digest_of(root.data(0)) : std::string{}; }
+            {
+                statement identity{*db, "SELECT data FROM metadata WHERE name='project'"};
+                if (identity.next()) {
+                    auto id = identity.data(0);
+                    if ((!project.empty() && id != project) || !content::is_hash(id))
+                        fail("wrong_project", "durable project identity differs");
+                    project = std::move(id);
+                }
+            }
+            {
+                statement root{*db, "SELECT data FROM metadata WHERE name='state_snapshot'"};
+                observed_snapshot = root.next() ? digest_of(root.data(0)) : std::string{};
+            }
             std::uint64_t observed_version = data_version;
             {
                 statement generation{*db, "PRAGMA data_version"};
@@ -2544,7 +2858,8 @@ namespace nodes {
             projection_garbage.clear();
             projected_before_eviction += source.projected_files();
             source = kernel{};
-            cached_payload_files.clear(); cached_payload_bytes = 0;
+            cached_payload_files.clear();
+            cached_payload_bytes = 0;
             policies.clear();
             pending_objects.clear();
             new_candidates.clear();
@@ -2674,7 +2989,7 @@ namespace nodes {
                 return out;
             }
             if (auto name = matching_view(frontier))
-                    return ready_reply(*name, include_text, path);
+                return ready_reply(*name, include_text, path);
             ensure_kernel();
             auto out = identity();
             out.frontier = source.frontier(frontier);
@@ -2713,8 +3028,8 @@ namespace nodes {
         struct shown {
             std::uint64_t per_side, total;
         };
-        auto differences(const std::vector<std::string>& before_heads, const std::vector<std::string>& after_heads,
-                         std::optional<shown> budget = std::nullopt) -> std::vector<source_difference> {
+        auto differences(const std::vector<std::string>& before_heads, const std::vector<std::string>& after_heads, std::optional<shown> budget = std::nullopt)
+            -> std::vector<source_difference> {
             auto old_owner = source.projection(before_heads), current_owner = source.projection(after_heads);
             const auto& old = *old_owner;
             const auto& current = *current_owner;
@@ -2786,16 +3101,28 @@ namespace nodes {
             auto& b = get(id, "batch");
             auto& attempt = get(b.at("attempt").text(), "attempt");
             auto& intent = get(b.at("intent").text(), "intent");
-            std::string outcome = identity_conflicts.contains(b.at("author").text() + ":" + b.at("operation").text()) ? std::string{nodes::code::identity_conflict}
-                                  : proof.empty()                                                                     ? "unconfirmed"
-                                                                                                                      : "accepted";
+            std::string outcome = identity_conflicts.contains(b.at("author").text() + ":" + b.at("operation").text())
+                                      ? std::string{nodes::code::identity_conflict}
+                                  : proof.empty() ? "unconfirmed"
+                                                  : "accepted";
             // Only this node's own signed receipt vouches for the caller it recorded.
             bool local = std::ranges::any_of(proof, [&](auto& receipt) { return is_validated(receipt) && get(receipt).at("issuer").text() == node.id(); });
             auto actor = local ? request_input(attempt.at("input").text()).at("actor").text() : std::string{};
-            return {id, shown_operation(attempt), b.at("author").text(), std::move(actor),
-                    attempt.at("executor").text(), attempt.at("tool").text(), intent.at("summary").text(),
-                    get(attempt.at("result").text(), "blob").at("data").raw(), outcome, b.at("policy").text(), b.at("line").text(),
-                    string_list(b.at("parents")), string_list(b.at("dependencies")), std::move(proof), b.at("lamport").number()};
+            return {id,
+                    shown_operation(attempt),
+                    b.at("author").text(),
+                    std::move(actor),
+                    attempt.at("executor").text(),
+                    attempt.at("tool").text(),
+                    intent.at("summary").text(),
+                    get(attempt.at("result").text(), "blob").at("data").raw(),
+                    outcome,
+                    b.at("policy").text(),
+                    b.at("line").text(),
+                    string_list(b.at("parents")),
+                    string_list(b.at("dependencies")),
+                    std::move(proof),
+                    b.at("lamport").number()};
         }
         // One batch as a contribution: its history entry, what it changed against its parents, and the worldlines that contain it.
         auto contribution(const node_request& in) -> node_reply {
@@ -2843,27 +3170,29 @@ namespace nodes {
             if (permissions.at("kind").text() == "policy")
                 preserved = string_list(permissions.at("settled"));
             for (auto conflict = identity_conflicts.begin(); conflict != identity_conflicts.end(); ++conflict)
-              for (auto& event : source.identity_events(conflict->first)) {
-                if (!source.includes(heads, event)) continue;
-                bool settled = false;
-                for (auto& admission : preserved)
-                    if (source.includes(string_list(get(admission, "admission").at("frontier")), event)) {
-                        settled = true;
-                        break;
-                    }
-                if (!settled)
-                    for (auto& id : object_ids("review"))
-                        if (is_validated(id)) {
-                            auto& b = get(id);
-                            if (b.at("policy").text() != p || b.at("target").at("name").text() != worldline || b.at("target").at("owner").text() != node.id())
-                                continue;
-                            auto choices = string_list(b.at("identities"));
-                            if (std::ranges::find(choices, conflict->second) != choices.end() && source.includes(string_list(b.at("frontier")), event))
-                                settled = true;
+                for (auto& event : source.identity_events(conflict->first)) {
+                    if (!source.includes(heads, event))
+                        continue;
+                    bool settled = false;
+                    for (auto& admission : preserved)
+                        if (source.includes(string_list(get(admission, "admission").at("frontier")), event)) {
+                            settled = true;
+                            break;
                         }
-                if (!settled)
-                    blocked.insert(conflict->second);
-            }
+                    if (!settled)
+                        for (auto& id : object_ids("review"))
+                            if (is_validated(id)) {
+                                auto& b = get(id);
+                                if (b.at("policy").text() != p || b.at("target").at("name").text() != worldline ||
+                                    b.at("target").at("owner").text() != node.id())
+                                    continue;
+                                auto choices = string_list(b.at("identities"));
+                                if (std::ranges::find(choices, conflict->second) != choices.end() && source.includes(string_list(b.at("frontier")), event))
+                                    settled = true;
+                            }
+                    if (!settled)
+                        blocked.insert(conflict->second);
+                }
             return {blocked.begin(), blocked.end()};
         }
         auto receipt(const std::string& id, bool replayed) -> node_reply {
@@ -2903,6 +3232,21 @@ namespace nodes {
             q.text(4, result);
             q.next();
         }
+        // The receipt of `operation` as this node executed it for its author, if it ran.
+        auto executed(const std::string& operation) -> std::optional<std::string> {
+            statement q{*db, "SELECT receipt FROM bindings WHERE author=?1 AND operation=?2"};
+            q.text(1, author.id());
+            q.text(2, operation);
+            if (q.next() && !q.data(0).empty())
+                return q.data(0);
+            for (auto& id : receipts(author.id() + ":" + operation))
+                if (is_validated(id)) {
+                    auto& b = get(id);
+                    if (b.at("operation").text() == operation && b.at("author").text() == author.id() && b.at("issuer").text() == node.id())
+                        return id;
+                }
+            return {};
+        }
         auto retry(const node_request& in, const std::string& digest) -> std::optional<node_reply> {
             statement q{*db, "SELECT digest,receipt FROM bindings WHERE author=?1 AND operation=?2"};
             q.text(1, author.id());
@@ -2926,8 +3270,8 @@ namespace nodes {
             return {};
         }
         auto accept(const node_request& in, const std::string& line, const std::string& request_digest, const std::string& effect_digest,
-                    const std::vector<std::string>& prior, const std::vector<std::string>& frontier, const std::string& result_id, const std::string& attempt_id,
-                    bool override_author = false) -> node_reply {
+                    const std::vector<std::string>& prior, const std::vector<std::string>& frontier, const std::string& result_id,
+                    const std::string& attempt_id, bool override_author = false) -> node_reply {
             auto p = policy(in.worldline);
             auto a = base_body("admission", project);
             a["issuer"] = node.id();
@@ -3003,12 +3347,11 @@ namespace nodes {
                     effects.emplace_back(value::map{{"file", file}, {"left", left.encoded()}, {"right", right.encoded()}, {"text", text}, {"type", "insert"}});
             };
             auto erase = [&](const source_file& file, std::uint64_t offset, std::uint64_t count) {
-                if (count > codec::collection_limit)
-                    fail(nodes::code::resource_limit, "deletion target collection limit");
                 value::array selected;
-                selected.reserve(count);
-                for (std::uint64_t i = 0; i < count; ++i)
-                    selected.push_back(file.at(offset + i).encoded());
+                for (auto& f : file.span(offset, count))
+                    selected.push_back(value::map{{"count", f.count}, {"first", f.first}, {"run", f.run}});
+                if (selected.size() > codec::collection_limit)
+                    fail(nodes::code::resource_limit, "deletion target collection limit");
                 if (!selected.empty())
                     effects.emplace_back(value::map{{"file", file.id}, {"targets", std::move(selected)}, {"type", "erase"}});
             };
@@ -3090,7 +3433,8 @@ namespace nodes {
                     std::vector<std::pair<std::string, std::string>> moved;
                     auto prefix = e.path + "/";
                     for (auto it = state.paths.lower_bound(prefix); it != state.paths.end() && it->first.starts_with(prefix); ++it)
-                        for (auto& id : *it->second) moved.emplace_back(id, it->first);
+                        for (auto& id : *it->second)
+                            moved.emplace_back(id, it->first);
                     std::ranges::sort(moved);
                     for (auto& [id, path] : moved) {
                         auto destination = e.target + path.substr(e.path.size());
@@ -3150,9 +3494,9 @@ namespace nodes {
                 fail(nodes::code::invalid_record, "operation ID must be 32-byte lowercase hex");
             if (!in.genesis_nonce.empty() || !in.authors.empty() || !in.nodes.empty() || !in.policies.empty() || !in.settled.empty() || !in.want.empty() ||
                 !in.parts.empty() || !in.configuration.empty() || !in.environment.empty() || in.generation || !in.spans.empty() || in.force ||
-                (!in.scopes.empty() && (in.action != "apply" || in.scopes != std::vector<std::string>{std::string{nodes::global_scope}} || in.holder.empty())) ||
-                !in.revision.empty() || !in.snapshot.empty() ||
-                in.protected_worldlines != std::vector<std::string>{"main"} || in.max_bytes != 1024 * 1024 ||
+                (!in.scopes.empty() &&
+                 (in.action != "apply" || in.scopes != std::vector<std::string>{std::string{nodes::global_scope}} || in.holder.empty())) ||
+                !in.revision.empty() || !in.snapshot.empty() || in.protected_worldlines != std::vector<std::string>{"main"} || in.max_bytes != 1024 * 1024 ||
                 in.limit != 100)
                 fail(nodes::code::invalid_record, "source publication contains fields for another operation");
             if (in.activation && in.action != "resolve")
@@ -3186,9 +3530,9 @@ namespace nodes {
                 fail(nodes::code::source_conflict, "worldline already exists");
             std::vector<std::string> prior = found == roots.end() ? std::vector<std::string>{} : found->second;
             // Writers in one worldline may observe an older state of it; selections must observe the current root.
-            if (selection(in.action) ? in.expected != prior
-                                     : in.expected != source.frontier(in.expected) ||
-                                           std::ranges::any_of(in.expected, [&](auto& event) { return !source.includes(prior, event); }))
+            if (selection(in.action) ? in.expected != prior : in.expected != source.frontier(in.expected) || std::ranges::any_of(in.expected, [&](auto& event) {
+                                                                  return !source.includes(prior, event);
+                                                              }))
                 fail("stale_frontier", "expected source frontier is not part of this worldline");
             auto p = policy(in.worldline);
             auto& permissions = get(p);
@@ -3299,7 +3643,8 @@ namespace nodes {
             if (!in.scopes.empty()) {
                 auto now = source.projection(prior);
                 for (auto& e : in.edits)
-                    for (const auto& path : {e.kind == "create" || e.kind == "binary_create" ? e.path : std::string{}, e.kind == "move" ? e.target : std::string{}})
+                    for (const auto& path :
+                         {e.kind == "create" || e.kind == "binary_create" ? e.path : std::string{}, e.kind == "move" ? e.target : std::string{}})
                         if (auto held = now->paths.find(path); !path.empty() && held != now->paths.end() && !held->second->empty())
                             fail(nodes::code::source_conflict, path + " was created since this batch read the source");
             }
@@ -3340,13 +3685,18 @@ namespace nodes {
         }
         static constexpr std::size_t semantic_records = 200000, semantic_text = 4096, semantic_bytes = 16 * 1024 * 1024, anchor_spans = 10000;
         template <class F> static void each_span(semantic::generation& g, F&& f) {
-            for (auto& scope : g.scopes) f(scope.range);
+            for (auto& scope : g.scopes)
+                f(scope.range);
             for (auto& symbol : g.symbols) {
-                for (auto& span : symbol.declarations) f(span);
-                for (auto& span : symbol.definitions) f(span);
+                for (auto& span : symbol.declarations)
+                    f(span);
+                for (auto& span : symbol.definitions)
+                    f(span);
             }
-            for (auto& reference : g.references) f(reference.range);
-            for (auto& diagnostic : g.diagnostics) f(diagnostic.range);
+            for (auto& reference : g.references)
+                f(reference.range);
+            for (auto& diagnostic : g.diagnostics)
+                f(diagnostic.range);
         }
         auto semantic_publish(const node_request& in) -> node_reply {
             if (!in.generation || !in.environment.empty() || !in.expected.empty() || !in.source.empty() || !in.target.empty() || !in.snapshot.empty() ||
@@ -3367,19 +3717,32 @@ namespace nodes {
             auto measure = [&](const std::string& value) {
                 if (value.size() > semantic_text)
                     fail(nodes::code::resource_limit, "semantic text field exceeds 4 KiB");
-                text += value.size() + 5 * static_cast<std::size_t>(std::ranges::count_if(value, [](unsigned char c) { return c < 0x20 || c == '"' || c == '\\'; }));
+                text += value.size() +
+                        5 * static_cast<std::size_t>(std::ranges::count_if(value, [](unsigned char c) { return c < 0x20 || c == '"' || c == '\\'; }));
             };
-            for (auto& scope : generation.scopes) for (auto* v : {&scope.id, &scope.parent, &scope.kind, &scope.symbol}) measure(*v);
+            for (auto& scope : generation.scopes)
+                for (auto* v : {&scope.id, &scope.parent, &scope.kind, &scope.symbol})
+                    measure(*v);
             for (auto& symbol : generation.symbols) {
-                for (auto* v : {&symbol.id, &symbol.name, &symbol.kind, &symbol.scope}) measure(*v);
+                for (auto* v : {&symbol.id, &symbol.name, &symbol.kind, &symbol.scope})
+                    measure(*v);
                 records += symbol.declarations.size() + symbol.definitions.size();
             }
-            for (auto& reference : generation.references) for (auto* v : {&reference.target, &reference.kind}) measure(*v);
-            for (auto& relation : generation.relations) for (auto* v : {&relation.source, &relation.target, &relation.kind}) measure(*v);
-            for (auto& diagnostic : generation.diagnostics) for (auto* v : {&diagnostic.severity, &diagnostic.message}) measure(*v);
-            for (auto& covered : generation.covered) for (auto* v : {&covered.document, &covered.digest}) measure(*v);
+            for (auto& reference : generation.references)
+                for (auto* v : {&reference.target, &reference.kind})
+                    measure(*v);
+            for (auto& relation : generation.relations)
+                for (auto* v : {&relation.source, &relation.target, &relation.kind})
+                    measure(*v);
+            for (auto& diagnostic : generation.diagnostics)
+                for (auto* v : {&diagnostic.severity, &diagnostic.message})
+                    measure(*v);
+            for (auto& covered : generation.covered)
+                for (auto* v : {&covered.document, &covered.digest})
+                    measure(*v);
             each_span(generation, [&](semantic::span& span) {
-                for (auto* v : {&span.document, &span.first.run, &span.last.run}) measure(*v);
+                for (auto* v : {&span.document, &span.first.run, &span.last.run})
+                    measure(*v);
             });
             if (records > semantic_records || text > semantic_bytes)
                 fail(nodes::code::resource_limit, "semantic generation is too large");
@@ -3571,8 +3934,13 @@ namespace nodes {
                                 "WHERE line=?1 ORDER BY id"};
             rows.text(1, line);
             while (rows.next()) {
-                nodes::lock l{.id = rows.number(0), .holder = rows.data(1), .scope = rows.data(2), .symbol = rows.data(3), .environment = rows.data(4),
-                              .document = rows.data(5), .acquired = static_cast<std::int64_t>(rows.number(10))};
+                nodes::lock l{.id = rows.number(0),
+                              .holder = rows.data(1),
+                              .scope = rows.data(2),
+                              .symbol = rows.data(3),
+                              .environment = rows.data(4),
+                              .document = rows.data(5),
+                              .acquired = static_cast<std::int64_t>(rows.number(10))};
                 if (!rows.data(6).empty()) {
                     l.first = semantic::anchor{rows.data(6), rows.number(7)};
                     l.last = semantic::anchor{rows.data(8), rows.number(9)};
@@ -3635,7 +4003,9 @@ namespace nodes {
                 analysis = std::move(found->first);
             }
             for (auto& id : in.scopes) {
-                nodes::lock l{.holder = in.holder, .scope = id, .environment = id == nodes::global_scope ? std::string{} : in.environment,
+                nodes::lock l{.holder = in.holder,
+                              .scope = id,
+                              .environment = id == nodes::global_scope ? std::string{} : in.environment,
                               .acquired = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count()};
                 if (id != nodes::global_scope) {
                     auto scope = std::ranges::find(analysis->scopes, id, &semantic::scope::id);
@@ -3800,9 +4170,9 @@ namespace nodes {
                         fail("scope_locked", holding(h));
                 for (auto& h : current)
                     if (h.lock.holder == in.holder &&
-                        (h.global() || (h.intact && wanted.range && h.range && h.lock.document == wanted.lock.document &&
-                                        h.range->first <= wanted.range->first &&
-                                        (point ? wanted.range->first <= h.range->second : wanted.range->second <= h.range->second))))
+                        (h.global() ||
+                         (h.intact && wanted.range && h.range && h.lock.document == wanted.lock.document && h.range->first <= wanted.range->first &&
+                          (point ? wanted.range->first <= h.range->second : wanted.range->second <= h.range->second))))
                         return;
                 fail("scope_locked", "lock the scope that contains this change first");
             };
@@ -4157,28 +4527,51 @@ namespace nodes {
                 materialize(name, heads);
             return inventory();
         }
-        void materialize(const std::string& name,const std::vector<std::string>& heads) {
-            checked_name(name);auto snapshot_owner=source.projection(heads);const auto& snapshot=*snapshot_owner;
-            if(!snapshot.conflicts.empty())fail(nodes::code::source_conflict,"cannot materialize unresolved source");
-            auto directory=root/"working"/name;checked_root(directory);auto marker=directory/".fughetta-version";
-            if(std::filesystem::is_symlink(std::filesystem::symlink_status(marker)))fail(nodes::code::storage_failure,"working marker is a symbolic link");
+        void materialize(const std::string& name, const std::vector<std::string>& heads) {
+            checked_name(name);
+            auto snapshot_owner = source.projection(heads);
+            const auto& snapshot = *snapshot_owner;
+            if (!snapshot.conflicts.empty())
+                fail(nodes::code::source_conflict, "cannot materialize unresolved source");
+            auto directory = root / "working" / name;
+            checked_root(directory);
+            auto marker = directory / ".fughetta-version";
+            if (std::filesystem::is_symlink(std::filesystem::symlink_status(marker)))
+                fail(nodes::code::storage_failure, "working marker is a symbolic link");
             std::set<std::filesystem::path> keep;
-            for(auto& [_,file]:snapshot.files){if(file->path==".fughetta-version"||file->path.starts_with(".fughetta-version/"))fail(nodes::code::source_conflict,"source collides with materialization marker");keep.insert((directory/file->path).lexically_normal());}
-            durability::durable_remove(marker);std::vector<std::filesystem::path> removed,directories;
-            for(auto& entry:std::filesystem::recursive_directory_iterator(directory)) {
-                if(entry.is_symlink())fail(nodes::code::storage_failure,"working tree contains a symbolic link");
-                if(entry.is_directory())directories.push_back(entry.path());else if(!keep.contains(entry.path().lexically_normal()))removed.push_back(entry.path());
+            for (auto& [_, file] : snapshot.files) {
+                if (file->path == ".fughetta-version" || file->path.starts_with(".fughetta-version/"))
+                    fail(nodes::code::source_conflict, "source collides with materialization marker");
+                keep.insert((directory / file->path).lexically_normal());
             }
-            for(auto& path:removed)durability::durable_remove(path);
-            std::ranges::sort(directories,[](auto& a,auto& b){return a.native().size()>b.native().size();});
-            for(auto& path:directories)if(std::filesystem::is_empty(path))durability::durable_remove(path);
-            for(auto& [_,file]:snapshot.files) {
-                auto destination=directory/file->path;checked_root(destination.parent_path());bool current=false;
-                if(std::filesystem::is_regular_file(destination)&&std::filesystem::file_size(destination)==file->bytes()&&durability::is_executable(destination)==file->executable)
-                    current=digest_of(io_files.read(destination))==file->digest;
-                if(!current)io_files.write(destination,file->content(),file->executable);interrupt_at("during_materialization");
+            durability::durable_remove(marker);
+            std::vector<std::filesystem::path> removed, directories;
+            for (auto& entry : std::filesystem::recursive_directory_iterator(directory)) {
+                if (entry.is_symlink())
+                    fail(nodes::code::storage_failure, "working tree contains a symbolic link");
+                if (entry.is_directory())
+                    directories.push_back(entry.path());
+                else if (!keep.contains(entry.path().lexically_normal()))
+                    removed.push_back(entry.path());
             }
-            io_files.write(marker,version(heads));
+            for (auto& path : removed)
+                durability::durable_remove(path);
+            std::ranges::sort(directories, [](auto& a, auto& b) { return a.native().size() > b.native().size(); });
+            for (auto& path : directories)
+                if (std::filesystem::is_empty(path))
+                    durability::durable_remove(path);
+            for (auto& [_, file] : snapshot.files) {
+                auto destination = directory / file->path;
+                checked_root(destination.parent_path());
+                bool current = false;
+                if (std::filesystem::is_regular_file(destination) && std::filesystem::file_size(destination) == file->bytes() &&
+                    durability::is_executable(destination) == file->executable)
+                    current = digest_of(io_files.read(destination)) == file->digest;
+                if (!current)
+                    io_files.write(destination, file->content(), file->executable);
+                interrupt_at("during_materialization");
+            }
+            io_files.write(marker, version(heads));
         }
         void record_failure(const node_request& in, const error& failure) {
             if (dirty)
@@ -4216,8 +4609,25 @@ namespace nodes {
     auto local_node::author_id() const -> std::string { return state_->author.id(); }
     auto local_node::statistics() const -> node_work {
         auto& s = *state_;
-        return {s.projected_before_eviction + s.source.projected_files(), s.db->state_nodes_read,    s.db->state_values_read, s.db->state_nodes_written,
-                s.db->state_values_written, s.db->state_bytes_written, s.kernel_loaded && s.source.fully_loaded(), s.causal_headers_read, s.causal_effects_read, s.file_histories_read, s.file_payloads_read, s.db->state_bytes_read, s.kernel_loaded ? (s.source.has_reader() ? "indexed" : "complete") : "none", s.sequence_pages_read, s.sequence_pages_written, s.insertion_payloads_read, s.cache_evictions, s.db->state_bytes_decoded, s.db->causal_blocks_read};
+        return {s.projected_before_eviction + s.source.projected_files(),
+                s.db->state_nodes_read,
+                s.db->state_values_read,
+                s.db->state_nodes_written,
+                s.db->state_values_written,
+                s.db->state_bytes_written,
+                s.kernel_loaded && s.source.fully_loaded(),
+                s.causal_headers_read,
+                s.causal_effects_read,
+                s.file_histories_read,
+                s.file_payloads_read,
+                s.db->state_bytes_read,
+                s.kernel_loaded ? (s.source.has_reader() ? "indexed" : "complete") : "none",
+                s.sequence_pages_read,
+                s.sequence_pages_written,
+                s.insertion_payloads_read,
+                s.cache_evictions,
+                s.db->state_bytes_decoded,
+                s.db->causal_blocks_read};
     }
     void local_node::use_author(key signer) { state_->author = std::move(signer); }
     void local_node::confirm_with(commit_check* check) { state_->db->confirm = check; }
@@ -4342,9 +4752,11 @@ namespace nodes {
         };
         if (known_checkpoint.empty()) {
             statement rows{*s.db, "SELECT id FROM objects ORDER BY rowid"};
-            while (rows.next()) emit(rows.data(0));
+            while (rows.next())
+                emit(rows.data(0));
         } else {
-            for (auto& id : inventory.objects) emit(id);
+            for (auto& id : inventory.objects)
+                emit(id);
         }
         flush();
         return inventory;
@@ -4430,20 +4842,28 @@ namespace nodes {
     }
     auto local_node::call(const node_request& in) -> node_reply {
         auto& s = *state_;
-        struct cache_boundary { impl& state; ~cache_boundary() { state.trim_kernel(); } } cache{s};
+        struct cache_boundary {
+            impl& state;
+            ~cache_boundary() { state.trim_kernel(); }
+        } cache{s};
         try {
-            static const std::set<std::string> reads{"identity", "offer",   "usage",   "rejected", "send",    "inspect",
-                                                     "tree",     "read",    "compare", "history",  "receipt", "semantic", "anchor", "locks",
-                                                     "worldlines", "content", "contribution"};
-            if (s.read_only && !reads.contains(in.action)) fail(nodes::code::policy_denied, "source reader does not accept mutations");
+            static const std::set<std::string> reads{"identity", "offer",   "usage",    "rejected", "send",  "inspect",    "tree",    "read",        "compare",
+                                                     "history",  "receipt", "semantic", "anchor",   "locks", "worldlines", "content", "contribution"};
+            if (s.read_only && !reads.contains(in.action))
+                fail(nodes::code::policy_denied, "source reader does not accept mutations");
             std::optional<read_snapshot> snapshot;
             if (reads.contains(in.action))
                 snapshot.emplace(*s.db);
             if (in.action == "audit") {
                 transaction tx{*s.db};
                 std::uint64_t generation_value = 0;
-                { statement generation{*s.db, "PRAGMA data_version"}; generation.next(); generation_value = generation.number(0); }
-                if (!s.archive_audited || generation_value != s.data_version) s.reload(true);
+                {
+                    statement generation{*s.db, "PRAGMA data_version"};
+                    generation.next();
+                    generation_value = generation.number(0);
+                }
+                if (!s.archive_audited || generation_value != s.data_version)
+                    s.reload(true);
                 s.dirty = true;
                 s.source.detach_reader();
                 s.reset_state_storage();
@@ -4588,18 +5008,35 @@ namespace nodes {
             if (in.action == "receipt") {
                 if (!in.target.empty())
                     return s.receipt(in.target, false);
-                statement q{*s.db, "SELECT receipt FROM bindings WHERE author=?1 AND operation=?2"};
+                if (auto id = s.executed(in.operation))
+                    return s.receipt(*id, false);
+                // Flows that run several operations under one ID ask this first, so an abandoned one starts none of them.
+                statement q{*s.db, "SELECT 1 FROM bindings WHERE author=?1 AND operation=?2 AND digest='abandoned'"};
                 q.text(1, s.author.id());
                 q.text(2, in.operation);
-                if (q.next() && !q.data(0).empty())
-                    return s.receipt(q.data(0), false);
-                for (auto& id : s.receipts(s.author.id() + ":" + in.operation))
-                    if (s.is_validated(id)) {
-                        auto& b = s.get(id);
-                        if (b.at("operation").text() == in.operation && b.at("author").text() == s.author.id() && b.at("issuer").text() == s.node.id())
-                            return s.receipt(id, false);
-                    }
+                if (q.next())
+                    fail(nodes::code::identity_conflict, "operation was abandoned");
                 fail(nodes::code::outcome_unknown, "no verified original execution receipt");
+            }
+            if (in.action == "abandon") {
+                // An operation that has not run never will: its binding takes a digest no request has, so the request, arriving later,
+                // fails as an operation ID reused with different input. One that ran answers with its receipt.
+                if (!content::is_hash(in.operation))
+                    fail(nodes::code::invalid_record, "abandon names an operation");
+                transaction tx{*s.db};
+                s.refresh_external();
+                if (auto id = s.executed(in.operation))
+                    return s.receipt(*id, false);
+                statement q{*s.db,
+                            "INSERT INTO bindings(author,operation,digest,receipt) VALUES(?1,?2,'abandoned','') ON CONFLICT(author,operation) DO UPDATE SET "
+                            "digest='abandoned'"};
+                q.text(1, s.author.id());
+                q.text(2, in.operation);
+                q.next();
+                tx.commit();
+                auto out = s.identity();
+                out.operation = in.caller_operation.empty() ? in.operation : in.caller_operation;
+                return out;
             }
             static const std::set<std::string> mutations{"apply", "fork", "integrate", "admit", "reverse", "redo", "resolve"};
             if (!mutations.contains(in.action))
@@ -4607,7 +5044,8 @@ namespace nodes {
             return s.publish(in);
         } catch (const error& e) {
             static const std::set<std::string> recorded{"apply", "fork", "integrate", "admit", "reverse", "redo", "resolve"};
-            if (!s.read_only && recorded.contains(in.action) && content::is_hash(in.operation) && !s.project.empty() && e.code != nodes::code::storage_failure) {
+            if (!s.read_only && recorded.contains(in.action) && content::is_hash(in.operation) && !s.project.empty() &&
+                e.code != nodes::code::storage_failure) {
                 try {
                     s.record_failure(in, e);
                 } catch (...) {
@@ -4630,7 +5068,8 @@ namespace nodes {
             out.operation = in.caller_operation.empty() ? in.operation : in.caller_operation;
             out.missing = e.missing;
             out.conflicts = e.conflicts;
-            out.complete = e.code != nodes::code::missing_objects && e.code != nodes::code::outcome_unknown && e.code != nodes::code::storage_failure && e.missing.empty();
+            out.complete =
+                e.code != nodes::code::missing_objects && e.code != nodes::code::outcome_unknown && e.code != nodes::code::storage_failure && e.missing.empty();
             if (auto i = s.roots.find(in.worldline); i != s.roots.end())
                 out.frontier = i->second;
             return out;
