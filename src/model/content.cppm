@@ -74,6 +74,15 @@ export namespace content {
     }
     inline auto hash_of(std::string_view data) -> hash { return hash_of(std::as_bytes(std::span{data})); }
 
+    // Constant-time equality for secrets: unequal lengths differ at once; equal lengths compare in constant time.
+    inline auto secure_equal(std::string_view a, std::string_view b) -> bool {
+        if (a.size() != b.size())
+            return false;
+        if (a.empty())
+            return true;
+        return sodium_memcmp(a.data(), b.data(), a.size()) == 0;
+    }
+
     inline auto is_hash(std::string_view h) -> bool {
         return h.size() == 64 && std::ranges::all_of(h, [](char c) { return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'); });
     }

@@ -15,10 +15,21 @@ namespace {
     auto document() -> config::document {
         config::document d;
         d.limits = {.max_file_bytes = 1000, .max_projects = 5, .read_max_lines = 50};
-        d.projects["app"].analysis["Cpp"] = {.server = fixture::clice("clice", {"--log-level", "off"})};
+        d.projects["app"].build_configurations["Debug"] = fixture::cmake("build/debug");
+        fixture::options<"cmake">(d.projects["app"].build_configurations["Debug"].builders.at("main")).export_compile_commands = true;
+        d.projects["app"].analysis["Cpp"] = {.server = fixture::clice("clice", {"--log-level", "off"}), .build_configuration = "Debug"};
         return d;
     }
     static constexpr auto cases = [] {
+        "worker dependency publisher requires an absolute exclusive destination"_test = [] {
+            for (const auto* text : {R"({"dependency_publish":""})", R"({"dependency_publish":"relative"})",
+                    R"({"dependency_publish":"/published","dependency_upstream":"/upstream"})",
+                    R"({"dependency_publish":"/published"})",
+                    R"({"dependency_recipe":{"executable":"/usr/bin/vcpkg","root":"/opt/vcpkg","triplets":["x64-linux"]}})"})
+                expect(throws<std::invalid_argument>([&] { config::parse_worker(text); }));
+            const auto worker = config::parse_worker(R"({"dependency_publish":"/published","dependency_recipe":{"executable":"/usr/bin/vcpkg","root":"/opt/vcpkg","triplets":["x64-linux"]}})");
+            expect(worker.dependency_publish == "/published" && !worker.dependency_upstream);
+        };
         "source limits and language profiles resolve independently"_test = [] {
             auto d = document();
             config::validate(d);
@@ -144,19 +155,20 @@ namespace {
             expect(capped.builds_per_hour == 3u && capped.read_max_lines == 2000u) << "a grant lowers a limit and never raises one";
         };
 
-        "worker and Source environments resolve independently"_test = [] {
+        "analysis references its worker build environment"_test = [] {
             auto d = sample();
             auto source_build = fixture::cmake("build/source", "cc");
             auto& options = fixture::options<"cmake">(source_build.builders.at("main"));
             options.export_compile_commands = true;
             source_build.outputs["database"] = {"configure", "compilation_database"};
             source_build.env["OWNER"] = "source";
-            d.projects.at("app").analysis["cpp"] = {.build = source_build, .inputs = {"database"}};
+            d.projects.at("app").build_configurations["Analysis"] = source_build;
+            d.projects.at("app").analysis["cpp"] = {.build_configuration = "Analysis"};
             config::validate(d);
             auto e = config::resolve(d, "app");
             expect(e.config("Debug-gcc").build.env.contains("CC"));
-            auto& analysis = e.analysis.at("cpp");
-            expect(!analysis.build.env.contains("CC") && analysis.build.env.at("OWNER") == "source");
+            auto& analysis = e.config(e.analysis.at("cpp").build_configuration);
+            expect(analysis.build.env.at("CC") == "clang" && analysis.build.env.at("OWNER") == "source");
             expect(fixture::options<"cmake">(analysis.build.builders.at("main")).build_dir == "build/source");
         };
 

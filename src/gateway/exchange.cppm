@@ -69,10 +69,4 @@ namespace source {
     auto call(net::ip::tcp::endpoint source, jobs::node_usage request, coroutine::stop_token stop) -> jobs::node_usage_reply {
         return detail::invoke(source, std::move(request), stop);
     }
-    auto call(net::ip::tcp::endpoint source, language::request request, coroutine::stop_token stop) -> language::result {
-        return detail::invoke(source, std::move(request), stop);
-    }
-    auto call(net::ip::tcp::endpoint source, jobs::analysis_finish request, coroutine::stop_token stop) -> language::result {
-        return detail::invoke(source, std::move(request), stop);
-    }
 } // namespace source

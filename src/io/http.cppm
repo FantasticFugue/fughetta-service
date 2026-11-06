@@ -2,6 +2,7 @@ export module http;
 import std;
 import coroutine;
 import meta;
+import constants;
 export import httpant;
 
 export namespace web {
@@ -44,9 +45,19 @@ export namespace web {
 
     class event_stream {
     public:
+        explicit event_stream(std::size_t max_pending_bytes = constants::event_stream_buffer_bytes) : max_pending_bytes_(max_pending_bytes) {}
+
         auto pending_bytes() const -> std::size_t { return pending_.size(); }
 
         void push(std::string_view text) {
+            if (closed_)
+                return;
+            // A reader that is not draining must never let the buffer grow without bound: what is queued is dropped and the stream ends.
+            if (pending_.size() + text.size() > max_pending_bytes_) {
+                pending_.clear();
+                close();
+                return;
+            }
             pending_.append(text);
             wake();
         }
@@ -120,6 +131,7 @@ export namespace web {
 
         std::string pending_;
         bool closed_ = false;
+        std::size_t max_pending_bytes_ = constants::event_stream_buffer_bytes;
         std::coroutine_handle<> waiter_{};
     };
     static_assert(http::body_stream<event_stream>);

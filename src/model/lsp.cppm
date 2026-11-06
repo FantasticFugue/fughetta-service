@@ -31,6 +31,14 @@ namespace lsp::detail {
         detail::range selectionRange;
         std::optional<std::vector<symbol>> children;
     };
+    struct location {
+        std::string uri;
+        detail::range range;
+    };
+    struct location_link {
+        std::string targetUri;
+        detail::range targetRange, targetSelectionRange;
+    };
     struct diagnostic {
         detail::range range;
         std::optional<generic> severity, code;
@@ -39,6 +47,7 @@ namespace lsp::detail {
     struct published {
         std::string uri;
         std::vector<diagnostic> diagnostics;
+        std::optional<std::int64_t> version;
     };
     struct report_of {
         std::string kind;
@@ -58,7 +67,47 @@ namespace lsp::detail {
     // What the server's answer to `initialize` says it offers. What it does not name, it does not offer.
     struct capabilities {
         std::optional<std::string> positionEncoding;
-        std::optional<generic> documentSymbolProvider, diagnosticProvider;
+        std::optional<generic> documentSymbolProvider, diagnosticProvider, definitionProvider, referencesProvider;
+    };
+    // One request at a time is admitted by the session lock. Its reader may finish the
+    // response before the caller starts waiting, or after cancellation has removed it.
+    struct response {
+        std::optional<message> value;
+        std::exception_ptr error;
+        bool cancelled = false;
+        std::coroutine_handle<> waiter;
+        struct on_stop {
+            response* self;
+            void operator()() const noexcept {
+                self->cancelled = true;
+                self->wake();
+            }
+        };
+        std::optional<execution::stop_callback_for_t<coroutine::stop_token, on_stop>> watch;
+        auto await_ready() const noexcept -> bool { return value.has_value() || error || cancelled; }
+        template <class P> auto await_suspend(std::coroutine_handle<P> frame) noexcept -> std::coroutine_handle<> {
+            auto token = execution::get_stop_token(execution::get_env(frame.promise()));
+            if (token.stop_requested()) {
+                cancelled = true;
+                return frame;
+            }
+            waiter = frame;
+            if (token.stop_possible())
+                watch.emplace(token, on_stop{this});
+            return std::noop_coroutine();
+        }
+        auto await_resume() -> std::optional<message> {
+            watch.reset();
+            if (cancelled)
+                return std::nullopt;
+            if (error)
+                std::rethrow_exception(error);
+            return std::move(value);
+        }
+        void wake() {
+            if (auto frame = std::exchange(waiter, {}))
+                frame.resume();
+        }
     };
     struct initialized {
         detail::capabilities capabilities;
@@ -292,6 +341,10 @@ namespace lsp::detail {
 // never an empty answer. Spans name only a place, a path and Unicode scalar offsets, and the caller turns them into character
 // identities of the version it analyzed. No call here waits by itself: the caller bounds each one with a deadline.
 export namespace lsp {
+    struct query_error : std::invalid_argument {
+        using std::invalid_argument::invalid_argument;
+    };
+
     struct document {
         std::string path, language, text;
     };
@@ -343,8 +396,12 @@ export namespace lsp {
             utf16_ = encoding == "utf-16";
             symbols_ = detail::offered(capabilities.documentSymbolProvider);
             pull_ = detail::offered(capabilities.diagnosticProvider);
+            definitions_ = detail::offered(capabilities.definitionProvider);
+            references_ = detail::offered(capabilities.referencesProvider);
             started_ = true;
             co_await notify("initialized", object({}));
+            reading_ = true;
+            reader_.spawn(pump());
         }
 
         // Reports what the server offers about one document.
@@ -353,12 +410,172 @@ export namespace lsp {
             co_return co_await reported(d);
         }
 
+        auto lookup(const semantic::query& query) -> coroutine::task<std::vector<semantic::location>> {
+            auto held = co_await lock_.lock();
+            using detail::object, detail::text;
+            if (query.action != "definitions" && query.action != "references")
+                throw query_error("a location query names definitions or references");
+            if (query.path.empty() || query.symbol.empty() || (query.line && !*query.line))
+                throw query_error("definitions and references require path, symbol and an optional positive line");
+            if (!(query.action == "definitions" ? definitions_ : references_))
+                throw std::runtime_error("language server does not offer " + query.action);
+            auto source = documents_.find(query.path);
+            if (source == documents_.end())
+                throw query_error("language query path is not an analyzed source file: " + query.path);
+            auto identifier = object({{"textDocument", object({{"uri", text(detail::uri(root_ / query.path))}})}});
+            std::vector<detail::position> candidates;
+            if (symbols_) {
+                auto answer = co_await call("textDocument/documentSymbol", identifier);
+                std::size_t seen = 0;
+                if (!detail::bounded(answer, 0, seen))
+                    throw std::runtime_error("language symbol response exceeds the record limit");
+                if (auto symbols = rfl::from_generic<std::vector<detail::symbol>>(answer)) {
+                    auto visit = [&](this auto&& self, const detail::symbol& symbol, std::string prefix) -> void {
+                        auto qualified = prefix.empty() ? symbol.name : prefix + "::" + symbol.name;
+                        if ((query.symbol == symbol.name || query.symbol == qualified) && (!query.line || symbol.selectionRange.start.line + 1 == *query.line))
+                            candidates.push_back(symbol.selectionRange.start);
+                        if (symbol.children)
+                            for (const auto& child : *symbol.children)
+                                self(child, qualified);
+                    };
+                    for (const auto& symbol : *symbols)
+                        visit(symbol, "");
+                }
+            }
+            // Providers without document symbols can still resolve a name at a selected occurrence.
+            if (candidates.empty()) {
+                const auto& input = source->second.value.text;
+                auto identifier_byte = [](unsigned char c) { return std::isalnum(c) || c == '_' || c >= 0x80; };
+                for (std::size_t at = 0; (at = input.find(query.symbol, at)) != std::string::npos; at += query.symbol.size()) {
+                    auto end = at + query.symbol.size();
+                    if ((at && identifier_byte(input[at - 1])) || (end < input.size() && identifier_byte(input[end])))
+                        continue;
+                    detail::position position;
+                    for (std::size_t i = 0; i < at;) {
+                        auto c = static_cast<unsigned char>(input[i]);
+                        if (c == '\r' || c == '\n') {
+                            i += c == '\r' && i + 1 < at && input[i + 1] == '\n' ? 2 : 1;
+                            ++position.line;
+                            position.character = 0;
+                        } else {
+                            auto width = c < 0x80 ? 1u : c >= 0xF0 ? 4u : c >= 0xE0 ? 3u : 2u;
+                            position.character += utf16_ && width == 4 ? 2 : 1;
+                            i += width;
+                        }
+                    }
+                    if (!query.line || position.line + 1 == *query.line)
+                        candidates.push_back(position);
+                }
+            }
+            if (candidates.size() != 1)
+                throw query_error(candidates.empty() ? "symbol was not found in the selected file/line"
+                                                     : "symbol is ambiguous; select its occurrence with line");
+            auto position = candidates.front();
+            auto params = object({{"textDocument", object({{"uri", text(detail::uri(root_ / query.path))}})},
+                                  {"position", object({{"line", detail::generic{static_cast<std::int64_t>(position.line)}},
+                                                       {"character", detail::generic{static_cast<std::int64_t>(position.character)}}})}});
+            if (query.action == "references")
+                params = object({{"textDocument", object({{"uri", text(detail::uri(root_ / query.path))}})},
+                                 {"position", object({{"line", detail::generic{static_cast<std::int64_t>(position.line)}},
+                                                      {"character", detail::generic{static_cast<std::int64_t>(position.character)}}})},
+                                 {"context", object({{"includeDeclaration", detail::generic{true}}})}});
+            auto answer = co_await call(query.action == "definitions" ? "textDocument/definition" : "textDocument/references", std::move(params));
+            std::size_t seen = 0;
+            if (!detail::bounded(answer, 0, seen))
+                throw std::runtime_error("language locations exceed the response limit");
+            std::vector<detail::location> locations;
+            if (std::holds_alternative<std::nullopt_t>(answer.get()))
+                co_return std::vector<semantic::location>{};
+            if (auto list = rfl::from_generic<std::vector<detail::location>>(answer))
+                locations = std::move(*list);
+            else if (auto links = rfl::from_generic<std::vector<detail::location_link>, rfl::DefaultIfMissing>(answer)) {
+                for (const auto& link : *links)
+                    locations.push_back({link.targetUri, link.targetSelectionRange});
+            } else if (auto one = rfl::from_generic<detail::location>(answer))
+                locations.push_back(std::move(*one));
+            else
+                throw std::runtime_error("language server returned unreadable locations");
+            std::vector<semantic::location> result;
+            for (const auto& location : locations) {
+                auto path = detail::path_of(location.uri);
+                if (!path)
+                    throw std::runtime_error("language server returned a non-file location");
+                auto relative = path->lexically_relative(root_).generic_string();
+                auto found = documents_.find(relative);
+                std::string external;
+                if (found == documents_.end()) {
+                    std::error_code error;
+                    auto bytes = std::filesystem::file_size(*path, error);
+                    if (error || bytes > (4u << 20))
+                        throw std::runtime_error("cannot read the language server's target file within the document limit: " + path->string());
+                    std::ifstream input{*path, std::ios::binary};
+                    external.assign(std::istreambuf_iterator<char>{input}, {});
+                    if (external.size() != bytes || external.contains('\0'))
+                        throw std::runtime_error("language target is not readable text: " + path->string());
+                }
+                detail::lines lines{found == documents_.end() ? std::string_view{external} : std::string_view{found->second.value.text}, utf16_};
+                auto first = lines.offset(location.range.start), last = lines.offset(location.range.end);
+                auto first_line = lines.offset({location.range.start.line, 0}), last_line = lines.offset({location.range.end.line, 0});
+                if (!first || !last || !first_line || !last_line || *last < *first)
+                    throw std::runtime_error("language server returned a range outside its document");
+                std::string context;
+                if (auto outline = outlines_.find(relative); outline != outlines_.end()) {
+                    std::uint64_t width = std::numeric_limits<std::uint64_t>::max();
+                    for (const auto& scope : outline->second.scopes)
+                        if (scope.range.place && scope.range.place->begin <= *first && scope.range.place->end >= *last &&
+                            scope.range.place->end - scope.range.place->begin < width) {
+                            width = scope.range.place->end - scope.range.place->begin;
+                            context = scope.symbol;
+                        }
+                }
+                result.push_back({relative.starts_with("../") || relative == ".." ? path->generic_string() : relative, location.range.start.line + 1,
+                                  *first - *first_line + 1, location.range.end.line + 1, *last - *last_line + 1, std::move(context)});
+            }
+            co_return result;
+        }
+
+        // Apply a complete source snapshot before querying any document. Watch notifications also
+        // cover generated inputs, such as a compilation database, that are not open text documents.
+        auto synchronize(const std::vector<document>& documents, const std::vector<std::string>& changed = {}) -> coroutine::task<> {
+            auto held = co_await lock_.lock();
+            using detail::object, detail::text;
+            std::set<std::string> present;
+            for (const auto& d : documents)
+                present.insert(d.path);
+            for (auto it = documents_.begin(); it != documents_.end();) {
+                if (present.contains(it->first)) {
+                    ++it;
+                    continue;
+                }
+                co_await notify("textDocument/didClose", object({{"textDocument", object({{"uri", text(detail::uri(root_ / it->first))}})}}));
+                outlines_.erase(it->first);
+                it = documents_.erase(it);
+            }
+            for (const auto& d : documents)
+                co_await update(d);
+            detail::generic::Array events;
+            for (const auto& path : changed)
+                events.push_back(object({{"uri", text(detail::uri(root_ / path))}, {"type", detail::generic{std::int64_t{2}}}}));
+            if (!events.empty())
+                co_await notify("workspace/didChangeWatchedFiles", object({{"changes", std::move(events)}}));
+        }
+
+        // Retire a failed or cancelled context without a shutdown round trip.
+        auto abort() -> coroutine::task<> {
+            if (child_)
+                child_->kill();
+            reader_.request_stop();
+            co_await coroutine::under(coroutine::stop_token{}, reader_.join());
+            reading_ = false;
+        }
+
         // A server that does not finish shutting down within five seconds is killed.
         // A session still busy with another request is ended at once: killing the server ends that request too.
         auto stop() -> coroutine::task<int> {
             auto held = lock_.try_lock();
             if (!held) {
-                child_->kill();
+                co_await abort();
+                auto finished = co_await lock_.lock();
                 co_return -1;
             }
             std::optional<int> code;
@@ -374,8 +591,7 @@ export namespace lsp {
             } catch (...) {
                 failed = std::current_exception();
             }
-            if (!code)
-                child_->kill();
+            co_await abort();
             if (failed)
                 std::rethrow_exception(failed);
             co_return code.value_or(-1);
@@ -385,28 +601,72 @@ export namespace lsp {
         auto send(const detail::generic& body) -> coroutine::task<> {
             auto text = rfl::json::write(body);
             auto frame = std::format("Content-Length: {}\r\n\r\n{}", text.size(), text);
+            auto turn = co_await writing_.lock();
             co_await io::async_write(*child_, std::as_bytes(std::span{frame}));
         }
         auto notify(std::string method, detail::generic params) -> coroutine::task<> {
             co_await send(detail::object({{"jsonrpc", detail::text("2.0")}, {"method", detail::text(std::move(method))}, {"params", std::move(params)}}));
         }
-        // Asks for `method` and returns its result. Everything the server sends meanwhile is read: its own requests are answered,
-        // the diagnostics it pushes are kept, and its other notifications are left out.
+        auto pump() -> coroutine::task<> {
+            try {
+                for (;;) {
+                    auto incoming = co_await coroutine::stop_point(receive());
+                    if (!incoming)
+                        break;
+                    if (incoming->method) {
+                        if (incoming->id)
+                            co_await answer(*incoming);
+                        else if (incoming->params && *incoming->method == "textDocument/publishDiagnostics")
+                            pushed(*incoming->params);
+                    } else if (pending_ && incoming->id && detail::same_id(*incoming->id, waiting_id_)) {
+                        pending_->value = std::move(*incoming);
+                        pending_->wake();
+                    }
+                }
+                ended_ = std::make_exception_ptr(std::runtime_error("language reader stopped"));
+            } catch (...) {
+                ended_ = std::current_exception();
+            }
+            if (pending_) {
+                pending_->error = ended_;
+                pending_->wake();
+            }
+        }
+
         auto call(std::string method, detail::generic params) -> coroutine::task<detail::generic> {
+            if (ended_)
+                std::rethrow_exception(ended_);
             auto id = ++next_;
+            detail::response response;
+            struct reset {
+                detail::response*& slot;
+                ~reset() { slot = nullptr; }
+            } guard{pending_};
+            if (reading_) {
+                waiting_id_ = id;
+                pending_ = &response;
+            }
             co_await send(detail::object(
                 {{"jsonrpc", detail::text("2.0")}, {"id", detail::generic{id}}, {"method", detail::text(method)}, {"params", std::move(params)}}));
             for (;;) {
-                auto incoming = co_await receive();
-                if (incoming.method) {
-                    if (incoming.id)
-                        co_await answer(incoming);
-                    else if (incoming.params && *incoming.method == "textDocument/publishDiagnostics")
-                        pushed(*incoming.params);
-                    continue;
+                detail::message incoming;
+                if (reading_) {
+                    auto result = co_await response;
+                    if (!result)
+                        co_await coroutine::stop;
+                    incoming = std::move(*result);
+                } else {
+                    incoming = co_await receive();
+                    if (incoming.method) {
+                        if (incoming.id)
+                            co_await answer(incoming);
+                        else if (incoming.params && *incoming.method == "textDocument/publishDiagnostics")
+                            pushed(*incoming.params);
+                        continue;
+                    }
+                    if (!incoming.id || !detail::same_id(*incoming.id, id))
+                        continue;
                 }
-                if (!incoming.id || !detail::same_id(*incoming.id, id))
-                    continue;
                 if (incoming.error)
                     throw std::runtime_error(std::format("language server refused {}: {}", method, incoming.error->message));
                 co_return incoming.result.value_or(detail::null);
@@ -430,11 +690,20 @@ export namespace lsp {
                                 {"error", object({{"code", detail::generic{std::int64_t{-32601}}}, {"message", text("method not supported")}})}});
             co_await send(reply);
         }
-        // A push about the open document replaces the last one, as the specification says.
+        // Ignore delayed diagnostics from an earlier document version.
         void pushed(const detail::generic& params) {
             auto parsed = rfl::from_generic<detail::published, rfl::DefaultIfMissing>(params);
-            if (parsed && open_ && detail::path_of(parsed->uri) == open_)
-                pushed_ = std::move(parsed->diagnostics);
+            if (!parsed)
+                return;
+            auto path = detail::path_of(parsed->uri);
+            if (!path)
+                return;
+            auto relative = path->lexically_relative(root_).generic_string();
+            auto found = documents_.find(relative);
+            if (found != documents_.end() && (!parsed->version || *parsed->version == found->second.version)) {
+                found->second.diagnostics = std::move(parsed->diagnostics);
+                found->second.current_diagnostics = parsed->version.has_value();
+            }
         }
         auto receive() -> coroutine::task<detail::message> {
             for (;;) {
@@ -558,52 +827,73 @@ export namespace lsp {
             for (auto& s : *symbols)
                 visit(s, "", "", 0);
         }
-        // Shows the server one document and asks for what it declared it offers: the symbols, and the diagnostics, pulled when
-        // the server pulls and otherwise those it pushed while the symbols were awaited.
-        auto reported(const document& d) -> coroutine::task<semantic::outline> {
+        struct opened {
+            document value;
+            std::int64_t version = 1;
+            std::vector<detail::diagnostic> diagnostics;
+            bool current_diagnostics = false;
+        };
+
+        auto update(const document& d) -> coroutine::task<> {
             if (!started_)
                 throw std::logic_error("language server session was not started");
+            using detail::object, detail::text;
+            auto uri = text(detail::uri(root_ / d.path));
+            auto found = documents_.find(d.path);
+            if (found == documents_.end()) {
+                auto version = ++version_;
+                documents_.emplace(d.path, opened{d, version});
+                co_await notify(
+                    "textDocument/didOpen",
+                    object({{"textDocument",
+                             object({{"uri", uri}, {"languageId", text(d.language)}, {"version", detail::generic{version}}, {"text", text(d.text)}})}}));
+            } else if (found->second.value.text != d.text) {
+                auto version = ++version_;
+                found->second = opened{d, version};
+                outlines_.erase(d.path);
+                co_await notify("textDocument/didChange", object({{"textDocument", object({{"uri", uri}, {"version", detail::generic{version}}})},
+                                                                  {"contentChanges", detail::generic::Array{object({{"text", text(d.text)}})}}}));
+            }
+        }
+
+        auto reported(const document& d) -> coroutine::task<semantic::outline> {
             if (!symbols_ && !pull_)
                 throw std::runtime_error(
                     std::format("the language server declares neither documentSymbolProvider nor diagnosticProvider, so {} cannot be described", d.path));
             using detail::object, detail::text;
-            open_ = root_ / d.path;
-            pushed_.clear();
-            auto uri = text(detail::uri(*open_));
-            auto identifier = object({{"textDocument", object({{"uri", uri}})}});
-            co_await notify(
-                "textDocument/didOpen",
-                object({{"textDocument",
-                         object({{"uri", uri}, {"languageId", text(d.language)}, {"version", detail::generic{std::int64_t{1}}}, {"text", text(d.text)}})}}));
+            co_await update(d);
+            auto identifier = object({{"textDocument", object({{"uri", text(detail::uri(root_ / d.path))}})}});
             semantic::outline out;
-            try {
-                if (symbols_)
-                    described(co_await call("textDocument/documentSymbol", identifier), d, out);
-                if (pull_)
-                    converted(co_await call("textDocument/diagnostic", identifier), d, out.diagnostics);
-                else
-                    located(d, pushed_, out.diagnostics);
-            } catch (...) {
-                // The session is not used again after a failed document, so the server is not told to close it.
-                open_.reset();
-                throw;
+            if (symbols_)
+                described(co_await call("textDocument/documentSymbol", identifier), d, out);
+            if (pull_)
+                converted(co_await call("textDocument/diagnostic", identifier), d, out.diagnostics);
+            else {
+                const auto& latest = documents_.at(d.path);
+                located(d, latest.diagnostics, out.diagnostics);
+                out.complete = latest.current_diagnostics;
+                out.cacheable = false; // A document version cannot certify cross-file dependencies of pushed diagnostics.
             }
-            open_.reset();
-            co_await notify("textDocument/didClose", object({{"textDocument", object({{"uri", uri}})}}));
+            outlines_[d.path] = out;
             co_return out;
         }
 
         native::scheduler io_;
         std::optional<native::process> child_;
-        coroutine::mutex lock_;
+        coroutine::mutex lock_, writing_;
+        coroutine::scope reader_;
+        detail::response* pending_ = nullptr;
+        std::exception_ptr ended_;
+        std::int64_t waiting_id_ = 0, version_ = 0;
+        bool reading_ = false;
         std::string buffer_;
         std::array<std::byte, 16 * 1024> chunk_{};
         std::filesystem::path root_;
-        std::optional<std::filesystem::path> open_;
+        std::map<std::string, opened> documents_;
+        std::map<std::string, semantic::outline> outlines_;
         detail::generic settings_ = detail::null;
-        std::vector<detail::diagnostic> pushed_;
         std::int64_t next_ = 0;
-        bool started_ = false, utf16_ = true, symbols_ = false, pull_ = false;
+        bool started_ = false, utf16_ = true, symbols_ = false, pull_ = false, definitions_ = false, references_ = false;
     };
 
     // What one survey may take: documents and their bytes are checked before any is read, records as the server reports them.
@@ -626,7 +916,9 @@ export namespace lsp {
         auto left = [&] {
             return std::max(std::chrono::seconds{1}, std::chrono::duration_cast<std::chrono::seconds>(until - std::chrono::steady_clock::now()));
         };
-        try {
+        auto token = co_await coroutine::current_token;
+        bool finished = false;
+        auto work = [&]() -> coroutine::task<> {
             if (!co_await coroutine::deadline(io, std::min(bounds.per_document, left()), session.start(tree, std::move(initialization))))
                 throw std::runtime_error("the language server did not start in time");
             std::size_t records = 0;
@@ -641,10 +933,15 @@ export namespace lsp {
                 std::ranges::move(described->symbols, std::back_inserter(out.symbols));
                 std::ranges::move(described->diagnostics, std::back_inserter(out.diagnostics));
             }
+        };
+        try {
+            finished = co_await coroutine::under(token, work());
         } catch (...) {
             failed = std::current_exception();
         }
-        (void)co_await session.stop();
+        co_await coroutine::under(coroutine::stop_token{}, session.abort());
+        if (!finished && !failed)
+            co_await coroutine::stop;
         if (failed)
             std::rethrow_exception(failed);
         co_return out;

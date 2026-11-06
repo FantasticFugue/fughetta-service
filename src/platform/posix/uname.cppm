@@ -47,24 +47,42 @@ namespace host {
         return env;
     }
 
-    auto detect_tools(const std::map<std::string, std::string>& mapped) -> std::vector<std::string> {
-        std::set<std::string> found;
-        for (auto& [name, path] : mapped)
-            if (::access(path.c_str(), X_OK) == 0)
-                found.insert(name);
+    auto resolve_tools(const std::map<std::string, std::string>& mapped, const std::vector<std::string>& wanted) -> std::map<std::string, std::string> {
+        std::map<std::string, std::string> found;
         auto path = std::getenv("PATH");
         for (auto dir : std::views::split(std::string_view{path ? path : ""}, ':')) {
             std::error_code ec;
             auto folder = std::string{dir.begin(), dir.end()};
             if (folder.empty())
                 folder = ".";
-            for (auto& file : std::filesystem::directory_iterator(folder, ec)) {
+            if (!wanted.empty()) {
+                for (const auto& name : wanted) {
+                    auto file = std::filesystem::path{folder} / name;
+                    if (std::filesystem::is_regular_file(file, ec) && !ec && ::access(file.c_str(), X_OK) == 0)
+                        found.try_emplace(name, std::filesystem::absolute(file).string());
+                }
+                continue;
+            }
+            for (const auto& file : std::filesystem::directory_iterator(folder, ec)) {
+                if (!wanted.empty() && !std::ranges::contains(wanted, file.path().filename().string()))
+                    continue;
                 if (!file.is_regular_file(ec) || ec || ::access(file.path().c_str(), X_OK) != 0)
                     continue;
-                found.insert(file.path().filename().string());
+                found.try_emplace(file.path().filename().string(), std::filesystem::absolute(file.path()).string());
             }
         }
-        return {found.begin(), found.end()};
+        for (const auto& [name, path] : mapped) {
+            found.erase(name);
+            if (::access(path.c_str(), X_OK) == 0)
+                found[name] = std::filesystem::absolute(path).string();
+        }
+        return found;
+    }
+    auto detect_tools(const std::map<std::string, std::string>& mapped) -> std::vector<std::string> {
+        std::vector<std::string> names;
+        for (const auto& [name, path] : resolve_tools(mapped))
+            names.push_back(name);
+        return names;
     }
 
     auto name() -> std::string {

@@ -20,6 +20,26 @@ namespace {
         return c;
     }
     static constexpr auto cases = [] {
+        "dependency manifests contain selectors but never registry configuration or commands"_test = [] {
+            auto manifest = builds::dependency_manifest(R"({"name":"tenant","dependencies":["fmt",{"name":"zlib","features":["core"],"default-features":false}],"features":{"tests":{"description":"tests","dependencies":["catch2"]}},"default-features":["tests"],"command":"untrusted","overrides":[{"name":"fmt","version":"10.0.0"}]})");
+            const auto encoded = rfl::json::write(manifest);
+            expect(encoded.contains("fmt") && encoded.contains("catch2") && !encoded.contains("untrusted") && !encoded.contains("tenant"));
+            for (const auto* text : {R"({"vcpkg-configuration":{}})", R"({"dependencies":["../escape"]})",
+                    R"json({"dependencies":[{"name":"fmt","platform":"$(command)"}]})json", R"({"builtin-baseline":"not-a-hash"})"})
+                expect(throws<std::invalid_argument>([&] { builds::dependency_manifest(text); }));
+        };
+        "dependency filling is described only for supported provider inputs"_test = [] {
+            auto c = configured();
+            auto& options = fixture::options<"vcpkg">(c.builders.at("deps"));
+            auto plan = builds::prepare(c, {.operation = "build"});
+            expect(plan.steps.front().dependencies.has_value());
+            expect(plan.steps.front().dependencies->triplet == "x64-linux");
+            options.overlay_ports = {"ports"};
+            expect(!builds::prepare(c, {.operation = "build"}).steps.front().dependencies);
+            options.overlay_ports.clear();
+            options.extra = {"--dry-run"};
+            expect(!builds::prepare(c, {.operation = "build"}).steps.front().dependencies);
+        };
         "vcpkg installation feeds the CMake configuration on a worker"_test = [] {
             auto c = configured();
             auto& v = fixture::options<"vcpkg">(c.builders.at("deps"));
@@ -28,7 +48,25 @@ namespace {
             v.buildtrees_dir = "build/trees";
             auto plan = builds::prepare(c, {.operation = "build"});
             expect(plan.steps.size() == 3u);
-            auto install = builds::locate(plan.steps.front(), "/work/project", {{"vcpkg", "/opt/tools/vcpkg"}}, 3);
+            auto install = builds::locate(plan.steps.front(), "/work/project", {{"vcpkg", "/opt/tools/vcpkg"}}, 3, {}, "/shared/dependencies");
+            expect(install.env.at("VCPKG_BINARY_SOURCES") == "clear;files,/shared/dependencies/vcpkg,readwrite");
+            expect(install.env.at("VCPKG_FEATURE_FLAGS") == "binarycaching");
+            auto consumer = builds::locate(plan.steps.front(), "/work/project", {}, 1, {}, "/private/dependencies", "/published/cache,stable");
+            expect(consumer.env.at("VCPKG_BINARY_SOURCES") == "clear;files,/published/cache`,stable/vcpkg,read;files,/private/dependencies/vcpkg,readwrite");
+            for (const auto* writable : {"/published", "/published/sub/..", "/published/vcpkg/private"})
+                expect(throws<std::invalid_argument>([&] { builds::locate(plan.steps.front(), "/work/project", {}, 1, {}, writable, "/published"); }));
+            expect(throws<std::invalid_argument>([&] { builds::locate(plan.steps.front(), "/work/project", {}, 1, {}, "/published", "/published/vcpkg/nested"); }));
+            auto escaped = builds::locate(plan.steps.front(), "/work/other", {}, 1, {}, "/shared/cache,semi;tick`");
+            expect(escaped.env.at("VCPKG_BINARY_SOURCES") == "clear;files,/shared/cache`,semi`;tick``/vcpkg,readwrite");
+            auto literal = builds::locate(plan.steps.front(), "/work/other", {}, 1, {}, "/shared/${tree}/${jobs}/${tool:cc}");
+            expect(literal.env.at("VCPKG_BINARY_SOURCES") == "clear;files,/shared/${tree}/${jobs}/${tool:cc}/vcpkg,readwrite");
+            auto argument = plan.steps.front();
+            argument.argv.push_back("${cache:vcpkg}");
+            expect(throws<std::invalid_argument>([&] { builds::locate(argument, "/tree", {}, 1, {}, "/shared"); }));
+            auto environment = plan.steps.front();
+            environment.env["OTHER"] = "${cache:vcpkg}";
+            expect(throws<std::invalid_argument>([&] { builds::locate(environment, "/tree", {}, 1, {}, "/shared"); }));
+            expect(throws<std::invalid_argument>([&] { builds::locate(plan.steps.front(), "/work/project", {}, 1); }));
             expect(install.argv.front() == "/opt/tools/vcpkg" && install.env.at("VCPKG_MAX_CONCURRENCY") == "3");
             expect(std::ranges::contains(install.argv, "--vcpkg-root=/opt/vcpkg"));
             expect(std::ranges::contains(install.argv, "--x-install-root=/work/project/build/installed"));
@@ -38,23 +76,35 @@ namespace {
             v.extra = {"--triplet=other"};
             expect(throws<std::invalid_argument>([&] { builds::validate(c); }));
             v.extra.clear();
+            for (const auto* option : {"--binarysource=clear", "--binarysource=files,/other,readwrite", "--binarycaching",
+                    "--no-binarycaching", "--feature-flags=-binarycaching", "--editable"}) {
+                v.extra = {option};
+                expect(throws<std::invalid_argument>([&] { builds::validate(c); }));
+            }
+            v.extra.clear();
+            for (const auto* argument : {"--binarysource=clear", "@${tree}/options.rsp", "--BINARYSOURCE=clear", "--x-binarysource=clear"}) {
+                c.tasks.at("dependencies").parameters.args = {argument};
+                expect(throws<std::invalid_argument>([&] { builds::prepare(c, {.operation = "build"}); }));
+            }
+            c.tasks.at("dependencies").parameters.args.clear();
+            v.env["VCPKG_FEATURE_FLAGS"] = "-binarycaching";
+            expect(throws<std::invalid_argument>([&] { builds::validate(c); }));
+            v.env.clear();
             v.install_dir.clear();
             expect(throws<std::invalid_argument>([&] { builds::validate(c); }));
         };
         "clice initialization and executable mapping use the prepared project"_test = [] {
             language::configuration c{
                 .server = language::with<"clice">{.options = {.args = {"--log-level", "off"}, .cache_dir = "build/clice", .append = {"-std=c++23"}}},
-                .build = configured(),
-                .operation = "prepare",
-                .inputs = {"database"}};
-            auto plan = language::prepare(c);
+                .build_configuration = "native"};
+            auto plan = language::prepare(c, configured());
             auto json = rfl::json::write(plan.server.initialization);
             expect(json.contains("build/debug/compile_commands.json") && json.contains("-std=c++23"));
             auto local = language::locate(plan.server, "/work/project", {{"clice", "/opt/clice/bin/clice"}}, 2);
             expect(local.argv == std::vector<std::string>{"/opt/clice/bin/clice", "serve", "--log-level", "off"});
             expect(rfl::json::write(local.initialization) == json);
-            c.inputs.clear();
-            expect(throws<std::invalid_argument>([&] { language::prepare(c); }));
+            c.build_configuration.clear();
+            expect(throws<std::invalid_argument>([&] { language::prepare(c, configured()); }));
         };
     };
 } // namespace

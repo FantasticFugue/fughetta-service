@@ -301,7 +301,7 @@ namespace durability {
             OVERLAPPED offset{};
             if (!::LockFileEx(file.value, LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY, 0, MAXDWORD, MAXDWORD, &offset)) {
                 if (::GetLastError() == ERROR_LOCK_VIOLATION)
-                    throw std::runtime_error(std::format("{} {} is in use by another process", what, dir.string()));
+                    throw lock_busy(std::format("{} {} is in use by another process", what, dir.string()));
                 winapi::fail("LockFileEx directory ownership");
             }
         }

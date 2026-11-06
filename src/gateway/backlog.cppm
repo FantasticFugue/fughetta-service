@@ -28,6 +28,14 @@ namespace tools {
         co_return co_await cores::call(rt_.get_scheduler(here), rt_.get_scheduler(0), [this]() -> coroutine::task<std::vector<view>> { co_return views(); });
     }
 
+    auto backlog::forget(std::size_t here, std::string key) -> coroutine::task<> {
+        if (here != 0) {
+            co_await cores::call(rt_.get_scheduler(here), rt_.get_scheduler(0), [this, key] { return forget(0, key); });
+            co_return;
+        }
+        std::erase_if(cache_, [&](const auto& item) { return item.first == key; });
+    }
+
     auto backlog::cancel(std::size_t here, std::uint64_t id, worlds::actor who) -> coroutine::task<std::string> {
         if (here == 0)
             co_return withdraw(id, who);
@@ -46,19 +54,22 @@ namespace tools {
         // The same asker's older request for the same project, configuration and operation has not started: this one replaces it.
         for (auto it = jobs_.begin(); it != jobs_.end();) {
             auto j = *it++;
-            if (!j->running && j->what.key != e.key && j->what.project == e.project && j->what.configuration == e.configuration &&
-                j->what.operation == e.operation && std::ranges::all_of(j->tickets, [&](auto& t) { return t->actor_ == e.actor; }))
+            if (e.operation == "build" && j->what.operation == "build" && e.cacheable && j->what.cacheable && !j->what.fresh && !j->running && j->what.key != e.key &&
+                j->what.project == e.project && j->what.configuration == e.configuration && j->what.operation == e.operation &&
+                j->what.worldline == e.worldline && std::ranges::all_of(j->tickets, [&](auto& t) { return t->actor_ == e.actor; }))
                 finish(j, refused(j->what, "replaced by a newer request for the same configuration"), "replaced");
         }
         auto held = std::make_shared<ticket>(e.actor);
         if (e.cacheable && !e.fresh)
             if (auto hit = std::ranges::find(cache_, e.key, &std::pair<std::string, outcome>::first); hit != cache_.end()) {
                 cache_.splice(cache_.begin(), cache_, hit);
+                held->reuse_ = "cache";
                 held->result_ = hit->second;
                 held->done_.store(true, std::memory_order_release);
                 return held;
             }
-        if (auto same = std::ranges::find_if(jobs_, [&](auto& j) { return j->what.key == e.key; }); same != jobs_.end()) {
+        if (auto same = std::ranges::find_if(jobs_, [&](auto& j) { return !e.fresh && j->what.key == e.key; }); same != jobs_.end()) {
+            held->reuse_ = "shared";
             held->job_ = (*same)->id;
             held->progress_ = (*same)->progress;
             (*same)->tickets.push_back(held);
@@ -150,9 +161,12 @@ namespace tools {
         if (tree)
             tree->busy = true;
         std::optional<std::optional<outcome>> out;
-        std::string failure;
+        std::string failure, failure_code;
         try {
             out = co_await coroutine::under(j->stop.get_token(), j->run(zero_, *j->progress, tree ? tree->name : std::string{}));
+        } catch (const tool_error& e) {
+            failure = e.what();
+            failure_code = e.code;
         } catch (const std::exception& e) {
             failure = e.what();
         }
@@ -160,17 +174,29 @@ namespace tools {
             tree->busy = false;
             // A tree keeps what a worker built in it. A job that was stopped or failed may have changed it on the way, so its last build
             // no longer says what it holds; a job that found every worker busy never reached it.
-            auto* built = out && *out ? std::get_if<config_result>(&**out) : nullptr;
-            if (built && !built->worker.empty()) {
+            bool synced = false;
+            if (out && *out)
+                std::visit(
+                    [&](const auto& result) {
+                        if constexpr (std::same_as<std::remove_cvref_t<decltype(result)>, config_result>)
+                            synced = !result.worker.empty() && result.ok;
+                        else
+                            synced = !result.worker.empty() && result.status == "prepared";
+                    },
+                    **out);
+            if (synced) {
                 tree->files = {j->what.files.begin(), j->what.files.end()};
                 tree->used = ++clock_;
-            } else if (!out || !failure.empty() || built)
+            } else if (!out || !failure.empty() || *out)
                 tree->files.clear();
         }
         --running_;
-        if (!failure.empty())
-            finish(j, refused(j->what, std::move(failure)), "done");
-        else if (!out)
+        if (!failure.empty()) {
+            auto result = refused(j->what, std::move(failure));
+            if (!failure_code.empty())
+                std::get<config_result>(result).error_code = std::move(failure_code);
+            finish(j, std::move(result), "done");
+        } else if (!out)
             finish(j, refused(j->what, "cancelled"), "cancelled");
         else if (!*out) {
             j->running = false;
@@ -182,13 +208,22 @@ namespace tools {
 
     void backlog::finish(const std::shared_ptr<job>& j, outcome r, std::string state) {
         auto* built = std::get_if<config_result>(&r);
-        if (state == "done" && j->what.cacheable && built && built->error.empty() && !built->worker.empty()) {
+        auto* analyzed = std::get_if<language::result>(&r);
+        auto reusable = built ? built->error.empty() && !built->worker.empty()
+                              : analyzed->status == "prepared" && analyzed->analysis == "analyzed" && !analyzed->worker.empty() && analyzed->outline &&
+                                    analyzed->outline->complete && analyzed->outline->cacheable;
+        if (built)
+            reusable = reusable && built->export_error.empty() && std::ranges::all_of(built->exports, [](const auto& file) { return file.delivery_error.empty(); }) &&
+                std::ranges::all_of(built->steps, [](const auto& step) {
+                    return step.log_error.empty() && step.cache_error.empty() && (!step.log || step.log->delivery_error.empty());
+                });
+        if (state == "done" && j->what.cacheable && reusable) {
             std::erase_if(cache_, [&](auto& c) { return c.first == j->what.key; });
             cache_.emplace_front(j->what.key, r);
             if (cache_.size() > cached_results)
                 cache_.pop_back();
         }
-        auto ok = built ? built->ok : std::get<language::result>(r).status == "prepared";
+        auto ok = built ? built->ok : std::get<language::result>(r).status == "prepared" && std::get<language::result>(r).analysis == "analyzed";
         finished_.push_front({.id = j->id,
                               .project = j->what.project,
                               .configuration = j->what.configuration,

@@ -22,6 +22,7 @@ export namespace replica {
         explicit store(std::filesystem::path root, limits l = {}) : root_(std::move(root)), lock_(root_, "worker directory"), limits_(l) {
             std::filesystem::create_directories(root_ / "blobs" / "partial");
             std::filesystem::create_directories(root_ / "trees");
+            discard(root_ / "discarded");
             index();
         }
 
@@ -103,6 +104,42 @@ export namespace replica {
 
         // The files of an offered snapshot.
         auto files(std::string_view project, const content::hash& snapshot) -> std::vector<content::entry> { return find_offer(project, snapshot).files; }
+
+        // Detach under the store lock; traverse and delete after releasing that lock.
+        auto detach(std::string_view project, std::string_view target) -> std::filesystem::path {
+            const auto key = tree_key(project, target);
+            auto dir = tree(key);
+            unlinked(root_, dir.lexically_relative(root_).generic_string());
+            std::filesystem::path retired;
+            if (std::filesystem::exists(dir)) {
+                const auto parent = root_ / "discarded";
+                std::filesystem::create_directories(parent);
+                static std::atomic<std::uint64_t> next{0};
+                do { retired = parent / std::to_string(next.fetch_add(1)); }
+                while (!std::filesystem::create_directory(retired));
+                std::filesystem::rename(dir, retired / "tree");
+            }
+            std::filesystem::remove(manifest_path(key));
+            return retired;
+        }
+
+        static void discard(const std::filesystem::path& path) {
+            if (path.empty()) return;
+            std::error_code ec;
+            auto status = std::filesystem::symlink_status(path, ec);
+            if (ec) return;
+            if (!std::filesystem::exists(status)) return;
+            if (std::filesystem::is_directory(status)) {
+                std::filesystem::permissions(path, std::filesystem::perms::owner_all, std::filesystem::perm_options::add, ec);
+                if (ec) return;
+                auto it = std::filesystem::directory_iterator(path, ec);
+                while (!ec && it != std::filesystem::directory_iterator{}) {
+                    discard(it->path());
+                    it.increment(ec);
+                }
+            }
+            std::filesystem::remove(path, ec);
+        }
 
         auto checkout(std::string_view project, const content::hash& snapshot, std::string_view target = {}) -> std::filesystem::path {
             auto& wanted = find_offer(project, snapshot);

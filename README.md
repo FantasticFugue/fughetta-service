@@ -1,15 +1,22 @@
 # fughetta-service
 
-A remote development service for coding agents, exposed over MCP.
+Build and language services for coding agents, exposed over MCP.
+
+Fughetta runs builds, tests, runs, and language analysis on remote workers with
+configured toolchains—driving build systems, package managers, test runners, and
+language servers through their published report formats—and returns structured
+diagnostics and test results instead of terminal scrollback. Capability is
+fine-grained (one provider per toolchain), while the agent-facing interface
+stays a few MCP tools.
 
 The first release serves builds, tests, and runs: agents edit files on their
 own machine, [fug](../fughetta-cli) sends them, and several agents share one
 queue of deduplicated, cached jobs on warm workers. Behind that sits the
 longer-term layer the service is built on: worldlines that hold each project's
 code and let agents work on it together, and language analysis that reads
-symbols and scopes from those versions. Its file and worldline tools serve
-clients that sync code (`fug`, `agent-cloud`); they are not yet the main agent
-interface.
+symbols and scopes from those versions. The business MCP exposes only
+`configurations`, `language`, `build`, `test`, and `run`. Clients sync source and
+read worldline history through the member REST API; agents edit their local copy.
 
 The `fughetta-service` executable runs a gateway process that manages one
 source process and a worker pool for one workspace. The hosted platform places
@@ -246,9 +253,10 @@ Worker inflight series include the authenticated `worker_id` alongside the
 display name, so same-name registered machines have distinct series. Managed
 connections sharing the same display name have one series with summed inflight
 requests; their total connection count remains separate.
-Language preparation persists its completed, failed, cancelled, or unknown
-receipt in a bounded interval even when its caller cancels. Repeating its
-operation retrieves that receipt instead of rerunning the command.
+Language queries prepare missing analysis within the original call on a worker.
+Each caller holds a cancellation ticket; preparation has no separate operation
+or durable receipt. When no worker meets the requirements, the call reports
+`no_worker`. Source never executes preparation commands.
 
 Remote defaults are a 15-second application heartbeat and a 90-second Core
 stale threshold. `heartbeat_seconds` accepts 1–30 seconds. Temporary connection failures use bounded
@@ -271,13 +279,164 @@ build manifests before executing its tasks.
 | --- | --- |
 | CMake / CTest | Configure and build with explicit directories, presets, compilers, variables, and targets. The CMake builder's `test` object controls CTest selection, parallelism, timeout, and failure behavior. An empty test selection fails by default. |
 | vcpkg | Install a manifest into `install_dir`; the task exports the installed directory. Point CMake at the selected checkout's `scripts/buildsystems/vcpkg.cmake`, bind `VCPKG_INSTALLED_DIR` to that output, and set `VCPKG_MANIFEST_INSTALL=OFF` when the graph already performs installation. |
-| clice | Read compilation-database outputs from the preparation graph, with explicit cache, compile-flag additions/removals, executable, and environment settings. |
+| clice | Read compilation-database outputs derived from the bound build graph, with explicit cache, compile-flag additions/removals, executable, and environment settings. |
 | TypeScript / tsc | Check a selected `tsconfig.json` without emitting, or compile into an explicit output directory. Compiler options are typed fields; terminal diagnostics remain available without being parsed as a structured report. |
 | typescript-language-server | Analyze TypeScript, TSX, JavaScript, and JSX through LSP. Configure tsserver, inlay/completion preferences, implicit-project settings, locale, and memory through initialization options. |
 | Bun | Build and test only. Every operation automatically performs a frozen-lockfile `bun install` first, with lifecycle scripts disabled by default. Build entrypoints, output, bundler options, test paths, and name filters are typed; there is no `run` operation or arbitrary command argument field. Tests use Bun's native JUnit reporter. |
 | uv | Lock, sync, build distributions, and run a command. Environment and distribution directories are explicit; dependency groups, extras, interpreter selection, and offline execution are modeled separately. |
 | ty | Run type checks with import environments and rule severity settings; warnings fail by default. Its language server has independent diagnostic, completion, inlay-hint, and configuration settings. |
 | Ruff | Check lint and formatting without rewriting source. The language server has independent rules, formatting, code-action, and configuration settings. |
+
+The vcpkg provider binds its binary cache outside the hot checkout. Managed
+workers share `<server.storage>/dependencies/vcpkg`. An independent worker can
+set `dependency_cache` to an absolute shared-mount path; its vcpkg archives use
+the `vcpkg` subdirectory. Without that setting, an independent worker uses
+`<work_root>/dependencies/vcpkg`; registered workers use
+`<work_root>/<workspace_id>/<worker_id>/dependencies/vcpkg` instead. Set
+`dependency_cache` on every participating independent worker to share a mount.
+A fresh build keeps this cache. Projects retain
+their own install and build directories; archive keys and package compatibility
+are determined by vcpkg. The provider sets `VCPKG_BINARY_SOURCES` for the install
+step, including escaping reserved characters in vcpkg's source-list syntax.
+Project `extra` and invocation arguments cannot override binary-cache sources,
+disable binary caching, or request editable installs. Invocation response files
+are rejected. The provider owns `VCPKG_FEATURE_FLAGS` and sets `binarycaching`
+on the install step, overriding build-level feature flags. The cache placeholder is
+reserved for the managed source string. CMake-driven manifest installation does
+not use this path; use the vcpkg provider and disable CMake's manifest install as
+described above.
+Shared cache mounts must belong to the deployment's trusted build environment;
+the current process isolation does not make a writable mount safe for mutually
+untrusted build commands. Workers serialize vcpkg installations with a lock in
+the shared cache directory, so a waiting install can restore packages published
+by the preceding one. Waiting is cancellable and counts against the execution
+deadline. The shared filesystem must support locks across participating hosts;
+unrelated cache mounts cannot coordinate builds. This currently serializes all
+vcpkg installs sharing that directory, including installs of different packages.
+Dependency archives are not covered by `max_cache_bytes` or the checkout TTL.
+Operators must provision capacity and prune old archives while cache users are
+stopped. Keep the directory lock file; removing it can break exclusion between
+processes. Automatic dependency-cache retention is not implemented yet.
+
+For a trusted publisher and separate consumers, set each consumer's
+`dependency_upstream` to the absolute root of the published cache. The provider
+reads its `vcpkg` subdirectory before the consumer's writable cache
+(`dependency_cache` or its default);
+new archives go only to that consumer cache. Locks also stay in the writable
+cache. The two `vcpkg` subdirectories are rejected if their resolved paths overlap
+before taking a lock. Configure the trusted publisher with `dependency_publish`
+as described below. Consumer caches must stay private to their trust domain.
+Mount the published root read-only in consumer environments: vcpkg's `read`
+source mode governs vcpkg, not arbitrary project commands. This configuration
+does not create or verify an OS filesystem boundary or provision a publisher.
+The gateway schedules cache fills on connected publishers before consumer installs.
+The pinned [vcpkg tool's files provider](https://github.com/microsoft/vcpkg-tool/blob/2026-09-26/src/vcpkg/binarycaching.cpp#L289)
+publishes a completed archive by rename. Across filesystems it copies to a
+temporary sibling of the destination before renaming. A shared mount must
+preserve that atomic rename behavior. This source inspection does not verify
+the deployed filesystem. Direct vcpkg writers can replace an existing ABI archive;
+use the staged `dependency_publish` path below for no-replace publication.
+
+A dedicated trusted worker can set `dependency_publish` to the published root
+instead of `dependency_upstream`. Its writable cache stays private, defaulting
+to `<worker-root>/publisher/dependencies` so it does not reuse the older general
+cache. Configure `dependency_recipe` together with `dependency_publish`; its
+executable, registry root, allowed triplets, optional absolute overlay paths and
+environment belong to the operator. Start with an empty private cache; never
+reuse one that held untrusted builds. The publisher rejects regular build and
+source-upload RPCs and only accepts typed dependency selectors. Each fill uses
+a fresh install tree, reads published archives and serializes installs with the published root's lock,
+and after a successful install copies new ABI archives to temporary files on
+the destination filesystem. It flushes each copy and creates the final entry
+with a hard link that cannot replace an existing file. Later changes to private
+archives do not change published copies. Publication errors appear in the
+step's `cache_error` without discarding its exit status, and prevent reuse of
+that build result. Each archive is limited to 8 GiB; publication visits at most
+65,536 entries across the whole private cache and checks the execution deadline
+while copying. A successful install triggers publication of all unpublished
+archives in that trusted private cache, including completed dependency archives
+left by earlier failed installs. It does not limit publication to the last
+install's outputs. Prune the private cache while publishers are stopped before
+it reaches the entry limit; remove malformed archives reported by `cache_error`
+before retrying. Publication is atomic per archive, so entries committed before
+a later archive fails remain available.
+The gateway reads the consumer manifest from its pinned source snapshot and
+projects it to package/feature/version selectors. Project commands, environment,
+registry definitions and source files never reach the publisher. Provider steps
+with custom overlays or opaque arguments, and snapshots with custom registry
+configuration, build privately. Empty triplets use the first operator-admitted
+triplet; specify it as the publisher's native host triplet. Package ABI matching
+remains vcpkg's responsibility. The builtin registry resolves selected versions
+through the operator root's version database; a requested baseline selects
+versions, not an arbitrary port script tree ([registry implementation](https://github.com/microsoft/vcpkg-tool/blob/2026-09-26/src/vcpkg/registries.cpp#L527)). A different consumer toolchain, environment or
+port input causes a private miss instead of accepting an incompatible archive.
+
+Fills share backlog tickets across equal concurrent requests, before the consumer
+job enters the queue. They count against the same concurrency and build-rate/time quotas without
+nested queue waits; shared fill work is charged once to its initiating project. Completed fills are not memoized: each later fill rechecks
+the real archive store, including after operator pruning. Failed/unavailable
+fills permit private builds; waiting is cancellable and consumes the caller's
+timeout. Build results expose bounded per-step `dependency_cache` statuses; `filled`
+means the publisher completed, not a measured consumer ABI hit. Warm-context
+affinity remains primary; otherwise toolchain selection favors a live matching
+publisher. Consumer mounts must be read-only at the OS boundary; only trusted
+publisher processes may write the
+published directory. Interrupted publication can leave `.publish-*` directories;
+operators may remove them while publisher processes are stopped.
+
+The recommended deployment boundary is one runtime per tenant or trust domain,
+with a separate runtime for trusted dependency publishing. A runtime can be a
+virtual machine or a sandboxed container; the service does not require a
+particular orchestrator. Resource cgroups and vcpkg's `read` mode do not enforce
+this filesystem boundary. The deployment owns it; the worker owns validation,
+coordination and no-replace publication.
+
+Merge these cache fields into a consumer's existing Worker configuration:
+
+```json
+{
+  "work_root": "/var/lib/fughetta/worker",
+  "dependency_cache": "/var/lib/fughetta/dependencies",
+  "dependency_upstream": "/cache/published"
+}
+```
+
+For the dedicated trusted publisher, use these fields instead:
+
+```json
+{
+  "work_root": "/var/lib/fughetta/publisher",
+  "dependency_cache": "/var/lib/fughetta/publisher/dependencies",
+  "dependency_publish": "/cache/published",
+  "dependency_recipe": {
+    "executable": "/opt/vcpkg/vcpkg",
+    "root": "/opt/vcpkg",
+    "triplets": ["x64-linux", "arm64-linux"],
+    "timeout_s": 1800
+  }
+}
+```
+
+The identical `/cache/published` paths refer to different runtime mount views
+of the same published storage. The deployment must enforce these permissions:
+
+| Resource | Consumer runtime | Publisher runtime |
+| --- | --- | --- |
+| Published cache, including any submounts | Read-only, with no writable alias exposed | Writable only to the trusted publisher |
+| Checkout, reports and private cache | Writable; private to this trust domain | Writable; starts empty and receives only trusted inputs |
+| Worker configuration and credentials | Own workspace only; operator-controlled configuration | Separate trusted workspace; unavailable to consumers |
+| Gateway admission | Own workspace's requests | Dedicated publisher role; only typed dependency fills, excluded from general worker selection |
+
+Before enabling cross-tenant reuse, exercise the boundary from an actual build
+step in a disposable deployment: creation, replacement and deletion of cache
+canary files must fail for the consumer, while reads succeed. Other tenants'
+private storage and publisher credentials must be inaccessible. Then verify
+that two independent publisher runtimes sharing the storage compile a cold ABI
+once, consumers restore it, and interruption during publication exposes no
+partial archive. These checks also establish the mount's lock and hard-link
+semantics. The current local RPC test covers two worker services on one host;
+it does not establish this deployment boundary or cross-host behavior. No such
+deployment is provisioned by this repository yet.
 
 Results come from reports in fixed protocols, never from the text a tool prints
 for people, so a new tool version does not break them. A step writes its reports
@@ -304,11 +463,47 @@ the configuration MCP. `schema` returns the settings schema with the options of
 every adapter and language server, so the tool list stays small; a refused save
 names the field.
 
-Language services negotiate symbol and diagnostic capabilities, collect pull or
-push diagnostics, and publish them into the semantic outline. Diagnostics retain
-source anchors and survive source-service restart. Executable mappings and
-prepared-tree environment bindings apply on both the source and worker paths.
-Saving settings does not execute preparation or analysis.
+Worker language sessions negotiate symbol, diagnostic, definition, and reference
+capabilities. Sessions remain attached to their hot directories and receive file
+updates between requests. Queries return results for the selected source snapshot;
+source nodes store no semantic results or character anchors for analysis. Definitions
+and references accept a file path, symbol name, and optional one-based line.
+Executable mappings and prepared-tree environment bindings apply on workers. Each analysis configuration
+contains `server` and a `build_configuration` reference. The provider selects
+artifact-producing tasks and their dependencies from that build configuration;
+there are no analysis `build`, `operation`, or `inputs` fields. Preparation and
+builds share the project's worldline and build-configuration directory pool.
+A ty server using a relative Python environment selects its uv environment
+producer automatically. Saving settings validates the reference and graph
+without executing preparation or analysis.
+
+Workers report a runtime fingerprint before accepting work. It hashes provider-default
+and configured executable contents, the platform, effective worker environment, distribution
+package manifests, and recognized Java/Android SDK release manifests. Standalone
+worker configuration can supply `sdk_manifests: {"name": "/path/to/manifest"}`
+for other managed SDKs. Custom executables must be mapped in `tools`; missing or
+unreadable executables are omitted from advertised capabilities. SDK releases
+and tools must remain immutable while the
+worker is connected; restart the worker after updating them. Project and step
+environment overrides are included in the computation key.
+
+Build and language computations use source content and the selected runtime,
+independently of caller, worldline, or version. Every caller has its own audit
+record, including cache/shared execution status; only actual executions consume
+execution quota. Test and run calls each execute their runtime steps. Push-only
+diagnostics without a matching document version return `stale: true` and are
+not cached. Even version-matched pushed diagnostics are excluded from the shared
+cache because a document version cannot identify changes to its dependencies. A
+later query can observe diagnostics received in the background.
+Invalid symbol selections return `invalid_record` without restarting the server.
+
+`build` with `fresh: true` bypasses cached and in-flight results, retires the
+selected directory's language session, and recreates that working directory
+from the source snapshot before running the build. Shared dependency caches
+remain available. Builds without `fresh` preserve generated outputs for incremental
+execution. A clean build detaches its old directory under the store lock and
+deletes it after releasing that lock. Worker startup reclaims detached directories
+left by an interrupted deletion.
 
 The Console exposes component-specific editors. Local executable versions,
 behavioral acceptance, and remaining deployment limits are recorded once in the
@@ -325,10 +520,10 @@ The configuration owns the execution thread budget and subprocess CPU budget:
 | Setting | Allocation |
 | --- | --- |
 | `threads` | Execution threads across gateway, source, and workers. Each process gets one I/O thread. Gateway and source each reserve two blocking workers; each compute worker gets one. Remaining threads are split between the gateway and source blocking pools. Sleeping main and signal-watcher threads are outside this count. |
-| `jobs` | CPU execution shares for subprocess work. Source preparation and language analysis share one serialized slot; the remainder is divided evenly among workers. |
+| `jobs` | CPU execution shares for subprocess work. All shares are divided evenly among workers; source runs no subprocess work. |
 | `workers` | Worker process count. Each worker admits one task at a time, including its language-analysis phase. |
 
-`threads` must be at least `6 + 2 * workers`; `jobs` must exceed `workers`.
+`threads` must be at least `6 + 2 * workers`; `jobs` must be positive and at least `workers`.
 A file-only deployment can use `{ "threads": 6, "jobs": 1, "workers": 0 }`.
 Budgets have no defaults. Local configuration determines the startup
 budget; hosted controllers can update it through the host-only
@@ -343,11 +538,11 @@ cancellation, and CORS preflight remain available. The main process retains its
 PID and loads the persisted budget for the next process group. See the hosted
 [runtime budget controls](../cloud-gateway/README.md#runtime-budgets).
 
-The top-level `tools` map supplies executable paths to source and workers.
+The top-level `tools` map supplies executable paths to workers.
 
 Build environments receive the assigned parallelism for CMake, CTest, Make,
 and OpenMP. Linux cgroup CPU quotas apply to the task process tree, including
-language servers. Compute workers and local preparation require a writable
+language servers. Compute workers require a writable
 cgroup v2 delegation at `/sys/fs/cgroup/workers` with CPU and memory controllers.
 Run the service and tests from a leaf inside that delegation so children can
 enter their task cgroups. Directory ownership alone does not permit moving a
@@ -361,13 +556,13 @@ use loopback. Back up the configuration and the complete storage directory.
 
 `src/fughetta-service.cpp` is the executable entry. `src/service/` owns process
 lifecycles; `src/gateway/` handles public requests; `src/source/` owns storage
-and source preparation; `src/worker/` executes tasks. Shared domain models live
+and source history; `src/worker/` executes build and analysis tasks. Shared domain models live
 in `src/model/`, execution helpers in `src/core/`, and I/O and platform providers
 in `src/io/` and `src/platform/`. Tests live in `tests/`.
 
 Development rules are in [AGENTS.md](AGENTS.md). Clients that sync files, `fug`
-and `agent-cloud`, use the `worldline` MCP tool; its `tools/list` schema is the
-contract.
+and `agent-cloud`, use `POST /api/v1/projects/{project}/worldline`.
+The route uses `tools::worldline::input` from `src/gateway/tools.cppm`.
 
 The local debug preset configured and generated successfully. Release
 configuration and Windows execution remain unverified. Automatic self-hosted
@@ -391,3 +586,61 @@ Current transport, identity, and lifecycle evidence is maintained in the
 gateway's [verification entry](../cloud-gateway/README.md#verification).
 Production Core provisioning and Windows execution remain outside these local
 checks.
+
+### Exported operation files
+
+A build configuration can name files or directories to deliver after a successful
+operation. For example, an existing build operation can add:
+
+```json
+{
+  "tasks": ["compile"],
+  "exports": { "application": "build/bin/app", "assets": "build/assets" }
+}
+```
+
+Paths are relative to the worker's working tree. Exports are independent of the
+provider's typed analysis outputs. The worker copies regular files into immutable
+content objects before returning the result. Declared paths through links or
+outside the tree are refused. Links found inside an exported directory are
+skipped and listed as relative paths in `export_skipped`; regular files are
+still delivered. One operation exports at most 4096 files and 1 GiB. Export capture
+failures appear in `export_error`, preserve the process result, and prevent result
+caching. Failed runs also export declared files that they produced; missing
+outputs after a failed execution are skipped without an extra error. Successful
+executions must produce their declared outputs. Delivered files include each file's name,
+relative path, digest, size, and executable flag.
+
+The gateway validates and stores the bytes before returning the result. Members
+receive existing stored objects without another worker transfer when the digest
+and size match, including after a fresh build. Members
+can read chunks through `GET /api/v1/projects/{project}/exports/{digest}` with
+`offset` and `length` (at most 4 MiB). A project must have received a result for
+that object, including a shared cache result, before this route serves it.
+`fug` downloads and verifies these files under its ignored local state directory.
+
+Worker step output also goes to asynchronous log files outside the build tree.
+Steps with a truncated inline summary or more than 8 KiB of output return a
+`log` object through the same verified download route, including failed steps.
+Language preparation requests keep inline output without publishing log objects.
+The disk log budget is 64 MiB per execution, shared by its steps. `log_truncated`
+reports exhaustion of this budget independently of the inline `truncated`
+flag. A log storage failure is reported in `log_error` without discarding the
+process exit status or its captured inline output.
+
+A transfer or project download-grant failure after execution sets that file's
+`delivery_error`. The completed steps, diagnostics, and exit status remain in
+the result. Results with transfer errors are excluded from new result-cache
+entries. `fug` preserves these errors without issuing another download for the
+unavailable file.
+
+Remote artifact and log objects expire after seven days without use. Collection
+also targets 20 GiB of stored objects, oldest first, while protecting objects
+created or read in the last ten minutes. This is a soft cache target during
+active transfers. Worker maintenance runs collection at most once per minute;
+the gateway collects on delivery and download activity at that interval.
+Interrupted partial uploads and capture scratch directories expire after a day.
+Project grants are removed with their content objects. If an object expires
+while its computation result is still cached, the next call reports the delivery
+error and invalidates that result; a later call can compute it again. Local
+files already downloaded by `fug` are retained until the user removes them.

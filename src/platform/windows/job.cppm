@@ -57,6 +57,13 @@ namespace isolation {
                 ++state_->failures;
         return state_->failures;
     }
+    auto scope::memory_pressure() const -> bool {
+        MEMORYSTATUSEX status{};
+        status.dwLength = sizeof(status);
+        if (!::GlobalMemoryStatusEx(&status))
+            winapi::fail("GlobalMemoryStatusEx");
+        return status.dwMemoryLoad >= 90 || memory_failures() != 0;
+    }
     void scope::concurrency(std::uint32_t parallel) {
         auto processors = ::GetActiveProcessorCount(ALL_PROCESSOR_GROUPS);
         if (!parallel || !processors)

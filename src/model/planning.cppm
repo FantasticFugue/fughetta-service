@@ -158,6 +158,10 @@ namespace builds {
             order(c, all);
             for (auto& [id, op] : c.operations) {
                 name(id);
+                for (const auto& [label, path] : op.exports) {
+                    name(label);
+                    content::checked_path(path);
+                }
                 if (op.tasks.empty())
                     throw std::invalid_argument("build operation has no tasks: " + id);
                 auto tasks = order(c, op.tasks);
@@ -235,6 +239,12 @@ namespace builds {
                 combine(out.needs, spec.needs);
                 add(out.source_dirs, spec.source_dirs);
                 add(out.build_dirs, spec.build_dirs);
+                task_plan task{.name = id, .dependencies = t.after, .first_step = out.steps.size()};
+                for (auto& [_, input] : t.inputs)
+                    if (!std::ranges::contains(task.dependencies, input.task))
+                        task.dependencies.push_back(input.task);
+                for (auto& [port, artifact] : spec.outputs)
+                    task.outputs.push_back({id + "/" + port, artifact.type, artifact.path, artifact.kind});
                 auto steps = expand(b, t.operation, p);
                 if (steps.empty())
                     throw std::invalid_argument("adapter produced no steps: " + id);
@@ -258,6 +268,8 @@ namespace builds {
                         bind_inputs(value, t.inputs, c, d);
                     out.steps.push_back(std::move(step));
                 }
+                task.step_count = out.steps.size() - task.first_step;
+                out.tasks.push_back(std::move(task));
             }
             for (auto& [id, ref] : c.outputs)
                 if (std::ranges::contains(tasks, ref.task)) {
@@ -285,9 +297,50 @@ namespace builds {
         check(c, d);
         return plan_of(c, d, request);
     }
-    auto locate(step value, const std::filesystem::path& tree, const toolset& tools, std::uint32_t jobs, const std::filesystem::path& reports) -> step {
+    auto prepare_inputs(const configuration& c, const std::vector<std::string>& types, const std::map<std::string, std::string>& selected_paths) -> plan {
+        auto descriptions = describe(c);
+        check(c, descriptions);
+        if (!c.enabled)
+            throw std::invalid_argument("analysis build configuration is disabled");
+        if (types.empty())
+            return {.needs = c.needs.get(), .env = c.env};
+        std::vector<std::string> roots;
+        std::vector<context> inputs;
+        std::set<std::string> seen;
+        for (auto& type : types) {
+            if (!seen.insert(type).second)
+                continue;
+            std::vector<std::pair<std::string, context>> producers;
+            for (auto& [id, task] : c.tasks)
+                for (auto& [port, artifact] : spec_of(c, descriptions, id).outputs)
+                    if (artifact.type == type && (!selected_paths.contains(type) || selected_paths.at(type) == artifact.path))
+                        producers.push_back({id, {id + "/" + port, artifact.type, artifact.path, artifact.kind}});
+            if (producers.empty())
+                throw std::invalid_argument("analysis has no producer of " + type);
+            std::map<std::string, std::string> paths;
+            for (auto& [id, artifact] : producers) {
+                if (auto existing = paths.find(artifact.path); existing != paths.end()) {
+                    if (existing->second != id)
+                        throw std::invalid_argument("analysis producers write the same artifact: " + artifact.path);
+                    continue;
+                }
+                paths.emplace(artifact.path, id);
+                if (!std::ranges::contains(roots, id))
+                    roots.push_back(id);
+                inputs.push_back(artifact);
+            }
+        }
+        auto selected = c;
+        selected.operations["__analysis"] = {.tasks = std::move(roots)};
+        auto out = plan_of(selected, descriptions, {.operation = "__analysis"});
+        out.contexts = std::move(inputs);
+        return out;
+    }
+    auto locate(step value, const std::filesystem::path& tree, const toolset& tools, std::uint32_t jobs, const std::filesystem::path& reports,
+                const std::filesystem::path& dependency_cache, const std::filesystem::path& dependency_upstream) -> step {
         auto root = std::filesystem::absolute(tree);
         auto bind = [&](std::string& text) {
+            if (text.contains("${cache:")) throw std::invalid_argument("cache placeholders are reserved for managed binary sources");
             replace_all(text, "${tree}", root.string());
             replace_all(text, "${jobs}", std::to_string(jobs));
             if (!reports.empty())
@@ -304,8 +357,29 @@ namespace builds {
         };
         for (auto& arg : value.argv)
             bind(arg);
-        for (auto& [_, v] : value.env)
-            bind(v);
+        for (auto& [name, v] : value.env) {
+            if (name == "VCPKG_BINARY_SOURCES" && v == "clear;files,${cache:vcpkg},readwrite") {
+                if (dependency_cache.empty()) throw std::invalid_argument("vcpkg dependency cache is not configured");
+                if (!dependency_upstream.empty()) {
+                    const auto writable = std::filesystem::weakly_canonical(std::filesystem::absolute(dependency_cache / "vcpkg"));
+                    const auto upstream = std::filesystem::weakly_canonical(std::filesystem::absolute(dependency_upstream / "vcpkg"));
+                    const auto [left, right] = std::mismatch(writable.begin(), writable.end(), upstream.begin(), upstream.end());
+                    if (left == writable.end() || right == upstream.end())
+                        throw std::invalid_argument("writable dependency cache must not overlap the published upstream cache");
+                }
+                auto source = [](const std::filesystem::path& cache) {
+                    std::string escaped;
+                    for (char c : std::filesystem::absolute(cache / "vcpkg").string()) {
+                        if (c == '`' || c == ',' || c == ';') escaped += '`';
+                        escaped += c;
+                    }
+                    return ";files," + escaped;
+                };
+                v = "clear";
+                if (!dependency_upstream.empty()) v += source(dependency_upstream) + ",read";
+                v += source(dependency_cache) + ",readwrite";
+            } else bind(v);
+        }
         relative(value.cwd, true);
         value.cwd = (value.cwd.empty() ? root : root / value.cwd).string();
         if (!value.argv.empty() && value.argv[0].find_first_of("/\\") != std::string::npos && !std::filesystem::path(value.argv[0]).is_absolute())

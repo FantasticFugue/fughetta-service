@@ -1,5 +1,6 @@
 export module protocol;
 import std;
+import constants;
 export import utility;
 import reflection;
 import coroutine;
@@ -37,6 +38,8 @@ export namespace jobs {
         std::optional<std::string> worker_id;
         std::optional<std::string> workspace_id;
         std::uint32_t heartbeat_seconds = 2;
+        std::string toolchain_id;
+        bool dependency_publisher = false;
     };
 
     struct admission {
@@ -133,6 +136,11 @@ export namespace jobs {
     struct source_bytes {
         std::vector<source_part> parts;
     };
+    struct export_read {
+        content::hash digest;
+        std::uint64_t offset = 0;
+        std::uint64_t length = part_size;
+    };
 
     struct authority_ack {
         std::uint64_t stored = 0;
@@ -171,16 +179,6 @@ export namespace jobs {
             n += p.storage_bytes;
         return n;
     }
-    // A preparation a worker ran, handed to the source: it anchors and publishes the outline and keeps the receipt.
-    struct analysis_finish {
-        language::request request;
-        language::result result;
-        std::optional<semantic::outline> outline;
-        std::vector<std::string> surveyed;
-        std::string service;
-        std::optional<std::string> survey_error;
-    };
-
     struct node_capture {
         std::string project;
         std::vector<std::string> ignore;
@@ -200,6 +198,7 @@ export namespace jobs {
         rfl::Generic initialization;
         std::map<std::string, std::string> env;
         std::uint32_t seconds = 600;
+        semantic::query query;
     };
 
     struct build_request {
@@ -212,11 +211,20 @@ export namespace jobs {
         std::map<std::string, std::string> env;
         std::optional<std::uint64_t> max_memory_bytes;
         std::optional<std::uint32_t> max_cpu_seconds;
-        // Files the steps must write anew, removed before they run; artifacts to measure once every step succeeded; and a survey of the
-        // tree after them. A request with any of these is a preparation: its steps must leave the tracked files as they were.
-        std::vector<std::string> replaced;
+        // Measure outputs and analyze the tree after successful steps. These operations must preserve tracked source files.
         std::vector<builds::context> measure;
         std::optional<jobs::survey> survey;
+        bool fresh = false;
+        std::map<std::string, std::string> exports;
+    };
+
+    struct dependency_fill {
+        builds::vcpkg_manifest manifest;
+        std::string triplet;
+        std::string host_triplet;
+        std::vector<std::string> features;
+        bool default_features = true;
+        std::uint32_t timeout_s = 1800;
     };
 
     struct step_report {
@@ -229,6 +237,10 @@ export namespace jobs {
         // What the step's reports say, read on the worker.
         std::vector<builds::finding> diagnostics;
         std::optional<builds::tally> tests;
+        std::optional<builds::exported_file> log;
+        bool log_truncated = false;
+        std::string log_error;
+        std::string cache_error;
     };
 
     struct build_report {
@@ -240,11 +252,16 @@ export namespace jobs {
         std::vector<builds::artifact_result> measured;
         // The survey's outline and the documents it covered, or why it failed.
         std::optional<semantic::outline> outline;
+        std::vector<semantic::location> locations;
         std::vector<std::string> surveyed;
         std::optional<std::string> survey_error;
+        std::string survey_error_code = "analysis_failed";
+        std::vector<builds::exported_file> exports;
+        std::string export_error;
+        std::vector<std::string> export_skipped;
 
         auto ok() const -> bool {
-            return !steps.empty() && std::ranges::all_of(steps, [](auto& s) { return s.exit_code == 0 && !s.timed_out; });
+            return std::ranges::all_of(steps, [](auto& s) { return s.exit_code == 0 && !s.timed_out; });
         }
     };
 
@@ -264,11 +281,10 @@ export namespace jobs {
     using signals = meta::list<signal<"hello", hello>, signal<"worker.admission", admission>, signal<"heartbeat", heartbeat>, signal<"progress", progress>,
                                signal<"cancel", cancel>>;
 
-    using requests =
-        meta::list<rpc<"node.call", node_call, nodes::node_reply>, rpc<"node.capture", node_capture, nodes::node_reply>,
-                   rpc<"node.usage", node_usage, node_usage_reply>, rpc<"analysis.prepare", language::request, language::result>,
-                   rpc<"analysis.finish", analysis_finish, language::result>, rpc<"hash_file", hash_file, digest>, rpc<"sync.offer", sync_offer, sync_plan>,
-                   rpc<"sync.parts", source_bytes, authority_ack>, rpc<"build", build_request, build_report>>;
+    using requests = meta::list<rpc<"node.call", node_call, nodes::node_reply>, rpc<"node.capture", node_capture, nodes::node_reply>,
+                                rpc<"node.usage", node_usage, node_usage_reply>, rpc<"hash_file", hash_file, digest>, rpc<"sync.offer", sync_offer, sync_plan>,
+                                rpc<"sync.parts", source_bytes, authority_ack>, rpc<"build", build_request, build_report>,
+                                rpc<"export.read", export_read, source_bytes>, rpc<"dependency.fill", dependency_fill, build_report>>;
 
     inline constexpr std::uint32_t result = kind<"result">;
     inline constexpr std::uint32_t failure_code = kind<"failure">;
@@ -338,6 +354,11 @@ export namespace transport {
         static auto decode(std::span<const std::byte> payload) -> T {
             if (payload.empty())
                 throw std::invalid_argument("protocol: empty frame payload");
+            if constexpr (std::same_as<T, jobs::dependency_fill>) {
+                if (payload.size() > constants::dependency_request_bytes)
+                    throw std::invalid_argument("dependency fill request exceeds size limit");
+                return rfl::json::read<T, rfl::NoExtraFields>(std::string_view{reinterpret_cast<const char*>(payload.data()), payload.size()}).value();
+            }
             return rfl::json::read<T>(std::string_view{reinterpret_cast<const char*>(payload.data()), payload.size()}).value();
         }
     };

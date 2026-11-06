@@ -41,7 +41,6 @@ namespace {
             static_assert(std::same_as<jobs::reply_t<jobs::source_bytes>, jobs::authority_ack>);
             static_assert(std::same_as<jobs::reply_t<jobs::sync_offer>, jobs::sync_plan>);
             static_assert(std::same_as<jobs::reply_t<jobs::build_request>, jobs::build_report>);
-            static_assert(std::same_as<jobs::reply_t<language::request>, language::result>);
             static_assert(jobs::code<jobs::heartbeat> == jobs::kind<"heartbeat">);
             jobs::hash_file file{.path = "dataset/file.cpp"};
             expect(jobs::locate(file) == "dataset");
@@ -56,10 +55,10 @@ namespace {
             auto restored = transport::decode<jobs::build_report>({.payload = transport::encode(report)});
             expect(restored.ok() && restored.worker == "local");
             restored.steps.front().timed_out = true;
-            expect(!restored.ok() && !jobs::build_report{}.ok());
-            language::request request{.project = "app", .config = {.build = mixed(), .inputs = {"database"}}};
+            expect(!restored.ok() && jobs::build_report{}.ok());
+            language::request request{.config = {.build_configuration = "native"}, .build = mixed()};
             auto prepared = transport::decode<language::request>({.payload = transport::encode(request)});
-            expect(language::prepare(prepared.config).inputs.size() == 1u);
+            expect(language::prepare(prepared.config, prepared.build).inputs.size() == 1u);
         };
 
         "CMake and Bazel compose by typed inputs"_test = [] {
@@ -80,7 +79,7 @@ namespace {
             c.operations["prepare"] = {.tasks = {"configure", "build"}};
             auto once = builds::prepare(c, {.operation = "prepare"});
             expect(once.steps.size() == 3u) << "shared dependencies expand once";
-            auto prepared = language::prepare({.build = mixed(), .inputs = {"database"}});
+            auto prepared = language::prepare({.build_configuration = "native"}, mixed());
             expect(prepared.build.steps.size() == 2u && prepared.inputs[0].type == "compilation_database");
             expect(prepared.server.provider == "clice" && prepared.server.argv == std::vector<std::string>{"clice", "serve"});
             expect(rfl::json::write(prepared.server.initialization) ==
@@ -88,6 +87,23 @@ namespace {
             auto build = builds::locate(plan.steps[2], "/tree", {}, 3);
             expect(build.env.at("CMAKE_BUILD_PARALLEL_LEVEL") == "3") << "a step uses the jobs its runner allows";
             expect(std::ranges::contains(builds::locate(plan.steps[0], "/tree", {}, 3).argv, "--jobs=3"));
+        };
+
+        "analysis selects artifact producers and their dependencies without compiling"_test = [] {
+            auto configuration = mixed();
+            configuration.operations.erase("prepare");
+            configuration.outputs.clear();
+            auto plan = builds::prepare_inputs(configuration, {"compilation_database"});
+            expect(plan.steps.size() == 2u && plan.tasks.size() == 2u);
+            expect(plan.tasks.at(0).name == "generate" && plan.tasks.at(1).name == "configure");
+            expect(plan.tasks.at(1).dependencies == std::vector<std::string>{"generate"});
+            expect(plan.tasks.at(1).first_step == 1u && plan.tasks.at(1).step_count == 1u);
+            expect(plan.contexts.size() == 1u && plan.contexts.at(0).path == "build/cmake/compile_commands.json");
+            expect(std::ranges::any_of(plan.tasks.at(1).outputs, [](auto& output) { return output.type == "compilation_database"; }));
+            expect(builds::prepare_inputs(configuration, {}).steps.empty());
+            expect(throws<std::invalid_argument>([&] { builds::prepare_inputs(configuration, {"missing"}); }));
+            configuration.tasks["another"] = configuration.tasks.at("configure");
+            expect(throws<std::invalid_argument>([&] { builds::prepare_inputs(configuration, {"compilation_database"}); }));
         };
 
         "graph and type failures are rejected before any execution"_test = [] {
@@ -107,8 +123,8 @@ namespace {
             reject([](auto& c) { c.outputs.at("archive").output = "missing"; });
             expect(throws<std::invalid_argument>([&] { builds::prepare(baseline, {.operation = "prepare", .parameters = {.targets = {"app"}}}); }));
             expect(throws<std::invalid_argument>([&] { builds::prepare(baseline, {.operation = "build", .parameters = {.labels = "unit"}}); }));
-            expect(throws<std::invalid_argument>([&] { language::prepare({.build = baseline, .inputs = {"archive"}}); })) << "clice reads no archive";
-            expect(throws<std::invalid_argument>([&] { language::prepare({.build = baseline}); })) << "clice needs a compilation database";
+            expect(throws<std::invalid_argument>([&] { language::prepare({.build_configuration = "native"}, {}); })) << "clice requires an artifact producer";
+            expect(throws<std::invalid_argument>([&] { language::prepare({}, baseline); })) << "analysis requires a build reference";
             expect(!rfl::json::read<builds::builder>(R"({"adapter":"missing","options":{}})")) << "an unknown adapter is refused when parsed";
             expect(!rfl::json::read<language::provider>(R"({"provider":"clangd"})")) << "so is an unknown language provider";
         };

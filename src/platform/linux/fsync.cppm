@@ -177,7 +177,7 @@ namespace durability {
             f_ = open(path_, O_RDWR | O_CREAT);
             if (::flock(f_.get(), LOCK_EX | LOCK_NB) != 0) {
                 if (errno == EWOULDBLOCK)
-                    throw std::runtime_error(std::format("{} {} is in use by another process", what, dir.string()));
+                    throw lock_busy(std::format("{} {} is in use by another process", what, dir.string()));
                 fail("cannot lock", path_);
             }
             auto pid = std::format("{}\n", ::getpid());

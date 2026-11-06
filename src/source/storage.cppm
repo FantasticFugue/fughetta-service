@@ -54,7 +54,7 @@ export namespace storage {
         struct capture_record {
             std::string tool, request_digest, source_head;
         };
-        auto capture_node(nodes::local_node& repository, std::string operation, std::string caller_operation, std::string actor, std::string holder,
+        auto capture_node(nodes::local_node& repository, std::string operation, std::string caller_operation, std::string actor,
                           const std::vector<std::string>& expected, std::string intent, std::uint64_t file_limit, std::uint64_t project_limit)
             -> nodes::node_reply {
             if (!content::is_hash(operation))
@@ -109,7 +109,6 @@ export namespace storage {
                                     .operation = std::move(operation),
                                     .owner = repository.node_id(),
                                     .actor = std::move(actor),
-                                    .holder = std::move(holder),
                                     .caller_operation = std::move(caller_operation),
                                     .expected = expected,
                                     .edits = std::move(edits),

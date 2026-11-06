@@ -18,7 +18,6 @@ namespace {
         program.add_argument("--port").default_value(9091).scan<'i', int>().metavar("PORT").help("port of the internal listener (1-65535)");
         program.add_argument("--storage").default_value(std::string{"storage"}).metavar("PATH").help("durable source state directory");
         program.add_argument("--threads").default_value(static_cast<int>(allocation::plan{}.source_disk)).scan<'i', int>().help("assigned disk thread budget");
-        program.add_argument("--tool").append().metavar("NAME=PATH").help("analysis preparation executable");
         program.parse_args(argc, argv);
 
         auto port = program.get<int>("--port");
@@ -31,13 +30,6 @@ namespace {
                            .port = static_cast<std::uint16_t>(port),
                            .storage = program.get<std::string>("--storage"),
                            .disk_threads = static_cast<std::uint32_t>(threads)};
-        if (auto tools = program.present<std::vector<std::string>>("--tool"))
-            for (const auto& tool : *tools) {
-                auto equal = tool.find('=');
-                if (equal == std::string::npos || equal == 0 || equal + 1 == tool.size())
-                    throw std::invalid_argument("--tool requires NAME=PATH");
-                cfg.tools[tool.substr(0, equal)] = tool.substr(equal + 1);
-            }
         config::validate(cfg);
         return cfg;
     }
@@ -49,7 +41,7 @@ export int run_source(int argc, char** argv) {
         cores::io_context<runtime::context> context{1};
         cores::signal_watch signals{context};
         execution::thread_pool disk{cfg.disk_threads};
-        source_server::service files{context, cfg.storage, disk, cfg.tools};
+        source_server::service files{context, cfg.storage, disk};
         context.run([&](auto& io, std::size_t core) -> coroutine::task<> {
             auto listener = native::listener{io, io::parse_endpoint(cfg.bind, cfg.port)};
             if (core == 0)

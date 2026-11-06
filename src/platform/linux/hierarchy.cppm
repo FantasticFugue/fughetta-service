@@ -51,6 +51,25 @@ namespace isolation {
         auto target() const -> isolation::target { return {path_.string()}; }
         auto cpu_exhausted() const -> bool { return cpu_ && counter(read(path_ / "cpu.stat"), "usage_usec") >= std::uint64_t{*cpu_} * 1000000; }
         auto memory_failures() const -> std::uint64_t { return counter(read(path_ / "memory.events"), "oom_kill"); }
+        auto memory_pressure() const -> bool {
+            if (memory_failures())
+                return true;
+            // A parent may constrain this worker more tightly than its own process group.
+            for (auto path = path_; !path.empty() && path != path.root_path(); path = path.parent_path()) {
+                if (!std::filesystem::exists(path / "memory.max"))
+                    break;
+                auto maximum = read(path / "memory.max");
+                std::uint64_t limit = 0, used = 0;
+                auto [end, error] = std::from_chars(maximum.data(), maximum.data() + maximum.size(), limit);
+                if (error != std::errc{} || !limit)
+                    continue;
+                auto current = read(path / "memory.current");
+                auto [last, failure] = std::from_chars(current.data(), current.data() + current.size(), used);
+                if (failure == std::errc{} && used >= limit - limit / 10)
+                    return true;
+            }
+            return false;
+        }
         void concurrency(std::uint32_t parallel) {
             if (!parallel)
                 throw std::invalid_argument("CPU concurrency must be positive");
@@ -112,6 +131,7 @@ namespace isolation {
     auto scope::target() const -> isolation::target { return state_->target(); }
     auto scope::cpu_exhausted() const -> bool { return state_->cpu_exhausted(); }
     auto scope::memory_failures() const -> std::uint64_t { return state_->memory_failures(); }
+    auto scope::memory_pressure() const -> bool { return state_->memory_pressure(); }
     void scope::concurrency(std::uint32_t parallel) { state_->concurrency(parallel); }
     void scope::close() { state_->close(); }
     pool::pool(std::string_view worker_key) : state_(std::make_unique<state>(worker_key)) {}

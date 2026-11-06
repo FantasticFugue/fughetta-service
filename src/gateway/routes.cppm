@@ -235,7 +235,7 @@ namespace front {
         inline auto node_status(std::string_view code) -> http::status {
             static const std::set<std::string_view, std::less<>> conflicts{
                 "wrong_project",       "stale_frontier",  nodes::code::source_conflict, nodes::code::identity_conflict,
-                "dependency_conflict", "policy_conflict", "worldline_boundary",         "scope_locked"};
+                "dependency_conflict", "policy_conflict", "worldline_boundary"};
             return conflicts.contains(code)                                                       ? http::status{409}
                    : code == nodes::code::policy_denied || code == nodes::code::permission_denied ? http::status{403}
                    : code == nodes::code::missing_objects || code == nodes::code::outcome_unknown ? http::status{503}
@@ -252,6 +252,68 @@ namespace front {
             }
             return reply;
         }
+        // Local clients use this route to synchronize files and select explicit worldlines.
+        struct post_worldline : endpoint<"POST", "/api/v1/projects/{project}/worldline", access::member> {
+            static auto handle(context& c, params p, const web::target&, std::string_view body) -> coroutine::task<web::reply> {
+                auto in = rfl::json::read<tools::worldline::input, rfl::NoExtraFields>(body);
+                if (!in || in->project.value() != p[0])
+                    throw coded_error(400, nodes::code::invalid_record, "worldline request must name the project in the URL");
+                mcp::notifier note;
+                try {
+                    co_return ok(co_await tools::worldline::run(*c.services, std::move(*in), note, *c.who));
+                } catch (const tools::tool_error& error) {
+                    throw coded_error(node_status(error.code), error.code, error.what());
+                }
+            }
+        };
+        struct mail_page {
+            std::vector<nodes::mail_message> messages;
+            std::uint64_t next = 0;
+            bool more = false, replayed = false;
+        };
+        struct get_export : endpoint<"GET", "/api/v1/projects/{project}/exports/{digest}", access::member> {
+            static auto handle(context& c, params p, const web::target& target, std::string_view) -> coroutine::task<web::reply> {
+                auto bytes = co_await c.files.read_export(c.core, p[0], {p[1], target.number("offset", 0, constants::export_bytes),
+                                                                         target.number("length", jobs::part_size, jobs::part_size)});
+                const auto& part = bytes.parts.at(0);
+                struct chunk { std::string digest; std::uint64_t offset, total; std::string data_base64; };
+                co_return ok(chunk{part.digest.str(), part.offset, part.total,
+                    tools::lines::base64({reinterpret_cast<const char*>(part.bytes.data()), part.bytes.size()})});
+            }
+        };
+        struct post_mail : endpoint<"POST", "/api/v1/projects/{project}/d-mail", access::member> {
+            struct input {
+                std::string worldline = "main", operation_id, recipient, body;
+            };
+            static auto handle(context& c, params p, const web::target&, std::string_view body) -> coroutine::task<web::reply> {
+                auto in = rfl::json::read<input, rfl::DefaultIfMissing, rfl::NoExtraFields>(body);
+                if (!in || in->operation_id.empty() || in->operation_id.size() > 256)
+                    throw coded_error(400, nodes::code::invalid_record, "d-mail requires an operation_id of 1 through 256 characters");
+                auto& services = *c.services;
+                auto result = co_await tools::node_call(services, p[0],
+                                                        {.action = "mail_send",
+                                                         .mail = nodes::mail_input{in->recipient, in->body},
+                                                         .worldline = in->worldline,
+                                                         .operation = tools::lines::operation_of(in->operation_id),
+                                                         .caller_operation = in->operation_id},
+                                                        *c.who);
+                co_return ok(mail_page{std::move(result.messages), 0, false, result.replayed});
+            }
+        };
+        struct get_mail : endpoint<"GET", "/api/v1/projects/{project}/d-mail", access::member> {
+            static auto handle(context& c, params p, const web::target& target, std::string_view) -> coroutine::task<web::reply> {
+                auto& services = *c.services;
+                auto after = target.number("after", 0, std::numeric_limits<std::uint64_t>::max());
+                auto result = co_await tools::node_call(services, p[0],
+                                                        {.action = "mail_list",
+                                                         .after = after,
+                                                         .target = std::string{target.text("recipient").value_or("main")},
+                                                         .limit = target.number("limit", 20, 100)},
+                                                        *c.who, true);
+                auto next = result.messages.empty() ? after : result.messages.back().id;
+                co_return ok(mail_page{std::move(result.messages), next, result.truncated});
+            }
+        };
         struct post_node : endpoint<"POST", "/api/v1/projects/{project}/node", access::owner> {
             static auto handle(context& c, params p, const web::target&, std::string_view body) -> coroutine::task<web::reply> {
                 auto in = rfl::json::read<nodes::node_request, rfl::DefaultIfMissing, rfl::NoExtraFields>(body);
@@ -386,12 +448,6 @@ namespace front {
             }
         };
 
-        struct analysis_input {
-            std::string operation_id;
-            std::string worldline;
-            std::string revision;
-        };
-
         // Settles an operation whose reply was lost: it ran, or it never will. Clients call it, not agents, so it stays out of the tools.
         struct abandon_operation : endpoint<"POST", "/api/v1/projects/{project}/operations/{operation}/abandon", access::member> {
             struct settled {
@@ -426,44 +482,6 @@ namespace front {
                 auto settings = config::resolve(*c.config.current(c.core), p[0]);
                 auto request = config::parse_as<builds::request>(body, "build plan");
                 co_return ok(builds::prepare(settings.config(p[1]).build, request));
-            }
-        };
-
-        auto analysis_call(context& c, const std::string& project, const std::string& name, std::string action, analysis_input input)
-            -> coroutine::task<web::reply> {
-            auto settings = config::resolve(*c.config.current(c.core), project);
-            auto found = settings.analysis.find(name);
-            if (found == settings.analysis.end() && action != "receipt")
-                throw config::not_found("analysis configuration not found");
-            if (action == "plan")
-                co_return ok(language::prepare(found->second));
-            content::checked_name(input.operation_id);
-            auto spec = found == settings.analysis.end() ? language::configuration{} : found->second;
-            language::request request{.project = project,
-                                      .ignore = settings.ignore,
-                                      .action = std::move(action),
-                                      .operation_id = input.operation_id,
-                                      .worldline = input.worldline,
-                                      .revision = input.revision,
-                                      .config = std::move(spec)};
-            auto result = co_await tools::prepare(*c.services, project, name, std::move(request), *c.who);
-            co_return ok(result);
-        }
-
-        struct plan_analysis : endpoint<"POST", "/api/v1/projects/{project}/analysis/{name}/plan", access::member> {
-            static auto handle(context& c, params p, const web::target&, std::string_view) -> coroutine::task<web::reply> {
-                co_return co_await analysis_call(c, p[0], p[1], "plan", {});
-            }
-        };
-        struct prepare_analysis : endpoint<"POST", "/api/v1/projects/{project}/analysis/{name}/prepare", access::member> {
-            static auto handle(context& c, params p, const web::target&, std::string_view body) -> coroutine::task<web::reply> {
-                auto input = config::parse_as<analysis_input>(body, "analysis preparation");
-                co_return co_await analysis_call(c, p[0], p[1], "prepare", std::move(input));
-            }
-        };
-        struct analysis_receipt : endpoint<"GET", "/api/v1/projects/{project}/analysis/{name}/receipt", access::member> {
-            static auto handle(context& c, params p, const web::target& target, std::string_view) -> coroutine::task<web::reply> {
-                co_return co_await analysis_call(c, p[0], p[1], "receipt", {.operation_id = std::string{target.text("operation_id").value_or("")}});
             }
         };
 
@@ -828,13 +846,12 @@ namespace front {
         }
     };
 
-    using admin_api =
-        routes<api::get_config, api::get_server, api::put_server, api::get_limits, api::put_limits, api::get_granted, api::put_granted, api::get_runtime,
-               api::put_runtime, api::get_source, api::post_node, api::post_node_capture, api::get_node_source, api::get_node_file, api::get_templates,
-               api::post_generate, api::list_projects, api::get_project, api::put_project, api::delete_project, api::get_effective, api::get_build_adapters,
-               api::get_settings_schema, api::plan_build, api::plan_analysis, api::prepare_analysis, api::analysis_receipt, api::abandon_operation,
-               api::get_builds, api::get_workers, api::register_worker, api::delete_worker, api::rename_worker, api::get_usage, api::get_events, api::get_stats,
-               api::get_me, api::get_health, api::get_metrics>;
+    using admin_api = routes<api::get_config, api::get_server, api::put_server, api::get_limits, api::put_limits, api::get_granted, api::put_granted,
+                             api::get_runtime, api::put_runtime, api::post_worldline, api::get_export, api::post_mail, api::get_mail, api::get_source, api::post_node,
+                             api::post_node_capture, api::get_node_source, api::get_node_file, api::get_templates, api::post_generate, api::list_projects,
+                             api::get_project, api::put_project, api::delete_project, api::get_effective, api::get_build_adapters, api::get_settings_schema,
+                             api::plan_build, api::abandon_operation, api::get_builds, api::get_workers, api::register_worker, api::delete_worker,
+                             api::rename_worker, api::get_usage, api::get_events, api::get_stats, api::get_me, api::get_health, api::get_metrics>;
 
     auto route(context& c, std::string_view method, const web::target& target, std::string_view body) -> coroutine::task<web::reply> {
         co_return co_await admin_api::handle(c, method, target, body);

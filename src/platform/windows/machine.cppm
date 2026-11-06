@@ -63,18 +63,24 @@ namespace host {
         if (!::SetEnvironmentVariableW(key.c_str(), winapi::wide(value).c_str()))
             winapi::fail("SetEnvironmentVariable");
     }
-    auto detect_tools(const std::map<std::string, std::string>& mapped) -> std::vector<std::string> {
-        std::set<std::string> found;
-        for (auto& [name, path] : mapped)
-            if (::SearchPathW(nullptr, winapi::wide(path).c_str(), L".exe", 0, nullptr, nullptr))
-                found.insert(name);
+    auto resolve_tools(const std::map<std::string, std::string>& mapped, const std::vector<std::string>& wanted) -> std::map<std::string, std::string> {
+        std::map<std::string, std::string> found;
         auto path = std::getenv("PATH");
         for (auto dir : std::views::split(std::string_view{path ? path : ""}, ';')) {
             std::error_code ec;
             auto folder = std::string{dir.begin(), dir.end()};
             if (folder.empty())
                 continue;
-            for (auto& file : std::filesystem::directory_iterator(folder, ec)) {
+            if (!wanted.empty()) {
+                for (const auto& name : wanted)
+                    for (const auto extension : {".exe", ".com"}) {
+                        auto file = std::filesystem::path{folder} / (name + extension);
+                        if (std::filesystem::is_regular_file(file, ec) && !ec)
+                            found.try_emplace(name, std::filesystem::absolute(file).string());
+                    }
+                continue;
+            }
+            for (const auto& file : std::filesystem::directory_iterator(folder, ec)) {
                 if (!file.is_regular_file(ec) || ec)
                     continue;
                 auto extension = file.path().extension().string();
@@ -83,10 +89,29 @@ namespace host {
                     continue;
                 auto name = file.path().stem().string();
                 std::ranges::transform(name, name.begin(), [](unsigned char c) { return std::tolower(c); });
-                found.insert(std::move(name));
+                if (!wanted.empty() && !std::ranges::contains(wanted, name))
+                    continue;
+                found.try_emplace(name, std::filesystem::absolute(file.path()).string());
             }
         }
-        return {found.begin(), found.end()};
+        for (const auto& [name, path] : mapped) {
+            found.erase(name);
+            auto wanted = winapi::wide(path);
+            auto count = ::SearchPathW(nullptr, wanted.c_str(), L".exe", 0, nullptr, nullptr);
+            if (!count)
+                continue;
+            std::wstring resolved(count + 1, L'\0');
+            auto used = ::SearchPathW(nullptr, wanted.c_str(), L".exe", static_cast<DWORD>(resolved.size()), resolved.data(), nullptr);
+            if (used && used < resolved.size())
+                found[name] = winapi::utf8(std::wstring_view{resolved.data(), used});
+        }
+        return found;
+    }
+    auto detect_tools(const std::map<std::string, std::string>& mapped) -> std::vector<std::string> {
+        std::vector<std::string> names;
+        for (const auto& [name, path] : resolve_tools(mapped))
+            names.push_back(name);
+        return names;
     }
 
     auto name() -> std::string {

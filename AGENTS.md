@@ -9,7 +9,7 @@ their own repositories and are not built here.
 | Question | File |
 | --- | --- |
 | Usage, build, and service layout | `README.md` |
-| The current worldline protocol | the `worldline` MCP tool's `tools/list` schema |
+| The current worldline protocol | `tools::worldline::input` in `src/gateway/tools.cppm`, exposed by `src/gateway/routes.cppm` |
 | Per-directory conventions | the nearest `AGENTS.md` below this one |
 
 ## Dependencies

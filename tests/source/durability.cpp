@@ -70,7 +70,7 @@ namespace {
             test::scratch tmp{"files"};
             {
                 durability::dir_lock held{tmp.dir, "storage"};
-                expect(throws<std::runtime_error>([&] { durability::dir_lock again{tmp.dir, "storage"}; }));
+                expect(throws<durability::lock_busy>([&] { durability::dir_lock again{tmp.dir, "storage"}; }));
             }
             durability::dir_lock after{tmp.dir, "storage"};
         };

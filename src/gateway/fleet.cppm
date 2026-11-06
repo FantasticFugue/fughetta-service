@@ -6,6 +6,7 @@ import native;
 import coroutine;
 import protocol;
 import configuration;
+import content;
 import utility;
 
 export namespace routing {
@@ -45,12 +46,16 @@ export namespace routing {
         std::optional<std::string> created_by;
         std::optional<std::int64_t> created_at, last_connected_at, revoked_at;
         bool managed = true;
+        std::string toolchain_id;
+        bool dependency_publisher = false;
     };
 
     struct requirements {
         std::vector<std::string> tools;
         std::optional<std::string> os;
         std::optional<std::string> arch;
+        std::optional<std::string> toolchain_id;
+        bool dependency_publisher = false;
         friend auto operator==(const requirements&, const requirements&) -> bool = default;
     };
 
@@ -88,6 +93,8 @@ export namespace routing {
             for (auto& m : members_) {
                 if (stale(*m, now))
                     continue;
+                if (m->hello.dependency_publisher != sel.needs.dependency_publisher)
+                    continue;
                 any_live = true;
                 if (!tools_met(*m, sel.needs)) {
                     missing_tools = true;
@@ -108,7 +115,8 @@ export namespace routing {
                 std::string joined;
                 for (auto& t : missing)
                     joined += (joined.empty() ? "" : ", ") + t;
-                return std::format("no attached worker provides all required tools (missing: {})", joined);
+                return joined.empty() && sel.needs.toolchain_id ? "no attached worker has the selected toolchain fingerprint"
+                                                                : std::format("no attached worker provides all required tools (missing: {})", joined);
             }
             if (bad_platform) {
                 std::string want;
@@ -122,7 +130,7 @@ export namespace routing {
                 return "every attached worker is at its dispatch limit";
             if (any_live)
                 return "no attached worker can take the dispatch now";
-            return "every build machine stopped answering; restart `fug worker` on it";
+            return sel.needs.dependency_publisher ? "no live dependency publisher is available" : "no live general build worker is available";
         }
 
         // Whether a live worker meets the selection but has no room for another dispatch.
@@ -178,6 +186,15 @@ export namespace routing {
             } catch (const std::exception&) {
                 co_return;
             }
+            // The enrollment secret only lives as long as this admission; every exit
+            // path below (refusals included) must leave no credential bytes behind.
+            struct scrub {
+                jobs::hello& held;
+                ~scrub() {
+                    std::ranges::fill(held.auth, '\0');
+                    held.auth.clear();
+                }
+            } wipe{hello};
             if (hello.protocol != jobs::protocol_version) {
                 logging::warn("worker.connection refused reason=worker_protocol_mismatch");
                 if (registry)
@@ -218,11 +235,13 @@ export namespace routing {
                     }
             } else {
                 auto token = config_ ? config_->current(core_)->worker_token : std::nullopt;
-                if (hello.worker_id || hello.workspace_id || (token && hello.auth != *token)) {
+                if (hello.worker_id || hello.workspace_id || (token && !content::secure_equal(hello.auth, *token))) {
                     logging::warn("worker.connection refused reason=worker_authentication_failed");
                     co_return;
                 }
             }
+            // Clear before the hello is stored on the member; the scrub still covers
+            // every refusal and exception path above.
             std::ranges::fill(hello.auth, '\0');
             hello.auth.clear();
             auto held = std::make_shared<member>(std::move(hello), std::move(peer));
@@ -269,7 +288,7 @@ export namespace routing {
         auto describe(std::size_t core) const -> std::vector<worker_view> {
             std::vector<worker_view> out;
             auto now = clock::now();
-            for (auto& m : members_)
+            for (auto& m : members_) {
                 out.push_back({m->hello.name,
                                m->hello.platform,
                                m->hello.max_inflight,
@@ -280,6 +299,9 @@ export namespace routing {
                                m->hello.tools,
                                {m->trees.begin(), m->trees.end()},
                                m->hello.worker_id});
+                out.back().toolchain_id = m->hello.toolchain_id;
+                out.back().dependency_publisher = m->hello.dependency_publisher;
+            }
             return out;
         }
 
@@ -356,7 +378,9 @@ export namespace routing {
         }
 
         static auto tools_met(const member& m, const requirements& needs) -> bool {
-            return std::ranges::all_of(needs.tools, [&](const std::string& t) { return std::ranges::contains(m.hello.tools, t); });
+            return m.hello.dependency_publisher == needs.dependency_publisher &&
+                   (!needs.toolchain_id || *needs.toolchain_id == m.hello.toolchain_id) &&
+                   std::ranges::all_of(needs.tools, [&](const std::string& t) { return std::ranges::contains(m.hello.tools, t); });
         }
 
         static auto platform_met(const member& m, const requirements& needs) -> bool {

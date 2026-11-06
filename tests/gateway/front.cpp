@@ -56,14 +56,18 @@ namespace {
         storage::registry files{rt, tmp.dir / "storage", hub, pool, source.endpoint()};
         tools::services services{hub.slot(0), router, files, 0};
         tools::backlog queue{rt, services};
-        front::server server{front::context{hub, files, router, rt, 0, nullptr, nullptr, nullptr, &services}, services};
-        explicit harness(std::string mode = "token") : mode(std::move(mode)) { services.queue = &queue; }
+        std::chrono::milliseconds heartbeat;
+        front::server server{front::context{hub, files, router, rt, 0, nullptr, nullptr, nullptr, &services}, services, heartbeat};
+        explicit harness(std::string mode = "token", std::chrono::milliseconds interval = std::chrono::seconds{15})
+            : mode(std::move(mode)), heartbeat(interval) {
+            services.queue = &queue;
+        }
         std::uint16_t port = 0;
 
         auto ask(ctx& io, http::method method, std::string target, std::string body = {}, std::vector<http::header> fields = {}, bool authenticated = true)
             -> coroutine::task<answer> {
             auto s = co_await io::connect(io, {net::ip::address_v4{{127, 0, 0, 1}}, port});
-            web::stream<socket> transport{s};
+            test::http_stream transport{s};
             if (authenticated)
                 fields.push_back({"authorization", "Bearer sk_test"});
             http::request req{.method = method, .target = std::move(target), .scheme = "http", .authority = "localhost", .fields = std::move(fields)};
@@ -94,6 +98,115 @@ namespace {
     }
 
     static constexpr auto front_suite = [] {
+        "export downloads require project grants including shared build cache hits"_test = [] {
+            using namespace std::chrono_literals;
+            harness h;
+            h.rt.run([&](ctx& io, std::size_t) -> coroutine::task<> {
+                auto listener = native::listener{io, {net::ip::address_v4::loopback(), 0}};
+                h.port = listener.local_endpoint().port();
+                auto workers = native::listener{io, {net::ip::address_v4::loopback(), 0}};
+                auto connection = co_await io::connect(io, workers.local_endpoint());
+                auto peer = co_await execution::then(net::async_accept(workers), [](auto socket, auto) { return std::move(socket); });
+                transport::channel<socket> channel{connection};
+                transport::dispatcher<socket> dispatch;
+                const std::string data = "verified artifact";
+                const auto digest = content::hash_of(data);
+                const std::string log = "complete compiler log";
+                const auto log_digest = content::hash_of(log);
+                int builds = 0, downloads = 0;
+                bool fail_download = false;
+                bool remove_project = false;
+                dispatch.on<jobs::sync_offer>([](jobs::sync_offer offer, auto&) -> coroutine::task<jobs::sync_plan> {
+                    co_return jobs::sync_plan{.snapshot = offer.tree.id()};
+                });
+                dispatch.on<jobs::build_request>([&](jobs::build_request request, auto&) -> coroutine::task<jobs::build_report> {
+                    ++builds;
+                    expect(request.exports.at("binary") == "out/app");
+                    if (remove_project) expect((co_await h.ask(io, DELETE, "/api/v1/projects/app")).status == 200);
+                    co_return jobs::build_report{.steps = {{.name = "compile", .exit_code = 0, .output = "log", .truncated = true,
+                            .log = builds::exported_file{"step-0.log", "0.log", log_digest, log.size(), false}}},
+                        .exports = {{"binary", "app", digest, data.size(), true}}};
+                });
+                dispatch.on<jobs::export_read>([&](jobs::export_read request, auto&) -> coroutine::task<jobs::source_bytes> {
+                    ++downloads;
+                    if (fail_download) throw std::runtime_error("artifact transport unavailable");
+                    const auto& value = request.digest == log_digest ? log : data;
+                    auto part = std::as_bytes(std::span{value}).subspan(request.offset, request.length);
+                    co_return jobs::source_bytes{{{request.digest, request.offset, value.size(), {part.begin(), part.end()}}}};
+                });
+                co_await channel.post(jobs::hello{.name = "export-builder", .protocol = jobs::protocol_version,
+                    .tools = {"true"}, .toolchain_id = "export-toolchain"});
+                co_await coroutine::with_scope([&](coroutine::scope& children) -> coroutine::task<> {
+                    children.spawn([](harness& h, native::listener& listener, coroutine::scope& children) -> coroutine::task<> {
+                        for (;;) children.spawn(h.server.serve(co_await execution::then(net::async_accept(listener), [](auto socket, auto) { return std::move(socket); })));
+                    }(h, listener, children));
+                    children.spawn(h.router.workers(0).admit(io, std::move(peer)));
+                    children.spawn([](auto& channel, auto& dispatch, coroutine::scope& children) -> coroutine::task<> {
+                        for (;;) children.spawn(dispatch.handle(channel, co_await channel.recv()));
+                    }(channel, dispatch, children));
+                    children.spawn(h.queue.serve(io));
+                    while (h.router.workers(0).describe(0).empty()) co_await execution::schedule_after(io, 1ms);
+                    config::settings project;
+                    project.build_configurations["native"] = fixture::commands({"true"});
+                    project.build_configurations["native"].operations["build"].exports = {{"binary", "out/app"}};
+                    project.default_configurations = {"native"};
+                    for (auto name : {"app", "other"}) {
+                        const auto saved = co_await h.save(io, std::string{"/api/v1/projects/"} + name, config::write(project));
+                        expect(saved.status == 200) << saved.body;
+                    }
+                    const auto path = "/api/v1/projects/app/exports/" + digest.str();
+                    expect((co_await h.ask(io, GET, path)).status != 200);
+                    const auto first = co_await h.mcp(io, call("build", R"({"project":"app"})"));
+                    expect(first.status == 200 && first.body.contains(digest.str())) << first.body;
+                    expect(builds == 1);
+                    const auto log_reply = co_await h.ask(io, GET, "/api/v1/projects/app/exports/" + log_digest.str());
+                    expect(log_reply.status == 200 && log_reply.body.contains(tools::lines::base64(log)));
+                    const auto part = co_await h.ask(io, GET, path + "?offset=9&length=8");
+                    expect(part.status == 200 && part.body.contains(tools::lines::base64("artifact"))) << part.body;
+                    expect((co_await h.ask(io, GET, path, {}, {}, false)).status == 401);
+                    const auto other = "/api/v1/projects/other/exports/" + digest.str();
+                    expect((co_await h.ask(io, GET, other)).status != 200) << "knowing a digest grants no access";
+                    const auto cached = co_await h.mcp(io, call("build", R"({"project":"other"})"));
+                    expect(cached.status == 200 && cached.body.contains(digest.str())) << cached.body;
+                    expect(builds == 1) << "identical inputs reuse the existing result";
+                    expect((co_await h.ask(io, GET, other)).status == 200) << "cache recipients gain download access";
+                    expect((co_await h.ask(io, GET, "/api/v1/projects/missing/exports/" + digest.str())).status != 200);
+                    expect((co_await h.ask(io, GET, path + "?offset=99")).status != 200);
+                    fail_download = true;
+                    const auto previous_downloads = downloads;
+                    const auto reused = co_await h.mcp(io, call("build", R"({"project":"app","fresh":true})"));
+                    expect(reused.status == 200 && !reused.body.contains("artifact transport unavailable")) << reused.body;
+                    expect(builds == 2 && downloads == previous_downloads) << "fresh execution reuses stored artifact and log bytes";
+                    std::filesystem::remove(h.tmp.dir / "storage/.exports/blobs" / digest.view());
+                    const auto failed = co_await h.mcp(io, call("build", R"({"project":"app","fresh":true})"));
+                    expect(failed.status == 200 && failed.body.contains("artifact transport unavailable") && failed.body.contains(R"("exit_code":0)")) << failed.body;
+                    expect(!failed.body.contains("outcome_unknown")) << "execution results survive delivery failures";
+                    expect(builds == 3);
+                    fail_download = false;
+                    const auto rebuilt = co_await h.mcp(io, call("build", R"({"project":"app"})"));
+                    expect(rebuilt.status == 200 && builds == 4) << "failed delivery invalidates the result cache";
+                    std::filesystem::remove(h.tmp.dir / "storage/.exports/blobs" / digest.view());
+                    const auto stale = co_await h.mcp(io, call("build", R"({"project":"app"})"));
+                    struct execution_reply {
+                        struct payload { tools::results structuredContent; };
+                        payload result;
+                    };
+                    const auto stale_result = rfl::json::read<execution_reply>(stale.body).value();
+                    expect(stale.status == 200 && builds == 4 && !stale_result.result.structuredContent.results.at(0).exports.at(0).delivery_error.empty());
+                    const auto repaired = co_await h.mcp(io, call("build", R"({"project":"app"})"));
+                    expect(repaired.status == 200 && builds == 5) << "missing objects do not trap later calls in a stale cache";
+                    remove_project = true;
+                    const auto removed = co_await h.mcp(io, call("build", R"({"project":"app","fresh":true})"));
+                    const auto removed_result = rfl::json::read<execution_reply>(removed.body).value();
+                    const auto& completed = removed_result.result.structuredContent.results.at(0);
+                    expect(removed.status == 200 && completed.steps.at(0).exit_code == 0 && completed.error.empty());
+                    expect(!completed.exports.at(0).delivery_error.empty());
+                    expect(completed.steps.at(0).log && !completed.steps.at(0).log->delivery_error.empty());
+                    expect((co_await h.ask(io, GET, path)).status != 200);
+
+                });
+            });
+        };
         "trusted authentication requires a configured workspace identity"_test = [] {
             expect(throws<std::invalid_argument>([] { config::parse(R"({"server":{"auth":{"mode":"trusted"}}})"); }))
                 << "trusted mode must name the workspace it serves";
@@ -168,6 +281,81 @@ namespace {
                     }
                     expect(update.contains(R"("changes":8)")) << update;
                     socket.close();
+                });
+            });
+        };
+        "MCP keepalives detect a disconnected caller and release its queued ticket"_test = [] {
+            using namespace std::chrono_literals;
+            harness h{"token", 10ms};
+            h.rt.run([&](ctx& io, std::size_t) -> coroutine::task<> {
+                auto listener = native::listener{io, {net::ip::address_v4::loopback(), 0}};
+                h.port = listener.local_endpoint().port();
+                auto worker_listener = native::listener{io, {net::ip::address_v4::loopback(), 0}};
+                auto worker_socket = co_await io::connect(io, worker_listener.local_endpoint());
+                auto worker_peer = co_await execution::then(net::async_accept(worker_listener), [](auto socket, auto) { return std::move(socket); });
+                transport::channel<socket> worker_channel{worker_socket};
+                co_await worker_channel.post(jobs::hello{.name = "queued-builder", .protocol = jobs::protocol_version, .tools = {"true"}, .toolchain_id = "test-toolchain"});
+                co_await coroutine::with_scope([&](coroutine::scope& children) -> coroutine::task<> {
+                    children.spawn([](harness& h, native::listener& listener, coroutine::scope& children) -> coroutine::task<> {
+                        for (;;)
+                            children.spawn(
+                                h.server.serve(co_await execution::then(net::async_accept(listener), [](auto socket, auto) { return std::move(socket); })));
+                    }(h, listener, children));
+                    children.spawn(h.router.workers(0).admit(io, std::move(worker_peer)));
+                    while (h.router.workers(0).describe(0).empty())
+                        co_await execution::schedule_after(io, 1ms);
+                    children.spawn(h.queue.serve(io));
+                    co_await h.save(io, "/api/v1/config/limits", R"({"concurrent_builds":1})");
+                    config::settings project;
+                    project.build_configurations["test"] = fixture::commands({"true"});
+                    project.default_configurations = {"test"};
+                    co_await h.save(io, "/api/v1/projects/app", config::write(project));
+                    co_await h.ask(io, http::method::POST, "/api/v1/projects/app/worldline",
+                                   R"({"project":"app","action":"apply","observed":"","operation_id":"seed","changes":[{"kind":"create","path":"a.txt","text":"a"}]})");
+                    auto blocker = co_await h.queue.submit(
+                        0, {.key = "blocker", .project = "app", .configuration = "blocker", .operation = "blocker", .actor = "blocker", .trees = "blocker"},
+                        [&io](tools::services&, jobs::progress_log&, std::string) -> coroutine::task<std::optional<tools::backlog::outcome>> {
+                            co_await execution::schedule_after(io, 30s);
+                            co_return tools::config_result{.ok = true};
+                        });
+                    struct release {
+                        std::shared_ptr<tools::backlog::ticket> ticket;
+                        ~release() { ticket->leave(); }
+                    } guard{blocker};
+                    auto socket = co_await io::connect(io, listener.local_endpoint());
+                    web::stream<decltype(socket)> transport{socket};
+                    http::v1::client client{transport};
+                    http::request request{
+                        .method = http::method::POST,
+                        .target = "/mcp",
+                        .scheme = "http",
+                        .authority = "localhost",
+                        .fields = {{"authorization", "Bearer sk_test"}, {"accept", "text/event-stream"}, {"content-type", "application/json"}}};
+                    auto body = call("build", R"({"project":"app"})", R"({"progressToken":"heartbeat"})");
+                    request.fields.push_back({"content-length", std::to_string(body.size())});
+                    request.fields.push_back({"host", "localhost"});
+                    http::span_body payload{std::as_bytes(std::span{body.data(), body.size()})};
+                    auto response = co_await http::coroutine::request(client, std::move(request), payload);
+                    std::array<std::byte, 4096> buffer;
+                    std::string frames;
+                    while (!frames.contains(": keepalive\n\n") || !frames.contains("queued, ")) {
+                        auto count = co_await coroutine::deadline(io, 2s, http::coroutine::read(response.body, buffer));
+                        if (!count || !*count)
+                            break;
+                        frames.append(reinterpret_cast<const char*>(buffer.data()), *count);
+                    }
+                    expect(frames.contains(": keepalive\n\n")) << frames;
+                    socket.close();
+                    bool cancelled = false;
+                    for (int attempt = 0; attempt < 100 && !cancelled; ++attempt) {
+                        co_await execution::schedule_after(io, 20ms);
+                        auto jobs = co_await h.queue.list(0);
+                        cancelled = std::ranges::any_of(jobs, [](auto& job) { return job.configuration == "test" && job.state == "cancelled"; });
+                    }
+                    expect(cancelled) << "a disconnected request must release its backlog ticket";
+                    blocker->leave();
+                    while (!h.queue.idle())
+                        co_await execution::schedule_after(io, 20ms);
                 });
             });
         };
@@ -416,24 +604,25 @@ namespace {
             });
         };
 
-        "build plans, worker status, history, and analysis preparation have REST routes"_test = [] {
+        "build plans and status remain available while manual analysis routes are removed"_test = [] {
             harness h;
             h.rt.run([&](ctx& io, std::size_t) -> coroutine::task<> {
                 co_await h.hub.edit(0, [](config::store& store) {
                     config::settings project;
                     project.build_configurations["Debug"] = fixture::commands({"python3", "-c", "print('built')"});
-                    language::configuration analysis;
+                    language::configuration analysis{.build_configuration = "Analysis"};
+                    builds::configuration analysis_build;
                     builds::config<"command"> command;
                     command.operations["prepare"] = {
                         .argv = {"python3", "-c",
                                  "import json; from pathlib import Path; p=Path('commands.json'); "
                                  "p.write_text(json.dumps([{'directory':str(Path.cwd()),'file':'main.c','arguments':['cc','-c','main.c']}]))"},
                         .outputs = {{"db", {"compilation_database", "commands.json"}}}};
-                    analysis.build.builders["main"] = builds::with<"command">{.options = command};
-                    analysis.build.tasks["db"] = {.builder = "main", .operation = "prepare"};
-                    analysis.build.operations["prepare"] = {.tasks = {"db"}};
-                    analysis.build.outputs["db"] = {.task = "db", .output = "db"};
-                    analysis.inputs = {"db"};
+                    analysis_build.builders["main"] = builds::with<"command">{.options = command};
+                    analysis_build.tasks["db"] = {.builder = "main", .operation = "prepare"};
+                    analysis_build.operations["prepare"] = {.tasks = {"db"}};
+                    analysis_build.outputs["db"] = {.task = "db", .output = "db"};
+                    project.build_configurations["Analysis"] = analysis_build;
                     project.analysis["Cpp"] = analysis;
                     store.put_project("app", project, 0);
                 });
@@ -466,29 +655,21 @@ namespace {
                 auto metrics = co_await request("GET", "/metrics");
                 expect(metrics.body.contains("gateway_builds_total") && metrics.body.contains("gateway_synced_bytes_total"));
                 expect(metrics.body.contains(R"(result="unknown"} 0)") && metrics.body.contains(R"(result="cancelled"} 0)"));
-                auto plan = co_await request("POST", base + "/analysis/Cpp/plan");
-                expect(plan.head.status == 200 && plan.body.contains("commands.json")) << plan.body;
+                for (auto action : {"plan", "prepare", "receipt"}) {
+                    auto removed = co_await request(action == std::string_view{"receipt"} ? "GET" : "POST", base + "/analysis/Cpp/" + action);
+                    expect(removed.head.status == 404);
+                }
                 mcp::notifier note;
                 const worlds::actor actor{.issuer = "token", .user = "tester", .role = "owner"};
-                co_await tools::worldline::run(h.services, {.project = "app", .action = "lock", .scopes = std::vector<std::string>{"::"}}, note, actor);
-                co_await tools::write::run(
-                    h.services, {.project = "app", .path = "main.c", .content = "int main(void) { return 0; }", .operation_id = "write-25"}, note, actor);
-                auto prepared = co_await request("POST", base + "/analysis/Cpp/prepare", R"({"operation_id":"rest-prepare"})");
-                expect(prepared.head.status == 200 && prepared.body.contains(R"("status":"prepared")")) << prepared.body;
-                auto repeated = co_await request("POST", base + "/analysis/Cpp/prepare", R"({"operation_id":"rest-prepare"})");
-                expect(repeated.head.status == 200 && repeated.body.contains(R"("replayed":true)"))
-                    << "a repeated preparation answers its receipt: " << repeated.body;
-                auto queued = co_await h.queue.list(0);
-                expect(std::ranges::any_of(queued, [](auto& v) { return v.operation == "prepare" && v.state == "done" && v.ok == std::optional<bool>{true}; }))
-                    << "a preparation takes its turn in the build queue";
-                auto receipt = co_await request("GET", base + "/analysis/Cpp/receipt?operation_id=rest-prepare");
-                expect(receipt.head.status == 200 && receipt.body.contains(R"("status":"prepared")")) << receipt.body;
-                auto language = co_await tools::language_query::run(
-                    h.services, {.project = "app", .worldline = "", .configuration = "Cpp", .action = "prepare", .operation_id = "mcp-prepare"}, note, actor);
-                expect(language.preparation && language.preparation->status == "prepared");
-                auto again = co_await tools::language_query::run(
-                    h.services, {.project = "app", .worldline = "", .configuration = "Cpp", .action = "receipt", .operation_id = "mcp-prepare"}, note, actor);
-                expect(again.preparation && again.preparation->status == "prepared");
+                for (auto action : {"plan", "prepare", "receipt", "scopes"}) {
+                    bool rejected = false;
+                    try {
+                        co_await tools::language_query::run(h.services, {.project = "app", .configuration = "Cpp", .action = action}, note, actor);
+                    } catch (const tools::tool_error&) {
+                        rejected = true;
+                    }
+                    expect(rejected) << action;
+                }
             });
         };
 
@@ -542,9 +723,6 @@ namespace {
 
                         replies.push_back(std::move(captured));
 
-                        nodes::node_request hold{.action = "lock", .scopes = {"::"}};
-                        auto locked = co_await h.ask(io, http::method::POST, base, rfl::json::write(hold));
-                        expect(locked.status == 200) << locked.body;
                         nodes::node_request request{.action = "apply",
                                                     .operation = content::hash_of("browser-seed").str(),
                                                     .expected = first->frontier,
@@ -648,65 +826,55 @@ namespace {
                         }(h, l, children));
                         co_await h.save(io, "/api/v1/config/limits", R"({"max_file_bytes": 100})");
                         co_await h.save(io, "/api/v1/projects/app", "{}");
-                        auto at = R"({"project":"app")";
                         a.push_back(co_await h.mcp(io, R"({"jsonrpc":"2.0","id":1,"method":"tools/list"})"));
-                        a.push_back(co_await h.mcp(io, call("worldline", std::format(R"({},"action":"lock","scopes":["::"]}})", at))));
-                        a.push_back(co_await h.mcp(io, call("write", std::format(R"({},"path":"a.txt","content":"hi\n","operation_id":"op-a"}})", at))));
-                        a.push_back(co_await h.mcp(
-                            io, call("write", std::format(R"({},"path":"b.txt","content":"{}","operation_id":"op-b"}})", at, std::string(200, 'x')))));
-                        a.push_back(co_await h.mcp(
-                            io, call("edit", std::format(R"({},"path":"a.txt","old_string":"absent","new_string":"x","operation_id":"op-e"}})", at))));
+                        for (const auto name : {"read", "write", "edit", "remove", "move", "list", "glob", "search", "worldline", "generate", "jobs"}) {
+                            auto refused = co_await h.mcp(io, call(name, R"({"project":"app"})"));
+                            expect(refused.body.contains("unknown tool")) << refused.body;
+                        }
                         a.push_back(co_await h.ask(io, GET, "/mcp"));
                         a.push_back(co_await h.mcp(io, "{not json"));
                         a.push_back(co_await h.mcp(io, R"({"jsonrpc":"2.0","id":1,"method":"ping"})", {{"mcp-protocol-version", "1999-01-01"}}));
                         a.push_back(co_await h.mcp(io, R"({"jsonrpc":"2.0","id":1,"method":"ping"})", {{"origin", "http://evil.example"}}));
                         a.push_back(co_await h.mcp(io, R"({"jsonrpc":"2.0","id":1,"method":"ping"})", {{"origin", "http://ok.example"}}));
                         a.push_back(co_await h.mcp(io, std::string(5000, ' ')));
-                        a.push_back(co_await h.mcp(io, call("read", std::format(R"({},"path":"a.txt"}})", at), R"({"progressToken":"p1"})"),
+                        a.push_back(co_await h.mcp(io, call("configurations", R"({"project":"app"})", R"({"progressToken":"p1"})"),
                                                    {{"accept", "application/json, text/event-stream"}}));
+                        const auto endpoint = "/api/v1/projects/app/worldline";
+                        const auto inspected = co_await h.ask(io, http::method::POST, endpoint, R"({"project":"app","action":"inspect"})");
+                        const auto initial = rfl::json::read<tools::worldline::output>(inspected.body).value().version.value();
+                        const auto apply = std::format(R"({{"project":"app","action":"apply","observed":"{}","operation_id":"op-a","changes":[{{"kind":"create","path":"a.txt","text":"hi\n"}}]}})", initial);
+                        a.push_back(co_await h.ask(io, http::method::POST, endpoint, apply));
+                        a.push_back(co_await h.ask(io, http::method::POST, endpoint, R"({"project":"app","action":"receipt","operation_id":"op-a"})"));
+                        a.push_back(co_await h.ask(io, http::method::POST, endpoint, apply));
+                        a.push_back(co_await h.ask(io, http::method::POST, endpoint, R"({"project":"app","action":"fork","name":"wl","operation_id":"op-fork"})"));
+                        a.push_back(co_await h.ask(io, http::method::POST, endpoint, R"({"project":"app","action":"history","worldline":"wl"})"));
+                        a.push_back(co_await h.ask(io, http::method::POST, endpoint, R"({"project":"app","action":"read","path":"a.txt"})"));
                         a.push_back(co_await h.ask(io, GET, "/api/v1/usage"));
-                        a.push_back(co_await h.ask(io, GET, "/api/v1/stats?days=1"));
                         a.push_back(co_await h.ask(io, GET, "/metrics"));
-                        a.push_back(co_await h.mcp(io, call("worldline", std::format(R"({},"action":"fork","name":"wl","operation_id":"op-1"}})", at))));
-                        a.push_back(co_await h.mcp(io, call("worldline", std::format(R"({},"action":"history","worldline":"wl"}})", at))));
-                        a.push_back(co_await h.mcp(io, call("write", std::format(R"({},"path":"c.txt","content":"receipt\n","operation_id":"op-c"}})", at))));
-                        a.push_back(co_await h.mcp(io, call("worldline", std::format(R"({},"action":"receipt","operation_id":"op-c"}})", at))));
-                        a.push_back(co_await h.mcp(io, call("write", std::format(R"({},"path":"c.txt","content":"receipt\n","operation_id":"op-c"}})", at))));
-                        a.push_back(co_await h.mcp(io, call("write", std::format(R"({},"path":"c.txt","content":"changed\n","operation_id":"op-c"}})", at))));
-                        a.push_back(co_await h.mcp(
-                            io,
-                            call(
-                                "worldline",
-                                std::format(
-                                    R"({},"action":"apply","observed":"{}","operation_id":"op-d","changes":[{{"kind":"create","path":"d.txt","text":"d\n"}}]}})",
-                                    at, std::string(64, '0')))));
                     });
                 }(h, io, a);
             });
-            expect((a.size() == 22u) >> fatal);
-            expect(a[0].status == 200 && a[0].body.contains(R"("name":"language")") && a[0].body.contains("outputSchema")) << a[0].body;
-            expect(a[1].body.contains(R"("isError":false)")) << a[1].body;
-            expect(a[2].body.contains(R"("isError":false)")) << a[2].body;
-            expect(a[3].body.contains(R"("isError":true)") && a[3].body.contains("100 byte file limit") && a[3].body.contains("resource_limit")) << a[3].body;
-            expect(a[4].body.contains(R"("isError":true)") && a[4].body.contains("does not occur")) << a[4].body;
-            expect(a[5].status == 405);
-            expect(a[6].status == 400 && a[6].body.contains("-32700")) << a[6].body;
-            expect(a[7].status == 400);
-            expect(a[8].status == 403);
-            expect(a[9].status == 200 && a[9].allow_origin == "http://ok.example");
-            expect(a[10].status == 413);
-            expect(a[11].content_type == "text/event-stream") << a[11].content_type;
-            expect(a[11].body.starts_with("event: message\ndata: {") && a[11].body.contains(R"(\"content\":\"hi\\n\")")) << a[11].body;
-            expect(a[12].status == 200) << a[12].body;
-            expect(a[13].body.contains(R"("tool_calls":5)") && a[13].body.contains(R"("tool_errors":2)")) << a[13].body;
-            expect(a[14].body.contains(R"(gateway_tool_calls_total{tool="write",result="error"} 1)")) << a[14].body;
-            expect(a[15].body.contains(R"("isError":false)")) << a[15].body;
-            expect(a[16].body.contains(R"("actor":"token:tester")")) << "history names the authenticated caller" << a[16].body;
-            expect(a[17].body.contains(R"("isError":false)") && a[17].body.contains(R"("replayed":false)")) << a[17].body;
-            expect(a[18].body.contains(R"("isError":false)") && a[18].body.contains(content::hash_of("receipt\n"))) << a[18].body;
-            expect(a[19].body.contains(R"("isError":false)") && a[19].body.contains(R"("replayed":true)")) << a[19].body;
-            expect(a[20].body.contains(R"("isError":true)") && a[20].body.contains("identity_conflict")) << a[20].body;
-            expect(a[21].body.contains(R"("isError":true)") && a[21].body.contains("invalid_record")) << a[21].body;
+            expect((a.size() == 16u) >> fatal);
+            for (const auto name : {"configurations", "build", "test", "run", "language"})
+                expect(a[0].body.contains(std::format(R"("name":"{}")", name)));
+            for (const auto name : {"read", "write", "edit", "remove", "move", "list", "glob", "search", "worldline", "generate", "jobs"})
+                expect(!a[0].body.contains(std::format(R"("name":"{}")", name)));
+            expect(a[0].status == 200 && a[0].body.contains("outputSchema"));
+            expect(a[1].status == 405);
+            expect(a[2].status == 400 && a[2].body.contains("-32700"));
+            expect(a[3].status == 400);
+            expect(a[4].status == 403);
+            expect(a[5].status == 200 && a[5].allow_origin == "http://ok.example");
+            expect(a[6].status == 413);
+            expect(a[7].content_type == "text/event-stream" && a[7].body.starts_with("event: message\ndata: {"));
+            for (std::size_t i = 8; i < a.size(); ++i) expect(a[i].status == 200) << a[i].body;
+            expect(a[8].body.contains(R"("replayed":false)"));
+            expect(a[9].body.contains(content::hash_of("hi\n")));
+            expect(a[10].body.contains(R"("replayed":true)"));
+            expect(a[11].body.contains(R"("worldline":"wl")"));
+            expect(a[12].body.contains(R"("actor":"token:tester")"));
+            expect(a[13].body.contains(R"("data_base64":"aGkK")"));
+            expect(a[15].body.contains("gateway_tool_calls_total"));
         };
     };
 } // namespace

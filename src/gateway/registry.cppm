@@ -11,6 +11,8 @@ import protocol;
 import client;
 import async;
 import native;
+import delivery;
+import constants;
 
 export namespace storage {
     struct project_ctx {
@@ -27,6 +29,93 @@ export namespace storage {
 
         std::function<void()> changed;
 
+        auto has_export(std::size_t here, content::hash digest, std::uint64_t size) -> coroutine::task<bool> {
+            if (!content::is_hash(digest)) co_return false;
+            co_return co_await io::blocking(rt_.get_scheduler(here), pool_, [this, digest, size] {
+                std::lock_guard held{exports_mutex_};
+                const auto path = storage_ / ".exports/blobs" / digest.view();
+                std::error_code ec;
+                const auto status = std::filesystem::symlink_status(path, ec);
+                if (ec || !std::filesystem::is_regular_file(status)) return false;
+                const auto stored = std::filesystem::file_size(path, ec);
+                if (ec || stored != size) return false;
+                std::filesystem::last_write_time(path, std::filesystem::file_time_type::clock::now(), ec);
+                return !ec;
+            });
+        }
+
+        auto receive_export(std::size_t here, jobs::source_part part) -> coroutine::task<> {
+            co_await io::blocking(rt_.get_scheduler(here), pool_, [this, part = std::move(part)] {
+                if (!content::is_hash(part.digest)) throw std::invalid_argument("invalid export digest");
+                std::shared_ptr<std::mutex> receiver;
+                {
+                    std::lock_guard held{exports_mutex_};
+                    std::erase_if(export_receivers_, [](const auto& item) { return item.second.expired(); });
+                    auto& slot = export_receivers_[part.digest.str()];
+                    receiver = slot.lock();
+                    if (!receiver) slot = receiver = std::make_shared<std::mutex>();
+                    collect_exports();
+                }
+                std::lock_guard receiving{*receiver};
+                const auto storage = storage_ / ".exports/blobs";
+                {
+                    std::lock_guard held{exports_mutex_};
+                    const auto target = storage / part.digest.view();
+                    if (std::filesystem::is_regular_file(std::filesystem::symlink_status(target)) &&
+                        std::filesystem::file_size(target) == part.total) {
+                        std::filesystem::last_write_time(target, std::filesystem::file_time_type::clock::now());
+                        return;
+                    }
+                }
+                if (!delivery::stage(storage, part)) return;
+                delivery::verify(storage, part.digest, part.total);
+                std::lock_guard held{exports_mutex_};
+                delivery::publish(storage, part.digest);
+            });
+        }
+
+        auto grant_exports(std::size_t here, std::string project, std::vector<builds::exported_file> files) -> coroutine::task<std::vector<builds::exported_file>> {
+            try {
+                config::resolve(*config_.current(here), project);
+                content::checked_name(project);
+            } catch (const std::exception& error) {
+                for (auto& file : files)
+                    if (file.delivery_error.empty()) file.delivery_error = std::string{error.what()}.substr(0, 512);
+                co_return files;
+            }
+            co_return co_await io::blocking(rt_.get_scheduler(here), pool_, [this, project, files = std::move(files)] mutable {
+                std::lock_guard held{exports_mutex_};
+                collect_exports();
+                const auto directory = storage_ / ".exports/projects" / project;
+                for (auto& file : files) {
+                    if (!file.delivery_error.empty()) continue;
+                    try {
+                    std::filesystem::create_directories(directory);
+                    if (!content::is_hash(file.digest)) throw std::invalid_argument("invalid export digest");
+                    const auto blob = storage_ / ".exports/blobs" / file.digest.view();
+                    if (std::filesystem::file_size(blob) != file.size) throw std::runtime_error("export size mismatch");
+                    std::filesystem::last_write_time(blob, std::filesystem::file_time_type::clock::now());
+                    std::error_code ec;
+                    const auto granted = directory / file.digest.view();
+                    if (std::filesystem::exists(granted) && !std::filesystem::equivalent(blob, granted)) std::filesystem::remove(granted);
+                    std::filesystem::create_hard_link(blob, granted, ec);
+                    if (ec && ec != std::errc::file_exists) throw std::filesystem::filesystem_error("grant export", blob, ec);
+                    } catch (const std::exception& error) { file.delivery_error = std::string{error.what()}.substr(0, 512); }
+                }
+                return files;
+            });
+        }
+
+        auto read_export(std::size_t here, std::string project, jobs::export_read request) -> coroutine::task<jobs::source_bytes> {
+            config::resolve(*config_.current(here), project);
+            content::checked_name(project);
+            co_return co_await io::blocking(rt_.get_scheduler(here), pool_, [this, project, request] {
+                std::lock_guard held{exports_mutex_};
+                collect_exports();
+                return delivery::read(storage_ / ".exports/projects" / project, request);
+            });
+        }
+
         auto node(std::size_t here, std::string project, nodes::node_request request, worlds::actor actor, bool reading) -> coroutine::task<nodes::node_reply> {
             // The source opens a repository for any project it is asked about, so only configured projects reach it.
             auto doc = config_.current(here);
@@ -41,17 +130,6 @@ export namespace storage {
             if (!reading && changed)
                 changed();
             co_return out;
-        }
-
-        auto analysis(std::size_t here, std::string project, language::request request) -> coroutine::task<language::result> {
-            completed(here, project, request);
-            co_return co_await remote(here, std::move(request));
-        }
-
-        // A preparation a worker ran, for the source to publish and keep; its request is completed as `begin`'s was.
-        auto analysis(std::size_t here, std::string project, jobs::analysis_finish done) -> coroutine::task<language::result> {
-            completed(here, project, done.request);
-            co_return co_await remote(here, std::move(done));
         }
 
         // What the source stores for each project.
@@ -100,12 +178,28 @@ export namespace storage {
         }
 
     private:
-        void completed(std::size_t here, const std::string& project, language::request& request) {
-            auto settings = config::resolve(*config_.current(here), project);
-            request.project = project;
-            request.ignore = settings.ignore;
-            // The environment the analysis is published under is what the language tool queries and scope locks name.
-            request.environment = content::hash_of(config::write(request.config));
+        void collect_exports() {
+            const auto now = std::chrono::steady_clock::now();
+            if (now < export_collect_) return;
+            export_collect_ = now + constants::export_collect_interval;
+            const auto blobs = storage_ / ".exports/blobs";
+            std::set<std::string> receiving;
+            for (const auto& [digest, lock] : export_receivers_) if (!lock.expired()) receiving.insert(digest);
+            delivery::collect(blobs, constants::export_retention, constants::export_cache_bytes, receiving);
+            std::error_code ec;
+            for (const auto& project : std::filesystem::directory_iterator(storage_ / ".exports/projects", ec)) {
+                if (!std::filesystem::is_directory(project.symlink_status(ec)) || ec) continue;
+                for (const auto& file : std::filesystem::directory_iterator(project.path(), ec)) {
+                    if (!std::filesystem::is_regular_file(file.symlink_status(ec)) || ec || !content::is_hash(file.path().filename().string())) continue;
+                    const auto blob = blobs / file.path().filename();
+                    if (!std::filesystem::exists(blob, ec) && !ec) std::filesystem::remove(file.path(), ec);
+                    else if (!ec && !std::filesystem::equivalent(blob, file.path(), ec) && !ec) {
+                        std::filesystem::remove(file.path(), ec);
+                        if (!ec) std::filesystem::create_hard_link(blob, file.path(), ec);
+                    }
+                }
+                std::filesystem::remove(project.path(), ec);
+            }
         }
 
         template <class Request> auto remote(std::size_t here, Request request) -> coroutine::task<jobs::reply_t<Request>> {
@@ -155,5 +249,8 @@ export namespace storage {
         net::ip::tcp::endpoint source_;
         coroutine::mutex ledger_lock_;
         std::unique_ptr<usage::ledger> ledger_;
+        std::mutex exports_mutex_;
+        std::map<std::string, std::weak_ptr<std::mutex>> export_receivers_;
+        std::chrono::steady_clock::time_point export_collect_{};
     };
 } // namespace storage

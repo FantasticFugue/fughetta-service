@@ -337,6 +337,10 @@ export namespace config {
         for (auto& [name, a] : s.analysis) {
             check_name("analysis", name);
             language::validate(a);
+            auto bound = s.build_configurations.find(a.build_configuration);
+            if (bound == s.build_configurations.end())
+                throw std::invalid_argument("analysis " + name + " names an unknown build_configuration: " + a.build_configuration);
+            language::prepare(a, bound->second);
         }
         for (auto& [name, c] : s.build_configurations) {
             check_name("build configuration", name);
@@ -427,7 +431,6 @@ export namespace config {
         std::uint16_t port = 9091;
         std::string storage = "storage";
         std::uint32_t disk_threads = allocation::plan{}.source_disk;
-        builds::toolset tools;
     };
 
     inline void validate(const source& s) {
@@ -456,6 +459,11 @@ export namespace config {
         std::map<std::string, std::string> env;
         bool inherit_env = true;
         builds::toolset tools;
+        std::map<std::string, std::string> sdk_manifests;
+        std::optional<std::string> dependency_cache;
+        std::optional<std::string> dependency_upstream;
+        std::optional<std::string> dependency_publish;
+        std::optional<builds::dependency_recipe> dependency_recipe;
     };
 
     inline auto parse_worker(std::string_view text) -> worker {
@@ -468,6 +476,17 @@ export namespace config {
         io::parse_endpoint(w.gateway);
         if (w.work_root.empty())
             throw std::invalid_argument("Worker work_root is empty");
+        if (w.dependency_cache && (w.dependency_cache->empty() || !std::filesystem::path(*w.dependency_cache).is_absolute()))
+            throw std::invalid_argument("Worker dependency_cache must be an absolute path");
+        if (w.dependency_upstream && (w.dependency_upstream->empty() || !std::filesystem::path(*w.dependency_upstream).is_absolute()))
+            throw std::invalid_argument("Worker dependency_upstream must be an absolute path");
+        if (w.dependency_publish && (w.dependency_publish->empty() || !std::filesystem::path(*w.dependency_publish).is_absolute()))
+            throw std::invalid_argument("Worker dependency_publish must be an absolute path");
+        if (w.dependency_publish && w.dependency_upstream)
+            throw std::invalid_argument("Worker dependency_publish already supplies the upstream cache");
+        if (w.dependency_publish.has_value() != w.dependency_recipe.has_value())
+            throw std::invalid_argument("Worker dependency_publish and dependency_recipe must be configured together");
+        if (w.dependency_recipe) builds::validate(*w.dependency_recipe);
         if (w.compute_threads == 0 || w.parallel == 0)
             throw std::invalid_argument("worker thread and parallel budgets must be positive");
         if (w.max_inflight == 0)

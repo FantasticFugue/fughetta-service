@@ -1,3 +1,5 @@
+module;
+#include <sodium.h>
 export module keyring;
 import std;
 import content;
@@ -14,10 +16,16 @@ export namespace keyring {
 
     // A new bearer token: 32 random bytes in hex.
     inline auto mint() -> std::string {
-        std::random_device random;
+        static const auto initialized = sodium_init();
+        if (initialized < 0)
+            throw std::runtime_error("cannot initialize bearer token entropy");
+        std::array<unsigned char, 32> bytes{};
+        randombytes_buf(bytes.data(), bytes.size());
         std::string out;
-        for (int i = 0; i < 32; ++i)
-            out += std::format("{:02x}", random() & 0xff);
+        out.reserve(64);
+        for (unsigned char b : bytes)
+            out += std::format("{:02x}", static_cast<unsigned>(b));
+        sodium_memzero(bytes.data(), bytes.size());
         return out;
     }
 
@@ -49,7 +57,7 @@ export namespace keyring {
         if (!std::ranges::equal(scheme, std::string_view{"bearer "}, {}, [](char c) { return static_cast<char>(std::tolower(static_cast<unsigned char>(c))); }))
             throw unauthorized("send a bearer token");
         auto digest = hash(value.substr(7));
-        auto found = std::ranges::find(auth.tokens, digest, &config::token::hash);
+        auto found = std::ranges::find_if(auth.tokens, [&](const config::token& t) { return content::secure_equal(digest, t.hash); });
         if (found == auth.tokens.end())
             throw unauthorized("unknown bearer token");
         return {.issuer = "token", .user = found->name, .caller = found->name, .role = found->role, .client = hash("client:" + digest)};

@@ -127,8 +127,12 @@ namespace {
             language::config<"ty"> ty{.python = "build/venv"};
             ty.server.diagnostic_mode = "workspace";
             ty.server.configuration["rules"] = rfl::json::read<rfl::Generic>(R"({"unresolved-import":"warn"})").value();
-            auto plan = language::prepare({.server = language::with<"ty">{.options = std::move(ty)}});
+            auto environments = project();
+            environments.builders["other"] = builds::with<"uv">{.options = {.env_dir = "build/other", .build_dir = "build/other-dist"}};
+            environments.tasks["other"] = {.builder = "other", .operation = "sync"};
+            auto plan = language::prepare({.server = language::with<"ty">{.options = std::move(ty)}, .build_configuration = "native"}, environments);
             expect(plan.server.argv == std::vector<std::string>{"ty", "server"});
+            expect(plan.build.steps.size() == 1u && plan.inputs.size() == 1u && plan.inputs.front().type == "python_environment");
             expect(rfl::json::write(plan.server.initialization) ==
                    R"({"settings":{"configuration":{"rules":{"unresolved-import":"warn"}},"diagnosticMode":"workspace"}})");
             expect(plan.server.env.at("VIRTUAL_ENV") == "${tree}/build/venv") << "ty finds the uv environment by its variable";
@@ -142,12 +146,14 @@ namespace {
             ruff.server.formatter.backend = "uv";
             ruff.server.actions.fix_violation.enable = false;
             ruff.server.exclude = {"build/**"};
-            auto launched = language::prepare({.server = language::with<"ruff">{.options = std::move(ruff)}}).server;
+            auto launched = language::prepare({.server = language::with<"ruff">{.options = std::move(ruff)}, .build_configuration = "native"}, {}).server;
             expect(launched.argv == std::vector<std::string>{"ruff", "server"});
             expect(rfl::json::write(launched.initialization) == R"({"settings":{"lineLength":100,"exclude":["build/**"],"lint":{"select":["ANN","I"]},)"
                                                                 R"("format":{"backend":"uv"},"codeAction":{"fixViolation":{"enable":false}}}})");
 
-            auto reject = [](auto provider) { expect(throws<std::invalid_argument>([&] { language::prepare({.server = provider}); })); };
+            auto reject = [](auto provider) {
+                expect(throws<std::invalid_argument>([&] { language::prepare({.server = provider, .build_configuration = "native"}, {}); }));
+            };
             reject(language::with<"ty">{.options = {.executable = "/usr/local/bin/ty"}});
             reject(language::with<"ty">{.options = {.env = {{"VIRTUAL_ENV", "other"}}, .python = "build/venv"}});
             reject(language::with<"ty">{.options = {.server = {.diagnostic_mode = "always"}}});

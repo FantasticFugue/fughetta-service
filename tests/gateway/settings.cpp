@@ -60,7 +60,7 @@ namespace {
         auto ask(ctx& io, http::method method, std::string target, std::string body = {}, std::vector<http::header> fields = {}, bool authenticated = true)
             -> coroutine::task<answer> {
             auto s = co_await io::connect(io, {net::ip::address_v4{{127, 0, 0, 1}}, port});
-            web::stream<socket> transport{s};
+            test::http_stream transport{s};
             if (authenticated)
                 fields.push_back({"authorization", "Bearer sk_test"});
             http::request req{.method = method, .target = std::move(target), .scheme = "http", .authority = "localhost", .fields = std::move(fields)};
@@ -125,7 +125,7 @@ namespace {
         };
         auto business_tools = extract(business);
         auto config_tools = extract(configuration);
-        expect(config_tools.size() == settings::catalog().size());
+        expect(config_tools.size() == 4u);
         for (const auto& tool : config_tools) {
             expect(!std::ranges::contains(business_tools, tool.name, &mcp::tool::name)) << tool.name;
             if (tool.name == "save_project") {
@@ -143,23 +143,9 @@ namespace {
             expect(!via_mcp.isError && via_rest.status == 200) << via_mcp.content.front().text;
             expect(rfl::json::write(via_mcp.structuredContent.value()) == via_rest.body);
         };
-        co_await compare("configuration", rfl::Generic::Object{}, "/api/v1/config", "sk_member");
-        co_await compare("server", rfl::Generic::Object{}, "/api/v1/config/server");
-        co_await compare("limits", rfl::Generic::Object{}, "/api/v1/config/limits");
         co_await compare("schema", rfl::Generic::Object{}, "/api/v1/settings-schema");
-        expect((co_await rest(h, io, GET, "/api/v1/settings-schema", "", "sk_member")).body.contains("language server caches"));
-
-        auto server = h.hub.current(0)->server;
-        server.max_request_bytes = 2u << 20;
-        auto saved = result(co_await invoke(h, io, "save_server", mcp::object({{"body", body(0, server)}})));
-        expect(!saved.isError) << saved.content.front().text;
-        co_await compare("server", rfl::Generic::Object{}, "/api/v1/config/server");
-        expect(h.hub.current(0)->server.max_request_bytes == server.max_request_bytes);
-        config::limits limits{.max_projects = 20, .read_max_lines = 80};
-        saved = result(co_await invoke(h, io, "save_limits", mcp::object({{"body", body(0, limits)}})));
-        expect(!saved.isError);
-        auto read = co_await rest(h, io, GET, "/api/v1/config/limits");
-        expect(saved.content.front().text == read.body);
+        for (auto removed : {"configuration", "server", "save_server", "limits", "save_limits", "projects", "remove_project", "preview", "analysis"})
+            expect(result(co_await invoke(h, io, removed, mcp::object({}))).isError);
 
         config::settings settings;
         settings.ignore = {"generated", "*.o"};
@@ -167,72 +153,30 @@ namespace {
         settings.build_configurations["Debug"] = fixture::cmake("build/debug");
         settings.run_configurations["tests"] = {.operation = "test", .configurations = {"Debug"}};
         settings.default_configurations = {"Debug"};
-        settings.analysis["Cpp"] = {.server = fixture::clice("clice", {"--log-level", "off"})};
+        fixture::options<"cmake">(settings.build_configurations["Debug"].builders.at("main")).export_compile_commands = true;
+        settings.analysis["Cpp"] = {.server = fixture::clice("clice", {"--log-level", "off"}), .build_configuration = "Debug"};
         std::uint64_t revision = 0;
         auto input = arguments("app", body(revision, settings));
-        saved = result(co_await invoke(h, io, "save_project", input, "sk_member"));
+        auto saved = result(co_await invoke(h, io, "save_project", input, "sk_member"));
         expect(!saved.isError) << saved.content.front().text;
-        read = co_await rest(h, io, GET, project, "", "sk_member");
+        auto read = co_await rest(h, io, GET, project, "", "sk_member");
         expect(saved.content.front().text == read.body);
         auto decoded = rfl::json::read<front::api::section_view<config::settings>>(read.body).value();
         expect(config::write(decoded.value) == config::write(settings));
         co_await compare("project", arguments("app", {}), project, "sk_member");
-        co_await compare("projects", mcp::object({}), "/api/v1/projects", "sk_member");
         co_await compare("effective", arguments("app", {}), project + "/effective", "sk_member");
         // Reusing an old revision returns the same complete error as REST.
         saved = result(co_await invoke(h, io, "save_project", input));
         auto failed = co_await rest(h, io, PUT, project, rfl::json::write(body(revision, settings)));
         expect(saved.isError && failed.status == 409 && saved.content.front().text == failed.body);
 
-        auto selection = mcp::object({{"project", "app"}, {"name", "Debug"}, {"body", rfl::to_generic(builds::request{.operation = "build"})}});
-        auto planned = result(co_await invoke(h, io, "preview", selection));
-        auto rest_plan = co_await rest(h, io, http::method::POST, project + "/build-configurations/Debug/plan", R"({"operation":"build","parameters":{}})");
-        expect(!planned.isError && rest_plan.status == 200 && planned.content.front().text == rest_plan.body);
-        auto analysis = mcp::object({{"project", "app"}, {"name", "Cpp"}});
-        planned = result(co_await invoke(h, io, "analysis", analysis));
-        rest_plan = co_await rest(h, io, http::method::POST, project + "/analysis/Cpp/plan", "{}");
-        expect(planned.isError && rest_plan.status == 400 && planned.content.front().text == rest_plan.body)
-            << "the configuration names no language service: " << rest_plan.body;
-
-        struct rejection {
-            std::string tool, path, token;
-            http::method method;
-            rfl::Generic args, payload;
-        };
-        for (const auto& check :
-             std::vector<rejection>{{"save_server", "/api/v1/config/server", "sk_member", PUT, mcp::object({{"body", body(1, server)}}), body(1, server)},
-                                    {"save_limits", "/api/v1/config/limits", "sk_member", PUT, mcp::object({{"body", body(0, limits)}}), body(0, limits)}}) {
-            auto rejected = co_await invoke(h, io, check.tool, check.args, check.token);
-            auto denied = co_await rest(h, io, check.method, check.path, rfl::json::write(check.payload), check.token);
-            auto rpc = rfl::json::read<mcp::response>(rejected.body).value();
-            if (rpc.error) {
-                expect(denied.body.contains(rpc.error->message));
-            } else {
-                auto outcome = result(rejected);
-                expect(outcome.isError && outcome.content.front().text == denied.body);
-            }
-            expect(denied.status == 403);
-        }
-
-        // Invalid values and missing revisions are parsed by the REST handlers.
-        auto invalid_server = server;
-        invalid_server.http_bind = "localhost";
-        auto invalid_project = settings;
-        invalid_project.ignore = {""};
-        for (const auto& check : std::vector<rejection>{
-                 {"save_server", "/api/v1/config/server", "sk_test", PUT, mcp::object({{"body", body(h.hub.current(0)->revisions.server, invalid_server)}}),
-                  body(h.hub.current(0)->revisions.server, invalid_server)},
-                 {"save_project", project, "sk_member", PUT, arguments("app", body(decoded.revision, invalid_project)),
-                  body(decoded.revision, invalid_project)},
-                 {"save_limits", "/api/v1/config/limits", "sk_owner", PUT, mcp::object({{"body", mcp::object({{"value", rfl::to_generic(limits)}})}}),
-                  mcp::object({{"value", rfl::to_generic(limits)}})}}) {
-            auto outcome = result(co_await invoke(h, io, check.tool, check.args, check.token));
-            auto response = co_await rest(h, io, check.method, check.path, rfl::json::write(check.payload), check.token);
-            expect(outcome.isError && response.status == 400 && outcome.content.front().text == response.body) << outcome.content.front().text;
-        }
-        auto removed = result(co_await invoke(h, io, "remove_project", arguments("app", {}), "sk_member"));
-        expect(!removed.isError);
-        expect((co_await rest(h, io, GET, project)).status == 404);
+        auto invalid = settings;
+        invalid.analysis.at("Cpp").build_configuration = "missing";
+        auto payload = body(decoded.revision, invalid);
+        auto rejected = result(co_await invoke(h, io, "save_project", arguments("app", payload), "sk_member"));
+        auto denied = co_await rest(h, io, PUT, project, rfl::json::write(payload), "sk_member");
+        expect(rejected.isError && denied.status == 400 && rejected.content.front().text == denied.body);
+        expect(denied.body.contains("build_configuration"));
 
         auto method = co_await h.ask(io, GET, "/mcp/config");
         expect(method.status == 405);
@@ -244,6 +188,21 @@ namespace {
         expect(blocked.status == 403);
     }
     const auto cases = [] {
+        "a configuration tool answers a non-JSON core response as an MCP error"_test = [] {
+            // The dispatch stands for a REST route that failed before framing JSON.
+            settings::bound bound{[](const worlds::actor&, std::string, std::string, std::string) -> coroutine::task<web::reply> {
+                co_return web::reply{.head = {.status = 200}, .body = "<html>gateway busy</html>"};
+            }};
+            cores::io_context<native::context> rt{1};
+            rt.run([&](ctx&, std::size_t) -> coroutine::task<> {
+                mcp::notifier drop;
+                const worlds::actor who{.issuer = "token", .user = "tester", .caller = "settings-suite", .role = "owner"};
+                auto outcome = co_await bound.call("schema", rfl::Generic::Object{}, drop, who);
+                expect(outcome.error);
+                expect(outcome.text.contains("not JSON")) << outcome.text;
+            });
+        };
+
         "configuration MCP shares REST operations and separates tool catalogs"_test = [] {
             harness h;
             h.rt.run([&](ctx& io, std::size_t) -> coroutine::task<> {

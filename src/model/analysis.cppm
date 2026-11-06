@@ -2,37 +2,33 @@ module language;
 import reflection;
 
 namespace language {
-    auto timeout(const configuration& c) -> std::uint32_t { return c.build.limits.timeout_s.value_or(60); }
-    auto output_limit(const configuration& c) -> std::uint64_t { return c.build.limits.output_limit.value_or(1u << 20); }
+    auto timeout(const builds::configuration& c) -> std::uint32_t { return c.limits.timeout_s.value_or(1800); }
+    auto output_limit(const builds::configuration& c) -> std::uint64_t { return c.limits.output_limit.value_or(1u << 20); }
     auto provider_of(const provider& p) -> std::string_view {
         return p.visit([](const auto& w) { return std::remove_cvref_t<decltype(w)>::name; });
     }
-    namespace {
-        void settings(const configuration& c) {
-            if (!timeout(c) || timeout(c) > 90)
-                throw std::invalid_argument("analysis timeout must be between 1 and 90 seconds");
-            if (output_limit(c) > (1u << 20))
-                throw std::invalid_argument("analysis output limit exceeds 1 MiB");
-            if (c.build.limits.max_memory_bytes || c.build.limits.max_cpu_seconds)
-                throw std::invalid_argument("Source preparation does not provide process resource isolation");
-            if (rfl::json::write(c).find("\\u0000") != std::string::npos)
-                throw std::invalid_argument("analysis configuration contains a null character");
-        }
-    } // namespace
-    auto prepare(const configuration& c) -> plan {
-        settings(c);
-        // A server that reads no build output needs no build.
-        auto build = c.build.operations.empty() ? builds::plan{} : builds::prepare(c.build, {.operation = c.operation});
-        std::vector<builds::context> inputs;
-        std::set<std::string> seen;
-        for (auto& name : c.inputs) {
-            if (!seen.insert(name).second)
-                throw std::invalid_argument("duplicate language service input: " + name);
-            auto output = std::ranges::find(build.contexts, name, &builds::context::name);
-            if (output == build.contexts.end())
-                throw std::invalid_argument("preparation does not provide output: " + name);
-            inputs.push_back(*output);
-        }
+    auto fingerprint(const configuration& c, const builds::configuration& build) -> content::hash {
+        return content::hash_of(rfl::json::write(c) + "\n" + rfl::json::write(build));
+    }
+    auto prepare(const configuration& c, const builds::configuration& bound) -> plan {
+        validate(c);
+        auto types = c.server.visit([](const auto& w) {
+            using implementation = typename std::remove_cvref_t<decltype(w)>::implementation;
+            if constexpr (requires { implementation::required_inputs(w.options); })
+                return implementation::required_inputs(w.options);
+            std::vector<std::string> out;
+            for (auto type : implementation::inputs)
+                out.emplace_back(type);
+            return out;
+        });
+        auto paths = c.server.visit([](const auto& w) -> std::map<std::string, std::string> {
+            using implementation = typename std::remove_cvref_t<decltype(w)>::implementation;
+            if constexpr (requires { implementation::input_paths(w.options); })
+                return implementation::input_paths(w.options);
+            return {};
+        });
+        auto build = builds::prepare_inputs(bound, types, paths);
+        auto inputs = build.contexts;
         auto server = c.server.visit([&](const auto& w) {
             using implementation = typename std::remove_cvref_t<decltype(w)>::implementation;
             implementation::validate(w.options);
@@ -44,12 +40,7 @@ namespace language {
             return out;
         });
         builds::validate_environment(server.env);
-        auto recipe = content::hash_of(rfl::json::write(build));
-        return {.build = std::move(build),
-                .server = std::move(server),
-                .inputs = std::move(inputs),
-                .fingerprint = content::hash_of(rfl::json::write(c)),
-                .recipe = std::move(recipe)};
+        return {.build = std::move(build), .server = std::move(server), .inputs = std::move(inputs), .fingerprint = fingerprint(c, bound)};
     }
     auto locate(program value, const std::filesystem::path& tree, const builds::toolset& tools, std::uint32_t jobs) -> program {
         if (value.argv.empty())
@@ -64,11 +55,11 @@ namespace language {
         return value;
     }
     void validate(const configuration& c) {
-        if (!c.build.builders.empty() || !c.build.tasks.empty() || !c.build.operations.empty() || !c.build.outputs.empty() || !c.inputs.empty() ||
-            c.operation != "prepare")
-            prepare(c);
-        else
-            c.server.visit([](const auto& w) { std::remove_cvref_t<decltype(w)>::implementation::validate(w.options); });
+        if (c.build_configuration.empty())
+            throw std::invalid_argument("analysis build_configuration is required");
+        if (rfl::json::write(c).find("\\u0000") != std::string::npos)
+            throw std::invalid_argument("analysis configuration contains a null character");
+        c.server.visit([](const auto& w) { std::remove_cvref_t<decltype(w)>::implementation::validate(w.options); });
     }
     void check(const plan& p, const std::vector<content::entry>& files) {
         for (auto& entry : files) {

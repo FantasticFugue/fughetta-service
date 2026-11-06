@@ -95,8 +95,6 @@ export namespace runtime {
             io::command source_command{.argv = {executable.string(), "--role", "source", "--port", std::to_string(endpoint.port()), "--storage",
                                                 (root / "source").string(), "--threads", std::to_string(plan.source_disk)},
                                        .cwd = std::filesystem::current_path()};
-            for (auto& [name, tool] : doc.tools)
-                source_command.argv.insert(source_command.argv.end(), {"--tool", name + "=" + tool});
             auto& source = launch(io, tasks, std::move(source_command), "source");
             co_await ready(io, source);
             for (std::size_t i = 0; i < plan.workers.size(); ++i) {
@@ -106,6 +104,7 @@ export namespace runtime {
                 worker.name = std::format("local-{}", i);
                 worker.data_root = (root / "source").string();
                 worker.work_root = (root / "workers" / worker.name).string();
+                worker.dependency_cache = (root / "dependencies").string();
                 worker.compute_threads = 1;
                 worker.max_inflight = 1;
                 worker.tools = doc.tools;

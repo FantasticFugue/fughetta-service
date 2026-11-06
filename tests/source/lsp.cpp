@@ -48,6 +48,8 @@ while True:
         break
     method = message.get("method")
     log.write((method or "response " + json.dumps(message.get("result"))) + "\n")
+    if method in ("textDocument/didOpen", "textDocument/didChange", "textDocument/didClose", "workspace/didChangeWatchedFiles"):
+        log.write(json.dumps(message["params"]) + "\n")
     log.flush()
     if method == "initialize":
         write({"jsonrpc": "2.0", "id": message["id"], "result": {"capabilities": scenario["capabilities"]}})
@@ -55,15 +57,30 @@ while True:
         write({"jsonrpc": "2.0", "id": 900, "method": "workspace/configuration", "params": {"items": [{"section": "mock"}, {"section": "mock"}]}})
     elif method == "textDocument/didOpen":
         uri = message["params"]["textDocument"]["uri"]
+        if scenario.get("idle"):
+            write({"jsonrpc":"2.0", "id":901, "method":"workspace/configuration", "params":{"items":[{}]}})
+            write({"jsonrpc":"2.0", "method":"textDocument/publishDiagnostics", "params":{"uri":uri,"version":1,"diagnostics":items([[0,0,1,2,"idle","idle diagnostic"]])}})
+    elif method == "textDocument/didChange" and scenario.get("idle"):
+        for version, message in [(2,"current diagnostic"),(1,"stale diagnostic")]:
+            write({"jsonrpc":"2.0", "method":"textDocument/publishDiagnostics", "params":{"uri":uri,"version":version,"diagnostics":items([[0,0,1,2,"idle",message]])}})
     elif method == "textDocument/documentSymbol":
         if scenario.get("push"):
             write({"jsonrpc": "2.0", "method": "textDocument/publishDiagnostics", "params": {"uri": uri, "diagnostics": items(scenario["push"])}})
         write({"jsonrpc": "2.0", "id": message["id"], "result": scenario.get("symbols", [])})
     elif method == "textDocument/diagnostic":
+        if scenario.get("hang"):
+            continue
         if scenario.get("fail"):
             write({"jsonrpc": "2.0", "id": message["id"], "error": {"code": -32803, "message": scenario["fail"]}})
         else:
             write({"jsonrpc": "2.0", "id": message["id"], "result": {"kind": "full", "items": items(scenario.get("pull", []))}})
+    elif method in ("textDocument/definition", "textDocument/references"):
+        log.write(json.dumps(message["params"]) + "\n")
+        log.flush()
+        results = []
+        for spec in scenario.get("locations", []):
+            results.append({"uri": "file://" + os.path.join(here, spec["path"]), "range": spec["range"]})
+        write({"jsonrpc": "2.0", "id": message["id"], "result": results})
     elif method == "shutdown":
         write({"jsonrpc": "2.0", "id": message["id"], "result": None})
     elif method == "exit":
@@ -170,6 +187,7 @@ while True:
             expect(done.report->diagnostics.front().severity == "warning" && done.report->diagnostics.front().message == "[W1] unused");
             expect(is(done.report->diagnostics.front().range.place, "p.py", 6, 9));
             expect(!m.sent().contains("textDocument/diagnostic"));
+            expect(!done.report->complete) << "unversioned pushes are not safe content-cache entries";
         };
 
         "a server that declares nothing to ask fails the document and is not shown it"_test = [] {
@@ -185,6 +203,110 @@ while True:
                 "fail": "analysis crashed"})"};
             auto done = describe(m.argv, m.tmp.dir, "{}", {.path = "x.py", .language = "python", .text = "x = 1\n"});
             expect(!done.report && done.error.contains("refused textDocument/diagnostic") && done.error.contains("analysis crashed")) << done.error;
+        };
+
+        "a cancelled query releases its response waiter and stops the background reader"_test = [] {
+            mock m{"lsp-cancel", R"({"capabilities":{"diagnosticProvider":true},"hang":true})"};
+            native::context context;
+            auto ran = cores::run(context, [&]() -> coroutine::task<bool> {
+                auto io = context.get_scheduler();
+                lsp::session session{io, {.argv = m.argv, .cwd = m.tmp.dir}};
+                co_await session.start(m.tmp.dir, *rfl::json::read<rfl::Generic>("{}"));
+                lsp::document document{"a.py", "python", "x=1"};
+                auto result = co_await coroutine::deadline(io, std::chrono::milliseconds{30}, session.describe(document));
+                co_await session.abort();
+                co_return !result;
+            }());
+            expect(ran && *ran);
+        };
+
+        "an idle session answers server requests and keeps only current diagnostics"_test = [] {
+            mock m{"lsp-idle", R"({"capabilities":{"documentSymbolProvider":true},"idle":true})"};
+            native::context context;
+            auto ran = cores::run(context, [&]() -> coroutine::task<int> {
+                auto io = context.get_scheduler();
+                lsp::session session{io, {.argv = m.argv, .cwd = m.tmp.dir}};
+                co_await session.start(m.tmp.dir, *rfl::json::read<rfl::Generic>(R"({"settings":{"mode":"test"}})"));
+                std::vector<lsp::document> documents{{"a.py", "python", "x = 1\n"}};
+                co_await session.synchronize(documents);
+                for (int i = 0; i < 100 && !m.sent().contains("response [{"); ++i)
+                    co_await execution::schedule_after(io, std::chrono::milliseconds{5});
+                expect(m.sent().contains(R"(response [{"mode": "test"}])")) << "no client query was needed to answer the server";
+                auto first = co_await session.describe(documents.front());
+                expect((first.diagnostics.size() == 1u) >> fatal);
+                expect(first.diagnostics.front().message.contains("idle diagnostic"));
+                documents.front().text = "x = 2\n";
+                co_await session.synchronize(documents);
+                auto current = co_await session.describe(documents.front());
+                expect((current.diagnostics.size() == 1u) >> fatal);
+                expect(current.diagnostics.front().message.contains("current diagnostic"));
+                expect(current.complete) << "version-matched pushes describe this snapshot";
+                expect(!current.cacheable) << "pushes cannot certify changes to dependencies in other files";
+                co_return co_await session.stop();
+            }());
+            expect(ran && *ran == 0);
+        };
+
+        "definition and reference queries select names and return Unicode locations"_test = [] {
+            mock m{"lsp-locations", R"({"capabilities":{"definitionProvider":true,"referencesProvider":true},
+                "locations":[{"path":"b.py","range":{"start":{"line":0,"character":10},"end":{"line":0,"character":13}}}]})"};
+            native::context context;
+            auto ran = cores::run(context, [&]() -> coroutine::task<int> {
+                lsp::session session{context.get_scheduler(), {.argv = m.argv, .cwd = m.tmp.dir}};
+                co_await session.start(m.tmp.dir, *rfl::json::read<rfl::Generic>("{}"));
+                std::vector<lsp::document> documents{{"a.py", "python", "foo()\nfoo()\n"}, {"b.py", "python", "x = '😀'; foo()\n"}};
+                co_await session.synchronize(documents);
+                bool ambiguous = false;
+                try {
+                    (void)co_await session.lookup({.action = "definitions", .path = "a.py", .symbol = "foo"});
+                } catch (const std::invalid_argument&) {
+                    ambiguous = true;
+                }
+                expect(ambiguous);
+                auto definitions = co_await session.lookup({.action = "definitions", .path = "a.py", .symbol = "foo", .line = 2});
+                expect((definitions.size() == 1u) >> fatal);
+                expect(definitions.front().path == "b.py" && definitions.front().line == 1u && definitions.front().column == 10u &&
+                       definitions.front().end_column == 13u);
+                auto references = co_await session.lookup({.action = "references", .path = "b.py", .symbol = "foo"});
+                expect(references.size() == 1u);
+                co_return co_await session.stop();
+            }());
+            expect(ran && *ran == 0);
+            expect(m.sent().contains("\"character\": 10") && m.sent().contains("\"includeDeclaration\": true"));
+        };
+
+        "a session updates open files without restarting and closes removed files"_test = [] {
+            mock m{"lsp-incremental", R"({"capabilities":{"diagnosticProvider":true}, "pull":[]})"};
+            native::context context;
+            auto ran = cores::run(context, [&]() -> coroutine::task<int> {
+                lsp::session session{context.get_scheduler(), {.argv = m.argv, .cwd = m.tmp.dir}};
+                co_await session.start(m.tmp.dir, *rfl::json::read<rfl::Generic>("{}"));
+                std::vector<lsp::document> documents{{"a.py", "python", "x = '😀'\n"}, {"b.py", "python", "y = 1\n"}};
+                co_await session.synchronize(documents);
+                (void)co_await session.describe(documents.front());
+                documents.front().text = "x = '😀'; z = 2\n";
+                documents.pop_back();
+                std::vector<std::string> generated{"compile_commands.json"};
+                co_await session.synchronize(documents, generated);
+                (void)co_await session.describe(documents.front());
+                co_await session.synchronize(documents);
+                co_return co_await session.stop();
+            }());
+            expect(ran && *ran == 0);
+            auto log = m.sent();
+            auto occurrences = [&](std::string_view value) {
+                std::size_t count = 0, at = 0;
+                while ((at = log.find(value, at)) != std::string::npos) {
+                    ++count;
+                    at += value.size();
+                }
+                return count;
+            };
+            expect(occurrences("initialize\n") == 1u);
+            expect(occurrences("textDocument/didOpen\n") == 2u);
+            expect(occurrences("textDocument/didChange\n") == 1u);
+            expect(occurrences("textDocument/didClose\n") == 1u);
+            expect(log.contains("\"version\": 2") && log.contains("compile_commands.json"));
         };
 
         "a survey collects diagnostics from every visited document"_test = [] {

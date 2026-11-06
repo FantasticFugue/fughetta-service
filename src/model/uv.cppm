@@ -90,7 +90,7 @@ namespace builds {
             cache.push_back(*c.cache_dir);
         operation_spec lock{.needs = tools({c.executable}), .source_dirs = {c.project_dir}, .build_dirs = cache};
         operation_spec sync = lock, build = lock, run = lock;
-        sync.outputs = {{"environment", {"directory", c.env_dir, "directory"}}};
+        sync.outputs = {{"environment", {"directory", c.env_dir, "directory"}}, {"python_environment", {"python_environment", c.env_dir, "directory"}}};
         sync.build_dirs.push_back(c.env_dir);
         build.outputs = {{"distributions", {"python_distributions", c.build_dir, "directory"}}};
         build.build_dirs.push_back(c.build_dir);

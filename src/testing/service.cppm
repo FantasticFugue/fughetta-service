@@ -10,7 +10,7 @@ namespace test {
         net::ip::tcp::endpoint endpoint;
         std::jthread thread;
 
-        state(std::filesystem::path root, builds::toolset tools) : service(rt, std::move(root), disk, std::move(tools)) {
+        state(std::filesystem::path root) : service(rt, std::move(root), disk) {
             std::promise<net::ip::tcp::endpoint> ready;
             auto started = ready.get_future();
             thread = std::jthread([this, &ready] {
@@ -32,7 +32,7 @@ namespace test {
         }
     };
 
-    source_service::source_service(std::filesystem::path root, builds::toolset tools) : state_(std::make_unique<state>(std::move(root), std::move(tools))) {}
+    source_service::source_service(std::filesystem::path root) : state_(std::make_unique<state>(std::move(root))) {}
     source_service::~source_service() = default;
     auto source_service::endpoint() const -> net::ip::tcp::endpoint { return state_->endpoint; }
 } // namespace test

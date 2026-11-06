@@ -5,11 +5,11 @@ import allocation;
 namespace {
     using namespace boost::ut;
     const auto cases = [] {
-        "the source reservation and worker shares fit the global job budget"_test = [] {
-            for (std::uint32_t jobs = 2; jobs <= 64; ++jobs)
-                for (std::uint32_t workers = 1; workers < jobs; ++workers) {
+        "worker shares use the full global job budget"_test = [] {
+            for (std::uint32_t jobs = 1; jobs <= 64; ++jobs)
+                for (std::uint32_t workers = 1; workers <= jobs; ++workers) {
                     auto plan = allocation::distribute({.threads = 6 + 2 * workers, .jobs = jobs, .workers = workers});
-                    std::uint32_t total = 1;
+                    std::uint32_t total = 0;
                     for (auto worker : plan.workers) {
                         expect(worker.parallel > 0_u);
                         total += worker.parallel;
@@ -29,7 +29,7 @@ namespace {
             expect(plan.workers.empty());
         };
         "invalid budgets fail before launching processes"_test = [] {
-            for (auto budget : {allocation::budget{5, 1, 0}, allocation::budget{8, 0, 1}, allocation::budget{8, 1, 1}, allocation::budget{9, 3, 2}})
+            for (auto budget : {allocation::budget{5, 1, 0}, allocation::budget{8, 0, 1}, allocation::budget{10, 1, 2}, allocation::budget{9, 3, 2}})
                 expect(throws<std::invalid_argument>([&] { allocation::distribute(budget); }));
         };
     };

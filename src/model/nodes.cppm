@@ -19,27 +19,25 @@ export namespace nodes {
         std::uint64_t total = 0;
         std::string data;
     };
-    // A writer's hold on one syntax scope of a worldline, as the named analysis environment reported it.
-    // The global namespace "::" holds everything outside classes, functions and namespaces, and every file.
-    struct lock {
-        std::uint64_t id = 0;
-        std::string holder, scope, symbol, environment, document;
-        std::optional<semantic::anchor> first, last;
-        std::optional<semantic::place> place;
-        std::int64_t acquired = 0;
-    };
-    inline constexpr std::string_view global_scope = "::";
     struct line_view {
         std::string name, version, base_version, creator;
     };
+    struct mail_input {
+        std::string recipient, body;
+    };
+    struct mail_message {
+        std::uint64_t id = 0, at = 0;
+        std::string sender, worldline, recipient, body, operation;
+    };
     struct node_request {
         std::string action;
+        std::optional<mail_input> mail;
+        std::uint64_t after = 0;
         std::string worldline = "main";
         std::string revision, snapshot;
         std::string operation;
         std::string owner;
         std::string actor;
-        std::string holder;
         std::string caller_operation;
         std::string genesis_nonce;
         std::vector<std::string> expected;
@@ -61,9 +59,6 @@ export namespace nodes {
         std::vector<object_part> parts;
         std::string configuration;
         std::string environment;
-        std::optional<semantic::generation> generation;
-        std::vector<semantic::span> spans;
-        std::vector<std::string> scopes;
         bool force = false;
         bool capture = false;
         // Size limits for the published state, in bytes; zero is none. The workspace limit bounds the stored history of all its projects.
@@ -93,6 +88,8 @@ export namespace nodes {
         std::string operation;
         std::string version, source_digest, receipt, issuer, result, checkpoint;
         std::string materialized_version;
+        // The submitted edit on its observed base, before joining concurrent publications.
+        std::string written_version;
         std::string base_version;
         std::string receipt_status;
         std::string worldline;
@@ -103,10 +100,8 @@ export namespace nodes {
         std::vector<source_difference> changes;
         std::vector<history_entry> history;
         std::map<std::string, std::vector<std::string>> worldlines;
-        std::optional<semantic::generation> semantic;
-        std::vector<semantic::span> spans;
-        std::vector<lock> locks;
         std::vector<line_view> lines;
+        std::vector<mail_message> messages;
         // restore: the project configuration the package held, as JSON.
         std::string configuration;
         bool stale = false;

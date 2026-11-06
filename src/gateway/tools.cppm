@@ -1,6 +1,7 @@
 module;
 #include <sodium.h>
 export module tools;
+import constants;
 import std;
 import reflection;
 import coroutine;
@@ -387,18 +388,6 @@ export namespace tools {
         return out;
     }
 
-    struct lock_view {
-        std::uint64_t id = 0;
-        std::string holder, scope, symbol, environment;
-        std::optional<semantic::place> place;
-    };
-    inline auto locks_of(const nodes::node_reply& r) -> std::vector<lock_view> {
-        std::vector<lock_view> out;
-        for (auto& l : r.locks)
-            out.push_back({l.id, l.holder, l.scope, l.symbol, l.environment, l.place});
-        return out;
-    }
-
     // A retried file tool answers from its receipt: recomputing the change on the moved worldline would be another input.
     // What a file tool records with its batch: the digest of the tool input it was asked for, and its count of replacements.
     struct record {
@@ -449,18 +438,12 @@ export namespace tools {
     }
 
     struct worldline
-        : tool<"worldline",
-               "Work in a worldline of a project: list, inspect, read, fork, lock, unlock, locks, apply, receipt, history, reverse or redo. Many agents "
-               "work in one worldline at once and their edits converge; worldlines never merge. Every read reports a version; a write names the "
-               "version it observed (observed) and may observe an earlier one. Before editing, lock the syntax scopes you change: scope ids from the "
-               "language tool (action scopes) or \"::\" for code outside any class, function or namespace and for every file-level change (write, "
-               "create, remove, move, mode). A scope another holder locked fails with scope_locked naming the holder. Edits use Unicode scalar "
-               "offsets of the observed version. Resending an operation_id with identical input returns the recorded result; receipt recovers it "
-               "after a lost reply. Errors carry a code: stale_frontier, scope_locked, worldline_boundary, identity_conflict, outcome_unknown, "
-               "missing_objects, invalid_record or permission_denied."> {
+        : tool<"worldline", "Work in an explicit worldline: list, inspect, read, fork, apply, receipt, history, reverse or redo. "
+                           "Concurrent edits within a worldline converge; worldlines never merge. Writes name the observed version and "
+                           "use Unicode scalar offsets. Repeat an operation_id with identical input to recover its recorded result."> {
         struct input {
             rfl::Description<"Project name", std::string> project;
-            rfl::Description<"list, inspect, read, fork, lock, unlock, locks, apply, receipt, history, contribution, reverse, redo, export or restore",
+            rfl::Description<"list, inspect, read, fork, apply, receipt, history, contribution, reverse, redo, export or restore",
                              std::string>
                 action;
             rfl::Description<"Worldline name; main when absent", std::optional<std::string>> worldline;
@@ -472,10 +455,7 @@ export namespace tools {
             rfl::Description<"apply/fork/reverse/redo/restore: caller-chosen ID of this operation", std::optional<std::string>> operation_id;
             rfl::Description<"apply/fork/reverse/redo: what this change is for", std::optional<std::string>> intent;
             rfl::Description<"apply: one atomic batch", std::optional<std::vector<change>>> changes;
-            rfl::Description<"lock/unlock: scope ids, or \"::\"", std::optional<std::vector<std::string>>> scopes;
-            rfl::Description<"lock/unlock: the analysis environment the scope ids come from", std::optional<std::string>> environment;
-            rfl::Description<"unlock: one lock number instead of scopes", std::optional<std::uint64_t>> lock_id;
-            rfl::Description<"unlock: release another holder's lock (owners only); export: replace a package of that name", std::optional<bool>> force;
+            rfl::Description<"export: replace a package of that name", std::optional<bool>> force;
             rfl::Description<"export/restore: package name, shared by the workspace's projects", std::optional<std::string>> package;
             rfl::Description<"reverse/redo/contribution: the history entry to undo, restore or describe", std::optional<std::string>> target;
             rfl::Description<"history: page size", std::optional<std::uint64_t>> limit;
@@ -502,13 +482,12 @@ export namespace tools {
             std::optional<file_side> before, after;
         };
         struct output {
-            std::optional<std::string> worldline, version, base_version, path, digest, kind, data_base64, receipt, operation_id;
+            std::optional<std::string> worldline, version, written_version, base_version, path, digest, kind, data_base64, receipt, operation_id;
             std::optional<std::uint64_t> size;
             std::optional<bool> executable, replayed, truncated;
             std::optional<std::vector<line_entry>> worldlines;
             std::optional<std::vector<lines::entry>> files;
             std::optional<std::vector<std::string>> conflicts;
-            std::optional<std::vector<lock_view>> locks;
             std::optional<std::vector<history_entry>> entries;
             std::optional<std::vector<file_change>> changes;
             // contribution: the worldlines whose current version contains the entry.
@@ -588,17 +567,6 @@ export namespace tools {
                     },
                     name);
                 out = {.worldline = name, .version = r.version, .receipt = r.receipt, .operation_id = id, .replayed = r.replayed};
-            } else if (action == "lock" || action == "unlock" || action == "locks") {
-                nodes::node_request request{.action = action,
-                                            .worldline = line,
-                                            .environment = in.environment.value().value_or(""),
-                                            .scopes = in.scopes.value().value_or(std::vector<std::string>{}),
-                                            .force = in.force.value().value_or(false)};
-                if (in.lock_id.value())
-                    request.target = std::to_string(*in.lock_id.value());
-                auto r = co_await node_call(s, project, std::move(request), actor, action == "locks");
-                out.version = r.version;
-                out.locks = locks_of(r);
             } else if (action == "apply" || action == "reverse" || action == "redo") {
                 if (!in.operation_id.value())
                     throw tool_error(nodes::code::invalid_record, action + " names an operation_id");
@@ -621,6 +589,7 @@ export namespace tools {
                 auto r = co_await node_call(s, project, std::move(request), actor);
                 auto tree = co_await selected(s, project, line, r.version, actor);
                 out = {.worldline = line, .version = r.version, .receipt = r.receipt, .operation_id = in.operation_id.value(), .replayed = r.replayed};
+                out.written_version = r.written_version;
                 out.files = lines::manifest(tree);
             } else if (action == "receipt") {
                 auto r = co_await node_call(s, project,
@@ -631,6 +600,7 @@ export namespace tools {
                                             actor, true);
                 auto tree = co_await selected(s, project, line, r.version, actor);
                 out = {.worldline = r.worldline, .version = r.version, .receipt = r.receipt, .operation_id = in.operation_id.value(), .replayed = true};
+                out.written_version = r.written_version;
                 out.files = lines::manifest(tree);
             } else if (action == "history") {
                 auto limit = std::min<std::uint64_t>(in.limit.value().value_or(100), config::resolve(*s.snapshot(), project).limits.list_max_entries);
@@ -710,12 +680,12 @@ export namespace tools {
         }
     };
 
-    // File tools for the main worldline. They read its current version and write through the same locks as worldline apply.
+    // File operations read a snapshot and submit edits against that observed version.
     auto main_tree(services& s, const std::string& project, const worlds::actor& actor, bool text = false) -> coroutine::task<nodes::node_reply> {
         co_return co_await node_call(s, project, {.action = text ? "inspect" : "tree", .worldline = "main"}, actor, true);
     }
     auto main_apply(services& s, const std::string& project, const worlds::actor& actor, const nodes::node_reply& observed, std::vector<change> changes,
-                    std::string operation_id, std::string intent, std::string result = {}, std::vector<std::string> scopes = {})
+                    std::string operation_id, std::string intent, std::string result = {})
         -> coroutine::task<nodes::node_reply> {
         auto limits = config::resolve(*s.snapshot(), project).limits;
         co_return co_await node_call(s, project,
@@ -726,312 +696,13 @@ export namespace tools {
                                       .expected = observed.frontier,
                                       .edits = edits_of(changes, observed, limits),
                                       .intent = std::move(intent),
-                                      .result = std::move(result),
-                                      .scopes = std::move(scopes)},
+                                      .result = std::move(result)},
                                      actor);
     }
-
-    struct read : tool<"read", "Read a text file of a project's main worldline, optionally a range of lines. Long files are cut at the "
-                               "project's limits; ask for a later range with offset. The result names the version read."> {
-        struct input {
-            rfl::Description<"Project name", std::string> project;
-            rfl::Description<"Path relative to the project root", std::string> path;
-            rfl::Description<"First line to return, 1-based", std::optional<std::uint64_t>> offset;
-            rfl::Description<"Number of lines to return", std::optional<std::uint64_t>> limit;
-        };
-        struct output {
-            std::string content;
-            std::uint64_t first_line = 1;
-            std::uint64_t lines = 0;
-            std::uint64_t total_lines = 0;
-            bool truncated = false;
-            std::string version;
-        };
-
-        static auto run(services& s, input in, mcp::notifier&, const worlds::actor& actor) -> coroutine::task<output> {
-            auto project = project_of(in);
-            auto r = co_await node_call(s, project, {.action = "read", .worldline = "main", .target = in.path.value()}, actor, true);
-            auto file = std::ranges::find(r.files, in.path.value(), &nodes::file_view::path);
-            if (file == r.files.end())
-                throw tool_error(nodes::code::missing_objects, in.path.value() + " is not in the project");
-            if (file->kind != "text")
-                throw tool_error(nodes::code::invalid_record, in.path.value() + " is a binary file");
-            auto l = config::resolve(*s.snapshot(), project).limits;
-            auto out = slice(file->text, std::max<std::uint64_t>(1, in.offset.value().value_or(1)),
-                             std::min<std::uint64_t>(in.limit.value().value_or(l.read_max_lines), l.read_max_lines), l.read_max_bytes);
-            out.version = r.version;
-            co_return out;
-        }
-
-        static auto slice(std::string_view text, std::uint64_t first, std::uint64_t count, std::uint64_t max_bytes) -> output {
-            output out{.first_line = first};
-            std::uint64_t line = 1;
-            for (std::size_t pos = 0; pos < text.size(); ++line) {
-                auto end = text.find('\n', pos);
-                auto next = end == std::string_view::npos ? text.size() : end + 1;
-                if (line >= first && !out.truncated) {
-                    auto piece = text.substr(pos, next - pos);
-                    if (out.lines == count || out.content.size() + piece.size() > max_bytes)
-                        out.truncated = true;
-                    else {
-                        out.content.append(piece);
-                        ++out.lines;
-                    }
-                }
-                pos = next;
-            }
-            out.total_lines = line - 1;
-            return out;
-        }
-    };
 
     struct mutation {
         std::string version, receipt, operation_id;
         bool replayed = false;
-    };
-
-    struct write : tool<"write", "Create a file in the main worldline of a project, or replace its whole content. Needs the \"::\" lock (worldline "
-                                 "lock). Resubmitting the same operation_id returns the recorded result instead of writing again."> {
-        struct input {
-            rfl::Description<"Project name", std::string> project;
-            rfl::Description<"Path relative to the project root", std::string> path;
-            rfl::Description<"The new content", std::string> content;
-            rfl::Description<"Caller-chosen ID of this change; resending it with identical input returns the recorded result", std::string> operation_id;
-        };
-        using output = mutation;
-
-        static auto run(services& s, input in, mcp::notifier&, const worlds::actor& actor) -> coroutine::task<output> {
-            auto project = project_of(in);
-            std::string input = content::hash_of(rfl::json::write(in)).str();
-            co_return co_await once<output>(
-                s, project, actor, std::optional{in.operation_id.value()}, input,
-                [&]() -> coroutine::task<output> {
-                    auto observed = co_await main_tree(s, project, actor);
-                    bool exists = std::ranges::contains(observed.files, in.path.value(), &nodes::file_view::path);
-                    auto id = in.operation_id.value();
-                    auto r = co_await main_apply(s, project, actor, observed,
-                                                 {change{.kind = exists ? "write" : "create", .path = in.path.value(), .text = in.content.value()}}, id,
-                                                 "write " + in.path.value(), rfl::json::write(record{input}));
-                    co_return mutation{r.version, r.receipt, id, r.replayed};
-                },
-                [&](const auto& done) { return mutation{done.first.version, done.first.receipt, in.operation_id.value(), true}; });
-        }
-    };
-
-    struct edit : tool<"edit", "Replace text in a file of a project's main worldline. The old text must occur exactly once unless replace_all is "
-                               "set. Lock the scope that contains it first (worldline lock). Resubmitting the same operation_id returns the "
-                               "recorded result."> {
-        struct input {
-            rfl::Description<"Project name", std::string> project;
-            rfl::Description<"Path relative to the project root", std::string> path;
-            rfl::Description<"Text to replace, exactly as in the file", std::string> old_string;
-            rfl::Description<"Replacement text", std::string> new_string;
-            rfl::Description<"Replace every occurrence", std::optional<bool>> replace_all;
-            rfl::Description<"Caller-chosen ID of this change; resending it with identical input returns the recorded result", std::string> operation_id;
-        };
-        struct output {
-            std::string version, receipt, operation_id;
-            std::uint64_t replacements = 0;
-            bool replayed = false;
-        };
-
-        static auto run(services& s, input in, mcp::notifier&, const worlds::actor& actor) -> coroutine::task<output> {
-            auto project = project_of(in);
-            std::string input = content::hash_of(rfl::json::write(in)).str();
-            co_return co_await once<output>(
-                s, project, actor, std::optional{in.operation_id.value()}, input, [&]() { return fresh(s, project, in, actor, input); },
-                [&](const auto& done) { return output{done.first.version, done.first.receipt, in.operation_id.value(), done.second.replacements, true}; });
-        }
-        static auto fresh(services& s, const std::string& project, const input& in, const worlds::actor& actor, const std::string& input)
-            -> coroutine::task<output> {
-            auto r = co_await node_call(s, project, {.action = "read", .worldline = "main", .target = in.path.value()}, actor, true);
-            auto file = std::ranges::find(r.files, in.path.value(), &nodes::file_view::path);
-            if (file == r.files.end() || file->kind != "text")
-                throw tool_error(nodes::code::missing_objects, in.path.value() + " is not a text file of the project");
-            auto& from = in.old_string.value();
-            if (from.empty())
-                throw tool_error(nodes::code::invalid_record, "old_string is empty");
-            std::vector<std::size_t> at;
-            for (auto i = file->text.find(from); i != std::string::npos; i = file->text.find(from, i + from.size()))
-                at.push_back(i);
-            if (at.empty())
-                throw tool_error(nodes::code::invalid_record, "old_string does not occur in " + in.path.value());
-            if (at.size() > 1 && !in.replace_all.value().value_or(false))
-                throw tool_error(nodes::code::invalid_record, std::format("old_string occurs {} times; set replace_all or give more context", at.size()));
-            // One edit per occurrence would edit the path twice in one batch, so the edit spans from the first to the last occurrence.
-            std::string replaced;
-            std::size_t last = at.front();
-            for (auto i : at) {
-                replaced += file->text.substr(last, i - last);
-                replaced += in.new_string.value();
-                last = i + from.size();
-            }
-            auto begin = lines::scalars(std::string_view{file->text}.substr(0, at.front()));
-            auto count = lines::scalars(std::string_view{file->text}.substr(at.front(), last - at.front()));
-            auto id = in.operation_id.value();
-            auto tree = co_await selected(s, project, "main", r.version, actor);
-            auto done = co_await main_apply(s, project, actor, tree,
-                                            {change{.kind = "edit", .path = in.path.value(), .offset = begin, .count = count, .text = replaced}}, id,
-                                            "edit " + in.path.value(), rfl::json::write(record{input, at.size()}));
-            co_return output{done.version, done.receipt, id, at.size(), done.replayed};
-        }
-    };
-
-    struct remove : tool<"remove", "Delete a file of a project's main worldline. Needs the \"::\" lock (worldline lock). Resubmitting the same "
-                                   "operation_id returns the recorded result."> {
-        struct input {
-            rfl::Description<"Project name", std::string> project;
-            rfl::Description<"Path relative to the project root", std::string> path;
-            rfl::Description<"Caller-chosen ID of this change; resending it with identical input returns the recorded result", std::string> operation_id;
-        };
-        using output = mutation;
-
-        static auto run(services& s, input in, mcp::notifier&, const worlds::actor& actor) -> coroutine::task<output> {
-            auto project = project_of(in);
-            std::string input = content::hash_of(rfl::json::write(in)).str();
-            co_return co_await once<output>(
-                s, project, actor, std::optional{in.operation_id.value()}, input,
-                [&]() -> coroutine::task<output> {
-                    auto observed = co_await main_tree(s, project, actor);
-                    auto id = in.operation_id.value();
-                    auto r = co_await main_apply(s, project, actor, observed, {change{.kind = "remove", .path = in.path.value()}}, id,
-                                                 "remove " + in.path.value(), rfl::json::write(record{input}));
-                    co_return mutation{r.version, r.receipt, id, r.replayed};
-                },
-                [&](const auto& done) { return mutation{done.first.version, done.first.receipt, in.operation_id.value(), true}; });
-        }
-    };
-
-    struct move : tool<"move", "Rename or move a file within a project's main worldline. Needs the \"::\" lock (worldline lock). Resubmitting "
-                               "the same operation_id returns the recorded result."> {
-        struct input {
-            rfl::Description<"Project name", std::string> project;
-            rfl::Description<"Current path, relative to the project root", std::string> from;
-            rfl::Description<"New path, relative to the project root; must not exist", std::string> to;
-            rfl::Description<"Caller-chosen ID of this change; resending it with identical input returns the recorded result", std::string> operation_id;
-        };
-        using output = mutation;
-
-        static auto run(services& s, input in, mcp::notifier&, const worlds::actor& actor) -> coroutine::task<output> {
-            auto project = project_of(in);
-            std::string input = content::hash_of(rfl::json::write(in)).str();
-            co_return co_await once<output>(
-                s, project, actor, std::optional{in.operation_id.value()}, input,
-                [&]() -> coroutine::task<output> {
-                    auto observed = co_await main_tree(s, project, actor);
-                    auto id = in.operation_id.value();
-                    auto r = co_await main_apply(s, project, actor, observed, {change{.kind = "move", .path = in.from.value(), .destination = in.to.value()}},
-                                                 id, "move " + in.from.value(), rfl::json::write(record{input}));
-                    co_return mutation{r.version, r.receipt, id, r.replayed};
-                },
-                [&](const auto& done) { return mutation{done.first.version, done.first.receipt, in.operation_id.value(), true}; });
-        }
-    };
-
-    struct file {
-        std::string path;
-        std::uint64_t size = 0;
-    };
-
-    struct list : tool<"list", "List the files of a project's main worldline, optionally under a directory."> {
-        struct input {
-            rfl::Description<"Project name", std::string> project;
-            rfl::Description<"Directory to list, relative to the project root", std::optional<std::string>> prefix;
-        };
-        struct output {
-            std::vector<file> files;
-            bool truncated = false;
-            std::string version;
-        };
-
-        static auto run(services& s, input in, mcp::notifier&, const worlds::actor& actor) -> coroutine::task<output> {
-            auto project = project_of(in);
-            auto tree = co_await main_tree(s, project, actor);
-            auto prefix = in.prefix.value().value_or("");
-            co_return cap(
-                tree, [&](std::string_view p) { return prefix.empty() || p == prefix || (p.starts_with(prefix) && p[prefix.size()] == '/'); },
-                config::resolve(*s.snapshot(), project).limits.list_max_entries);
-        }
-
-        template <class F> static auto cap(const nodes::node_reply& tree, F keep, std::size_t max) -> output {
-            output out{.version = tree.version};
-            for (auto& e : lines::manifest(tree)) {
-                if (!keep(e.path))
-                    continue;
-                if (out.files.size() == max) {
-                    out.truncated = true;
-                    break;
-                }
-                out.files.push_back({e.path, e.size});
-            }
-            return out;
-        }
-    };
-
-    struct glob : tool<"glob", "Find files of a project's main worldline by path pattern: * and ? within a directory name, ** across "
-                               "directories (\"src/**/*.cpp\")."> {
-        struct input {
-            rfl::Description<"Project name", std::string> project;
-            rfl::Description<"Path pattern", std::string> pattern;
-        };
-        using output = list::output;
-
-        static auto run(services& s, input in, mcp::notifier&, const worlds::actor& actor) -> coroutine::task<output> {
-            auto project = project_of(in);
-            auto tree = co_await main_tree(s, project, actor);
-            co_return list::cap(
-                tree, [&](std::string_view p) { return content::glob(in.pattern.value(), p); },
-                config::resolve(*s.snapshot(), project).limits.list_max_entries);
-        }
-    };
-
-    struct search : tool<"search", "Search the text files of a project's main worldline for lines containing a string (or matching a "
-                                   "regular expression), optionally only in files matching a path pattern."> {
-        struct input {
-            rfl::Description<"Project name", std::string> project;
-            rfl::Description<"Text to find", std::string> query;
-            rfl::Description<"Treat the query as an ECMAScript regular expression", std::optional<bool>> regex;
-            rfl::Description<"Only files matching this path pattern", std::optional<std::string>> files;
-        };
-        struct match {
-            std::string path;
-            std::uint64_t line = 0;
-            std::string text;
-        };
-        struct output {
-            std::vector<match> matches;
-            bool truncated = false;
-            std::string version;
-        };
-
-        static auto run(services& s, input in, mcp::notifier&, const worlds::actor& actor) -> coroutine::task<output> {
-            auto project = project_of(in);
-            auto limit = config::resolve(*s.snapshot(), project).limits.search_max_matches;
-            auto tree = co_await main_tree(s, project, actor, true);
-            auto pattern = in.files.value().value_or("");
-            std::optional<std::regex> expression;
-            if (in.regex.value().value_or(false))
-                expression.emplace(in.query.value(), std::regex::ECMAScript);
-            output out{.version = tree.version};
-            std::ranges::sort(tree.files, {}, &nodes::file_view::path);
-            for (auto& f : tree.files) {
-                if (f.kind != "text" || (!pattern.empty() && !content::glob(pattern, f.path)))
-                    continue;
-                std::istringstream text{f.text};
-                std::uint64_t number = 0;
-                for (std::string line; std::getline(text, line);) {
-                    ++number;
-                    if (expression ? !std::regex_search(line, *expression) : line.find(in.query.value()) == std::string::npos)
-                        continue;
-                    if (out.matches.size() == limit) {
-                        out.truncated = true;
-                        co_return out;
-                    }
-                    out.matches.push_back({f.path, number, line});
-                }
-            }
-            co_return out;
-        }
     };
 
     struct step_result {
@@ -1041,6 +712,10 @@ export namespace tools {
         double seconds = 0;
         std::string output;
         bool truncated = false;
+        std::optional<builds::exported_file> log;
+        bool log_truncated = false;
+        std::string log_error;
+        std::string cache_error;
     };
 
     using diagnostic = builds::finding;
@@ -1061,6 +736,10 @@ export namespace tools {
         std::string snapshot;
         std::string error;
         std::string error_code;
+        std::vector<builds::exported_file> exports;
+        std::string export_error;
+        std::vector<std::string> export_skipped;
+        std::string dependency_cache;
     };
 
     // Build, test and run jobs of the workspace, kept on core zero. As many run at once as the limits and the workers allow; waiting
@@ -1108,6 +787,7 @@ export namespace tools {
             auto result() const -> const outcome& { return result_; }
             auto ahead() const -> std::size_t { return ahead_.load(std::memory_order_relaxed); }
             auto job() const -> std::uint64_t { return job_.load(std::memory_order_relaxed); }
+            auto reuse() const -> const std::string& { return reuse_; }
             // The progress its job reported since `seen`, which moves past it.
             auto progress(std::size_t& seen) -> std::vector<jobs::progress> { return progress_ ? progress_->since(seen) : std::vector<jobs::progress>{}; }
             void leave() { left_.store(true, std::memory_order_release); }
@@ -1115,6 +795,7 @@ export namespace tools {
         private:
             friend class backlog;
             std::string actor_;
+            std::string reuse_ = "executed";
             std::atomic<bool> done_{false}, left_{false};
             std::atomic<std::size_t> ahead_{0};
             std::atomic<std::uint64_t> job_{0};
@@ -1131,6 +812,7 @@ export namespace tools {
 
         auto submit(std::size_t here, entry e, runner r) -> coroutine::task<std::shared_ptr<ticket>>;
         auto list(std::size_t here) -> coroutine::task<std::vector<view>>;
+        auto forget(std::size_t here, std::string key) -> coroutine::task<>;
         // Cancels a job the caller asked for alone, or any job for an owner. Says what happened.
         auto cancel(std::size_t here, std::uint64_t id, worlds::actor who) -> coroutine::task<std::string>;
         // Core zero's loop: starts what may start and lets go of jobs nobody waits for any more.
@@ -1361,8 +1043,55 @@ export namespace tools {
         auto limit = std::chrono::seconds{request.timeout_s} + build_overhead;
         executor->begin();
         auto r = co_await within(io, limit, "the build", worker.call(request, progress));
+        std::uint64_t exported = 0, logged = 0;
+        if (r.exports.size() > constants::export_files) throw tool_error("invalid_worker_reply", "too many exported files");
+        std::vector<builds::exported_file*> transfer;
+        for (auto& file : r.exports) transfer.push_back(&file);
+        for (const auto& file : r.exports) {
+            content::checked_name(file.name);
+            content::checked_path(file.path);
+            if (!request.exports.contains(file.name) || !content::is_hash(file.digest) || file.size > constants::export_bytes - exported)
+                throw tool_error("invalid_worker_reply", "invalid exported file");
+            exported += file.size;
+        }
+        for (std::size_t index = 0; index < r.steps.size(); ++index) if (r.steps[index].log) {
+            const auto& log = *r.steps[index].log;
+            if (index >= request.steps.size() || log.name != "step-" + std::to_string(index) + ".log" ||
+                log.path != std::to_string(index) + ".log" || !content::is_hash(log.digest) || log.size > constants::log_bytes - logged)
+                throw tool_error("invalid_worker_reply", "invalid execution log");
+            logged += log.size;
+            transfer.push_back(&*r.steps[index].log);
+        }
+        for (auto* target : transfer) {
+            auto& file = *target;
+            try {
+            if (co_await files.has_export(core, file.digest, file.size)) continue;
+            std::uint64_t offset = 0;
+            do {
+                const auto length = std::min(part_size, file.size - offset);
+                auto bytes = co_await within(io, push_deadline, "an export", worker.call(jobs::export_read{file.digest, offset, length}));
+                if (bytes.parts.size() != 1) throw tool_error("invalid_worker_reply", "invalid export part count");
+                auto& part = bytes.parts.front();
+                if (part.digest != file.digest || part.offset != offset || part.total != file.size || part.packed || part.bytes.size() != length)
+                    throw tool_error("invalid_worker_reply", "invalid export part");
+                co_await files.receive_export(core, std::move(part));
+                offset += length;
+            } while (offset < file.size);
+            } catch (const std::exception& error) { file.delivery_error = std::string{error.what()}.substr(0, 512); }
+        }
         co_return std::pair{std::move(r), stats};
     }
+
+    struct invocation {
+        storage::registry& files;
+        std::size_t core;
+        usage::call_event event;
+        std::chrono::steady_clock::time_point started = std::chrono::steady_clock::now();
+        ~invocation() {
+            event.seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
+            files.post(core, [value = event](usage::ledger& ledger) { ledger.record(value); });
+        }
+    };
 
     // A build admitted by the ledger; ended without a record, it is recorded as cancelled.
     struct admission {
@@ -1389,7 +1118,8 @@ export namespace tools {
     // eligible worker is busy; the admission is then given back and the job waits.
     auto dispatch(services& s, std::string project, config::effective_config config, std::vector<jobs::step> steps, content::manifest snapshot,
                   jobs::build_request request, std::string worldline, std::string version, worlds::actor actor, jobs::progress_log& progress,
-                  std::string operation, std::shared_ptr<execution_identity> executor) -> coroutine::task<std::optional<backlog::outcome>> {
+                  std::string operation, std::shared_ptr<execution_identity> executor, std::string toolchain)
+        -> coroutine::task<std::optional<backlog::outcome>> {
         config_result r{.configuration = config.name, .snapshot = version};
         auto workspace = s.snapshot()->server.auth.workspace;
         auto who = worlds::identity_key(actor);
@@ -1425,8 +1155,9 @@ export namespace tools {
                 s.core,
                 routing::selection{.needs = config.needs.get() ? routing::requirements{.tools = config.needs.get()->tools,
                                                                                        .os = config.needs.get()->platform.os,
-                                                                                       .arch = config.needs.get()->platform.arch}
-                                                               : routing::requirements{},
+                                                                                       .arch = config.needs.get()->platform.arch,
+                                                                                       .toolchain_id = toolchain}
+                                                               : routing::requirements{.toolchain_id = toolchain},
                                    .tree_key = request.tree},
                 [&files, &rt, &router, executor = held.executor, project, tree = snapshot, request, worldline, version,
                  actor](auto& worker, jobs::progress_log* progress, std::size_t core) -> coroutine::task<std::pair<jobs::build_report, sync_stats>> {
@@ -1467,9 +1198,12 @@ export namespace tools {
             r.seconds = rep.seconds;
             std::tie(r.diagnostics, r.tests) = detail::read(rep);
             for (auto& st : rep.steps)
-                r.steps.push_back({st.name, st.exit_code, st.timed_out, st.seconds, std::move(st.output), st.truncated});
+                r.steps.push_back({st.name, st.exit_code, st.timed_out, st.seconds, std::move(st.output), st.truncated, std::move(st.log), st.log_truncated, std::move(st.log_error), std::move(st.cache_error)});
             r.blobs_sent = sync.blobs;
             r.bytes_sent = sync.bytes;
+            r.exports = std::move(rep.exports);
+            r.export_error = std::move(rep.export_error);
+            r.export_skipped = std::move(rep.export_skipped);
         }
         auto last = r.steps.empty() ? nullptr : &r.steps.back();
         usage::build_event event{.project = project,
@@ -1511,7 +1245,7 @@ export namespace tools {
                 pass(p);
             if (seen == 0 && told != held->ahead()) {
                 told = held->ahead();
-                pass({.stage = std::format("queued as job {}, {} ahead", held->job(), *told)});
+                pass({.stage = std::format("queued, {} ahead", *told)});
             }
             co_await execution::schedule_after(io, std::chrono::milliseconds{50});
         }
@@ -1520,7 +1254,7 @@ export namespace tools {
         co_return held->result();
     }
 
-    // What a worker reports for a preparation it ran, as the source keeps it.
+    // A compact result of worker preparation and analysis.
     inline auto prepared(const language::plan& plan, const content::manifest& files, std::string version, jobs::build_report& report) -> language::result {
         language::result out{.status = report.ok() ? "prepared" : "failed",
                              .revision = std::move(version),
@@ -1531,76 +1265,252 @@ export namespace tools {
                              .worker_id = report.worker_id};
         for (auto& step : report.steps)
             out.steps.push_back({step.name, step.exit_code, step.timed_out, step.seconds, std::move(step.output), step.truncated});
-        if (!report.ok())
+        if (!report.ok()) {
             out.error = "analysis preparation command failed";
-        auto outputs = report.measured.size() - std::min(report.measured.size(), plan.inputs.size());
-        out.artifacts.assign(report.measured.begin(), report.measured.begin() + static_cast<std::ptrdiff_t>(outputs));
-        out.inputs.assign(report.measured.begin() + static_cast<std::ptrdiff_t>(outputs), report.measured.end());
+            for (const auto& step : out.steps) {
+                if (step.exit_code == 0 && !step.timed_out)
+                    continue;
+                constexpr std::size_t limit = 4096;
+                auto start = step.output.size() > limit ? step.output.size() - limit : 0;
+                while (start < step.output.size() && (static_cast<unsigned char>(step.output[start]) & 0xC0) == 0x80)
+                    ++start;
+                out.error = std::format("analysis preparation step '{}': {}; truncated={}\n{}", step.name,
+                                        step.timed_out ? "timed out" : std::format("exit code {}", step.exit_code), step.truncated || start != 0,
+                                        step.output.substr(start));
+                break;
+            }
+        }
+        out.artifacts = report.measured;
+        for (const auto& input : plan.inputs)
+            if (auto measured = std::ranges::find(report.measured, input.name, &builds::artifact_result::name); measured != report.measured.end())
+                out.inputs.push_back(*measured);
         return out;
     }
 
-    // On the chosen worker: the source opens the receipt, then the worker gets the files and runs the preparation. Nothing runs when the
-    // receipt was there already; `begun` holds what the source answered.
-    auto prepare_on(native::scheduler io, storage::registry& registry, std::size_t core, transport::channel<native::socket>& worker, std::string project,
-                    content::manifest files, jobs::build_request build, language::request request, jobs::progress_log* progress, std::string line,
-                    std::string version, worlds::actor actor, std::optional<language::result>* begun, std::shared_ptr<execution_identity> executor)
-        -> coroutine::task<std::pair<jobs::build_report, sync_stats>> {
-        request.action = "begin";
-        auto opened =
-            co_await coroutine::under(coroutine::stop_token{}, coroutine::deadline(io, offer_deadline, registry.analysis(core, project, std::move(request))));
-        if (!opened || !*opened)
-            throw std::runtime_error("preparation admission timed out");
-        *begun = std::move(**opened);
-        if ((*begun)->status != "preparing" || (*begun)->replayed)
-            co_return {};
-        co_return co_await sync_and_run(io, registry, core, worker, project, std::move(files), std::move(build), progress, std::move(line), std::move(version),
-                                        std::move(actor), std::move(executor));
+    inline auto hot_key(const std::string& project, const std::string& worldline, const std::string& configuration) -> std::string {
+        return std::string{content::hash_of(rfl::json::write(std::vector<std::string>{project, worldline, configuration})).view().substr(0, 24)};
     }
 
-    auto finish_preparation(services& s, const std::string& project, jobs::analysis_finish finished) -> coroutine::task<language::result> {
-        auto saved = co_await coroutine::under(coroutine::stop_token{}, coroutine::deadline(s.workers.io_context().get_scheduler(s.core), offer_deadline,
-                                                                                            s.files.analysis(s.core, project, std::move(finished))));
-        if (!saved || !*saved)
-            throw std::runtime_error("preparation receipt persistence timed out");
-        co_return std::move(**saved);
+    // Select an actual runtime before computing a content key. Busy workers still name
+    // valid runtimes: a cache hit needs no slot, and a miss can wait in the backlog.
+    auto select_toolchain(services& s, routing::requirements needs, const std::string& trees) -> coroutine::task<std::string> {
+        auto workers = co_await s.workers.describe(s.core);
+        std::optional<std::tuple<bool, bool, std::string>> selected;
+        for (const auto& worker : workers) {
+            if (!worker.online || worker.dependency_publisher != needs.dependency_publisher ||
+                (needs.os && worker.platform.os != *needs.os) || (needs.arch && worker.platform.arch != *needs.arch) ||
+                !std::ranges::all_of(needs.tools, [&](const auto& name) { return std::ranges::contains(worker.tools, name); }))
+                continue;
+            if (worker.toolchain_id.empty())
+                continue;
+            bool cold = !std::ranges::any_of(worker.trees, [&](const auto& tree) { return tree.starts_with(trees + "-"); });
+            const bool publisher = std::ranges::any_of(workers, [&](const auto& candidate) {
+                return candidate.online && candidate.dependency_publisher && candidate.toolchain_id == worker.toolchain_id;
+            });
+            auto candidate = std::tuple{cold, !publisher, worker.toolchain_id};
+            if (!selected || candidate < *selected)
+                selected = std::move(candidate);
+        }
+        if (!selected)
+            throw tool_error("no_worker", "no worker with the required tools and a reported toolchain fingerprint is online");
+        co_return std::get<2>(*selected);
     }
 
-    // A preparation runs on a worker, in a build tree of the configuration beside its builds, when a worker can take it: the source
-    // keeps the receipt (`begin`, then `analysis.finish`) and publishes the outline. When no worker can, the source runs it all.
-    // Nothing while every worker that could is busy.
-    auto run_preparation(services& zero, std::string project, language::request request, std::string tree, worlds::actor actor)
-        -> coroutine::task<std::optional<backlog::outcome>> {
-        auto plan = language::prepare(request.config);
+    // Run fills before admitting the consumer job: no nested backlog slot is held while waiting.
+    auto fill_dependencies(services& s, const std::string& project, const std::vector<jobs::step>& steps,
+                           const content::manifest& snapshot, const std::string& toolchain, const worlds::actor& actor,
+                           const std::string& worldline, const std::string& version,
+                           std::chrono::steady_clock::time_point deadline, mcp::notifier* note) -> coroutine::task<std::string> {
+        if (!std::ranges::any_of(steps, [](const auto& step) { return step.dependencies.has_value(); })) co_return "";
+        const auto workers = co_await s.workers.describe(s.core);
+        if (!std::ranges::any_of(workers, [&](const auto& worker) {
+                return worker.online && worker.dependency_publisher && worker.toolchain_id == toolchain;
+            })) co_return "unavailable: no matching dependency publisher";
+        if (std::ranges::any_of(snapshot.files, [](const auto& file) {
+                return std::filesystem::path{file.path}.filename() == "vcpkg-configuration.json";
+            })) co_return "skipped: custom registries";
+        std::string status;
+        std::set<std::string> filled;
+        bool omitted = false;
+        for (const auto& step : steps) {
+            if (!step.dependencies) continue;
+            auto record_status = [&](std::string value) {
+                if (omitted) return;
+                constexpr std::string_view marker = "additional dependency results omitted";
+                const auto entry = step.name + ": " + value;
+                if (status.size() + entry.size() + 2 <= constants::dependency_status_bytes - marker.size() - 2) {
+                    if (!status.empty()) status += "; ";
+                    status += entry;
+                } else {
+                    if (!status.empty()) status += "; ";
+                    status += marker;
+                    omitted = true;
+                }
+            };
+            const auto& input = *step.dependencies;
+            const auto path = (std::filesystem::path{input.manifest_dir} / "vcpkg.json").lexically_normal().generic_string();
+            const auto found = std::ranges::find(snapshot.files, path, &content::entry::path);
+            if (found == snapshot.files.end() || found->size > constants::dependency_manifest_bytes) {
+                record_status("skipped: manifest absent or too large");
+                continue;
+            }
+            try {
+                nodes::node_request wanted{.action = "content", .worldline = worldline, .revision = version};
+                wanted.parts.push_back({found->digest.str(), 0, found->size, {}});
+                auto reply = co_await s.files.node(s.core, project, std::move(wanted), actor, true);
+                if (reply.code != "ok" || reply.parts.size() != 1) throw std::runtime_error("dependency manifest is unavailable");
+                const auto text = lines::unhex(reply.parts.front().data);
+                if (text.size() != found->size || content::hash_of(text) != found->digest)
+                    throw std::runtime_error("dependency manifest digest mismatch");
+                jobs::dependency_fill request{.manifest = builds::dependency_manifest(text), .triplet = input.triplet,
+                    .host_triplet = input.host_triplet, .features = input.features, .default_features = input.default_features};
+                const auto key = content::hash_of(rfl::json::write(std::tuple{std::string{"dependency.fill"}, toolchain, request})).str();
+                if (!filled.insert(key).second) { record_status("same dependencies as an earlier step"); continue; }
+                backlog::entry entry{.key = key, .project = project, .configuration = "dependencies", .operation = "dependencies",
+                    .actor = worlds::identity_key(actor), .cacheable = false};
+                auto ticket = co_await s.queue->submit(s.core, std::move(entry),
+                    [request, toolchain, project, actor, worldline, version, snapshot_id = snapshot.id().str()](services& zero, jobs::progress_log& progress, std::string) -> coroutine::task<std::optional<backlog::outcome>> {
+                        config_result out{.configuration = "dependencies"};
+                        std::uint64_t admission_id;
+                        try {
+                            admission_id = co_await zero.files.with(zero.core, project,
+                                [](storage::project_ctx& context) { return context.ledger.admit_build(context.settings.project, context.settings.limits); });
+                        } catch (const std::exception& error) {
+                            out.error = std::string{error.what()}.substr(0, 512);
+                            co_return out;
+                        }
+                        admission held{&zero.files, zero.core, admission_id,
+                            usage::build_event{.project = project, .target = "dependencies", .workspace_id = zero.snapshot()->server.auth.workspace,
+                                .worldline = worldline, .version = version, .snapshot = snapshot_id, .operation = "dependencies",
+                                .actor = worlds::identity_key(actor), .error_code = "cancelled"},
+                            std::chrono::steady_clock::now()};
+                        std::int32_t exit_code = -1;
+                        bool timed_out = false;
+                        try {
+                            auto report = co_await zero.workers.with_worker(zero.core,
+                                routing::selection{.needs = {.toolchain_id = toolchain, .dependency_publisher = true}},
+                                [request, &zero, identity = held.executor](auto& worker, jobs::progress_log* progress, std::size_t core) -> coroutine::task<jobs::build_report> {
+                                    identity->select(zero.workers.workers(core).identity(worker));
+                                    identity->begin();
+                                    co_return co_await within(zero.workers.io_context().get_scheduler(core),
+                                        std::chrono::seconds{request.timeout_s} + build_overhead, "dependency fill", worker.call(request, progress));
+                                }, &progress);
+                            out.worker = report.worker;
+                            out.ok = !report.steps.empty() && report.ok() && std::ranges::all_of(report.steps, [](const auto& step) { return step.cache_error.empty(); });
+                            if (!report.steps.empty()) { exit_code = report.steps.back().exit_code; timed_out = report.steps.back().timed_out; }
+                            if (!out.ok) out.error = "trusted dependency fill failed; private build remains available";
+                        } catch (const routing::no_worker& error) {
+                            if (error.busy) {
+                                held.ended = true;
+                                zero.files.post(zero.core, [admission_id](usage::ledger& ledger) { ledger.release(admission_id); });
+                                co_return std::nullopt;
+                            }
+                            out.error = error.what();
+                        } catch (const std::exception& error) { out.error = std::string{error.what()}.substr(0, 512); }
+                        held.executor->stamp(out);
+                        auto event = held.cancelled;
+                        held.executor->stamp(event);
+                        event.ok = out.ok;
+                        event.exit_code = exit_code;
+                        event.timed_out = timed_out;
+                        event.error_code = out.ok ? "" : "dependency_fill_failed";
+                        event.error = out.error;
+                        event.seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - held.started).count();
+                        held.ended = true;
+                        zero.files.post(zero.core, [admission_id, event](usage::ledger& ledger) { ledger.record(admission_id, event); });
+                        co_return out;
+                    });
+                const auto remaining = std::max(std::chrono::steady_clock::duration::zero(), deadline - std::chrono::steady_clock::now());
+                auto done = co_await coroutine::deadline(s.workers.io_context().get_scheduler(s.core), remaining,
+                    follow(s, ticket, [note](const jobs::progress& progress) { if (note) (*note)(progress_note(progress)); }));
+                if (!done) { record_status("timeout: waiting for shared dependencies"); co_return status; }
+                const auto& result = std::get<config_result>(*done);
+                record_status(result.ok ? "filled" : "failed: " + result.error);
+            } catch (const std::exception& error) { record_status("skipped: " + std::string{error.what()}.substr(0, 256)); }
+        }
+        co_return status;
+    }
+
+    // Preparation uses the bound build configuration's worker and hot directory. Source only supplies the pinned files.
+    auto run_preparation(services& zero, std::string project, language::request request, std::string tree, worlds::actor actor, std::string toolchain,
+                         jobs::progress_log* progress = nullptr) -> coroutine::task<std::optional<backlog::outcome>> {
+        language::plan plan;
+        try {
+            plan = language::prepare(request.config, request.build);
+        } catch (const std::invalid_argument& error) {
+            throw tool_error(nodes::code::invalid_record, error.what());
+        }
         auto line = request.worldline.empty() ? std::string{"main"} : request.worldline;
         auto selected_tree = co_await selected(zero, project, line, request.revision, actor);
         content::manifest files;
         for (auto& f : lines::manifest(selected_tree))
             files.files.push_back({f.path, f.digest, f.size, f.executable});
-        language::check(plan, files.files);
+        try {
+            language::check(plan, files.files);
+        } catch (const std::invalid_argument& error) {
+            throw tool_error(nodes::code::invalid_record, error.what());
+        }
         auto needs = routing::requirements{.tools = plan.build.needs.tools, .os = plan.build.needs.platform.os, .arch = plan.build.needs.platform.arch};
         if (plan.server.argv.front().find('/') == std::string::npos && !std::ranges::contains(needs.tools, plan.server.argv.front()))
             needs.tools.push_back(plan.server.argv.front());
+        needs.toolchain_id = toolchain;
         jobs::build_request build{.project = project,
                                   .tree = std::move(tree),
                                   .steps = plan.build.steps,
-                                  .timeout_s = language::timeout(request.config),
-                                  .output_limit = language::output_limit(request.config),
-                                  .env = plan.build.env};
+                                  .timeout_s = language::timeout(request.build),
+                                  .output_limit = language::output_limit(request.build),
+                                  .env = plan.build.env,
+                                  .max_memory_bytes = request.build.limits.max_memory_bytes,
+                                  .max_cpu_seconds = request.build.limits.max_cpu_seconds};
         for (auto& step : plan.build.steps)
             std::ranges::copy(step.outputs, std::back_inserter(build.measure));
-        std::ranges::copy(plan.inputs, std::back_inserter(build.measure));
-        for (auto& input : plan.inputs)
-            build.replaced.push_back(input.path);
         build.survey = jobs::survey{.provider = plan.server.provider,
                                     .argv = plan.server.argv,
                                     .initialization = plan.server.initialization,
                                     .env = plan.server.env,
-                                    .seconds = language::timeout(request.config)};
+                                    .seconds = language::timeout(request.build),
+                                    .query = request.query};
         auto& registry = zero.files;
         auto& rt = zero.workers.io_context();
         auto& router = zero.workers;
-        std::optional<language::result> begun;
         auto executor = std::make_shared<execution_identity>();
+        auto started = std::chrono::steady_clock::now();
+        std::uint64_t admission_id;
+        try {
+            admission_id = co_await zero.files.with(zero.core, project,
+                                                    [](storage::project_ctx& c) { return c.ledger.admit_build(c.settings.project, c.settings.limits); });
+        } catch (const usage::quota_exceeded& error) {
+            throw tool_error(nodes::code::resource_limit, error.what());
+        }
+        admission held{&zero.files,
+                       zero.core,
+                       admission_id,
+                       usage::build_event{.project = project,
+                                          .target = request.config.build_configuration,
+                                          .workspace_id = zero.snapshot()->server.auth.workspace,
+                                          .worldline = line,
+                                          .version = selected_tree.version,
+                                          .snapshot = files.id().str(),
+                                          .operation = "prepare",
+                                          .actor = worlds::identity_key(actor)},
+                       started,
+                       executor};
+        auto record = [&](const language::result& result, const sync_stats& sync) {
+            auto event = held.cancelled;
+            executor->stamp(event);
+            event.ok = result.status == "prepared" && result.analysis == "analyzed";
+            event.seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
+            event.blobs_sent = sync.blobs;
+            event.bytes_sent = sync.bytes;
+            event.error = result.analysis_error.value_or(result.error);
+            event.error_code = event.ok || result.status == "failed" ? "" : result.status == "prepared" ? result.analysis_error_code : result.status;
+            if (!result.steps.empty()) {
+                event.exit_code = result.steps.back().exit_code;
+                event.timed_out = result.steps.back().timed_out;
+            }
+            held.ended = true;
+            zero.files.post(zero.core, [id = admission_id, event](usage::ledger& ledger) { ledger.record(id, event); });
+        };
         std::optional<std::pair<jobs::build_report, sync_stats>> done;
         std::string failure, failure_code;
         bool stopped = false;
@@ -1609,22 +1519,26 @@ export namespace tools {
             done = co_await coroutine::under(
                 token, zero.workers.with_worker(
                            zero.core, routing::selection{.needs = needs, .tree_key = build.tree},
-                           [&registry, &rt, &router, &begun, executor, project, files, build, request, line, version = selected_tree.version,
+                           [&registry, &rt, &router, executor, project, files, build, line, version = selected_tree.version,
                             actor](auto& worker, jobs::progress_log* progress, std::size_t core) -> coroutine::task<std::pair<jobs::build_report, sync_stats>> {
                                auto identity = router.workers(core).identity(worker);
                                executor->select(identity);
-                               auto result = co_await prepare_on(rt.get_scheduler(core), registry, core, worker, project, files, build, request, progress, line,
-                                                                 version, actor, &begun, executor);
+                               auto result = co_await sync_and_run(rt.get_scheduler(core), registry, core, worker, project, files, build, progress, line,
+                                                                   version, actor, executor);
                                result.first.worker = std::move(identity.first);
                                result.first.worker_id = std::move(identity.second);
                                co_return result;
                            },
-                           {}));
+                           progress));
             stopped = !done;
         } catch (const routing::no_worker& e) {
-            if (e.busy)
+            if (e.busy) {
+                held.ended = true;
+                zero.files.post(zero.core, [id = admission_id](usage::ledger& ledger) { ledger.release(id); });
                 co_return std::nullopt;
-            begun.reset();
+            }
+            failure = e.what();
+            failure_code = "no_worker";
         } catch (const tool_error& e) {
             failure = e.what();
             failure_code = e.code;
@@ -1635,56 +1549,106 @@ export namespace tools {
             failure = e.what();
             failure_code = executor->started() ? "outcome_unknown" : "sync_failed";
         }
-        if (stopped) {
-            if (begun && begun->status == "preparing" && !begun->replayed) {
-                language::result cancelled{.status = "cancelled", .revision = selected_tree.version, .snapshot = files.id(), .error = "cancelled"};
-                executor->stamp(cancelled);
-                co_await finish_preparation(zero, project, jobs::analysis_finish{.request = request, .result = std::move(cancelled)});
-            }
+        if (stopped)
             co_await coroutine::stop;
-        }
-        if (!begun && failure.empty())
-            co_return co_await zero.files.analysis(zero.core, project, std::move(request));
-        if (begun && (begun->status != "preparing" || begun->replayed))
-            co_return *begun;
         if (!done) {
-            auto status = failure_code == "outcome_unknown" ? "outcome_unknown" : failure_code == "sync_failed" ? "sync_failed" : "failed";
-            language::result failed{.status = status, .revision = selected_tree.version, .snapshot = files.id(), .error = failure};
+            language::result failed{.status = failure_code, .revision = selected_tree.version, .snapshot = files.id(), .error = failure};
             executor->stamp(failed);
-            if (!begun)
-                co_return failed;
-            co_return co_await finish_preparation(zero, project, jobs::analysis_finish{.request = request, .result = std::move(failed)});
+            record(failed, {});
+            co_return failed;
         }
         auto& report = done->first;
-        jobs::analysis_finish finished{.request = request,
-                                       .result = prepared(plan, files, selected_tree.version, report),
-                                       .outline = std::move(report.outline),
-                                       .surveyed = std::move(report.surveyed),
-                                       .service = plan.server.provider,
-                                       .survey_error = std::move(report.survey_error)};
-        co_return co_await finish_preparation(zero, project, std::move(finished));
+        auto result = prepared(plan, files, selected_tree.version, report);
+        result.worldline = line;
+        if (report.survey_error) {
+            result.analysis = "failed";
+            result.analysis_error = report.survey_error;
+            result.analysis_error_code = report.survey_error_code;
+        } else if (report.ok() && report.outline) {
+            result.analysis = "analyzed";
+            result.outline = std::move(report.outline);
+            result.locations = std::move(report.locations);
+        } else {
+            result.analysis = "failed";
+            result.analysis_error = result.error.empty() ? "language worker produced no result" : result.error;
+        }
+        record(result, done->second);
+        co_return result;
     }
 
-    // Language analysis preparation takes its turn in the backlog with builds, since it uses the same machine. Receipts are read at once.
-    auto prepare(services& s, std::string project, std::string configuration, language::request request, const worlds::actor& actor)
-        -> coroutine::task<language::result> {
-        if (request.action != "prepare")
-            co_return co_await s.files.analysis(s.core, project, std::move(request));
-        backlog::entry what{.key = content::hash_of(std::format("prepare\n{}\n{}", project, rfl::json::write(request))).str(),
+    // Each caller owns a waiting ticket; preparation has no durable receipt or separate user operation.
+    auto prepare(services& s, std::string project, std::string configuration, language::request request, const worlds::actor& actor,
+                 mcp::notifier* note = nullptr, semantic::query requested = {}) -> coroutine::task<language::result> {
+        if (request.worldline.empty())
+            request.worldline = "main";
+        auto source = co_await selected(s, project, request.worldline, request.revision, actor);
+        request.revision = source.version;
+        auto plan = language::prepare(request.config, request.build);
+        auto needs = routing::requirements{.tools = plan.build.needs.tools, .os = plan.build.needs.platform.os, .arch = plan.build.needs.platform.arch};
+        if (plan.server.argv.front().find('/') == std::string::npos && !std::ranges::contains(needs.tools, plan.server.argv.front()))
+            needs.tools.push_back(plan.server.argv.front());
+        auto trees = hot_key(project, request.worldline, request.config.build_configuration);
+        content::manifest manifest;
+        for (const auto& file : source.files)
+            manifest.files.push_back({file.path, file.digest, file.size, file.executable});
+        invocation observed{s.files,
+                            s.core,
+                            {.project = project,
+                             .configuration = configuration,
+                             .operation = requested.action,
+                             .actor = worlds::identity_key(actor),
+                             .worldline = request.worldline,
+                             .version = source.version,
+                             .snapshot = manifest.id().str(),
+                             .reuse = "none",
+                             .parameters = rfl::json::write(requested)}};
+        std::string toolchain;
+        try {
+            toolchain = co_await select_toolchain(s, needs, trees);
+        } catch (const tool_error&) {
+            observed.event.state = "failed";
+            throw;
+        }
+        auto normalized = request;
+        normalized.worldline.clear();
+        normalized.revision.clear();
+        normalized.config.build_configuration.clear();
+        auto key = content::hash_of(rfl::json::write(std::tuple{std::string{"language"}, manifest.id().str(), toolchain, normalized})).str();
+        const auto dependency_deadline = std::chrono::steady_clock::now() + std::chrono::seconds{language::timeout(request.build)};
+        co_await fill_dependencies(s, project, plan.build.steps, manifest, toolchain, actor, request.worldline, source.version, dependency_deadline, note);
+        const auto left = std::chrono::ceil<std::chrono::seconds>(dependency_deadline - std::chrono::steady_clock::now()).count();
+        if (left <= 0) throw tool_error("timeout", "execution deadline exceeded while filling dependencies");
+        request.build.limits.timeout_s = static_cast<std::uint32_t>(left);
+        backlog::entry what{.key = key,
                             .project = project,
                             .configuration = configuration,
                             .operation = "prepare",
                             .actor = worlds::identity_key(actor),
-                            .trees =
-                                std::string{content::hash_of(std::format("{}\n{}", project, rfl::json::write(request.config.build))).view().substr(0, 24)}};
-        auto held = co_await s.queue->submit(s.core, std::move(what), [project, request, actor](services& zero, jobs::progress_log&, std::string tree) {
-            return run_preparation(zero, project, request, std::move(tree), actor);
+                            .trees = trees,
+                            .cacheable = true,
+                            .worldline = request.worldline};
+        for (auto& f : source.files)
+            what.files.push_back(f.path + '\n' + f.digest);
+        auto held = co_await s.queue->submit(s.core, std::move(what),
+                                             [project, request, actor, toolchain](services& zero, jobs::progress_log& progress, std::string tree) {
+                                                 return run_preparation(zero, project, request, std::move(tree), actor, toolchain, &progress);
+                                             });
+        observed.event.calculation = key;
+        observed.event.reuse = held->reuse();
+        auto done = co_await follow(s, held, [note](const jobs::progress& progress) {
+            if (note)
+                (*note)(progress_note(progress));
         });
-        auto done = co_await follow(s, held, [](const jobs::progress&) {});
-        // A build-shaped answer is the backlog's own: the preparation was let go, cancelled or replaced, before it ran.
-        if (auto* refused = std::get_if<config_result>(&done))
-            throw tool_error(nodes::code::invalid_record, refused->error);
-        co_return std::get<language::result>(std::move(done));
+        if (auto* refused = std::get_if<config_result>(&done)) {
+            observed.event.state = "failed";
+            throw tool_error(refused->error_code, refused->error);
+        }
+        auto result = std::get<language::result>(std::move(done));
+        observed.event.state = result.status == "prepared" && result.analysis == "analyzed" ? "succeeded" : "failed";
+        result.worldline = request.worldline;
+        result.revision = source.version;
+        result.snapshot = manifest.id();
+        co_return result;
     }
 
     // One configuration of a build, test or run: queued in the backlog, waited for here, its progress passed on as it comes.
@@ -1697,19 +1661,62 @@ export namespace tools {
                                     .output_limit = config.limits.output_limit,
                                     .env = config.env,
                                     .max_memory_bytes = config.limits.max_memory_bytes,
-                                    .max_cpu_seconds = config.limits.max_cpu_seconds};
-        // Each queued or cached execution retains the source coordinate and caller that its audit record names.
-        auto key =
-            content::hash_of(std::format("{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}", s.snapshot()->server.auth.workspace, worldline, version, worlds::identity_key(actor),
-                                         operation, snapshot.id().view(), rfl::json::write(request), rfl::json::write(config.needs)))
-                .str();
+                                    .max_cpu_seconds = config.limits.max_cpu_seconds,
+                                    .fresh = fresh};
+        request.exports = config.build.operations.at(operation).exports;
+        auto trees = hot_key(project, worldline.empty() ? "main" : worldline, config.name);
+        auto required = config.needs.get().value_or(config::requirements{});
+        auto needs = routing::requirements{.tools = required.tools, .os = required.platform.os, .arch = required.platform.arch};
+        invocation observed{s.files,
+                            s.core,
+                            {.project = project,
+                             .configuration = config.name,
+                             .operation = operation,
+                             .actor = worlds::identity_key(actor),
+                             .worldline = worldline,
+                             .version = version,
+                             .snapshot = snapshot.id().str(),
+                             .reuse = "none"}};
+        std::string toolchain;
+        try {
+            toolchain = co_await select_toolchain(s, needs, trees);
+        } catch (const tool_error& error) {
+            observed.event.state = "failed";
+            r.configuration = config.name;
+            r.snapshot = version;
+            r.error = error.what();
+            r.error_code = error.code;
+            co_return;
+        }
+        auto normalized = request;
+        normalized.project.clear();
+        normalized.tree.clear();
+        normalized.fresh = false;
+        auto key = content::hash_of(rfl::json::write(std::tuple{operation, snapshot.id().str(), toolchain, normalized, config.needs})).str();
+        // Test and run operations are effects: every call gets its own execution.
+        static std::atomic<std::uint64_t> calls{0};
+        if (!cacheable)
+            key += "/call/" + std::to_string(calls.fetch_add(1));
+        const auto dependency_deadline = std::chrono::steady_clock::now() + std::chrono::seconds{request.timeout_s};
+        const auto dependency_status = co_await fill_dependencies(s, project, steps, snapshot, toolchain, actor, worldline, version, dependency_deadline, &note);
+        const auto left = std::chrono::ceil<std::chrono::seconds>(dependency_deadline - std::chrono::steady_clock::now()).count();
+        if (left <= 0) {
+            r.configuration = config.name;
+            r.snapshot = version;
+            r.dependency_cache = dependency_status;
+            r.error = "execution deadline exceeded while filling dependencies";
+            r.error_code = "timeout";
+            observed.event.state = "failed";
+            co_return;
+        }
+        request.timeout_s = static_cast<std::uint32_t>(left);
         auto executor = std::make_shared<execution_identity>();
-        backlog::entry what{.key = std::move(key),
+        backlog::entry what{.key = key,
                             .project = project,
                             .configuration = config.name,
                             .operation = operation,
                             .actor = worlds::identity_key(actor),
-                            .trees = std::string{content::hash_of(std::format("{}\n{}", project, rfl::json::write(config))).view().substr(0, 24)},
+                            .trees = trees,
                             .cacheable = cacheable,
                             .fresh = fresh,
                             .workspace_id = s.snapshot()->server.auth.workspace,
@@ -1719,25 +1726,38 @@ export namespace tools {
         for (auto& f : snapshot.files)
             what.files.push_back(f.path + '\n' + f.digest.str());
         auto held = co_await s.queue->submit(s.core, std::move(what),
-                                             [project, config, steps, snapshot, request, worldline, version, actor, operation,
-                                              executor](services& zero, jobs::progress_log& progress, std::string tree) {
+                                             [project, config, steps, snapshot, request, worldline, version, actor, operation, executor,
+                                              toolchain](services& zero, jobs::progress_log& progress, std::string tree) {
                                                  auto placed = request;
                                                  placed.tree = std::move(tree);
                                                  return dispatch(zero, project, config, steps, snapshot, std::move(placed), worldline, version, actor, progress,
-                                                                 operation, executor);
+                                                                 operation, executor, toolchain);
                                              });
+        observed.event.calculation = key;
+        observed.event.reuse = held->reuse();
         // A joined job or a cached result may come from an equal configuration of another name.
         r = std::get<config_result>(co_await follow(s, held, [&note, &config](const jobs::progress& p) {
             auto named = p;
             named.stage = std::format("{}: {}", config.name, p.stage);
             note(progress_note(named));
         }));
+        r.dependency_cache = dependency_status;
+        observed.event.state = r.ok ? "succeeded" : "failed";
         r.configuration = config.name;
         r.snapshot = version;
+        auto downloads = r.exports;
+        for (const auto& step : r.steps) if (step.log) downloads.push_back(*step.log);
+        auto granted = co_await s.files.grant_exports(s.core, project, std::move(downloads));
+        std::size_t index = 0;
+        for (auto& file : r.exports) file = std::move(granted.at(index++));
+        for (auto& step : r.steps) if (step.log) *step.log = std::move(granted.at(index++));
+        if (std::ranges::any_of(r.exports, [](const auto& file) { return !file.delivery_error.empty(); }) ||
+            std::ranges::any_of(r.steps, [](const auto& step) { return step.log && !step.log->delivery_error.empty(); }))
+            co_await s.queue->forget(s.core, key);
     }
 
     // Builds always run one fixed version of a worldline, the current one of main when nothing is named.
-    // Only the build tool's results are cached; `fresh` skips the cache.
+    // Only the build tool's results are cached; `fresh` rebuilds from a clean tree.
     auto execute_all(services& s, std::string project, std::string operation, bool cacheable, bool fresh,
                      std::vector<std::pair<config::effective_config, std::vector<jobs::step>>> jobs, mcp::notifier& note, std::string worldline,
                      std::string version, const worlds::actor& actor) -> coroutine::task<results> {
@@ -1811,7 +1831,7 @@ export namespace tools {
             rfl::Description<"Targets accepted by the selected build operation; configured targets if absent", std::optional<std::vector<std::string>>> targets;
             rfl::Description<"Worldline to build; main when absent", std::optional<std::string>> worldline;
             rfl::Description<"Version of the worldline to build; its current one when absent", std::optional<std::string>> version;
-            rfl::Description<"Run again even when an equal build finished before; builds answer from that result otherwise", std::optional<bool>> fresh;
+            rfl::Description<"Rebuild from a clean working tree, bypassing cached and in-flight build results", std::optional<bool>> fresh;
         };
         using output = results;
 
@@ -1881,36 +1901,31 @@ export namespace tools {
         }
     };
 
-    struct language_query : tool<"language", "Plan or prepare language analysis, retrieve a preparation receipt, or query the analysis of a worldline "
-                                             "version: scopes, symbols, definitions, references or diagnostics. Queries answer from the newest analysis "
-                                             "the version contains (stale when older); spans give a path and Unicode scalar offsets in the selected "
-                                             "version, or no place when their characters are gone. Lock scopes with the reported environment."> {
+    struct language_query : tool<"language", "Query symbols, definitions, references or diagnostics for a worldline version. "
+                                             "Analysis is prepared automatically within the call when missing or stale."> {
         struct input {
             rfl::Description<"Project name", std::string> project;
             rfl::Description<"Worldline; main when absent", std::optional<std::string>> worldline;
             rfl::Description<"Version to query; the current one when absent", std::optional<std::string>> version;
             rfl::Description<"Analysis configuration; the project's only one when absent", std::optional<std::string>> configuration;
-            rfl::Description<"plan, prepare, receipt, scopes, symbols, definitions, references or diagnostics", std::optional<std::string>> action;
-            rfl::Description<"definitions/references: the symbol id", std::optional<std::string>> symbol;
-            rfl::Description<"prepare/receipt: operation ID", std::optional<std::string>> operation_id;
+            rfl::Description<"symbols, definitions, references or diagnostics (default)", std::optional<std::string>> action;
+            rfl::Description<"File path; required for definitions and references", std::optional<std::string>> path;
+            rfl::Description<"Symbol name; a prefix for symbols, an exact name for definitions/references", std::optional<std::string>> symbol;
+            rfl::Description<"One-based source line to disambiguate a symbol", std::optional<std::uint64_t>> line;
         };
         struct output {
             std::string configuration;
             std::optional<std::string> environment, version;
             bool stale = false;
             bool analyzed = false;
-            std::optional<std::vector<semantic::scope>> scopes;
             std::optional<std::vector<semantic::symbol>> symbols;
-            std::optional<std::vector<semantic::reference>> references;
-            std::optional<std::vector<semantic::relation>> relations;
+            std::optional<std::vector<semantic::location>> definitions, references;
             std::optional<std::vector<semantic::diagnostic>> diagnostics;
-            std::optional<language::plan> plan;
-            std::optional<language::result> preparation;
         };
-        static auto run(services& s, input in, mcp::notifier&, const worlds::actor& actor) -> coroutine::task<output> {
+        static auto run(services& s, input in, mcp::notifier& note, const worlds::actor& actor) -> coroutine::task<output> {
             auto project = project_of(in);
             auto settings = config::resolve(*s.snapshot(), project);
-            auto action = in.action.value().value_or("scopes");
+            auto action = in.action.value().value_or("diagnostics");
             auto name = in.configuration.value().value_or("");
             if (name.empty()) {
                 if (settings.analysis.size() != 1)
@@ -1919,51 +1934,53 @@ export namespace tools {
                 name = settings.analysis.begin()->first;
             }
             auto found = settings.analysis.find(name);
-            if (found == settings.analysis.end() && action != "receipt")
+            if (found == settings.analysis.end())
                 throw tool_error(nodes::code::invalid_record, "analysis configuration not found: " + name);
             output out{.configuration = name};
-            if (action == "plan") {
-                out.plan = language::prepare(found->second);
-                co_return out;
-            }
             auto line = in.worldline.value().value_or("main");
-            if (action == "prepare" || action == "receipt") {
-                out.preparation = co_await prepare(s, project, name,
-                                                   {.action = action,
-                                                    .operation_id = in.operation_id.value().value_or(""),
-                                                    .worldline = line,
-                                                    .revision = in.version.value().value_or(""),
-                                                    .config = found == settings.analysis.end() ? language::configuration{} : found->second},
-                                                   actor);
-                co_return out;
-            }
-            static const std::set<std::string> queries{"scopes", "symbols", "definitions", "references", "diagnostics"};
+            if (line.empty())
+                line = "main";
+            static const std::set<std::string> queries{"symbols", "definitions", "references", "diagnostics"};
             if (!queries.contains(action))
                 throw tool_error(nodes::code::invalid_record, "unknown language action " + action);
-            out.environment = content::hash_of(config::write(found->second));
-            auto r = co_await node_call(s, project,
-                                        {.action = "semantic", .worldline = line, .revision = in.version.value().value_or(""), .environment = *out.environment},
-                                        actor, true);
-            out.version = r.version;
-            out.stale = r.stale;
-            if (!r.semantic)
-                co_return out;
+            auto bound = settings.config(found->second.build_configuration).build;
+            out.environment = language::fingerprint(found->second, bound).str();
+            semantic::query query{.action = action, .path = in.path.value().value_or(""), .symbol = in.symbol.value().value_or(""), .line = in.line.value()};
+            if (!query.path.empty())
+                content::checked_path(query.path);
+            if ((action == "definitions" || action == "references") && (query.path.empty() || query.symbol.empty()))
+                throw tool_error(nodes::code::invalid_record, "definitions and references require path and symbol");
+            if (query.line && !*query.line)
+                throw tool_error(nodes::code::invalid_record, "line must be positive");
+            auto calculation = action == "symbols" || action == "diagnostics" ? semantic::query{} : query;
+            auto prepared = co_await prepare(
+                s, project, name,
+                {.worldline = line, .revision = in.version.value().value_or(""), .config = found->second, .build = bound, .query = calculation}, actor, &note,
+                query);
+            if (prepared.status != "prepared" || prepared.analysis != "analyzed" || !prepared.outline)
+                throw tool_error(prepared.status == "prepared" || prepared.status == "failed" ? prepared.analysis_error_code : prepared.status,
+                                 prepared.analysis_error.value_or(prepared.error));
+            out.version = prepared.revision;
             out.analyzed = true;
-            auto& g = *r.semantic;
-            auto symbol = in.symbol.value();
-            if (action == "scopes")
-                out.scopes = std::move(g.scopes);
-            else if (action == "symbols")
-                out.symbols = std::move(g.symbols);
-            else if (action == "definitions") {
-                std::erase_if(g.symbols, [&](auto& x) { return symbol && x.id != *symbol; });
-                out.symbols = std::move(g.symbols);
-            } else if (action == "references") {
-                std::erase_if(g.references, [&](auto& x) { return symbol && x.target != *symbol; });
-                out.references = std::move(g.references);
-                out.relations = std::move(g.relations);
-            } else
-                out.diagnostics = std::move(g.diagnostics);
+            auto& report = *prepared.outline;
+            out.stale = !report.complete;
+            if (action == "symbols") {
+                std::erase_if(report.symbols, [&](const auto& value) {
+                    if (!query.symbol.empty() && !value.name.starts_with(query.symbol))
+                        return true;
+                    return !query.path.empty() &&
+                           !std::ranges::any_of(value.definitions, [&](const auto& span) { return span.place && span.place->path == query.path; });
+                });
+                out.symbols = std::move(report.symbols);
+            } else if (action == "definitions")
+                out.definitions = std::move(prepared.locations);
+            else if (action == "references")
+                out.references = std::move(prepared.locations);
+            else {
+                if (!query.path.empty())
+                    std::erase_if(report.diagnostics, [&](const auto& value) { return !value.range.place || value.range.place->path != query.path; });
+                out.diagnostics = std::move(report.diagnostics);
+            }
             co_return out;
         }
     };
@@ -1972,9 +1989,9 @@ export namespace tools {
         templates::plan preview;
         std::optional<mutation> receipt;
     };
-    // Generated files are created in main in one batch; existing files are never overwritten. The caller holds "::".
+    // Generated files are created in main in one observed batch; existing files are never overwritten.
     auto generate_files(services& s, const std::string& project, templates::parameters parameters, const worlds::actor& actor, std::string operation_id,
-                        bool preview, bool for_this_batch = false) -> coroutine::task<generation_result> {
+                        bool preview) -> coroutine::task<generation_result> {
         generation_result out{templates::render(parameters)};
         if (preview)
             co_return out;
@@ -1992,71 +2009,19 @@ export namespace tools {
                     changes.push_back({.kind = "create", .path = file.path, .text = file.text});
                 }
                 auto r = co_await main_apply(s, project, actor, observed, std::move(changes), operation_id, "generate " + parameters.template_id,
-                                             rfl::json::write(record{input}),
-                                             for_this_batch ? std::vector<std::string>{std::string{nodes::global_scope}} : std::vector<std::string>{});
+                                             rfl::json::write(record{input}));
                 co_return mutation{r.version, r.receipt, operation_id, r.replayed};
             },
             [&](const auto& done) { return mutation{done.first.version, done.first.receipt, operation_id, true}; });
         co_return out;
     }
-    // Generation for a caller that does not hold the global scope itself, as the console does: its batch takes "::" for itself alone, so
-    // no lock is left behind whatever happens to the request.
+    // Console generation publishes one observed batch. There is purposely no MCP
+    // `generate` tool: agents write files with the file tools, and the console's
+    // generation flow goes through this REST helper only.
     auto generate_globally(services& s, const std::string& project, templates::parameters parameters, const worlds::actor& actor, std::string operation_id)
         -> coroutine::task<generation_result> {
-        co_return co_await generate_files(s, project, std::move(parameters), actor, std::move(operation_id), false, true);
+        co_return co_await generate_files(s, project, std::move(parameters), actor, std::move(operation_id), false);
     }
-    struct generate : tool<"generate", "Preview or generate source classes/interfaces in an existing project. List file templates with action=catalog. "
-                                       "Render with action=preview. Create the files in main with action=apply and an operation_id; this needs the "
-                                       "\"::\" lock (worldline lock). Projects are created with the project settings, not here. Existing files are "
-                                       "never overwritten."> {
-        struct input {
-            rfl::Description<"Project name", std::string> project;
-            std::optional<std::string> action;
-            std::optional<templates::arguments> parameters;
-            std::optional<std::string> operation_id;
-        };
-        struct output {
-            std::vector<templates::descriptor> catalog;
-            std::optional<generation_result> generation;
-        };
-        static auto run(services& s, input in, mcp::notifier&, const worlds::actor& actor) -> coroutine::task<output> {
-            if (in.action == "catalog")
-                co_return output{templates::catalog()};
-            if (in.action.value_or("preview") != "preview" && in.action != "apply")
-                throw tool_error(nodes::code::invalid_record, "unknown generation action");
-            if (!in.parameters)
-                throw tool_error(nodes::code::invalid_record, "template parameters are required");
-            co_return output{{},
-                             co_await generate_files(s, project_of(in), templates::expand(*in.parameters), actor, in.operation_id.value_or(""),
-                                                     in.action.value_or("preview") == "preview")};
-        }
-    };
 
-    struct queue : tool<"jobs", "List the build, test and run jobs that are queued or running and the last ones that finished, or cancel one by id. "
-                                "Jobs run as the workspace's limits and workers allow and take turns by who asked; an equal job runs once for "
-                                "everyone who asks, and an equal finished build answers from its result. Cancel only a job no one else waits for, "
-                                "unless you are an owner."> {
-        struct input {
-            rfl::Description<"list (default) or cancel", std::optional<std::string>> action;
-            rfl::Description<"cancel: the job id", std::optional<std::uint64_t>> id;
-        };
-        struct output {
-            std::vector<backlog::view> jobs;
-            std::optional<std::string> cancelled;
-        };
-        static auto run(services& s, input in, mcp::notifier&, const worlds::actor& actor) -> coroutine::task<output> {
-            auto action = in.action.value().value_or("list");
-            if (action == "cancel") {
-                if (!in.id.value())
-                    throw tool_error(nodes::code::invalid_record, "cancel names the job id");
-                co_return output{.cancelled = co_await s.queue->cancel(s.core, *in.id.value(), actor)};
-            }
-            if (action != "list")
-                throw tool_error(nodes::code::invalid_record, "action is list or cancel");
-            co_return output{.jobs = co_await s.queue->list(s.core)};
-        }
-    };
-
-    using standard =
-        toolbox<read, write, edit, remove, move, list, glob, search, worldline, configurations, build, test, launch, language_query, generate, queue>;
+    using standard = toolbox<configurations, build, test, launch, language_query>;
 } // namespace tools

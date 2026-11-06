@@ -57,11 +57,18 @@ namespace {
 
     auto linux_platform() -> jobs::platform { return {.os = "linux", .arch = "x86_64"}; }
 
-    auto fake_worker(socket& s, std::string name, std::vector<std::string> tools = {"cmake"}, std::uint32_t max_inflight = 4, std::string auth = "")
+    auto fake_worker(socket& s, std::string name, std::vector<std::string> tools = {"cmake"}, std::uint32_t max_inflight = 4, std::string auth = "",
+                     bool publisher = false)
         -> coroutine::task<> {
         transport::channel<socket> chan{s};
-        co_await chan.post(jobs::hello{
-            .name = name, .auth = auth, .platform = linux_platform(), .max_inflight = max_inflight, .protocol = jobs::protocol_version, .tools = tools});
+        co_await chan.post(jobs::hello{.name = name,
+                                       .auth = auth,
+                                       .platform = linux_platform(),
+                                       .max_inflight = max_inflight,
+                                       .protocol = jobs::protocol_version,
+                                       .tools = tools,
+                                       .toolchain_id = std::string(64, 'a'),
+                                       .dependency_publisher = publisher});
         try {
             for (;;) {
                 auto f = co_await chan.recv();
@@ -118,6 +125,15 @@ namespace {
             } catch (const routing::no_worker& e) {
                 out.missing = e.what();
             }
+            auto pinned = co_await router.run(0, {.needs = {.toolchain_id = std::string(64, 'a')}}, jobs::hash_file{.path = "pinned"});
+            expect(pinned.hex == "fake:pinned");
+            bool mismatch = false;
+            try {
+                co_await router.run(0, {.needs = {.toolchain_id = std::string(64, 'b')}}, jobs::hash_file{.path = "wrong"});
+            } catch (const routing::no_worker& error) {
+                mismatch = !error.busy;
+            }
+            expect(mismatch) << "matching tool names cannot substitute another runtime fingerprint";
             rt.post(2, [this] { done.fire(); });
         }
     };
@@ -263,6 +279,30 @@ namespace {
     };
 
     static constexpr auto selection_suite = [] {
+        "dependency publishers cannot receive general work"_test = [] {
+            picker h;
+            h.rt.run([&](ctx& io, std::size_t) -> coroutine::task<> {
+                auto l = native::listener{io, {net::ip::address_v4::loopback(), 0}};
+                auto client = co_await io::connect(io, {net::ip::address_v4{{127, 0, 0, 1}}, l.local_endpoint().port()});
+                auto peer = co_await execution::then(net::async_accept(l), [](auto socket, auto) { return std::move(socket); });
+                co_await coroutine::with_scope([&](coroutine::scope& children) -> coroutine::task<> {
+                    children.spawn(h.router.workers(0).admit(io, std::move(peer)));
+                    children.spawn(fake_worker(client, "publisher", {"cmake"}, 1, "", true));
+                    while (h.router.workers(0).describe(0).empty())
+                        co_await execution::schedule_after(io, 1ms);
+                    auto& fleet = h.router.workers(0);
+                    expect(fleet.describe(0).front().dependency_publisher);
+                    expect(!fleet.holds({}));
+                    expect(!fleet.busy({}));
+                    expect(fleet.diagnose({}) == "no live general build worker is available");
+                    bool refused = false;
+                    try { co_await h.who({}); }
+                    catch (const routing::no_worker& error) { refused = !error.busy; }
+                    expect(refused);
+                    expect(co_await h.who({.needs = {.dependency_publisher = true}}) == "publisher:who");
+                });
+            });
+        };
         "affinity beats load, then it is least inflight, bounded by capacity"_test = [] {
             picker h;
             h.rt.run([&](ctx& io, std::size_t) -> coroutine::task<> {

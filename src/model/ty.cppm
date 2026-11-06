@@ -74,7 +74,17 @@ namespace language {
             settings server;
         };
         static constexpr std::array<std::pair<std::string_view, std::string_view>, 3> documents{{{"py", "python"}, {"pyi", "python"}, {"pyw", "python"}}};
-        static constexpr std::array<std::string_view, 0> inputs{};
+        static constexpr std::array<std::string_view, 1> inputs{"python_environment"};
+        static auto input_paths(const options& o) -> std::map<std::string, std::string> {
+            if (o.python && !std::filesystem::path(*o.python).is_absolute())
+                return {{"python_environment", *o.python}};
+            return {};
+        }
+        static auto required_inputs(const options& o) -> std::vector<std::string> {
+            if (o.python && !std::filesystem::path(*o.python).is_absolute())
+                return {"python_environment"};
+            return {};
+        }
 
         static void validate(const options& o);
         static auto launch(const options& o, const std::vector<builds::context>& inputs) -> program;
@@ -185,7 +195,10 @@ namespace language {
                 throw std::invalid_argument("a ty configuration key is a nonempty name with a value: " + key);
     }
 
-    auto server<"ty">::launch(const options& o, const std::vector<builds::context>&) -> program {
+    auto server<"ty">::launch(const options& o, const std::vector<builds::context>& inputs) -> program {
+        if (o.python && !std::filesystem::path(*o.python).is_absolute() &&
+            !std::ranges::any_of(inputs, [&](const auto& input) { return input.type == "python_environment" && input.path == *o.python; }))
+            throw std::invalid_argument("the bound build does not produce the ty Python environment: " + *o.python);
         auto& s = o.server;
         rfl::Generic::Object settings;
         if (!s.configuration.empty()) {

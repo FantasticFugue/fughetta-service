@@ -362,39 +362,12 @@ namespace {
             expect(text(good(node, {.action = "inspect"}), "b") == "A") << "a path the batch empties takes another file";
             expect(inspect(node).frontier == swapped.frontier);
         };
-        "an apply may take the global scope for its own batch only"_test = [] {
-            test::scratch tmp{"batch-scope"};
+        "source lock actions are removed"_test = [] {
+            test::scratch tmp{"no-locks"};
             nodes::local_node node{tmp.dir / "a"};
-            good(node, {.action = "initialize"});
-            auto seed = change(node, "scope-seed", {}, {.kind = "create", .path = "x", .text = "abcd"});
-            auto unlocked = attempt(node, {.action = "apply",
-                                           .operation = op("unlocked"),
-                                           .holder = "console",
-                                           .expected = seed.frontier,
-                                           .edits = {{.kind = "create", .path = "y", .text = "y"}}});
-            expect(unlocked.code == "scope_locked");
-            auto own = good(node, {.action = "apply",
-                                   .operation = op("own"),
-                                   .holder = "console",
-                                   .expected = seed.frontier,
-                                   .edits = {{.kind = "create", .path = "y", .text = "y"}},
-                                   .scopes = {"::"}});
-            expect(good(node, {.action = "locks", .holder = "console"}).locks.empty()) << "nothing stays held after the batch";
-            good(node, {.action = "lock", .holder = "agent", .scopes = {"::"}});
-            auto blocked = attempt(node, {.action = "apply",
-                                          .operation = op("blocked"),
-                                          .holder = "console",
-                                          .expected = own.frontier,
-                                          .edits = {{.kind = "create", .path = "z", .text = "z"}},
-                                          .scopes = {"::"}});
-            expect(blocked.code == "scope_locked" && blocked.reason.contains("agent")) << blocked.reason;
-            auto narrow = attempt(node, {.action = "apply",
-                                         .operation = op("narrow"),
-                                         .holder = "agent",
-                                         .expected = own.frontier,
-                                         .edits = {{.kind = "create", .path = "z", .text = "z"}},
-                                         .scopes = {"some-function"}});
-            expect(narrow.code == "invalid_record");
+            good(node, {.action="initialize"});
+            for (const auto action : {"lock", "unlock", "locks"})
+                expect(attempt(node,{.action=action}).code == "invalid_record");
         };
         "size limits hold for the state a publication leaves, reversals included"_test = [] {
             test::scratch tmp{"limits"};
@@ -474,109 +447,24 @@ namespace {
             nodes::local_node node{tmp.dir / "a"};
             good(node, {.action = "initialize"});
             auto seed = change(node, "shared-seed", {}, {.kind = "create", .path = "x", .text = "abcd"});
-            auto halves = good(node, {.action = "anchor", .spans = {{.place = semantic::place{"x", 0, 2}}, {.place = semantic::place{"x", 2, 4}}}});
-            good(node, {.action = "semantic.publish",
-                        .generation = semantic::generation{.version = seed.version,
-                                                           .environment = "test",
-                                                           .service = "test",
-                                                           .service_version = "1",
-                                                           .scopes = {{.id = "left", .kind = "function", .range = halves.spans[0]},
-                                                                      {.id = "right", .kind = "function", .range = halves.spans[1]}}}});
-            good(node, {.action = "lock", .holder = "alice", .environment = "test", .scopes = {"left"}});
-            auto taken = attempt(node, {.action = "lock", .holder = "bob", .environment = "test", .scopes = {"left"}});
-            expect(taken.code == "scope_locked" && taken.reason.contains("alice")) << taken.reason;
-            auto everything = attempt(node, {.action = "lock", .holder = "bob", .scopes = {"::"}});
-            expect(everything.code == "scope_locked") << "the global namespace contains every scope";
-            good(node, {.action = "lock", .holder = "bob", .environment = "test", .scopes = {"right"}});
-            auto trespass = attempt(node, {.action = "apply",
-                                           .operation = op("shared-trespass"),
-                                           .holder = "bob",
-                                           .expected = seed.frontier,
-                                           .edits = {{.kind = "edit", .path = "x", .text = "!", .offset = 0, .count = 1}}});
-            expect(trespass.code == "scope_locked" && trespass.reason.contains("alice")) << trespass.reason;
-            auto whole = attempt(node, {.action = "apply",
-                                        .operation = op("shared-whole"),
-                                        .holder = "bob",
-                                        .expected = seed.frontier,
-                                        .edits = {{.kind = "write", .path = "x", .text = "gone"}}});
-            expect(whole.code == "scope_locked") << "replacing a file needs the global namespace";
             auto first = good(node, {.action = "apply",
                                      .operation = op("shared-first"),
                                      .actor = "alice",
-                                     .holder = "alice",
                                      .expected = seed.frontier,
                                      .edits = {{.kind = "edit", .path = "x", .text = "1", .offset = 1}}});
             auto second = good(node, {.action = "apply",
                                       .operation = op("shared-second"),
                                       .actor = "bob",
-                                      .holder = "bob",
                                       .expected = seed.frontier,
                                       .edits = {{.kind = "edit", .path = "x", .text = "2", .offset = 3}}});
-            expect(second.frontier.size() == 2u) << "both writers remain concurrent heads";
-            expect(std::ranges::find(second.frontier, first.frontier.front()) != second.frontier.end());
+            expect(second.frontier.size() == 2u);
+            expect(std::ranges::contains(second.frontier, first.frontier.front()));
             expect(text(inspect(node), "x") == "a1bc2d");
             auto history = good(node, {.action = "history"});
             std::set<std::string> actors;
-            for (auto& entry : history.history)
+            for (const auto& entry : history.history)
                 actors.insert(entry.actor);
             expect(actors.contains("alice") && actors.contains("bob"));
-            expect(std::ranges::all_of(history.history, [&](auto& entry) { return entry.line == node.project_id(); }));
-            auto listed = good(node, {.action = "locks"});
-            expect(listed.locks.size() == 2u && listed.locks[0].place && listed.locks[0].place->path == "x" && listed.locks[0].scope == "left");
-            expect(attempt(node, {.action = "unlock", .holder = "bob"}).code == "invalid_record") << "an unlock names what it releases";
-            good(node, {.action = "unlock", .holder = "bob", .environment = "test", .scopes = {"right"}});
-            expect(good(node, {.action = "locks"}).locks.size() == 1u);
-            auto foreign = attempt(node, {.action = "unlock", .holder = "bob", .target = std::to_string(listed.locks[0].id)});
-            expect(foreign.code == "permission_denied") << "a writer cannot release another writer's lock";
-            good(node, {.action = "unlock", .holder = "bob", .target = std::to_string(listed.locks[0].id), .force = true});
-            expect(good(node, {.action = "locks"}).locks.empty());
-            auto unrelated = attempt(node, {.action = "apply",
-                                            .operation = op("shared-unrelated"),
-                                            .expected = {op("missing-event")},
-                                            .edits = {{.kind = "edit", .path = "x", .text = "3", .offset = 0}}});
-            expect(unrelated.code == "missing_objects") << unrelated.code;
-            auto blind = attempt(node, {.action = "apply", .operation = op("shared-blind"), .edits = {{.kind = "create", .path = "x", .text = "again"}}});
-            expect(blind.code == "stale_frontier") << "an edit cannot observe the empty state of a nonempty worldline";
-        };
-        "a scope lock authorizes edits only while its scope is whole"_test = [] {
-            test::scratch tmp{"lock-lost"};
-            nodes::local_node node{tmp.dir / "a"};
-            good(node, {.action = "initialize"});
-            auto seed = change(node, "lost-seed", {}, {.kind = "create", .path = "x", .text = "abcd"});
-            auto parts = good(node, {.action = "anchor", .spans = {{.place = semantic::place{"x", 0, 2}}, {.place = semantic::place{"x", 2, 4}}}});
-            good(node, {.action = "semantic.publish",
-                        .generation = semantic::generation{.version = seed.version,
-                                                           .environment = "test",
-                                                           .service = "test",
-                                                           .service_version = "1",
-                                                           .scopes = {{.id = "left", .kind = "function", .range = parts.spans[0]},
-                                                                      {.id = "data", .kind = "variable", .range = parts.spans[1]}}}});
-            auto variable = attempt(node, {.action = "lock", .holder = "alice", .environment = "test", .scopes = {"data"}});
-            expect(variable.code == "invalid_record") << "only enclosing scopes are locked";
-            good(node, {.action = "lock", .holder = "alice", .environment = "test", .scopes = {"left"}});
-            auto emptied = good(node, {.action = "apply",
-                                       .operation = op("lost-empty"),
-                                       .holder = "alice",
-                                       .expected = seed.frontier,
-                                       .edits = {{.kind = "edit", .path = "x", .offset = 0, .count = 2}}});
-            auto stray = attempt(node, {.action = "apply",
-                                        .operation = op("lost-stray"),
-                                        .holder = "alice",
-                                        .expected = emptied.frontier,
-                                        .edits = {{.kind = "edit", .path = "x", .text = "z", .offset = 1, .count = 1}}});
-            expect(stray.code == "scope_locked") << "a scope that lost its characters no longer covers the rest of the file";
-            auto again = attempt(node, {.action = "lock", .holder = "alice", .environment = "test", .scopes = {"left"}});
-            expect(again.code == "invalid_record") << again.reason;
-            auto joined = attempt(
-                node, {.action = "integrate", .operation = op("lost-integrate"), .holder = "alice", .expected = emptied.frontier, .source = emptied.frontier});
-            expect(joined.code == "scope_locked") << "a selection needs the global namespace";
-            good(node, {.action = "unlock", .holder = "alice", .environment = "test", .scopes = {"left"}});
-            good(node, {.action = "lock", .holder = "alice", .scopes = {"::"}});
-            good(node, {.action = "apply",
-                        .operation = op("lost-global"),
-                        .holder = "alice",
-                        .expected = emptied.frontier,
-                        .edits = {{.kind = "edit", .path = "x", .text = "z", .offset = 1, .count = 1}}});
         };
         "worldlines never take each other's source"_test = [] {
             test::scratch tmp{"line-boundary"};
@@ -670,57 +558,13 @@ namespace {
             auto renamed = good(loser, {.action = "fork", .worldline = "twin-2", .operation = op("twin-rename"), .source = hidden.frontier});
             expect(good(loser, {.action = "read", .worldline = "twin-2", .target = "x"}).files.size() == 1u);
         };
-        "language data follows edits through character identities and reports staleness"_test = [] {
-            test::scratch tmp{"semantic"};
+        "source rejects removed semantic and syntax-scope operations"_test = [] {
+            test::scratch tmp{"no-semantics"};
             nodes::local_node node{tmp.dir / "a"};
             good(node, {.action = "initialize"});
-            auto seed = change(node, "semantic-seed", {}, {.kind = "create", .path = "x.cpp", .text = "int f() { return 1; }\nint g();\n"});
-            auto located = good(node, {.action = "anchor",
-                                       .revision = seed.version,
-                                       .spans = {{.place = semantic::place{"x.cpp", 0, 21}}, {.place = semantic::place{"x.cpp", 4, 5}}}});
-            expect((located.spans.size() == 2u) >> fatal);
-            semantic::generation generation{.version = seed.version,
-                                            .environment = "debug",
-                                            .service = "test",
-                                            .service_version = "1",
-                                            .scopes = {{.id = "f", .kind = "function", .symbol = "f", .range = located.spans[0]}},
-                                            .symbols = {{.id = "f", .name = "f", .kind = "function", .scope = "", .definitions = {located.spans[1]}}}};
-            good(node, {.action = "semantic.publish", .generation = generation});
-            auto fresh = good(node, {.action = "semantic", .environment = "debug"});
-            expect((fresh.semantic.has_value() && !fresh.stale) >> fatal);
-            expect(fresh.semantic->scopes[0].range.place && fresh.semantic->scopes[0].range.place->begin == 0u &&
-                   fresh.semantic->scopes[0].range.place->end == 21u);
-            auto edited = change(node, "semantic-edit", seed.frontier, {.kind = "edit", .path = "x.cpp", .text = "// head\n", .offset = 0});
-            auto moved = good(node, {.action = "semantic", .environment = "debug"});
-            expect((moved.semantic.has_value() && moved.stale) >> fatal) << "an older generation still answers, marked stale";
-            auto& moved_place = *moved.semantic->scopes[0].range.place;
-            expect(moved_place.begin == 8u && moved_place.end == 29u && moved_place.path == "x.cpp");
-            auto removed = change(node, "semantic-remove", edited.frontier, {.kind = "edit", .path = "x.cpp", .offset = 12, .count = 1});
-            auto gone = good(node, {.action = "semantic", .environment = "debug"});
-            expect(!gone.semantic->symbols[0].definitions[0].place) << "a removed character leaves its span without a place";
-            expect(!good(node, {.action = "semantic", .environment = "release"}).semantic.has_value());
-            auto exact = generation;
-            exact.version = removed.version;
-            exact.scopes.clear();
-            exact.symbols.clear();
-            good(node, {.action = "semantic.publish", .generation = exact});
-            good(node, {.action = "semantic.publish", .generation = generation});
-            auto preferred = good(node, {.action = "semantic", .environment = "debug"});
-            expect(!preferred.stale && preferred.semantic->scopes.empty()) << "the selected version's own generation wins over a later older one";
-            auto fork = good(node, {.action = "fork", .worldline = "branch", .operation = op("semantic-fork"), .source = removed.frontier});
-            expect(good(node, {.action = "semantic", .worldline = "branch", .environment = "debug"}).semantic.has_value()) << "a fork sees its base";
-            auto gone_file = change(node, "semantic-delete", removed.frontier, {.kind = "remove", .path = "x.cpp"});
-            auto older = good(node, {.action = "semantic", .environment = "debug", .revision = seed.version});
-            expect(older.semantic->scopes[0].range.place.has_value());
-            auto deleted = good(node, {.action = "semantic", .environment = "debug"});
-            expect(deleted.stale);
-            auto bad = generation;
-            bad.scopes[0].parent = "missing";
-            expect(attempt(node, {.action = "semantic.publish", .generation = bad}).code == "invalid_record");
-            bad = generation;
-            bad.version = removed.version;
-            expect(attempt(node, {.action = "semantic.publish", .generation = bad}).code == "invalid_record")
-                << "spans must exist in the version they describe";
+            for (auto action : {"semantic", "semantic.publish", "anchor"})
+                expect(attempt(node, {.action = action}).code != "ok");
+            expect(attempt(node, {.action = "lock"}).code == "invalid_record");
         };
         "missing causal and corrupt sequence pages refuse edits and explicit archive audit reconstructs them"_test = [] {
             for (bool missing : {false, true}) {

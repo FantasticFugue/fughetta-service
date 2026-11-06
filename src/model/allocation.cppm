@@ -17,15 +17,14 @@ export namespace allocation {
         std::vector<worker> workers;
     };
     inline auto distribute(budget b) -> plan {
-        if (b.threads < 6 || !b.jobs || b.workers >= b.jobs || b.workers > (b.threads - 6) / 2)
-            throw std::invalid_argument(
-                "runtime requires threads >= 6 + 2 * workers, jobs >= 1, and workers < jobs (one job is reserved for source preparation)");
+        if (b.threads < 6 || !b.jobs || b.workers > b.jobs || b.workers > (b.threads - 6) / 2)
+            throw std::invalid_argument("runtime requires threads >= 6 + 2 * workers, jobs >= 1, and workers <= jobs");
         plan result;
         auto remaining = b.threads - 6 - 2 * b.workers;
         result.gateway_disk += remaining / 2;
         result.source_disk += remaining - remaining / 2;
         for (std::uint32_t i = 0; i < b.workers; ++i)
-            result.workers.push_back({(b.jobs - 1) / b.workers + (i < (b.jobs - 1) % b.workers ? 1u : 0u)});
+            result.workers.push_back({b.jobs / b.workers + (i < b.jobs % b.workers ? 1u : 0u)});
         return result;
     }
     struct observation {

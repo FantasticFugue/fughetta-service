@@ -66,6 +66,8 @@ export namespace builds {
     struct operation {
         std::vector<std::string> tasks;
         std::optional<std::string> receiver;
+        // Named files or directories, relative to the working tree, delivered after this operation.
+        std::map<std::string, std::string> exports;
     };
     struct configuration {
         std::map<std::string, builder> builders;
@@ -87,8 +89,11 @@ export namespace builds {
     auto schemas() -> const std::map<std::string, rfl::Generic>&;
     void validate(const configuration& c);
     auto prepare(const configuration& c, const request& request) -> plan;
+    // Selects only the tasks and prerequisites that produce the artifact types a consumer needs.
+    auto prepare_inputs(const configuration& c, const std::vector<std::string>& types, const std::map<std::string, std::string>& paths = {}) -> plan;
     // Binds a step to a tree on this machine, its mapped tools, the parallel jobs it may use and the directory of its reports.
-    auto locate(step value, const std::filesystem::path& tree, const toolset& tools, std::uint32_t jobs, const std::filesystem::path& reports = {}) -> step;
+    auto locate(step value, const std::filesystem::path& tree, const toolset& tools, std::uint32_t jobs, const std::filesystem::path& reports = {},
+                const std::filesystem::path& dependency_cache = {}, const std::filesystem::path& dependency_upstream = {}) -> step;
     // What the reports a bound step left in `reports` say, with paths made relative to `tree`; a missing report adds nothing,
     // and one that cannot be read says so as a diagnostic.
     auto collect(const step& bound, const std::filesystem::path& reports, const std::filesystem::path& tree) -> reading;

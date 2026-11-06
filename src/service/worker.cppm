@@ -11,6 +11,7 @@ import durability;
 import host;
 import constants;
 import isolation;
+import toolchain;
 
 namespace worker {
     // The Core refused this identity; retrying cannot succeed.
@@ -44,11 +45,28 @@ namespace worker {
                                        .tools = cfg_.tools,
                                        .isolate = true,
                                        .isolation_root = cfg_.worker_id ? std::optional{isolation::delegated()} : std::nullopt,
-                                       .parallel = cfg_.parallel},
+                                       .parallel = cfg_.parallel,
+                                       .dependency_cache = cfg_.dependency_cache ? std::optional{std::filesystem::path{*cfg_.dependency_cache}} : std::nullopt,
+                                       .dependency_upstream = cfg_.dependency_upstream ? std::optional{std::filesystem::path{*cfg_.dependency_upstream}} : std::nullopt,
+                                       .dependency_publish = cfg_.dependency_publish ? std::optional{std::filesystem::path{*cfg_.dependency_publish}} : std::nullopt,
+                                       .dependency_recipe = cfg_.dependency_recipe},
                       compute_) {}
 
-        auto run(native::scheduler& io, std::size_t core) -> coroutine::task<> {
+        auto run(native::scheduler& io, std::size_t core) -> coroutine::task<> { co_await builds_.run(core, connected(io, core)); }
+
+        auto connected(native::scheduler& io, std::size_t core) -> coroutine::task<> {
             co_await builds_.prepare(core);
+            auto identity = co_await offload(io, [this] {
+                auto env = cfg_.inherit_env ? host::environment() : std::map<std::string, std::string>{};
+                for (const auto& [name, value] : cfg_.env)
+                    env[name] = value;
+                env["OMP_NUM_THREADS"] = std::to_string(cfg_.parallel);
+                return toolchain::inspect(host::resolve_tools(cfg_.tools, toolchain::required_tools()), env, cfg_.sdk_manifests);
+            });
+            if (!identity)
+                throw std::runtime_error(identity.error());
+            tools_ = std::move(identity->tools);
+            toolchain_ = std::move(identity->id);
             if (!cfg_.worker_id) {
                 co_await serve(io, core);
                 co_return;
@@ -94,6 +112,7 @@ namespace worker {
             transport::dispatcher<S> serve;
             builds_.install(serve, core);
             serve.template on<jobs::hash_file>([this, &io](jobs::hash_file job, auto&) -> coroutine::task<jobs::digest> {
+                if (cfg_.dependency_publish) throw std::invalid_argument("dependency publishers only accept dependency.fill");
                 auto out = co_await offload(io, [this, job = std::move(job)] { return hash(job); });
                 if (!out)
                     throw std::runtime_error(out.error());
@@ -108,7 +127,9 @@ namespace worker {
                                            .tools = tools_,
                                            .worker_id = cfg_.worker_id,
                                            .workspace_id = cfg_.workspace_id,
-                                           .heartbeat_seconds = cfg_.worker_id ? cfg_.heartbeat_seconds : 2});
+                                           .heartbeat_seconds = cfg_.worker_id ? cfg_.heartbeat_seconds : 2,
+                                           .toolchain_id = toolchain_,
+                                           .dependency_publisher = cfg_.dependency_publish.has_value()});
 
             if (cfg_.worker_id) {
                 auto first = co_await coroutine::deadline(io, std::chrono::seconds{30}, chan.recv(constants::worker_hello_bytes));
@@ -126,7 +147,10 @@ namespace worker {
 
             std::cerr << "service-ready:worker\n";
             co_await coroutine::with_scope([&](coroutine::scope& requests) -> coroutine::task<> {
-                requests.spawn(beat(io, chan));
+                requests.spawn(beat(io, chan, core));
+                // The Core picks this Worker by the same limit; enforcing it locally keeps a misbehaving Core from driving unbounded concurrency.
+                auto max_inflight = static_cast<std::size_t>(cfg_.max_inflight);
+                std::atomic<std::size_t> inflight{0};
                 for (;;) {
                     auto frame = co_await chan.recv();
                     if (cfg_.worker_id && frame.kind == jobs::code<jobs::admission>) {
@@ -135,17 +159,38 @@ namespace worker {
                             reject(admitted.code);
                         continue;
                     }
-                    requests.spawn(serve.handle(chan, std::move(frame)));
+                    // Cancellation is cheap and must always reach the running call, so it never waits for a slot.
+                    if (frame.kind == jobs::code<jobs::cancel>) {
+                        requests.spawn(serve.handle(chan, std::move(frame)));
+                        continue;
+                    }
+                    if (inflight.load(std::memory_order_relaxed) >= max_inflight) {
+                        co_await chan.fail(frame.corr, "worker is at max_inflight", "worker_overloaded");
+                        continue;
+                    }
+                    inflight.fetch_add(1, std::memory_order_relaxed);
+                    requests.spawn(tracked(serve, chan, std::move(frame), inflight));
                 }
             });
         }
 
+        template <io::stream S>
+        static auto tracked(transport::dispatcher<S>& serve, transport::channel<S>& chan, transport::frame frame, std::atomic<std::size_t>& inflight)
+            -> coroutine::task<> {
+            struct release {
+                std::atomic<std::size_t>& inflight;
+                ~release() { inflight.fetch_sub(1, std::memory_order_relaxed); }
+            } counted{inflight};
+            co_await serve.handle(chan, std::move(frame));
+        }
+
         auto connect(native::scheduler& io) -> coroutine::task<socket> { co_return co_await io::connect(io, io::parse_endpoint(cfg_.gateway)); }
 
-        template <io::stream S> auto beat(native::scheduler& io, transport::channel<S>& chan) -> coroutine::task<> {
+        template <io::stream S> auto beat(native::scheduler& io, transport::channel<S>& chan, std::size_t core) -> coroutine::task<> {
             for (;;) {
                 co_await execution::schedule_after(io, std::chrono::seconds{cfg_.worker_id ? cfg_.heartbeat_seconds : 2});
                 co_await chan.post(jobs::heartbeat{});
+                co_await builds_.reclaim(core);
             }
         }
 
@@ -178,7 +223,8 @@ namespace worker {
 
         config::worker cfg_;
         std::string name_;
-        std::vector<std::string> tools_ = host::detect_tools(cfg_.tools);
+        std::vector<std::string> tools_;
+        std::string toolchain_;
         execution::thread_pool compute_;
         replica::service builds_;
     };

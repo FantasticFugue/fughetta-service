@@ -13,6 +13,20 @@ import utility;
 
 namespace nodes {
     namespace {
+        auto overlapping_paths(const auto& paths, const std::string& path) -> std::vector<std::string> {
+            std::vector<std::string> out;
+            for (auto prefix = path; !prefix.empty();) {
+                if (paths.contains(prefix)) out.push_back(prefix);
+                auto slash = prefix.rfind('/');
+                if (slash == std::string::npos) break;
+                prefix.resize(slash);
+            }
+            const auto prefix = path + "/";
+            for (auto it = paths.lower_bound(prefix); it != paths.end() && it->first.starts_with(prefix); ++it)
+                out.push_back(it->first);
+            return out;
+        }
+
         struct database {
             sqlite3* handle = nullptr;
             std::map<std::string, std::vector<sqlite3_stmt*>, std::less<>> statements;
@@ -42,12 +56,11 @@ namespace nodes {
                     "CREATE TABLE IF NOT EXISTS metadata(name TEXT PRIMARY KEY, data BLOB NOT NULL);"
                     "CREATE TABLE IF NOT EXISTS roots(name TEXT PRIMARY KEY, data BLOB NOT NULL);"
                     "CREATE TABLE IF NOT EXISTS revisions(id TEXT PRIMARY KEY, data BLOB NOT NULL);"
-                    "CREATE TABLE IF NOT EXISTS semantics(seq INTEGER PRIMARY KEY AUTOINCREMENT, environment TEXT NOT NULL, service TEXT NOT NULL, "
-                    "version TEXT NOT NULL, frontier BLOB NOT NULL, data TEXT NOT NULL, UNIQUE(environment, service, version));"
-                    "CREATE INDEX IF NOT EXISTS semantics_lookup ON semantics(environment, service, seq);"
-                    "CREATE TABLE IF NOT EXISTS locks(id INTEGER PRIMARY KEY AUTOINCREMENT, line TEXT NOT NULL, holder TEXT NOT NULL, scope TEXT NOT NULL, "
-                    "symbol TEXT NOT NULL, environment TEXT NOT NULL, document TEXT NOT NULL, first_run TEXT NOT NULL, first_offset INTEGER NOT NULL, "
-                    "last_run TEXT NOT NULL, last_offset INTEGER NOT NULL, acquired INTEGER NOT NULL, UNIQUE(line, holder, scope, environment));"
+                    "DROP TABLE IF EXISTS semantics;"
+                    "DROP TABLE IF EXISTS locks;"
+                    "CREATE TABLE IF NOT EXISTS dmail(id INTEGER PRIMARY KEY AUTOINCREMENT, at INTEGER NOT NULL, sender TEXT NOT NULL, "
+                    "line TEXT NOT NULL, recipient TEXT NOT NULL, body TEXT NOT NULL, operation TEXT NOT NULL, UNIQUE(sender,operation));"
+                    "CREATE INDEX IF NOT EXISTS dmail_recipient ON dmail(recipient,id);"
                     "CREATE TABLE IF NOT EXISTS bindings(author TEXT NOT NULL, operation TEXT NOT NULL, digest TEXT NOT NULL, receipt TEXT NOT NULL, PRIMARY "
                     "KEY(author,operation));"
                     "CREATE TABLE IF NOT EXISTS staging(id TEXT PRIMARY KEY, total INTEGER NOT NULL, data BLOB NOT NULL);"
@@ -3203,6 +3216,18 @@ namespace nodes {
             auto out = identity();
             out.frontier = string_list(a.at("frontier"));
             out.version = version(out.frontier);
+            for (const auto& event : out.frontier) {
+                const auto& batch = get(event);
+                if (batch.at("kind").text() != "batch" || batch.at("operation").text() != a.at("operation").text() ||
+                    batch.at("author").text() != r.at("author").text())
+                    continue;
+                auto own = version({event});
+                statement known{*db, "SELECT 1 FROM revisions WHERE id=?1"};
+                known.text(1, own);
+                if (known.next())
+                    out.written_version = std::move(own);
+                break;
+            }
             if (auto name = matching_view(out.frontier)) {
                 out.source_digest = views.at(*name).digest;
                 out.conflicts = views.at(*name).conflicts;
@@ -3407,9 +3432,13 @@ namespace nodes {
                         freed.insert(it->first);
             }
             auto claim = [&](const std::string& path) {
-                auto held = state.paths.find(path);
-                if ((held != state.paths.end() && !held->second->empty() && !freed.contains(path)) || !placed.insert(path).second)
-                    fail(nodes::code::source_conflict, path + " already exists");
+                for (const auto& held : overlapping_paths(state.paths, path))
+                    if (!state.paths.find(held)->second->empty() && !freed.contains(held))
+                        fail(nodes::code::source_conflict, path + " overlaps " + held);
+                for (const auto& held : placed)
+                    if (held == path || held.starts_with(path + "/") || path.starts_with(held + "/"))
+                        fail(nodes::code::source_conflict, path + " overlaps " + held);
+                placed.insert(path);
             };
             for (auto& e : in.edits) {
                 checked_path(e.path);
@@ -3492,12 +3521,9 @@ namespace nodes {
             checked_name(in.worldline);
             if (!content::is_hash(in.operation))
                 fail(nodes::code::invalid_record, "operation ID must be 32-byte lowercase hex");
-            if (!in.genesis_nonce.empty() || !in.authors.empty() || !in.nodes.empty() || !in.policies.empty() || !in.settled.empty() || !in.want.empty() ||
-                !in.parts.empty() || !in.configuration.empty() || !in.environment.empty() || in.generation || !in.spans.empty() || in.force ||
-                (!in.scopes.empty() &&
-                 (in.action != "apply" || in.scopes != std::vector<std::string>{std::string{nodes::global_scope}} || in.holder.empty())) ||
-                !in.revision.empty() || !in.snapshot.empty() || in.protected_worldlines != std::vector<std::string>{"main"} || in.max_bytes != 1024 * 1024 ||
-                in.limit != 100)
+            if (in.mail || in.after || !in.genesis_nonce.empty() || !in.authors.empty() || !in.nodes.empty() || !in.policies.empty() || !in.settled.empty() ||
+                !in.want.empty() || !in.parts.empty() || !in.configuration.empty() || !in.environment.empty() || in.force || !in.revision.empty() ||
+                !in.snapshot.empty() || in.protected_worldlines != std::vector<std::string>{"main"} || in.max_bytes != 1024 * 1024 || in.limit != 100)
                 fail(nodes::code::invalid_record, "source publication contains fields for another operation");
             if (in.activation && in.action != "resolve")
                 fail(nodes::code::invalid_record, "activation choices belong to conflict resolution");
@@ -3563,8 +3589,6 @@ namespace nodes {
                     heads.insert(heads.end(), in.source.begin(), in.source.end());
                     heads = source.frontier(std::move(heads));
                     observes_line(line, heads);
-                    if (!in.holder.empty())
-                        check_locks(in, prior);
                 } else {
                     if (found == roots.end() && in.worldline != "main")
                         fail(nodes::code::invalid_record, "join this worldline by integration first");
@@ -3572,8 +3596,6 @@ namespace nodes {
                     if (in.expected.empty() && !prior.empty())
                         fail("stale_frontier", "an edit must observe a state of the worldline");
                     heads = in.expected;
-                    if (!in.holder.empty())
-                        check_locks(in, heads);
                 }
             }
             if (in.action == "admit" && !allowed(permissions, "maintainers", author.id()))
@@ -3630,6 +3652,12 @@ namespace nodes {
                 b["required"] = strings(vector_set(std::move(required)));
                 auto event = put(std::move(b), author);
                 validate_object(event);
+                // A checkout that changes again while sending can advance its local baseline
+                // to its own submitted text without pretending it wrote back concurrent edits.
+                statement own_revision{*db, "INSERT OR IGNORE INTO revisions(id,data) VALUES(?1,?2)"};
+                own_revision.text(1, version({event}));
+                own_revision.bind(2, codec::encode(value::map{{"frontier", strings({event})}}));
+                own_revision.next();
                 heads = prior;
                 heads.push_back(event);
                 heads = source.frontier(std::move(heads));
@@ -3639,14 +3667,29 @@ namespace nodes {
                     std::ranges::any_of(projected->conflicts, [](auto& c) { return c.starts_with("dependency:"); }))
                     fail("dependency_conflict", "reversal requires a recorded dependency decision");
             }
-            // A batch that takes "::" for itself held nothing while its caller read the source, so what it creates must still be free now.
-            if (!in.scopes.empty()) {
+            // Concurrent creates and moves must not silently replace a path created after the observed snapshot.
+            if (in.action == "apply") {
                 auto now = source.projection(prior);
-                for (auto& e : in.edits)
-                    for (const auto& path :
-                         {e.kind == "create" || e.kind == "binary_create" ? e.path : std::string{}, e.kind == "move" ? e.target : std::string{}})
-                        if (auto held = now->paths.find(path); !path.empty() && held != now->paths.end() && !held->second->empty())
-                            fail(nodes::code::source_conflict, path + " was created since this batch read the source");
+                auto observed = source.projection(in.expected);
+                auto check_destination = [&](const std::string& path) {
+                    for (const auto& occupied : overlapping_paths(now->paths, path)) {
+                        auto before = observed->paths.find(occupied);
+                        for (const auto& id : *now->paths.find(occupied)->second)
+                            if (before == observed->paths.end() || !before->second->contains(id))
+                                fail(nodes::code::source_conflict, path + " was created since this batch read the source");
+                    }
+                };
+                for (auto& e : in.edits) {
+                    if (e.kind == "create" || e.kind == "binary_create")
+                        check_destination(e.path);
+                    else if (e.kind == "move")
+                        check_destination(e.target);
+                    else if (e.kind == "directory_move") {
+                        auto prefix = e.path + "/";
+                        for (auto it = observed->paths.lower_bound(prefix); it != observed->paths.end() && it->first.starts_with(prefix); ++it)
+                            check_destination(e.target + it->first.substr(e.path.size()));
+                    }
+                }
             }
             // A fork copies a state that exists; an integration or admission joins states, and that may grow the target.
             if (in.action == "integrate" || in.action == "admit")
@@ -3666,7 +3709,7 @@ namespace nodes {
             interrupt_at("after_commit");
             return out;
         }
-        // Language data is derived from source, so it stays local to this node and is checked against the version it describes.
+        // Reads select a stored revision within the requested worldline.
         auto selected_heads(const node_request& in) -> std::vector<std::string> {
             auto found = roots.find(in.worldline);
             if (found == roots.end() && in.worldline != "main")
@@ -3683,408 +3726,10 @@ namespace nodes {
             }
             return heads;
         }
-        static constexpr std::size_t semantic_records = 200000, semantic_text = 4096, semantic_bytes = 16 * 1024 * 1024, anchor_spans = 10000;
-        template <class F> static void each_span(semantic::generation& g, F&& f) {
-            for (auto& scope : g.scopes)
-                f(scope.range);
-            for (auto& symbol : g.symbols) {
-                for (auto& span : symbol.declarations)
-                    f(span);
-                for (auto& span : symbol.definitions)
-                    f(span);
-            }
-            for (auto& reference : g.references)
-                f(reference.range);
-            for (auto& diagnostic : g.diagnostics)
-                f(diagnostic.range);
-        }
-        auto semantic_publish(const node_request& in) -> node_reply {
-            if (!in.generation || !in.environment.empty() || !in.expected.empty() || !in.source.empty() || !in.target.empty() || !in.snapshot.empty() ||
-                !in.revision.empty() || !in.spans.empty() || !in.edits.empty() || !in.operation.empty() || in.activation || !in.configuration.empty() ||
-                !in.decisions.empty() || !in.dependencies.empty() || !in.intent.empty() || !in.result.empty() || !in.tool.empty() ||
-                !in.genesis_nonce.empty() || !in.authors.empty() || !in.nodes.empty() || !in.policies.empty() || !in.settled.empty() || !in.want.empty() ||
-                !in.parts.empty() || !in.caller_operation.empty() || in.force || in.capture || !in.scopes.empty() || in.max_bytes != 1024 * 1024 ||
-                in.limit != 100 || in.protected_worldlines != std::vector<std::string>{"main"})
-                fail(nodes::code::invalid_record, "semantic publication takes one generation and its worldline");
-            auto generation = *in.generation;
-            for (auto* field : {&generation.environment, &generation.service, &generation.service_version, &generation.version})
-                if (field->empty() || field->size() > 256)
-                    fail(nodes::code::invalid_record, "semantic generation identity is incomplete");
-            std::size_t records = generation.covered.size() + generation.scopes.size() + generation.symbols.size() + generation.references.size() +
-                                  generation.relations.size() + generation.diagnostics.size();
-            std::size_t text = 0;
-            // Counted as JSON text: a quote, backslash or control character takes up to six bytes.
-            auto measure = [&](const std::string& value) {
-                if (value.size() > semantic_text)
-                    fail(nodes::code::resource_limit, "semantic text field exceeds 4 KiB");
-                text += value.size() +
-                        5 * static_cast<std::size_t>(std::ranges::count_if(value, [](unsigned char c) { return c < 0x20 || c == '"' || c == '\\'; }));
-            };
-            for (auto& scope : generation.scopes)
-                for (auto* v : {&scope.id, &scope.parent, &scope.kind, &scope.symbol})
-                    measure(*v);
-            for (auto& symbol : generation.symbols) {
-                for (auto* v : {&symbol.id, &symbol.name, &symbol.kind, &symbol.scope})
-                    measure(*v);
-                records += symbol.declarations.size() + symbol.definitions.size();
-            }
-            for (auto& reference : generation.references)
-                for (auto* v : {&reference.target, &reference.kind})
-                    measure(*v);
-            for (auto& relation : generation.relations)
-                for (auto* v : {&relation.source, &relation.target, &relation.kind})
-                    measure(*v);
-            for (auto& diagnostic : generation.diagnostics)
-                for (auto* v : {&diagnostic.severity, &diagnostic.message})
-                    measure(*v);
-            for (auto& covered : generation.covered)
-                for (auto* v : {&covered.document, &covered.digest})
-                    measure(*v);
-            each_span(generation, [&](semantic::span& span) {
-                for (auto* v : {&span.document, &span.first.run, &span.last.run})
-                    measure(*v);
-            });
-            if (records > semantic_records || text > semantic_bytes)
-                fail(nodes::code::resource_limit, "semantic generation is too large");
-            ensure_kernel();
-            auto heads = selected_heads({.action = "inspect", .worldline = in.worldline, .revision = generation.version});
-            auto state_owner = source.projection(heads);
-            const auto& state = *state_owner;
-            each_span(generation, [&](semantic::span& span) {
-                span.place.reset();
-                auto found = state.files.find(span.document);
-                if (found == state.files.end() || found->second->kind != "text")
-                    fail(nodes::code::invalid_record, "semantic span names no text document of this version");
-                auto& file = *found->second;
-                auto first = file.position({span.first.run, span.first.offset}), last = file.position({span.last.run, span.last.offset});
-                if (!first || !last || *first > *last)
-                    fail(nodes::code::invalid_record, "semantic span is outside its document");
-            });
-            std::map<std::string, std::string> parents;
-            std::set<std::string> symbols;
-            for (auto& scope : generation.scopes)
-                if (scope.id.empty() || !parents.emplace(scope.id, scope.parent).second)
-                    fail(nodes::code::invalid_record, "semantic scope identities must be unique");
-            for (auto& symbol : generation.symbols)
-                if (symbol.id.empty() || !symbols.insert(symbol.id).second)
-                    fail(nodes::code::invalid_record, "semantic symbol identities must be unique");
-            for (auto& scope : generation.scopes) {
-                if (!scope.parent.empty() && !parents.contains(scope.parent))
-                    fail(nodes::code::invalid_record, "semantic scope parent is unknown");
-                if (!scope.symbol.empty() && !symbols.contains(scope.symbol))
-                    fail(nodes::code::invalid_record, "semantic scope symbol is unknown");
-            }
-            // Each scope is visited once: a walk stops at a scope already known to reach the top.
-            std::set<std::string> rooted;
-            for (auto& [id, _] : parents) {
-                std::vector<std::string> walk;
-                std::set<std::string> on_walk;
-                for (auto at = id; !at.empty() && !rooted.contains(at); at = parents.at(at)) {
-                    if (!on_walk.insert(at).second)
-                        fail(nodes::code::invalid_record, "semantic scopes form a cycle");
-                    walk.push_back(at);
-                }
-                rooted.insert(walk.begin(), walk.end());
-            }
-            // A child scope lies inside its parent, so a lock on the parent holds the child.
-            std::map<std::string, std::tuple<std::string, std::uint64_t, std::uint64_t>> extents;
-            for (auto& scope : generation.scopes) {
-                auto& file = *state.files.find(scope.range.document)->second;
-                extents[scope.id] = {scope.range.document, *file.position({scope.range.first.run, scope.range.first.offset}),
-                                     *file.position({scope.range.last.run, scope.range.last.offset})};
-            }
-            for (auto& scope : generation.scopes)
-                if (!scope.parent.empty()) {
-                    auto& [document, begin, end] = extents.at(scope.id);
-                    auto& [outer, first, last] = extents.at(scope.parent);
-                    if (document != outer || begin < first || end > last)
-                        fail(nodes::code::invalid_record, "semantic scope lies outside its parent");
-                }
-            for (auto& symbol : generation.symbols)
-                if (!symbol.scope.empty() && !parents.contains(symbol.scope))
-                    fail(nodes::code::invalid_record, "semantic symbol scope is unknown");
-            for (auto& reference : generation.references)
-                if (!symbols.contains(reference.target))
-                    fail(nodes::code::invalid_record, "semantic reference target is unknown");
-            for (auto& relation : generation.relations)
-                if (!symbols.contains(relation.source) || !symbols.contains(relation.target))
-                    fail(nodes::code::invalid_record, "semantic relation names an unknown symbol");
-            for (auto& covered : generation.covered) {
-                auto found = state.files.find(covered.document);
-                if (found == state.files.end() || found->second->digest != covered.digest)
-                    fail(nodes::code::invalid_record, "semantic coverage does not match this version");
-            }
-            auto data = rfl::json::write(generation);
-            if (data.size() > semantic_bytes)
-                fail(nodes::code::resource_limit, "semantic generation is too large");
-            transaction tx{*db};
-            // A new publication for the same version replaces the old row, so it also becomes the newest.
-            statement upsert{*db, "INSERT OR REPLACE INTO semantics(environment,service,version,frontier,data) VALUES(?1,?2,?3,?4,?5)"};
-            upsert.text(1, generation.environment);
-            upsert.text(2, generation.service);
-            upsert.text(3, generation.version);
-            upsert.bind(4, codec::encode(value::map{{"frontier", strings(heads)}}));
-            upsert.text(5, data);
-            upsert.next();
-            tx.commit();
-            auto out = identity();
-            out.version = generation.version;
-            out.frontier = heads;
-            return out;
-        }
-        // Turns path and character offsets of the selected version into character identities, so providers can publish spans.
-        auto anchor(const node_request& in) -> node_reply {
-            if (in.spans.size() > anchor_spans)
-                fail(nodes::code::resource_limit, "anchor request exceeds 10000 spans");
-            ensure_kernel();
-            auto heads = selected_heads(in);
-            auto state_owner = source.projection(heads);
-            const auto& state = *state_owner;
-            auto out = identity();
-            out.frontier = heads;
-            out.version = version(heads);
-            for (auto span : in.spans) {
-                if (!span.place)
-                    fail(nodes::code::invalid_record, "anchor span needs a place");
-                auto& at = *span.place;
-                auto& file = state.path(at.path);
-                if (file.kind != "text" || at.begin >= at.end || at.end > file.size())
-                    fail(nodes::code::invalid_record, "anchor span is outside its text document");
-                auto first = file.at(at.begin), last = file.at(at.end - 1);
-                span.document = file.id;
-                span.first = {first.run, first.offset};
-                span.last = {last.run, last.offset};
-                out.spans.push_back(std::move(span));
-            }
-            return out;
-        }
-        // The generation for the selected version, or else the causally newest one the selected source contains.
-        auto newest(const std::vector<std::string>& heads, const std::string& environment, const std::string& service)
-            -> std::optional<std::pair<semantic::generation, std::size_t>> {
-            statement rows{*db, "SELECT version,frontier,data FROM semantics WHERE environment=?1 AND (?2='' OR service=?2) ORDER BY seq DESC"};
-            rows.text(1, environment);
-            rows.text(2, service);
-            auto exact = version(heads);
-            std::optional<std::pair<std::vector<std::string>, std::string>> best;
-            auto selected = source.within(heads);
-            while (rows.next()) {
-                auto frontier = string_list(codec::decode(rows.data(1)).at("frontier"));
-                if (rows.data(0) == exact) {
-                    best = {std::move(frontier), rows.data(2)};
-                    break;
-                }
-                if ((frontier.empty() && !heads.empty()) || !std::ranges::all_of(frontier, selected))
-                    continue;
-                if (!best || (best->first != frontier && std::ranges::all_of(best->first, source.within(frontier))))
-                    best = {std::move(frontier), rows.data(2)};
-            }
-            if (!best)
-                return std::nullopt;
-            auto parsed = rfl::json::read<semantic::generation>(best->second);
-            if (!parsed)
-                fail(nodes::code::storage_failure, "stored semantic generation is unreadable");
-            return std::pair{std::move(*parsed), best->second.size()};
-        }
-        auto semantic_query(const node_request& in) -> node_reply {
-            if (in.environment.empty())
-                fail(nodes::code::invalid_record, "semantic query needs an environment");
-            ensure_kernel();
-            auto heads = selected_heads(in);
-            auto out = identity();
-            out.frontier = heads;
-            out.version = version(heads);
-            auto found = newest(heads, in.environment, in.target);
-            if (!found)
-                return out;
-            auto& [generation, stored] = *found;
-            auto state_owner = source.projection(heads);
-            const auto& state = *state_owner;
-            std::size_t placed = stored;
-            each_span(generation, [&](semantic::span& span) {
-                span.place.reset();
-                auto file = state.files.find(span.document);
-                if (file == state.files.end() || file->second->kind != "text")
-                    return;
-                auto first = file->second->position({span.first.run, span.first.offset}), last = file->second->position({span.last.run, span.last.offset});
-                if (first && last && *first <= *last) {
-                    auto& path = file->second->path;
-                    if ((placed += path.size() + 5 * std::ranges::count_if(path, [](unsigned char c) { return c < 0x20 || c == '"' || c == '\\'; }) + 96) >
-                        2 * semantic_bytes)
-                        fail(nodes::code::resource_limit, "semantic reply exceeds its byte budget");
-                    span.place = semantic::place{file->second->path, *first, *last + 1};
-                }
-            });
-            out.stale = generation.version != out.version;
-            out.semantic = std::move(generation);
-            return out;
-        }
-        // Scope locks are local to the node that accepts writes; they are not replicated objects. A lock is a syntax
-        // scope from language analysis; it holds the scope's characters, its children included, and "::" holds all.
-        // range is what the lock keeps from others; intact says whether its scope is still whole, the condition that lets its
-        // holder edit inside it.
-        struct held {
-            nodes::lock lock;
-            std::optional<std::pair<std::uint64_t, std::uint64_t>> range;
-            bool intact = true;
-            auto global() const -> bool { return lock.scope == nodes::global_scope; }
-        };
-        auto line_locks(const std::string& line) -> std::vector<nodes::lock> {
-            std::vector<nodes::lock> out;
-            statement rows{*db, "SELECT id,holder,scope,symbol,environment,document,first_run,first_offset,last_run,last_offset,acquired FROM locks "
-                                "WHERE line=?1 ORDER BY id"};
-            rows.text(1, line);
-            while (rows.next()) {
-                nodes::lock l{.id = rows.number(0),
-                              .holder = rows.data(1),
-                              .scope = rows.data(2),
-                              .symbol = rows.data(3),
-                              .environment = rows.data(4),
-                              .document = rows.data(5),
-                              .acquired = static_cast<std::int64_t>(rows.number(10))};
-                if (!rows.data(6).empty()) {
-                    l.first = semantic::anchor{rows.data(6), rows.number(7)};
-                    l.last = semantic::anchor{rows.data(8), rows.number(9)};
-                }
-                out.push_back(std::move(l));
-            }
-            return out;
-        }
-        // Where a scope lock is in one source state. A scope whose end characters were removed holds its whole document.
-        static auto resolve(const nodes::lock& l, const source_state& state) -> held {
-            held out{l, std::nullopt};
-            if (out.global())
-                return out;
-            if (auto found = state.files.find(l.document); found != state.files.end() && found->second->present) {
-                auto& file = *found->second;
-                auto b = file.position({l.first->run, l.first->offset}), e = file.position({l.last->run, l.last->offset});
-                out.intact = b && e && *b <= *e;
-                out.range = out.intact ? std::pair{*b, *e + 1} : std::pair{std::uint64_t{0}, file.size()};
-                out.lock.place = semantic::place{file.path, out.range->first, out.range->second};
-            }
-            return out;
-        }
-        static auto overlaps(const held& a, const held& b) -> bool {
-            if (a.global() || b.global())
-                return true;
-            return a.range && b.range && a.lock.document == b.lock.document && a.range->first < b.range->second && b.range->first < a.range->second;
-        }
-        static auto holding(const held& h) -> std::string { return std::format("{} holds {}", h.lock.holder, h.lock.scope); }
-        static auto encloses(std::string_view kind) -> bool { return kind == "namespace" || kind == "type" || kind == "function" || kind == "module"; }
-        static void lock_request(const node_request& in) {
-            if (in.holder.empty())
-                fail(nodes::code::invalid_record, "a lock request needs its holder");
-            if (!in.edits.empty() || !in.expected.empty() || !in.source.empty() || !in.decisions.empty() || in.generation || !in.spans.empty() ||
-                !in.operation.empty() || !in.revision.empty() || !in.snapshot.empty() || in.capture)
-                fail(nodes::code::invalid_record, "a lock request takes only scopes, an environment and a target");
-        }
-        auto lock(const node_request& in) -> node_reply {
-            lock_request(in);
-            if (in.scopes.empty())
-                fail(nodes::code::invalid_record, "a lock names its scopes");
-            if (in.scopes.size() > anchor_spans)
-                fail(nodes::code::resource_limit, "a lock names at most 10000 scopes");
-            transaction tx{*db};
-            refresh_external();
-            ensure_kernel();
-            auto line = root_line(in.worldline);
-            auto heads = selected_heads({.action = "inspect", .worldline = in.worldline});
-            auto state_owner = source.projection(heads);
-            const auto& state = *state_owner;
-            std::vector<held> existing;
-            for (auto& l : line_locks(line))
-                existing.push_back(resolve(l, state));
-            std::optional<semantic::generation> analysis;
-            if (std::ranges::any_of(in.scopes, [](auto& s) { return s != nodes::global_scope; })) {
-                if (in.environment.empty())
-                    fail(nodes::code::invalid_record, "a scope lock names the analysis environment of its scopes");
-                auto found = newest(heads, in.environment, in.target);
-                if (!found)
-                    fail(nodes::code::invalid_record, "this worldline has no analysis to name scopes from");
-                analysis = std::move(found->first);
-            }
-            for (auto& id : in.scopes) {
-                nodes::lock l{.holder = in.holder,
-                              .scope = id,
-                              .environment = id == nodes::global_scope ? std::string{} : in.environment,
-                              .acquired = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count()};
-                if (id != nodes::global_scope) {
-                    auto scope = std::ranges::find(analysis->scopes, id, &semantic::scope::id);
-                    if (scope == analysis->scopes.end())
-                        fail(nodes::code::invalid_record, "the analysis has no scope " + id);
-                    if (!encloses(scope->kind))
-                        fail(nodes::code::invalid_record, "only a namespace, type, function or module scope can be locked");
-                    l.symbol = scope->symbol;
-                    l.document = scope->range.document;
-                    l.first = scope->range.first;
-                    l.last = scope->range.last;
-                }
-                auto wanted = resolve(l, state);
-                if (!wanted.global() && (!wanted.range || !wanted.intact))
-                    fail(nodes::code::invalid_record, "scope " + id + " is not whole in this worldline's source; analyze it again");
-                for (auto& other : existing)
-                    if (other.lock.holder != in.holder && overlaps(wanted, other))
-                        fail("scope_locked", holding(other));
-                // Locking a scope again takes it as the newest analysis names it.
-                statement insert{*db, "INSERT INTO locks(line,holder,scope,symbol,environment,document,first_run,first_offset,last_run,last_offset,"
-                                      "acquired) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11) ON CONFLICT(line,holder,scope,environment) DO UPDATE SET "
-                                      "symbol=excluded.symbol,document=excluded.document,first_run=excluded.first_run,first_offset=excluded.first_offset,"
-                                      "last_run=excluded.last_run,last_offset=excluded.last_offset,acquired=excluded.acquired"};
-                insert.text(1, line);
-                insert.text(2, l.holder);
-                insert.text(3, l.scope);
-                insert.text(4, l.symbol);
-                insert.text(5, l.environment);
-                insert.text(6, l.document);
-                insert.text(7, l.first ? l.first->run : std::string{});
-                insert.number(8, l.first ? l.first->offset : 0);
-                insert.text(9, l.last ? l.last->run : std::string{});
-                insert.number(10, l.last ? l.last->offset : 0);
-                insert.number(11, static_cast<std::uint64_t>(l.acquired));
-                insert.next();
-                existing.push_back(std::move(wanted));
-            }
-            tx.commit();
-            return locks(in);
-        }
-        // Releases the named scopes of the caller, or one lock by number; a forced release may name another holder's lock.
-        auto unlock(const node_request& in) -> node_reply {
-            lock_request(in);
-            if (in.scopes.empty() == in.target.empty())
-                fail(nodes::code::invalid_record, "an unlock names either scopes or one lock number");
-            transaction tx{*db};
-            auto line = root_line(in.worldline);
-            if (!in.scopes.empty()) {
-                for (auto& scope : in.scopes) {
-                    statement remove{*db, "DELETE FROM locks WHERE line=?1 AND holder=?2 AND scope=?3 AND (?4='' OR environment=?4)"};
-                    remove.text(1, line);
-                    remove.text(2, in.holder);
-                    remove.text(3, scope);
-                    remove.text(4, scope == nodes::global_scope ? std::string{} : in.environment);
-                    remove.next();
-                }
-            } else {
-                std::uint64_t id = 0;
-                auto [end, error] = std::from_chars(in.target.data(), in.target.data() + in.target.size(), id);
-                if (error != std::errc{} || end != in.target.data() + in.target.size())
-                    fail(nodes::code::invalid_record, "unlock target is a lock number");
-                statement holder{*db, "SELECT holder FROM locks WHERE line=?1 AND id=?2"};
-                holder.text(1, line);
-                holder.number(2, id);
-                if (!holder.next())
-                    fail(nodes::code::invalid_record, "no such lock");
-                if (holder.data(0) != in.holder && !in.force)
-                    fail(nodes::code::permission_denied, "another writer holds this lock");
-                statement remove{*db, "DELETE FROM locks WHERE line=?1 AND id=?2"};
-                remove.text(1, line);
-                remove.number(2, id);
-                remove.next();
-            }
-            tx.commit();
-            return locks(in);
-        }
+        static constexpr std::size_t content_parts = 10000;
         // Byte ranges of files of one version, named by the SHA-256 of their bytes; builds sync workers from these.
         auto content(const node_request& in) -> node_reply {
-            if (in.parts.empty() || in.parts.size() > anchor_spans)
+            if (in.parts.empty() || in.parts.size() > content_parts)
                 fail(nodes::code::resource_limit, "a content request names 1 through 10000 parts");
             ensure_kernel();
             auto heads = selected_heads(in);
@@ -4109,6 +3754,77 @@ namespace nodes {
             }
             return out;
         }
+        auto mail(const node_request& in) -> node_reply {
+            auto out = identity();
+            auto read_message = [](statement& row) -> nodes::mail_message {
+                return {.id = row.number(0),
+                        .at = row.number(1),
+                        .sender = row.data(2),
+                        .worldline = row.data(3),
+                        .recipient = row.data(4),
+                        .body = row.data(5),
+                        .operation = row.data(6)};
+            };
+            if (in.action == "mail_list") {
+                if (in.target.empty() || in.target.size() > 256 || !in.limit || in.limit > 100)
+                    fail(nodes::code::invalid_record, "d-mail reads require a recipient and a limit of 1 through 100");
+                statement rows{*db, "SELECT id,at,sender,line,recipient,body,operation FROM dmail WHERE recipient=?1 AND id>?2 ORDER BY id LIMIT ?3"};
+                rows.text(1, in.target);
+                rows.number(2, in.after);
+                rows.number(3, in.limit + 1);
+                std::uint64_t bytes = 0;
+                while (rows.next()) {
+                    auto message = read_message(rows);
+                    if (out.messages.size() == in.limit || bytes + message.body.size() > 4 * 1024 * 1024) {
+                        out.truncated = true;
+                        break;
+                    }
+                    bytes += message.body.size();
+                    out.messages.push_back(std::move(message));
+                }
+                return out;
+            }
+            if (!in.mail || in.actor.empty() || !content::is_hash(in.operation))
+                fail(nodes::code::invalid_record, "d-mail requires an authenticated sender, operation ID, recipient and body");
+            const auto& value = *in.mail;
+            if (value.recipient.empty() || value.recipient.size() > 256 || value.body.empty() || value.body.size() > 1024 * 1024 ||
+                value.recipient.find('\0') != std::string::npos || value.body.find('\0') != std::string::npos)
+                fail(nodes::code::invalid_record, "d-mail recipient must be 1 through 256 bytes and body 1 byte through 1 MiB of text");
+            (void)scalars(value.recipient);
+            (void)scalars(value.body);
+            (void)root_line(in.worldline);
+            transaction tx{*db};
+            statement prior{*db, "SELECT id,at,sender,line,recipient,body,operation FROM dmail WHERE sender=?1 AND operation=?2"};
+            prior.text(1, in.actor);
+            prior.text(2, in.operation);
+            if (prior.next()) {
+                auto previous = read_message(prior);
+                if (previous.worldline != in.worldline || previous.recipient != value.recipient || previous.body != value.body)
+                    fail(nodes::code::source_conflict, "d-mail operation ID was already used with another message");
+                out.messages.push_back(std::move(previous));
+                out.replayed = true;
+                return out;
+            }
+            auto at = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count());
+            statement insert{*db, "INSERT INTO dmail(at,sender,line,recipient,body,operation) VALUES(?1,?2,?3,?4,?5,?6)"};
+            insert.number(1, at);
+            insert.text(2, in.actor);
+            insert.text(3, in.worldline);
+            insert.text(4, value.recipient);
+            insert.text(5, value.body);
+            insert.text(6, in.operation);
+            insert.next();
+            auto id = static_cast<std::uint64_t>(sqlite3_last_insert_rowid(db->handle));
+            tx.commit();
+            out.messages.push_back({.id = id,
+                                    .at = at,
+                                    .sender = in.actor,
+                                    .worldline = in.worldline,
+                                    .recipient = value.recipient,
+                                    .body = value.body,
+                                    .operation = in.operation});
+            return out;
+        }
         auto worldline_list() -> node_reply {
             ensure_kernel();
             auto out = identity();
@@ -4123,20 +3839,6 @@ namespace nodes {
             }
             return out;
         }
-        auto locks(const node_request& in) -> node_reply {
-            ensure_kernel();
-            auto line = root_line(in.worldline);
-            auto heads = selected_heads({.action = "inspect", .worldline = in.worldline});
-            auto state_owner = source.projection(heads);
-            auto out = identity();
-            out.frontier = heads;
-            out.version = version(heads);
-            for (auto& l : line_locks(line))
-                out.locks.push_back(resolve(l, *state_owner).lock);
-            return out;
-        }
-        // An attributed write must lie inside the caller's own scope locks, measured in the state it observed, and
-        // never inside another holder's. Text edits need a scope that contains them; every other change needs "::".
         // Limits hold for the state a batch publishes, concurrent changes joined: no file it grows or brings back exceeds the file limit,
         // and it may not grow a project beyond the project limit. Zero is no limit.
         template <class State> void check_limits(const node_request& in, const State& before, const State& after) {
@@ -4156,60 +3858,6 @@ namespace nodes {
             if (in.project_limit)
                 if (auto bytes = total(after); bytes > in.project_limit && bytes > total(before))
                     fail(nodes::code::resource_limit, std::format("the project would exceed its {} byte limit", in.project_limit));
-        }
-        void check_locks(const node_request& in, const std::vector<std::string>& heads) {
-            auto line = root_line(in.worldline);
-            auto state_owner = source.projection(heads);
-            const auto& state = *state_owner;
-            std::vector<held> current;
-            for (auto& l : line_locks(line))
-                current.push_back(resolve(l, state));
-            auto require = [&](const held& wanted, bool point) {
-                for (auto& h : current)
-                    if (h.lock.holder != in.holder && overlaps(h, wanted))
-                        fail("scope_locked", holding(h));
-                for (auto& h : current)
-                    if (h.lock.holder == in.holder &&
-                        (h.global() ||
-                         (h.intact && wanted.range && h.range && h.lock.document == wanted.lock.document && h.range->first <= wanted.range->first &&
-                          (point ? wanted.range->first <= h.range->second : wanted.range->second <= h.range->second))))
-                        return;
-                fail("scope_locked", "lock the scope that contains this change first");
-            };
-            const held everything{nodes::lock{.scope = std::string{nodes::global_scope}}, std::nullopt};
-            // An apply may take "::" for itself alone: it needs no other holder's lock in the way, and leaves nothing held behind.
-            if (in.action == "apply" && !in.scopes.empty()) {
-                if (in.scopes != std::vector<std::string>{std::string{nodes::global_scope}})
-                    fail(nodes::code::invalid_record, "an apply takes only the global scope for itself");
-                for (auto& h : current)
-                    if (h.lock.holder != in.holder)
-                        fail("scope_locked", holding(h));
-                return;
-            }
-            if (in.capture) {
-                if (!heads.empty() || std::ranges::any_of(in.edits, [](auto& e) { return e.kind != "create" && e.kind != "binary_create"; }))
-                    fail(nodes::code::invalid_record, "a capture only creates the files of an empty worldline");
-                for (auto& h : current)
-                    if (h.lock.holder != in.holder)
-                        fail("scope_locked", holding(h));
-                return;
-            }
-            if (in.action != "apply" || !in.decisions.empty())
-                return require(everything, false);
-            for (auto& e : in.edits) {
-                const source_file* file = nullptr;
-                if (!e.document.empty()) {
-                    if (auto it = state.files.find(e.document); it != state.files.end())
-                        file = it->second.get();
-                } else if (auto it = state.paths.find(e.path); it != state.paths.end() && it->second->size() == 1)
-                    file = state.files.find(*it->second->begin())->second.get();
-                if (e.kind != "edit" || !file || file->kind != "text") {
-                    require(everything, false);
-                    continue;
-                }
-                held target{nodes::lock{.document = file->id}, std::pair{e.offset, e.offset + std::max<std::uint64_t>(e.count, 1)}};
-                require(target, e.count == 0);
-            }
         }
         auto create_policy(const node_request& in) -> node_reply {
             auto previous = in.policies.empty() ? policies : vector_set(in.policies);
@@ -4847,8 +4495,8 @@ namespace nodes {
             ~cache_boundary() { state.trim_kernel(); }
         } cache{s};
         try {
-            static const std::set<std::string> reads{"identity", "offer",   "usage",    "rejected", "send",  "inspect",    "tree",    "read",        "compare",
-                                                     "history",  "receipt", "semantic", "anchor",   "locks", "worldlines", "content", "contribution"};
+            static const std::set<std::string> reads{"identity", "offer",   "usage",   "rejected",   "send",    "inspect",      "tree",     "read",
+                                                     "compare",  "history", "receipt", "worldlines", "content", "contribution", "mail_list"};
             if (s.read_only && !reads.contains(in.action))
                 fail(nodes::code::policy_denied, "source reader does not accept mutations");
             std::optional<read_snapshot> snapshot;
@@ -4935,24 +4583,14 @@ namespace nodes {
                 s.ensure_kernel();
                 return s.create_policy(in);
             }
-            if (in.action == "semantic")
-                return s.semantic_query(in);
-            if (in.action == "anchor")
-                return s.anchor(in);
-            if (in.action == "lock")
-                return s.lock(in);
-            if (in.action == "unlock")
-                return s.unlock(in);
-            if (in.action == "locks")
-                return s.locks(in);
+            if (in.action == "mail_send" || in.action == "mail_list")
+                return s.mail(in);
             if (in.action == "worldlines")
                 return s.worldline_list();
             if (in.action == "content")
                 return s.content(in);
             if (in.action == "contribution")
                 return s.contribution(in);
-            if (in.action == "semantic.publish")
-                return s.semantic_publish(in);
             if (in.action == "checkpoint") {
                 if (in.target.empty())
                     s.ensure_kernel();

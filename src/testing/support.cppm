@@ -2,9 +2,23 @@ export module support;
 import std;
 import native;
 import async;
+import coroutine;
+import http;
 import protocol;
 
 export namespace test {
+    // Keep sender constraint instantiation inside a module for clients compiled outside module units.
+    struct http_stream {
+        web::stream<native::socket> transport;
+        explicit http_stream(native::socket& socket) : transport(socket) {}
+        auto async_read(std::span<std::byte> buffer, std::stop_token stop) -> coroutine::task<std::size_t> {
+            co_return co_await transport.async_read(buffer, stop);
+        }
+        auto async_write(std::span<const std::byte> buffer, std::stop_token stop) -> coroutine::task<std::size_t> {
+            co_return co_await transport.async_write(buffer, stop);
+        }
+    };
+
     struct scratch {
         std::filesystem::path dir;
         explicit scratch(std::string_view name) : dir(std::filesystem::temp_directory_path() / std::format("test-{}-{}", name, std::random_device{}())) {
@@ -22,7 +36,7 @@ export namespace test {
         std::unique_ptr<state> state_;
 
     public:
-        explicit source_service(std::filesystem::path root, builds::toolset tools = {});
+        explicit source_service(std::filesystem::path root);
         ~source_service();
         auto endpoint() const -> net::ip::tcp::endpoint;
     };

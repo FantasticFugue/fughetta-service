@@ -394,12 +394,10 @@ export namespace package {
                                   .operation = in.operation,
                                   .owner = node.node_id(),
                                   .actor = in.actor,
-                                  .holder = in.holder,
                                   .caller_operation = in.caller_operation,
                                   .expected = fork.frontier,
                                   .intent = "restore package " + in.target,
                                   .result = record,
-                                  .scopes = {"::"},
                                   .file_limit = in.file_limit,
                                   .project_limit = in.project_limit};
         for (auto& f : kept.files) {

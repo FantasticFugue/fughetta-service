@@ -160,7 +160,7 @@ int main(int argc, char** argv) {
                                            .platform = {.os = "linux", .arch = "x86_64"},
                                            .max_inflight = 4,
                                            .protocol = jobs::protocol_version,
-                                           .tools = host::detect_tools(test::toolset())});
+                                           .tools = host::detect_tools(test::toolset()), .toolchain_id = std::string(64, 'a')});
             try {
                 co_await coroutine::with_scope([&](coroutine::scope& requests) -> coroutine::task<> {
                     requests.spawn([](ctx& io, auto& channel) -> coroutine::task<> {
@@ -199,15 +199,14 @@ int main(int argc, char** argv) {
                     co_await execution::schedule_after(io, 1ms);
 
                 for (auto project : {"app", "cm", "commands", "slow"})
-                    co_await tools::worldline::run(s, {.project = project, .action = "lock", .scopes = std::vector<std::string>{"::"}}, note, tester);
-                co_await tools::write::run(s, {.project = "app", .path = "src/msg.txt", .content = "hello v1\n", .operation_id = "write-15"}, note, tester);
+                co_await fixture::write_file(s, {.project = "app", .path = "src/msg.txt", .content = "hello v1\n", .operation_id = "write-15"}, note, tester);
                 out.builds.push_back(co_await build());
-                co_await tools::edit::run(
+                co_await fixture::edit_text(
                     s,
                     {.project = "app", .path = "src/msg.txt", .old_string = "v1", .new_string = "v2", .replace_all = std::nullopt, .operation_id = "edit-16"},
                     note, tester);
-                co_await tools::write::run(s, {.project = "app", .path = "big.bin", .content = std::string(9u << 20, 'z'), .operation_id = "write-17"}, note,
-                                           tester);
+                co_await fixture::write_file(s, {.project = "app", .path = "big.bin", .content = std::string(9u << 20, 'z'), .operation_id = "write-17"},
+                                             note, tester);
                 out.builds.push_back(co_await build());
                 out.cached = co_await build();
                 out.builds.push_back(co_await build(true));
@@ -225,29 +224,30 @@ int main(int argc, char** argv) {
                 for (std::size_t c = 0; c < rt.size(); ++c)
                     config.set(c, snapshot);
 
-                co_await tools::write::run(s, {.project = "cm", .path = "CMakeLists.txt", .content = std::string{cmake_lists}, .operation_id = "write-18"},
-                                           note, tester);
-                co_await tools::write::run(s, {.project = "cm", .path = "hello.c", .content = std::string{hello_c}, .operation_id = "write-19"}, note, tester);
+                co_await fixture::write_file(s, {.project = "cm", .path = "CMakeLists.txt", .content = std::string{cmake_lists}, .operation_id = "write-18"},
+                                             note, tester);
+                co_await fixture::write_file(s, {.project = "cm", .path = "hello.c", .content = std::string{hello_c}, .operation_id = "write-19"}, note,
+                                             tester);
                 auto started = std::chrono::steady_clock::now();
                 out.both = co_await tools::build::run(s, {.project = "cm", .configurations = std::nullopt, .targets = std::nullopt}, note, tester);
                 out.both_seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
-                co_await tools::edit::run(s,
-                                          {.project = "cm",
-                                           .path = "hello.c",
-                                           .old_string = R"(puts("hello from primary");)",
-                                           .new_string = R"(puts("hello from primary"))",
-                                           .replace_all = std::nullopt,
-                                           .operation_id = "edit-20"},
-                                          note, tester);
+                co_await fixture::edit_text(s,
+                                            {.project = "cm",
+                                             .path = "hello.c",
+                                             .old_string = R"(puts("hello from primary");)",
+                                             .new_string = R"(puts("hello from primary"))",
+                                             .replace_all = std::nullopt,
+                                             .operation_id = "edit-20"},
+                                            note, tester);
                 out.broken = co_await tools::build::run(s, {.project = "cm", .configurations = std::nullopt, .targets = std::nullopt}, note, tester);
-                co_await tools::edit::run(s,
-                                          {.project = "cm",
-                                           .path = "hello.c",
-                                           .old_string = R"(puts("hello from primary"))",
-                                           .new_string = R"(puts("hello from primary");)",
-                                           .replace_all = std::nullopt,
-                                           .operation_id = "edit-21"},
-                                          note, tester);
+                co_await fixture::edit_text(s,
+                                            {.project = "cm",
+                                             .path = "hello.c",
+                                             .old_string = R"(puts("hello from primary"))",
+                                             .new_string = R"(puts("hello from primary");)",
+                                             .replace_all = std::nullopt,
+                                             .operation_id = "edit-21"},
+                                            note, tester);
                 out.tested = co_await tools::test::run(s, {.project = "cm", .configurations = std::nullopt, .filter = std::nullopt, .labels = std::nullopt},
                                                        note, tester);
                 out.filtered = co_await tools::test::run(
@@ -257,7 +257,7 @@ int main(int argc, char** argv) {
                 out.ran = co_await tools::launch::run(s, {.project = "cm", .configuration = "hello", .configurations = std::nullopt}, note, tester);
 
                 if (check_commands) {
-                    co_await tools::write::run(
+                    co_await fixture::write_file(
                         s,
                         {.project = "commands",
                          .path = "pkg/Makefile",
@@ -279,7 +279,7 @@ int main(int argc, char** argv) {
                     }
                 }
 
-                co_await tools::write::run(s, {.project = "slow", .path = "x", .content = "x", .operation_id = "write-23"}, note, tester);
+                co_await fixture::write_file(s, {.project = "slow", .path = "x", .content = "x", .operation_id = "write-23"}, note, tester);
                 auto stopped = co_await coroutine::deadline(
                     io, 800ms, tools::build::run(s, {.project = "slow", .configurations = std::nullopt, .targets = std::nullopt}, note, tester));
                 out.slow_stopped = !stopped;
@@ -328,9 +328,8 @@ int main(int argc, char** argv) {
                 tasks.spawn(h.router.workers(0).admit(io, std::move(peer)));
                 while (!h.router.workers(0).holds({}))
                     co_await execution::schedule_after(io, 1ms);
-                co_await tools::worldline::run(services, {.project = "app", .action = "lock", .scopes = std::vector<std::string>{"::"}}, note, actor);
                 for (const auto& [path, text] : sources)
-                    co_await tools::write::run(services, {.project = "app", .path = path, .content = text, .operation_id = "write " + path}, note, actor);
+                    co_await fixture::write_file(services, {.project = "app", .path = path, .content = text, .operation_id = "write " + path}, note, actor);
                 auto result = co_await tools::build::run(services, {.project = "app"}, note, actor);
                 expect(result.ok >> fatal) << config::write(result);
                 std::vector<std::string> names;
@@ -346,6 +345,206 @@ int main(int argc, char** argv) {
         };
         h.rt.run([&](ctx& io, std::size_t core) { return core == 0 ? gate(io) : h.work(io); });
     }
+
+    constexpr std::string_view vcpkg_manifest_v1 = R"({
+  "$schema": "https://example.invalid/vcpkg.schema.json",
+  "name": "consumer-app",
+  "version": "1.2.3",
+  "builtin-baseline": "0123456789abcdef0123456789abcdef01234567",
+  "dependencies": ["fmt", {"name": "boost-asio", "features": ["ssl"], "default-features": false}]
+}
+)";
+
+    constexpr std::string_view vcpkg_manifest_v2 = R"({"dependencies": ["zlib"]}
+)";
+
+    // What the fake workers saw cross the wire, in the order it happened on the gateway's core.
+    struct dependency_capture {
+        std::vector<jobs::dependency_fill> fills;
+        std::vector<std::string> fill_workers;
+        std::vector<jobs::build_request> builds;
+        // RPCs that reached a worker of the wrong role; must stay empty.
+        std::vector<std::string> leaked;
+        std::vector<std::uint64_t> fill_seqs, build_seqs, build_saw_fill;
+        std::uint64_t sequence = 0, last_fill = 0;
+        bool fail_fill = false;
+    };
+
+    // A worker of the jobs protocol that answers from memory: no tool ever runs. A publisher answers dependency.fill,
+    // a consumer answers sync.offer and build; each records any call meant for the other role.
+    struct dependency_worker {
+        dependency_capture& captured;
+        std::string name;
+        bool publisher = false;
+        std::string toolchain = std::string(64, 'a');
+
+        auto serve(ctx& io, std::uint16_t port) -> coroutine::task<> {
+            auto sock = co_await io::connect(io, {net::ip::address_v4{{127, 0, 0, 1}}, port});
+            transport::channel<socket> chan{sock};
+            transport::dispatcher<socket> handlers;
+            handlers.on<jobs::sync_offer>([this](jobs::sync_offer offer, auto&) -> coroutine::task<jobs::sync_plan> {
+                if (publisher)
+                    captured.leaked.push_back("sync.offer");
+                co_return jobs::sync_plan{.snapshot = offer.tree.id()};
+            });
+            handlers.on<jobs::build_request>([this](jobs::build_request request, auto&) -> coroutine::task<jobs::build_report> {
+                if (publisher) {
+                    captured.leaked.push_back("build");
+                    throw std::invalid_argument("dependency publishers only accept dependency.fill");
+                }
+                captured.build_seqs.push_back(++captured.sequence);
+                captured.build_saw_fill.push_back(captured.last_fill);
+                captured.builds.push_back(std::move(request));
+                jobs::build_report report{.tree = captured.builds.back().tree};
+                for (const auto& step : captured.builds.back().steps)
+                    report.steps.push_back({.name = step.name, .exit_code = 0, .seconds = 0.001});
+                report.seconds = 0.001;
+                co_return report;
+            });
+            handlers.on<jobs::dependency_fill>([this](jobs::dependency_fill request, auto&) -> coroutine::task<jobs::build_report> {
+                if (!publisher)
+                    captured.leaked.push_back("dependency.fill");
+                captured.fill_seqs.push_back(++captured.sequence);
+                captured.last_fill = captured.sequence;
+                captured.fill_workers.push_back(name);
+                captured.fills.push_back(std::move(request));
+                jobs::build_report report;
+                report.steps.push_back({.name = "install", .exit_code = captured.fail_fill ? 1 : 0, .seconds = 0.001});
+                report.seconds = 0.001;
+                co_return report;
+            });
+            co_await chan.post(jobs::hello{.name = name,
+                                           .platform = {.os = "linux", .arch = "x86_64"},
+                                           .max_inflight = 4,
+                                           .protocol = jobs::protocol_version,
+                                           .tools = {"vcpkg"},
+                                           .toolchain_id = toolchain,
+                                           .dependency_publisher = publisher});
+            try {
+                co_await coroutine::with_scope([&](coroutine::scope& requests) -> coroutine::task<> {
+                    requests.spawn([](ctx& io, auto& channel) -> coroutine::task<> {
+                        for (;;) {
+                            co_await execution::schedule_after(io, 2s);
+                            co_await channel.post(jobs::heartbeat{});
+                        }
+                    }(io, chan));
+                    for (;;)
+                        requests.spawn(handlers.handle(chan, co_await chan.recv()));
+                });
+            } catch (const std::exception&) {
+            }
+        }
+    };
+
+    struct dependency_outcome {
+        tools::results first, pinned;
+    };
+
+    // A gateway with the in-process source and fake protocol workers; the consumer project's only build step is a
+    // vcpkg manifest install, so the real build tool path runs fill_dependencies before the private build.
+    struct dependency_harness {
+        bool with_publisher = true;
+        bool publisher_same_toolchain = true;
+        bool with_manifest = true;
+        bool with_configuration = false;
+        bool fail_fill = false;
+        bool repin = false;
+
+        test::scratch tmp{"deps"};
+        config::slots config{
+            2, [] {
+                config::document value;
+                builds::config<"vcpkg"> options;
+                options.install_dir = "vcpkg_installed";
+                options.triplet = "x64-linux";
+                options.host_triplet = "x64-linux";
+                builds::configuration build;
+                build.builders["vcpkg"] = builds::with<"vcpkg">{.options = std::move(options)};
+                build.tasks["deps"] = {.builder = "vcpkg", .operation = "install"};
+                build.operations["build"] = {.tasks = {"deps"}};
+                auto& project = value.projects["deps"];
+                project.build_configurations["shared"] = std::move(build);
+                project.default_configurations = {"shared"};
+                project.env["PRIVATE_TOKEN"] = "consumer-secret";
+                config::validate(value);
+                return std::make_shared<const config::document>(std::move(value));
+            }()};
+        cores::io_context<native::context> rt{2};
+        routing::router router{rt};
+        execution::thread_pool pool{2};
+        test::source_service source{tmp.dir / "source"};
+        storage::registry files{rt, tmp.dir / "storage", config, pool, source.endpoint()};
+        dependency_capture captured;
+        dependency_outcome out;
+
+        void run() {
+            rt.run([this](ctx& io, std::size_t core) -> coroutine::task<> {
+                if (core != 0)
+                    co_return;
+                co_await gate(io);
+            });
+        }
+
+        auto gate(ctx& io) -> coroutine::task<> {
+            captured.fail_fill = fail_fill;
+            dependency_worker consumer{captured, "w1"};
+            dependency_worker publisher{captured, "publisher", true, std::string(64, publisher_same_toolchain ? 'a' : 'b')};
+            auto listener = native::listener{io, {net::ip::address_v4::loopback(), 0}};
+            auto port = listener.local_endpoint().port();
+            tools::services services{config.slot(0), router, files, 0};
+            tools::backlog queue{rt, services};
+            services.queue = &queue;
+            mcp::notifier note;
+            const worlds::actor actor{.issuer = "token", .user = "tester", .caller = "dependency-suite", .role = "owner"};
+            co_await coroutine::with_scope([&](coroutine::scope& tasks) -> coroutine::task<> {
+                tasks.spawn(queue.serve(io));
+                tasks.spawn(consumer.serve(io, port));
+                std::size_t workers = 1;
+                if (with_publisher) {
+                    tasks.spawn(publisher.serve(io, port));
+                    ++workers;
+                }
+                for (std::size_t i = 0; i < workers; ++i) {
+                    auto peer = co_await execution::then(net::async_accept(listener), [](auto socket, auto) { return std::move(socket); });
+                    tasks.spawn(router.workers(0).admit(io, std::move(peer)));
+                }
+                for (std::size_t waited = 0; router.workers(0).describe(0).size() < workers;) {
+                    if (++waited > 5000)
+                        throw std::runtime_error("the fake workers did not connect");
+                    co_await execution::schedule_after(io, 1ms);
+                }
+                if (with_manifest)
+                    co_await fixture::write_file(
+                        services,
+                        {.project = "deps", .path = "vcpkg.json", .content = std::string{vcpkg_manifest_v1}, .operation_id = "deps-manifest-v1"},
+                        note, actor);
+                else
+                    co_await fixture::write_file(
+                        services, {.project = "deps", .path = "readme.txt", .content = "no dependency manifest\n", .operation_id = "deps-readme"},
+                        note, actor);
+                if (with_configuration)
+                    co_await fixture::write_file(
+                        services, {.project = "deps", .path = "vcpkg-configuration.json", .content = "{}\n", .operation_id = "deps-registries"},
+                        note, actor);
+                out.first = co_await tools::build::run(services, {.project = "deps", .configurations = std::nullopt, .targets = std::nullopt},
+                                                       note, actor);
+                if (repin) {
+                    co_await fixture::write_file(
+                        services,
+                        {.project = "deps", .path = "vcpkg.json", .content = std::string{vcpkg_manifest_v2}, .operation_id = "deps-manifest-v2"},
+                        note, actor);
+                    out.pinned = co_await tools::build::run(
+                        services,
+                        {.project = "deps",
+                         .configurations = std::nullopt,
+                         .targets = std::nullopt,
+                         .version = std::optional<std::string>{out.first.revision},
+                         .fresh = true},
+                        note, actor);
+                }
+            });
+        }
+    };
 
     static constexpr auto build_suite = [] {
         "a Worker cannot substitute the offered source snapshot"_test = [] {
@@ -392,6 +591,107 @@ int main(int argc, char** argv) {
             expect(nothrow([&] { tools::detail::operation(c, {.operation = "build"}); }));
             c.build.enabled = false;
             expect(throws<std::invalid_argument>([&] { tools::detail::operation(c, {.operation = "build"}); }));
+        };
+
+        "the pinned vcpkg manifest is projected to the matching publisher before the private build"_test = [] {
+            dependency_harness h;
+            h.repin = true;
+            h.run();
+            auto& c = h.captured;
+            expect((h.out.first.results.size() == 1u) >> fatal);
+            expect(h.out.first.ok) << config::write(h.out.first);
+            expect(h.out.first.results.at(0).dependency_cache == "deps: filled") << h.out.first.results.at(0).dependency_cache;
+
+            // Both the initial build and the pinned rebuild crossed the publisher as typed dependency.fill calls.
+            expect((c.fills.size() == 2u) >> fatal);
+            expect(c.fill_workers == std::vector<std::string>{"publisher", "publisher"});
+            auto& fill = c.fills.at(0);
+            expect((fill.manifest.dependencies.size() == 2u) >> fatal);
+            expect(std::holds_alternative<std::string>(fill.manifest.dependencies.at(0)));
+            expect(std::get<std::string>(fill.manifest.dependencies.at(0)) == "fmt");
+            expect((std::holds_alternative<builds::vcpkg_dependency>(fill.manifest.dependencies.at(1))) >> fatal);
+            auto& featured = std::get<builds::vcpkg_dependency>(fill.manifest.dependencies.at(1));
+            expect(featured.name == "boost-asio");
+            expect(featured.features == std::vector<std::string>{"ssl"});
+            expect(!featured.defaults.get());
+            expect(fill.manifest.baseline.get().value_or("") == "0123456789abcdef0123456789abcdef01234567");
+            expect(fill.triplet == "x64-linux" && fill.host_triplet == "x64-linux" && fill.default_features);
+            // The rebuild pinned the first revision: its fill contains the manifest as written then, not the current v2.
+            expect((c.fills.at(1).manifest.dependencies.size() == 2u) >> fatal);
+            expect(std::get<std::string>(c.fills.at(1).manifest.dependencies.at(0)) == "fmt") << "the pinned vcpkg.json, not v2 with zlib";
+
+            // Each fill ended before its consumer build began, and each build got its own fill.
+            expect((c.build_seqs.size() == 2u) >> fatal);
+            expect(c.fill_seqs.at(0) < c.build_seqs.at(0) && c.build_saw_fill.at(0) == c.fill_seqs.at(0))
+                << "the fill finished before the consumer build began";
+            expect(c.fill_seqs.at(1) < c.build_seqs.at(1) && c.build_saw_fill.at(1) == c.fill_seqs.at(1));
+            expect(c.fill_seqs.at(1) > c.build_seqs.at(0));
+
+            // The publisher boundary transmits only the typed manifest: no consumer commands, env or layout.
+            expect(c.leaked.empty()) << "the publisher only ever heard dependency.fill, the consumer never did";
+            auto wire = rfl::json::write(fill);
+            expect(wire.contains("fmt") && wire.contains("x64-linux"));
+            expect(!wire.contains("consumer-app") && !wire.contains("$schema") && !wire.contains("1.2.3"))
+                << "only declarative registry selectors cross the publisher boundary";
+            expect(!wire.contains("consumer-secret") && !wire.contains("PRIVATE_TOKEN") && !wire.contains("vcpkg_installed"))
+                << "consumer env and step layout never reach the publisher";
+            // The consumer still receives its regular step commands and environment, unchanged.
+            expect((c.builds.size() == 2u) >> fatal);
+            auto& consumer = c.builds.at(0);
+            expect((consumer.env.contains("PRIVATE_TOKEN")) >> fatal);
+            expect(consumer.env.at("PRIVATE_TOKEN") == "consumer-secret");
+            expect((!consumer.steps.empty()) >> fatal);
+            expect(consumer.steps.at(0).name == "deps");
+            expect(std::ranges::any_of(consumer.steps.at(0).argv, [](const std::string& arg) { return arg.contains("vcpkg_installed"); }));
+
+            expect((h.out.pinned.results.size() == 1u) >> fatal);
+            expect(h.out.pinned.ok && h.out.pinned.results.at(0).dependency_cache == "deps: filled") << config::write(h.out.pinned);
+        };
+
+        "a custom vcpkg-configuration keeps the fill away from the publisher"_test = [] {
+            dependency_harness h;
+            h.with_configuration = true;
+            h.run();
+            expect(h.out.first.ok) << config::write(h.out.first);
+            expect(h.out.first.results.at(0).dependency_cache == "skipped: custom registries")
+                << h.out.first.results.at(0).dependency_cache;
+            expect(h.captured.fills.empty());
+            expect(h.captured.builds.size() == 1u) << "the private build still runs";
+            expect(h.captured.leaked.empty());
+        };
+
+        "only a publisher with the consumer's toolchain is asked to fill"_test = [] {
+            dependency_harness h;
+            h.publisher_same_toolchain = false;
+            h.run();
+            expect(h.out.first.ok) << config::write(h.out.first);
+            expect(h.out.first.results.at(0).dependency_cache == "unavailable: no matching dependency publisher")
+                << h.out.first.results.at(0).dependency_cache;
+            expect(h.captured.fills.empty()) << "neither the wrong-toolchain publisher nor the plain consumer was asked";
+            expect(h.captured.builds.size() == 1u) << "an unavailable publisher does not block the private build";
+        };
+
+        "a failing dependency fill does not block the private build"_test = [] {
+            dependency_harness h;
+            h.fail_fill = true;
+            h.run();
+            expect(h.out.first.ok) << config::write(h.out.first);
+            auto& status = h.out.first.results.at(0).dependency_cache;
+            expect(status.starts_with("deps: failed: ") && status.find("private build remains available") != std::string::npos) << status;
+            expect((h.captured.fills.size() == 1u) >> fatal);
+            expect(h.captured.builds.size() == 1u);
+            expect(h.captured.fill_seqs.at(0) < h.captured.build_seqs.at(0)) << "the fill attempt ended before the build began";
+        };
+
+        "a missing vcpkg.json skips the fill and builds privately"_test = [] {
+            dependency_harness h;
+            h.with_manifest = false;
+            h.run();
+            expect(h.out.first.ok) << config::write(h.out.first);
+            expect(h.out.first.results.at(0).dependency_cache == "deps: skipped: manifest absent or too large")
+                << h.out.first.results.at(0).dependency_cache;
+            expect(h.captured.fills.empty());
+            expect(h.captured.builds.size() == 1u);
         };
 
         "an edit is synced to a worker and built there"_test = [] {

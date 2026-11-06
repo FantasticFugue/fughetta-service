@@ -49,7 +49,7 @@ add_implementation(io io entropy dns)
 # model
 add_layer(model)
 add_modules(model model allocation content codec archive semantic world nodes provider report cmake bazel
-  commands clice vcpkg typescript bun uv ty ruff build language protocol configuration usage runner replica lsp)
+  commands clice vcpkg typescript bun uv ty ruff build language protocol configuration usage runner replica delivery lsp toolchain)
 add_implementation(model model crypto planning generator analysis)
 
 # gateway
@@ -59,12 +59,12 @@ add_implementation(gateway gateway exchange routes broadcast backlog pairing)
 
 # source
 add_layer(source)
-add_modules(source source server storage index kernel engine preparation survey package)
+add_modules(source source server storage index kernel engine package)
 add_implementation(source source database)
 
 # worker
 add_layer(worker)
-add_modules(worker worker executor)
+add_modules(worker worker executor dependencies)
 
 ## Platform provider
 #

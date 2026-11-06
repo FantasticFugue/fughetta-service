@@ -1,25 +1,26 @@
 export module semantic;
 import std;
 
-// Language data that every analysis provider publishes and every consumer reads. Positions are the
-// identities of source characters, so they follow edits and do not depend on how a provider counts text.
+// Language data refers to the immutable snapshot analyzed by the worker.
 export namespace semantic {
-    // One source character: the edit run that inserted it and its index inside that run.
-    struct anchor {
-        std::string run;
-        std::uint64_t offset = 0;
-        auto operator<=>(const anchor&) const = default;
+    struct query {
+        std::string action = "diagnostics";
+        std::string path, symbol;
+        std::optional<std::uint64_t> line;
+    };
+    // One-based lines and Unicode scalar columns in the snapshot read by the adapter.
+    struct location {
+        std::string path;
+        std::uint64_t line = 0, column = 0, end_line = 0, end_column = 0;
+        std::string symbol;
     };
     // Where characters are in one text: a path and Unicode scalar offsets [begin, end).
     struct place {
         std::string path;
         std::uint64_t begin = 0, end = 0;
     };
-    // The characters first..last of one document. A provider reports only where they are in the text it read;
-    // a query reports where they are in the selected source, or nothing when they are gone.
+    // A provider reports a range in the snapshot it read; no source-side anchoring is needed.
     struct span {
-        std::string document;
-        anchor first, last;
         std::optional<semantic::place> place;
     };
     // Kinds are neutral: namespace, type, function, variable, module or other.
@@ -31,32 +32,14 @@ export namespace semantic {
         std::string id, name, kind, scope;
         std::vector<span> declarations, definitions;
     };
-    struct reference {
-        span range;
-        std::string target, kind;
-    };
-    struct relation {
-        std::string source, target, kind;
-    };
     struct diagnostic {
         span range;
         std::string severity, message;
     };
-    struct coverage {
-        std::string document, digest;
-    };
-    // Everything one provider reported for one source version in one environment.
-    struct generation {
-        std::string version, environment, service, service_version;
-        std::vector<coverage> covered;
-        std::vector<scope> scopes;
-        std::vector<symbol> symbols;
-        std::vector<reference> references;
-        std::vector<relation> relations;
-        std::vector<diagnostic> diagnostics;
-    };
-    // What a language server reported before its places are anchored in a source version.
+    // What a language server reported for one analyzed snapshot.
     struct outline {
+        bool complete = true;
+        bool cacheable = true;
         std::vector<scope> scopes;
         std::vector<symbol> symbols;
         std::vector<diagnostic> diagnostics;

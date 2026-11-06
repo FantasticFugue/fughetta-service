@@ -27,6 +27,10 @@ export namespace durability {
     void durable_rename(const std::filesystem::path& from, const std::filesystem::path& to);
     void durable_directories(const std::filesystem::path& dir);
 
+    struct lock_busy : std::runtime_error {
+        using std::runtime_error::runtime_error;
+    };
+
     class dir_lock {
     public:
         explicit dir_lock(const std::filesystem::path& dir, std::string_view what);

@@ -12,6 +12,7 @@ import tools;
 import fleet;
 import mcp;
 import support;
+import fixture;
 
 namespace {
     using namespace boost::ut;
@@ -19,10 +20,12 @@ namespace {
     using ctx = native::scheduler;
 
     static constexpr auto cases = [] {
-        "business tools work on the main worldline and language queries name their version"_test = [] {
+        "business tools work on the main worldline and language preparation errors are explicit"_test = [] {
             test::scratch tmp{"source-tools"};
             config::document document;
-            document.projects["app"].analysis["Cpp"] = {};
+            document.projects["app"].build_configurations["native"] = fixture::cmake("build/native");
+            fixture::options<"cmake">(document.projects["app"].build_configurations["native"].builders.at("main")).export_compile_commands = true;
+            document.projects["app"].analysis["Cpp"] = {.build_configuration = "native"};
             config::validate(document);
             config::slots config{1, std::make_shared<const config::document>(std::move(document))};
             cores::io_context<native::context> rt{1};
@@ -34,36 +37,43 @@ namespace {
                 storage::registry files{rt, tmp.dir / "state", config, gateway_disk,
                                         net::ip::tcp::endpoint{net::ip::address_v4{{127, 0, 0, 1}}, listener.local_endpoint().port()}};
                 tools::services services{config.slot(0), router, files, 0};
+                tools::backlog queue{rt, services};
+                services.queue = &queue;
                 mcp::notifier note;
                 const worlds::actor tester{.issuer = "token", .user = "tester", .caller = "suite", .role = "owner"};
                 co_await coroutine::with_scope([&](coroutine::scope& tasks) -> coroutine::task<> {
+                    tasks.spawn(queue.serve(io));
                     tasks.spawn([](ctx& io, auto& listener, auto& service, auto& tasks) -> coroutine::task<> {
                         for (;;)
                             tasks.spawn(service.serve(
                                 io, co_await execution::then(net::async_accept(listener), [](auto socket, auto) { return std::move(socket); }), 0));
                     }(io, listener, source, tasks));
                     tools::standard::bound toolbox{services};
-                    expect(toolbox.list().size() == 16u);
-                    for (const auto name : {"build", "test", "run", "configurations", "language", "worldline"})
+                    expect(std::ranges::none_of(toolbox.list(), [](const auto& tool) { return tool.name == "jobs"; }));
+                    expect(toolbox.list().size() == 5u);
+                    for (const auto name : {"build", "test", "run", "configurations", "language"})
                         expect(std::ranges::any_of(toolbox.list(), [name](const auto& tool) { return tool.name == name; }));
-                    co_await tools::worldline::run(services, {.project = "app", .action = "lock", .scopes = std::vector<std::string>{"::"}}, note, tester);
-                    co_await tools::write::run(services, {.project = "app", .path = "a.cpp", .content = "int a;\n", .operation_id = std::string{"write"}}, note,
-                                               tester);
-                    tools::edit::input edit{.project = "app", .path = "a.cpp", .old_string = "a", .new_string = "alpha", .operation_id = std::string{"edit"}};
-                    auto first = co_await tools::edit::run(services, edit, note, tester);
-                    auto repeated = co_await tools::edit::run(services, edit, note, tester);
+                    co_await fixture::write_file(services, {.project = "app", .path = "a.cpp", .content = "int a;\n", .operation_id = "write"}, note,
+                                                 tester);
+                    fixture::edit_input edit{.project = "app", .path = "a.cpp", .old_string = "a", .new_string = "alpha", .operation_id = "edit"};
+                    auto first = co_await fixture::edit_text(services, edit, note, tester);
+                    auto repeated = co_await fixture::edit_text(services, edit, note, tester);
                     expect(!first.replayed && repeated.replayed && repeated.replacements == 1u);
-                    auto language =
+                    bool failed = false;
+                    try {
                         co_await tools::language_query::run(services, {.project = "app", .configuration = "Cpp", .action = "diagnostics"}, note, tester);
-                    expect(language.version == first.version && !language.analyzed && language.environment && !language.environment->empty());
+                    } catch (const tools::tool_error& error) {
+                        failed = error.code == "no_worker";
+                    }
+                    expect(failed) << "analysis without workers never falls back to source execution";
                     auto receipt =
                         co_await tools::worldline::run(services, {.project = "app", .action = "receipt", .operation_id = std::string{"edit"}}, note, tester);
                     expect(receipt.version == first.version && receipt.files->at(0).digest == content::hash_of("int alpha;\n"));
                     auto history = co_await tools::worldline::run(services, {.project = "app", .action = "history"}, note, tester);
                     auto authored = std::ranges::find(*history.entries, std::string{"edit"}, &tools::worldline::history_entry::operation_id);
                     expect(authored != history.entries->end() && authored->actor == "token:tester") << "history names the caller's own operation ID";
-                    co_await tools::move::run(services, {.project = "app", .from = "a.cpp", .to = "src/a.cpp", .operation_id = "move-26"}, note, tester);
-                    auto read = co_await tools::read::run(services, {.project = "app", .path = "src/a.cpp"}, note, tester);
+                    co_await fixture::move_file(services, {.project = "app", .from = "a.cpp", .to = "src/a.cpp", .operation_id = "move-26"}, note, tester);
+                    auto read = co_await fixture::read_file(services, {.project = "app", .path = "src/a.cpp"}, note, tester);
                     expect(read.content == "int alpha;\n");
                     expect(!std::filesystem::exists(tmp.dir / "state/app"));
                 });
@@ -113,23 +123,10 @@ namespace {
                 return source::call(endpoint, jobs::node_call{.project = "app", .actor = who, .request = std::move(request)});
             };
             expect(call(alice, {.action = "initialize"}).code == "ok");
-            expect(call(alice, {.action = "lock", .scopes = {"::"}}).code == "ok");
             auto operation = content::hash_of("shared-operation-id").str();
             auto seed = call(alice, {.action = "apply", .operation = operation, .edits = {{.kind = "create", .path = "x", .text = "ab"}}});
             expect((seed.code == "ok") >> fatal) << seed.reason;
             expect(seed.operation == operation) << "the caller sees its own operation ID";
-            auto blocked = call(
-                bob,
-                {.action = "apply", .operation = operation, .expected = seed.frontier, .edits = {{.kind = "edit", .path = "x", .text = "c", .offset = 2}}});
-            expect(blocked.code == "scope_locked") << blocked.reason;
-            try {
-                source::call(endpoint, jobs::node_call{.project = "app", .actor = bob, .request = {.action = "unlock", .target = "1", .force = true}});
-                expect(false) << "a member released an owner's lock";
-            } catch (const transport::remote_error& error) {
-                expect(error.code == "permission_denied");
-            }
-            expect(call(alice, {.action = "unlock", .scopes = {"::"}}).code == "ok");
-            expect(call(bob, {.action = "lock", .scopes = {"::"}}).code == "ok");
             auto other = call(
                 bob,
                 {.action = "apply", .operation = operation, .expected = seed.frontier, .edits = {{.kind = "edit", .path = "x", .text = "c", .offset = 2}}});

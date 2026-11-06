@@ -65,13 +65,13 @@ namespace {
             auto gateway = start_gateway();
             auto saved = test::save(http_port, "/api/v1/config/limits", R"({"max_projects":7})");
             test::require(saved.status == 200, saved.body);
-            test::tool(http_port, "worldline", R"({"project":"app","action":"lock","scopes":["::"]})");
-            // The source commits but its answer is lost; the gateway learns the outcome from the receipt the write left.
-            auto lost =
-                test::tool(http_port, "write", R"({"project":"app","path":"ambiguous.txt","content":"committed without ack","operation_id":"lost-ack"})");
-            expect(lost.contains(R"("replayed":true)")) << "a lost answer is recovered from the receipt: " << lost;
+            // Pin the observation before publishing; retry and receipt recovery use that same input.
+            const auto observed = test::source_version(http_port, "app");
+            const auto changes = std::format(R"("observed":"{}","operation_id":"lost-ack","changes":[{{"kind":"create","path":"ambiguous.txt","text":"committed without ack"}}])", observed);
+            auto lost = test::worldline(http_port, "app", "apply", changes, true);
+            expect(lost.contains("outcome_unknown")) << "a lost answer requires receipt recovery: " << lost;
             expect(mutations == 1 && dropped == 1);
-            auto receipt = [&] { return test::tool(http_port, "worldline", R"({"project":"app","action":"receipt","operation_id":"lost-ack"})"); };
+            auto receipt = [&] { return test::worldline(http_port, "app", "receipt", R"("operation_id":"lost-ack")"); };
             auto original = receipt();
             struct entry {
                 std::string path, digest;
@@ -84,13 +84,13 @@ namespace {
             auto published = test::decode<outcome>(original);
             expect(published.files.size() == 1u && published.files[0].path == "ambiguous.txt" && published.files[0].size == 21u);
             expect(published.files[0].digest == content::hash_of("committed without ack") && content::is_hash(published.version));
-            auto read = [&] { return test::tool(http_port, "read", R"({"project":"app","path":"ambiguous.txt"})"); };
-            expect(read().contains("committed without ack"));
-            auto replayed =
-                test::tool(http_port, "write", R"({"project":"app","path":"ambiguous.txt","content":"committed without ack","operation_id":"lost-ack"})");
+            auto read = [&] { return test::worldline(http_port, "app", "read", R"("path":"ambiguous.txt")"); };
+            expect(read().contains(content::hash_of("committed without ack")));
+            auto replayed = test::worldline(http_port, "app", "apply", changes);
             expect(replayed.contains(R"("replayed":true)")) << replayed;
             expect(source->stop() == 0);
-            auto unavailable = test::tool(http_port, "write", R"({"project":"app","path":"unavailable.txt","content":"x","operation_id":"unavailable"})", true);
+            auto unavailable = test::worldline(http_port, "app", "apply",
+                std::format(R"("observed":"{}","operation_id":"unavailable","changes":[{{"kind":"create","path":"unavailable.txt","text":"x"}}])", published.version), true);
             expect(!unavailable.empty());
             expect(!std::filesystem::exists(tmp.dir / "state/app"));
             source = start_source();
@@ -101,12 +101,12 @@ namespace {
                     return false;
                 }
             });
-            expect(read().contains("committed without ack"));
-            test::tool(http_port, "edit",
-                       R"({"project":"app","path":"ambiguous.txt","old_string":"committed","new_string":"recovered","operation_id":"edit"})");
+            expect(read().contains(content::hash_of("committed without ack")));
+            test::worldline(http_port, "app", "apply", std::format(
+                R"("observed":"{}","operation_id":"edit","changes":[{{"kind":"edit","path":"ambiguous.txt","offset":0,"count":9,"text":"recovered"}}])", published.version));
             expect(gateway->stop() == 0);
             gateway = start_gateway();
-            expect(read().contains("recovered without ack"));
+            expect(read().contains(content::hash_of("recovered without ack")));
             expect(test::decode<outcome>(receipt()).receipt == published.receipt);
             auto limits = test::request(http_port, http::method::GET, "/api/v1/config");
             struct configuration {

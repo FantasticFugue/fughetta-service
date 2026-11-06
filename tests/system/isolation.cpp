@@ -2,6 +2,7 @@
 import launch;
 import boost.ut;
 import protocol;
+import content;
 import usage;
 
 namespace {
@@ -105,34 +106,37 @@ namespace {
             test::child gateway{test::gateway_command(SERVICE_EXECUTABLE, tmp.dir, {file.string()})};
             test::ready(gateway, http_port);
 
-            auto call = [&](std::string name, std::string project, std::string args, bool error = false) {
-                return test::tool(http_port, std::move(name), std::format(R"({{"project":"{}",{}}})", project, args), error);
+            auto source_call = [&](std::string project, std::string action, std::string fields = {}, bool error = false) {
+                return test::worldline(http_port, std::move(project), std::move(action), std::move(fields), error);
             };
-            auto lock = [&](std::string project) { call("worldline", project, R"("action":"lock","scopes":["::"])"); };
-            lock("app");
-            lock("lib");
-            call("write", "app", R"("path":"hello.txt","content":"durable source\n","operation_id":"hello")");
-            call("write", "lib", R"("path":"independent.txt","content":"independent","operation_id":"independent")");
-            expect(call("read", "app", R"("path":"hello.txt")").contains("durable source"));
+            auto create = [&](std::string project, std::string path, std::string text, std::string operation, std::string observed) {
+                return source_call(project, "apply", std::format(
+                    R"("observed":{},"operation_id":{},"changes":[{{"kind":"create","path":{},"text":{}}}])",
+                    rfl::json::write(observed), rfl::json::write(operation), rfl::json::write(path), rfl::json::write(text)));
+            };
+            create("app", "hello.txt", "durable source\n", "hello", test::source_version(http_port, "app"));
+            create("lib", "independent.txt", "independent", "independent", test::source_version(http_port, "lib"));
+            expect(source_call("app", "read", R"("path":"hello.txt")").contains(content::hash_of("durable source\n")));
             expect(!std::filesystem::exists(tmp.dir / "source/app/hello.txt")) << "main lives in the node repository, not in a checkout";
             expect(!std::filesystem::exists(tmp.dir / "state/app")) << "the gateway keeps no source";
             auto repository = tmp.dir / "source/.nodes/app/repository.sqlite";
 
             {
+                const auto observed = test::source_version(http_port, "app");
                 writer_lock held{repository};
                 auto blocked = std::async(std::launch::async, [&] {
-                    return call("write", "app", R"("path":"blocked.txt","content":"committed later","operation_id":"blocked-write")");
+                    return create("app", "blocked.txt", "committed later", "blocked-write", observed);
                 });
                 issued("blocked.txt");
                 auto began = std::chrono::steady_clock::now();
-                auto other = call("read", "lib", R"("path":"independent.txt")");
-                expect(other.contains("independent"));
+                auto other = source_call("lib", "read", R"("path":"independent.txt")");
+                expect(other.contains(content::hash_of("independent")));
                 // A read that waited for the blocked publication would take the source's whole five-second busy wait.
                 expect(std::chrono::steady_clock::now() - began < std::chrono::seconds{4}) << "another project's read waited for the blocked publication";
                 expect(blocked.wait_for(std::chrono::seconds{0}) == std::future_status::timeout) << "the publication did not wait for the write lock";
                 held.release();
                 expect(blocked.get().contains(R"("replayed":false)"));
-                expect(call("read", "app", R"("path":"blocked.txt")").contains("committed later"));
+                expect(source_call("app", "read", R"("path":"blocked.txt")").contains(content::hash_of("committed later")));
             }
 
             struct stored_project {
@@ -152,33 +156,17 @@ namespace {
             struct main_version {
                 std::string version;
             };
-            auto main = test::decode<main_version>(call("worldline", "app", R"("action":"inspect")"));
+            auto main = test::decode<main_version>(source_call("app", "inspect"));
             expect(source_view.status == 200 && source_view.body.contains("hello.txt") && source_view.body.contains(main.version))
                 << "the console's source view is main: " << source_view.body;
 
             auto listed = test::request(http_port, http::method::POST, "/mcp", R"({"jsonrpc":"2.0","id":1,"method":"tools/list"})");
-            for (auto name : {"read", "write", "edit", "worldline", "language", "build", "test", "run", "configurations", "generate"})
+            for (auto name : {"language", "build", "test", "run", "configurations"})
                 expect(listed.body.contains(std::format(R"("name":"{}")", name))) << name;
-            expect(!listed.body.contains(R"("name":"receipt")"));
-
-            auto catalog = call("generate", "app", R"("action":"catalog")");
-            expect(catalog.contains("cpp-class") && !catalog.contains("console"));
+            for (auto name : {"read", "write", "edit", "worldline", "generate", "receipt", "jobs"})
+                expect(!listed.body.contains(std::format(R"("name":"{}")", name))) << name;
             auto offered = test::request(http_port, http::method::GET, "/api/v1/templates");
             expect(offered.status == 200 && offered.body.contains("cpp-class") && !offered.body.contains("console")) << offered.body;
-            auto parameters = std::string{R"("parameters":{"template_id":"cpp-class","name":"Generated","directory":"src"})"};
-            auto preview = call("generate", "app", R"("action":"preview",)" + parameters);
-            expect(preview.contains("src/Generated.hpp") && !preview.contains("receipt"));
-            auto generated = call("generate", "app", R"("action":"apply","operation_id":"generate-class",)" + parameters);
-            expect(generated.contains(R"("replayed":false)")) << generated;
-            expect(call("read", "app", R"("path":"src/Generated.hpp")").contains("Generated"));
-            auto replayed = call("generate", "app", R"("action":"apply","operation_id":"generate-class",)" + parameters);
-            expect(replayed.contains(R"("replayed":true)")) << replayed;
-            call("worldline", "app", R"("action":"unlock","scopes":["::"])");
-            auto refused = call("generate", "app",
-                                R"("action":"apply","operation_id":"generate-other",)" +
-                                    std::string{R"("parameters":{"template_id":"cpp-class","name":"Other","directory":"src"})"},
-                                true);
-            expect(refused.contains("scope_locked")) << "generation without the global scope: " << refused;
 
             // Projects come from their settings, and generation only writes files into a project that already exists.
             auto created = test::request(http_port, http::method::PUT, "/api/v1/projects/demo", R"({"revision":0,"value":{}})");
@@ -193,10 +181,9 @@ namespace {
             auto body = R"({"parameters":{"template_id":"cpp-class","name":"Made","directory":"src"},"preview":false,"operation_id":"make-class"})";
             auto made = test::request(http_port, http::method::POST, path, body);
             expect(made.status == 200) << made.body;
-            expect(call("read", "demo", R"("path":"src/Made.hpp")").contains("Made"));
+            expect(source_call("demo", "read", R"("path":"src/Made.hpp")").contains("Made"));
             auto again = test::request(http_port, http::method::POST, path, body);
             expect(again.status == 200 && again.body.contains(R"("replayed":true)")) << again.body;
-            expect(call("worldline", "demo", R"("action":"locks")").contains(R"("locks":[])")) << "a console generation leaves no lock behind";
             test::require(test::request(http_port, http::method::PUT, "/api/v1/projects/small", R"({"revision":0,"value":{}})").status == 200,
                           "small project saved");
             test::require(test::save(http_port, "/api/v1/config/limits", R"({"max_file_bytes":8})").status == 200, "limits saved");
@@ -206,19 +193,20 @@ namespace {
             expect(oversized.status == 400 && oversized.body.contains("resource_limit")) << oversized.body;
             test::require(test::save(http_port, "/api/v1/config/limits", "{}").status == 200, "limits restored");
 
-            lock("app");
             auto kept = test::request(http_port, http::method::POST, "/api/v1/projects/app/generate",
                                       R"({"parameters":{"template_id":"cpp-class","name":"Kept","directory":"src"},"preview":false,"operation_id":"kept"})");
             expect(kept.status == 200) << kept.body;
-            expect(call("worldline", "app", R"("action":"locks")").contains(R"("scope":"::")")) << "the console keeps a global scope its caller already held";
             auto taken =
                 test::request(http_port, http::method::POST, "/api/v1/projects/app/generate",
                               R"({"parameters":{"template_id":"cpp-class","name":"Kept","directory":"src"},"preview":false,"operation_id":"kept-again"})");
             expect(taken.status == 409 && taken.body.contains("source_conflict")) << taken.body;
-            expect(call("build", "app", R"("worldline":"main")", true).size() > 0u) << "a build with no worker fails";
-            expect(call("write", "app", R"("path":"../escape","content":"x","operation_id":"escape")", true).contains("invalid_record"));
-            expect(call("write", "app", R"("path":"anonymous.txt","content":"x")", true).contains("invalid_record")) << "a change names its operation ID";
-            expect(call("read", "missing", R"("path":"x")", true).contains("missing_objects")) << "an unknown project is not opened";
+            expect(!test::tool(http_port, "build", R"({"project":"app","worldline":"main"})", true).empty()) << "a build with no worker fails";
+            auto observed = test::source_version(http_port, "app");
+            expect(source_call("app", "apply", std::format(
+                R"("observed":"{}","operation_id":"escape","changes":[{{"kind":"create","path":"../escape","text":"x"}}])", observed), true).contains("invalid_record"));
+            expect(source_call("app", "apply", std::format(
+                R"("observed":"{}","changes":[{{"kind":"create","path":"anonymous.txt","text":"x"}}])", observed), true).contains("invalid_record")) << "a change names its operation ID";
+            expect(source_call("missing", "read", R"("path":"x")", true).contains("not_found")) << "an unknown project is not opened";
             expect(!std::filesystem::exists(tmp.dir / "source/.nodes/missing"));
             expect(!std::filesystem::exists(tmp.dir / "source/escape"));
 

@@ -12,6 +12,7 @@ export namespace isolation {
         auto target() const -> isolation::target;
         auto cpu_exhausted() const -> bool;
         auto memory_failures() const -> std::uint64_t;
+        auto memory_pressure() const -> bool;
         void concurrency(std::uint32_t parallel);
         void close();
 

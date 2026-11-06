@@ -88,6 +88,7 @@ export namespace mcp {
             if (token) {
                 out.stream_ = stream_;
                 out.token_ = std::move(token);
+                out.progress_ = std::make_shared<std::int64_t>(0);
             }
             return out;
         }
@@ -98,7 +99,12 @@ export namespace mcp {
             auto sent = n;
             if (token_)
                 if (auto o = n.params.to_object()) {
-                    auto p = *o;
+                    rfl::Generic::Object p;
+                    for (auto& [key, value] : *o)
+                        if (n.method != "notifications/progress" || key != "total")
+                            p[key] = value;
+                    if (n.method == "notifications/progress")
+                        p["progress"] = ++*progress_;
                     p["progressToken"] = *token_;
                     sent.params = p;
                 }
@@ -108,6 +114,7 @@ export namespace mcp {
     private:
         web::event_stream* stream_ = nullptr;
         std::optional<rfl::Generic> token_;
+        std::shared_ptr<std::int64_t> progress_;
     };
 
     inline auto object(std::initializer_list<std::pair<std::string, rfl::Generic>> fields) -> rfl::Generic::Object {
@@ -200,10 +207,14 @@ export namespace mcp {
             if (!params)
                 co_return fail(*req.id, code::invalid_params, params.error().what());
             auto progress = out.tagged(progress_token(req));
-            auto outcome = co_await tools.call(params->name, params->arguments.value_or(rfl::Generic::Object{}), progress, who);
-            co_return reply(*req.id, rfl::to_generic(tool_result{.content = {block{.text = std::move(outcome.text)}},
-                                                                 .structuredContent = std::move(outcome.structured),
-                                                                 .isError = outcome.error}));
+            try {
+                auto outcome = co_await tools.call(params->name, params->arguments.value_or(rfl::Generic::Object{}), progress, who);
+                co_return reply(*req.id, rfl::to_generic(tool_result{.content = {block{.text = std::move(outcome.text)}},
+                                                                     .structuredContent = std::move(outcome.structured),
+                                                                     .isError = outcome.error}));
+            } catch (const std::exception& e) {
+                co_return fail(*req.id, code::internal_error, std::format("tool '{}' failed: {}", params->name, e.what()));
+            }
         }
 
     private:

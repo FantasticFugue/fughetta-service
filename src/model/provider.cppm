@@ -39,6 +39,13 @@ export namespace builds {
     // `${tree}` is the build tree, `${tool:name}` a mapped tool, `${jobs}` the parallel jobs the runner allows and `${reports}` the
     // directory, empty when the step starts, that its reports go to. standard_output names a report file that receives the step's
     // standard output, for a tool that prints its report there; the step's output is then its standard error alone.
+    struct dependency_input {
+        std::string manifest_dir;
+        std::string triplet;
+        std::string host_triplet;
+        std::vector<std::string> features;
+        bool default_features = true;
+    };
     struct step {
         std::string name;
         std::vector<std::string> argv;
@@ -47,6 +54,8 @@ export namespace builds {
         std::vector<context> outputs;
         std::vector<report> reports;
         std::optional<std::string> standard_output;
+        // A provider-authored description, never an executable command for the publisher.
+        std::optional<dependency_input> dependencies;
     };
     struct artifact {
         std::string type;
@@ -80,8 +89,24 @@ export namespace builds {
         std::uint64_t units = 0;
         std::string kind = "file";
     };
+    struct exported_file {
+        std::string name;
+        std::string path;
+        content::hash digest;
+        std::uint64_t size = 0;
+        bool executable = false;
+        std::string delivery_error;
+    };
+    struct task_plan {
+        std::string name;
+        std::vector<std::string> dependencies;
+        std::size_t first_step = 0;
+        std::size_t step_count = 0;
+        std::vector<context> outputs;
+    };
     struct plan {
         std::vector<step> steps;
+        std::vector<task_plan> tasks;
         std::vector<context> contexts;
         requirements needs;
         environment env;

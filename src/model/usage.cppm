@@ -42,11 +42,20 @@ export namespace usage {
         double seconds = 0;
     };
 
+    // A caller's observation is separate from the one execution shared by equal inputs.
+    struct call_event {
+        std::int64_t at = 0;
+        std::string project, configuration, operation, actor, worldline, version, snapshot, calculation;
+        std::string reuse = "executed", state = "cancelled", parameters;
+        double seconds = 0;
+    };
+
     // One line of the ledger. `seq` grows by one per event, so a reader resumes after the last one it has.
     struct event {
         std::uint64_t seq = 0;
         std::optional<build_event> build;
         std::optional<tool_event> tool;
+        std::optional<call_event> call;
     };
 
     // Events after a cursor. `oldest` is the first event still kept; a reader whose cursor is older has missed what lies between.
@@ -136,6 +145,14 @@ export namespace usage {
                 changed();
         }
 
+        void record(call_event e) {
+            if (!e.at)
+                e.at = now();
+            append(event{.seq = next_seq_++, .call = std::move(e)}, e.at);
+            if (changed)
+                changed();
+        }
+
         auto running() const -> std::uint32_t { return static_cast<std::uint32_t>(running_.size()); }
 
         auto builds_last_hour(std::string_view project) const -> std::uint32_t {
@@ -198,7 +215,7 @@ export namespace usage {
             std::string line;
             while (out.events.size() < limit && std::getline(in, line)) {
                 auto e = rfl::json::read<event, rfl::DefaultIfMissing>(line);
-                if (!e || (!e->build && !e->tool))
+                if (!e || (!e->build && !e->tool && !e->call))
                     continue;
                 out.next = e->seq;
                 out.events.push_back(std::move(*e));
@@ -276,7 +293,7 @@ export namespace usage {
                     continue;
                 }
                 next_seq_ = std::max(next_seq_, e->seq + 1);
-                auto at = e->build ? e->build->at : e->tool ? e->tool->at : 0;
+                auto at = e->build ? e->build->at : e->tool ? e->tool->at : e->call ? e->call->at : 0;
                 if (at < cutoff)
                     continue;
                 if (e->build)
@@ -299,8 +316,8 @@ export namespace usage {
                 kept.push_back(event{.seq = next_seq_ - 1});
             std::string out;
             for (auto& e : kept) {
-                auto at = e.build ? e.build->at : e.tool ? e.tool->at : 0;
-                if (e.build || e.tool)
+                auto at = e.build ? e.build->at : e.tool ? e.tool->at : e.call ? e.call->at : 0;
+                if (e.build || e.tool || e.call)
                     index_.push_back({e.seq, out.size(), at});
                 out += rfl::json::write(e) + '\n';
             }

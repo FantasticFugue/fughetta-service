@@ -240,16 +240,18 @@ export namespace front {
         using socket = native::socket;
         using toolset = tools::standard::bound;
 
-        server(context ctx, tools::services& services)
-            : ctx_(ctx), mcp_{std::string{constants::mcp_server_name}, "0.1.0", toolset{services}},
+        server(context ctx, tools::services& services, std::chrono::milliseconds heartbeat = constants::mcp_heartbeat)
+            : ctx_(ctx), heartbeat_(heartbeat), mcp_{std::string{constants::mcp_server_name}, "0.1.0", toolset{services}},
               settings_{"Fughetta configuration", "0.1.0", settings::bound{dispatch{ctx}}} {}
 
         auto serve(socket peer) -> coroutine::task<> {
             web::stream<socket> transport{peer};
             http::v1::server<web::stream<socket>> conn{transport};
+            std::string serving;
             try {
                 while (!conn.should_close()) {
                     auto in = co_await http::coroutine::receive(conn);
+                    serving = std::format("{} {}", in.head.method.token(), in.head.target);
                     auto doc = ctx_.config.current(ctx_.core);
                     auto t = web::target::parse(in.head.target);
                     auto origin = web::header(in.head, "origin");
@@ -292,9 +294,7 @@ export namespace front {
                         if (auto held = c.runtime->enter(t.path == "/api/v1/config/runtime"))
                             admitted.emplace(std::move(*held));
                         if (!admitted && method == "POST" && (t.path == "/mcp" || t.path == "/mcp/config")) {
-                            auto kind = draining_rpc(t.path, body);
-                            control_read = kind == drain_access::inspect;
-                            if (kind == drain_access::cancel)
+                            if (draining_cancel(body))
                                 if (auto held = c.runtime->enter(true))
                                     admitted.emplace(std::move(*held));
                         }
@@ -356,7 +356,11 @@ export namespace front {
                     }
                     co_await web::respond(conn, std::move(in.token), std::move(r.head), std::move(r.body));
                 }
-            } catch (const std::exception&) {
+            } catch (const std::exception& e) {
+                // A peer that aborts mid-request reaches here too; the log line is how a
+                // silent drop gets distinguished from a gateway fault.
+                logging::error(std::format("gateway: connection closed after unhandled exception{}: {}", serving.empty() ? "" : " while serving " + serving,
+                                           e.what()));
             }
             peer.close();
         }
@@ -379,32 +383,9 @@ export namespace front {
             }
         }
 
-        enum class drain_access { work, inspect, cancel };
-        static auto draining_rpc(std::string_view path, std::string_view body) -> drain_access {
+        static auto draining_cancel(std::string_view body) -> bool {
             auto rpc = rfl::json::read<mcp::request>(std::string{body});
-            if (!rpc)
-                return drain_access::work;
-            if (mcp::cancelled_request(*rpc))
-                return drain_access::cancel;
-            if (path != "/mcp" || rpc->method != "tools/call" || !rpc->params)
-                return drain_access::work;
-            auto params = rpc->params->to_object();
-            if (!params)
-                return drain_access::work;
-            auto name = params->get("name");
-            if (!name)
-                return drain_access::work;
-            auto text = name->to_string();
-            if (!text || *text != "jobs")
-                return drain_access::work;
-            if (auto arguments = params->get("arguments"))
-                if (auto object = arguments->to_object())
-                    if (auto action = object->get("action")) {
-                        auto value = action->to_string();
-                        if (value && *value == "cancel")
-                            return drain_access::cancel;
-                    }
-            return drain_access::inspect;
+            return rpc && mcp::cancelled_request(*rpc).has_value();
         }
 
         static auto error(http::status status, std::string why) -> web::reply {
@@ -458,21 +439,46 @@ export namespace front {
             }
 
             web::event_stream events;
-            http::response head{.status = 200, .fields = {{"content-type", "text/event-stream"}, {"cache-control", "no-cache"}}};
+            coroutine::stop_source heartbeat_stop, disconnected;
+            http::response head{.status = 200,
+                                .fields = {{"content-type", "text/event-stream"}, {"cache-control", "no-store, no-transform"}, {"x-accel-buffering", "no"}}};
             if (origin) {
                 head.fields.push_back({"access-control-allow-origin", std::string{*origin}});
                 head.fields.push_back({"vary", "origin"});
             }
             co_await coroutine::with_scope([&](coroutine::scope& children) -> coroutine::task<> {
-                children.spawn([](Conn& conn, auto token, http::response head, web::event_stream& events) -> coroutine::task<> {
-                    co_await http::coroutine::respond(conn, std::move(token), std::move(head), events);
-                }(conn, std::move(in.token), std::move(head), events));
+                children.spawn(
+                    [](Conn& conn, auto token, http::response head, web::event_stream& events, coroutine::stop_source& disconnected) -> coroutine::task<> {
+                        try {
+                            co_await http::coroutine::respond(conn, std::move(token), std::move(head), events);
+                        } catch (...) {
+                            disconnected.request_stop();
+                            throw;
+                        }
+                    }(conn, std::move(in.token), std::move(head), events, disconnected));
+                children.spawn(
+                    [](native::scheduler io, web::event_stream& events, coroutine::stop_token token, std::chrono::milliseconds interval) -> coroutine::task<> {
+                        co_await coroutine::under(token,
+                                                  [](native::scheduler io, web::event_stream& events, std::chrono::milliseconds interval) -> coroutine::task<> {
+                                                      for (;;) {
+                                                          co_await execution::schedule_after(io, interval);
+                                                          events.push(": keepalive\n\n");
+                                                      }
+                                                  }(io, events, interval));
+                    }(ctx_.rt.get_scheduler(ctx_.core), events, heartbeat_stop.get_token(), heartbeat_));
+                struct stop_heartbeat {
+                    coroutine::stop_source& source;
+                    ~stop_heartbeat() { source.request_stop(); }
+                } stop{heartbeat_stop};
                 mcp::notifier forward{events};
-                auto out = co_await cancellable(*rpc, forward, *who, configuration);
-                if (!out)
+                auto out = co_await cancellable(*rpc, forward, *who, configuration, disconnected.get_token());
+                if (disconnected.stop_requested()) {
+                    // The request ticket has been released; no response can reach this peer.
+                } else if (!out)
                     events.push(web::event_stream::message(rfl::json::write(cancelled(*rpc))));
                 else if (*out)
                     events.push(web::event_stream::message(rfl::json::write(**out)));
+                heartbeat_stop.request_stop();
                 events.close();
                 co_await children.join();
             });
@@ -486,7 +492,7 @@ export namespace front {
             co_return co_await mcp_.handle(rpc, out, who);
         }
 
-        auto cancellable(const mcp::request& rpc, mcp::notifier& out, const worlds::actor& who, bool configuration)
+        auto cancellable(const mcp::request& rpc, mcp::notifier& out, const worlds::actor& who, bool configuration, coroutine::stop_token peer = {})
             -> coroutine::task<std::optional<std::optional<mcp::response>>> {
             struct forward {
                 coroutine::stop_source* source;
@@ -494,9 +500,11 @@ export namespace front {
             };
             auto parent = co_await coroutine::current_token;
             coroutine::stop_source source;
-            std::optional<execution::stop_callback_for_t<coroutine::stop_token, forward>> link;
+            std::optional<execution::stop_callback_for_t<coroutine::stop_token, forward>> link, peer_link;
             if (parent.stop_possible())
                 link.emplace(parent, forward{&source});
+            if (peer.stop_possible())
+                peer_link.emplace(peer, forward{&source});
             struct registered {
                 in_flight* requests;
                 std::size_t core;
@@ -531,6 +539,7 @@ export namespace front {
         }
 
         context ctx_;
+        std::chrono::milliseconds heartbeat_;
         mcp::server<toolset> mcp_;
         mcp::server<settings::bound<dispatch>> settings_;
     };

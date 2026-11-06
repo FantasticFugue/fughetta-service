@@ -13,20 +13,12 @@ export namespace settings {
     struct empty {};
     using project =
         rfl::Description<"Project name: 1-64 letters, digits, dots, underscores or hyphens; start with a letter or digit. Example: app", std::string>;
-    using name = rfl::Description<"Existing build or analysis configuration name. Example: Debug", std::string>;
     struct location {
         settings::project project;
-    };
-    struct selection {
-        settings::project project;
-        settings::name name;
     };
     template <class T> struct save {
         rfl::Description<"Revision returned by the corresponding GET; 0 creates a new project. Example: 0", std::uint64_t> revision;
         T value;
-    };
-    template <class T> struct global {
-        save<T> body;
     };
     // The value is checked when saved, and a refusal names the field; its schema stays out of the tool list, read with `schema`.
     using project_value =
@@ -37,12 +29,6 @@ export namespace settings {
         settings::project project;
         save<project_value> body;
     };
-    struct preview {
-        settings::project project;
-        settings::name name;
-        builds::request body;
-    };
-
     struct entry {
         mcp::tool tool;
         std::string method;
@@ -57,27 +43,14 @@ export namespace settings {
 
     inline auto catalog() -> const std::vector<entry>& {
         static const std::vector<entry> entries{
-            describe<empty, "configuration", "Read the current configuration and revisions; members see no credentials.">("GET", "/api/v1/config"),
-            describe<empty, "server", "Read gateway server settings and revision. Owner access.">("GET", "/api/v1/config/server"),
-            describe<global<config::server>, "save_server", "Replace server settings at the read revision. Takes effect after gateway restart. Owner access.">(
-                "PUT", "/api/v1/config/server"),
-            describe<empty, "limits", "Read global limits and revision.">("GET", "/api/v1/config/limits"),
-            describe<global<config::limits>, "save_limits", "Replace global limits at the read revision. Owner access.">("PUT", "/api/v1/config/limits"),
             describe<location, "project", "Read project settings and revision. Member access.">("GET", "/api/v1/projects/{project}"),
-            describe<empty, "projects", "List projects. Member access.">("GET", "/api/v1/projects"),
             describe<project_save, "save_project",
                      "Replace project settings: build configurations, run configurations, analysis, ignore, environment and defaults. Read project first; "
                      "revision 0 creates a project. Member access.">("PUT", "/api/v1/projects/{project}"),
-            describe<location, "remove_project", "Remove a project from configuration; retained files remain. Member access.">("DELETE",
-                                                                                                                               "/api/v1/projects/{project}"),
             describe<location, "effective", "Read resolved project configuration and limits. Member access.">("GET", "/api/v1/projects/{project}/effective"),
             describe<empty, "schema",
                      "Read the JSON Schema of project settings, with the options of every build adapter and language server, before writing "
                      "save_project.">("GET", "/api/v1/settings-schema"),
-            describe<preview, "preview", "Preview a named build configuration without executing it. Member access.">(
-                "POST", "/api/v1/projects/{project}/build-configurations/{name}/plan"),
-            describe<selection, "analysis", "Preview a named analysis configuration. Member access.">("POST",
-                                                                                                      "/api/v1/projects/{project}/analysis/{name}/plan"),
         };
         return entries;
     }
@@ -120,8 +93,13 @@ export namespace settings {
             }
             if (!result)
                 co_return mcp::tool_outcome{.text = std::move(error), .error = true};
+            auto parsed = rfl::json::read<rfl::Generic>(result->body);
+            if (!parsed)
+                co_return mcp::tool_outcome{.text = std::format("the core answered status {} with a body that is not JSON: {}", result->head.status.code(),
+                                                                 parsed.error().what()),
+                                            .error = true};
             co_return mcp::tool_outcome{
-                .text = result->body, .structured = rfl::json::read<rfl::Generic>(result->body).value(), .error = result->head.status != 200};
+                .text = result->body, .structured = std::move(*parsed), .error = result->head.status != 200};
         }
 
     private:
