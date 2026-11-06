@@ -12,6 +12,10 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_CXX_SCAN_FOR_MODULES ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
+if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
+  add_compile_options(-Wall -Wextra)
+endif()
+
 set(SANITIZERS "" CACHE STRING "Comma-separated sanitizers")
 if(SANITIZERS)
   add_compile_options("-fsanitize=${SANITIZERS}")
