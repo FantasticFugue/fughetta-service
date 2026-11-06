@@ -146,11 +146,12 @@ namespace worker {
             }
 
             std::cerr << "service-ready:worker\n";
+            // Child requests can finish after the scope body; keep their counter alive through the join.
+            std::atomic<std::size_t> inflight{0};
             co_await coroutine::with_scope([&](coroutine::scope& requests) -> coroutine::task<> {
                 requests.spawn(beat(io, chan, core));
                 // The Core picks this Worker by the same limit; enforcing it locally keeps a misbehaving Core from driving unbounded concurrency.
                 auto max_inflight = static_cast<std::size_t>(cfg_.max_inflight);
-                std::atomic<std::size_t> inflight{0};
                 for (;;) {
                     auto frame = co_await chan.recv();
                     if (cfg_.worker_id && frame.kind == jobs::code<jobs::admission>) {
