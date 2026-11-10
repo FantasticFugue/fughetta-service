@@ -14,20 +14,20 @@ export namespace fixture {
     template <meta::fixed_string Name> auto options(const builds::builder& b) -> const builds::config<Name>& {
         return rfl::get<builds::with<Name>>(b.variant()).options;
     }
-    inline auto needs(builds::builder& b) -> builds::requirements& {
+    auto needs(builds::builder& b) -> builds::requirements& {
         return b.visit([](auto& w) -> builds::requirements& { return w.needs.get(); });
     }
-    inline auto env(builds::builder& b) -> builds::environment& {
+    auto env(builds::builder& b) -> builds::environment& {
         return b.visit([](auto& w) -> builds::environment& { return w.env; });
     }
     // The clice server of an analysis, started as `executable serve args...`.
-    inline auto clice(std::string executable, std::vector<std::string> args = {}) -> language::provider {
+    auto clice(std::string executable, std::vector<std::string> args = {}) -> language::provider {
         return language::with<"clice">{.options = {.executable = std::move(executable), .args = std::move(args)}};
     }
-    inline void command(builds::configuration& build, std::string operation, std::vector<std::string> argv) {
+    void command(builds::configuration& build, std::string operation, std::vector<std::string> argv) {
         options<"command">(build.builders.at("main")).operations.at(operation).argv = std::move(argv);
     }
-    inline auto commands(std::vector<std::string> build, std::vector<std::string> prepare = {}, std::vector<std::string> test = {}, std::string cwd = "",
+    auto commands(std::vector<std::string> build, std::vector<std::string> prepare = {}, std::vector<std::string> test = {}, std::string cwd = "",
                          std::vector<std::string> run = {}) -> builds::configuration {
         builds::config<"command"> c;
         builds::configuration out;
@@ -53,7 +53,7 @@ export namespace fixture {
         out.builders["main"] = builds::with<"command">{.options = std::move(c)};
         return out;
     }
-    inline auto cmake(std::string dir, std::string compiler = "") -> builds::configuration {
+    auto cmake(std::string dir, std::string compiler = "") -> builds::configuration {
         builds::configuration out;
         out.builders["main"] = builds::with<"cmake">{.options = {.build_dir = std::move(dir), .c_compiler = std::move(compiler)}};
         out.tasks = {{"configure", {.builder = "main", .operation = "configure"}},
@@ -62,7 +62,7 @@ export namespace fixture {
         out.operations = {{"prepare", {.tasks = {"configure"}}}, {"build", {.tasks = {"build"}}}, {"test", {.tasks = {"test"}}}};
         return out;
     }
-    inline void launcher(builds::configuration& build, std::string executable) {
+    void launcher(builds::configuration& build, std::string executable) {
         build.builders["launcher"] = builds::with<"command">{
             .options = {
                 .operations = {{"run", {.argv = {"${input:binary_dir}/" + executable}, .inputs = {{"binary_dir", "directory"}}, .append_args = true}}}}};
@@ -121,7 +121,7 @@ export namespace fixture {
         std::string version;
     };
 
-    inline auto write_file(tools::services& s, write_input in, mcp::notifier&, const worlds::actor& actor) -> coroutine::task<tools::mutation> {
+    auto write_file(tools::services& s, write_input in, mcp::notifier&, const worlds::actor& actor) -> coroutine::task<tools::mutation> {
         config::check_name("project", in.project);
         std::string input = content::hash_of(rfl::json::write(std::tuple{std::string{"write"}, in.path, in.content})).str();
         co_return co_await tools::once<tools::mutation>(
@@ -137,7 +137,7 @@ export namespace fixture {
             [&](const auto& done) { return tools::mutation{done.first.version, done.first.receipt, in.operation_id, true}; });
     }
 
-    inline auto edit_text(tools::services& s, edit_input in, mcp::notifier&, const worlds::actor& actor) -> coroutine::task<edit_output> {
+    auto edit_text(tools::services& s, edit_input in, mcp::notifier&, const worlds::actor& actor) -> coroutine::task<edit_output> {
         config::check_name("project", in.project);
         std::string input =
             content::hash_of(rfl::json::write(std::tuple{std::string{"edit"}, in.path, in.old_string, in.new_string, in.replace_all.value_or(false)})).str();
@@ -177,7 +177,7 @@ export namespace fixture {
             [&](const auto& done) { return edit_output{done.first.version, done.first.receipt, in.operation_id, done.second.replacements, true}; });
     }
 
-    inline auto remove_file(tools::services& s, remove_input in, mcp::notifier&, const worlds::actor& actor) -> coroutine::task<tools::mutation> {
+    auto remove_file(tools::services& s, remove_input in, mcp::notifier&, const worlds::actor& actor) -> coroutine::task<tools::mutation> {
         config::check_name("project", in.project);
         std::string input = content::hash_of(rfl::json::write(std::tuple{std::string{"remove"}, in.path})).str();
         co_return co_await tools::once<tools::mutation>(
@@ -191,7 +191,7 @@ export namespace fixture {
             [&](const auto& done) { return tools::mutation{done.first.version, done.first.receipt, in.operation_id, true}; });
     }
 
-    inline auto move_file(tools::services& s, move_input in, mcp::notifier&, const worlds::actor& actor) -> coroutine::task<tools::mutation> {
+    auto move_file(tools::services& s, move_input in, mcp::notifier&, const worlds::actor& actor) -> coroutine::task<tools::mutation> {
         config::check_name("project", in.project);
         std::string input = content::hash_of(rfl::json::write(std::tuple{std::string{"move"}, in.from, in.to})).str();
         co_return co_await tools::once<tools::mutation>(
@@ -205,7 +205,7 @@ export namespace fixture {
             [&](const auto& done) { return tools::mutation{done.first.version, done.first.receipt, in.operation_id, true}; });
     }
 
-    inline auto read_file(tools::services& s, read_input in, mcp::notifier&, const worlds::actor& actor) -> coroutine::task<read_output> {
+    auto read_file(tools::services& s, read_input in, mcp::notifier&, const worlds::actor& actor) -> coroutine::task<read_output> {
         config::check_name("project", in.project);
         auto r = co_await tools::node_call(s, in.project, {.action = "read", .worldline = "main", .target = in.path}, actor, true);
         auto file = std::ranges::find(r.files, in.path, &nodes::file_view::path);
@@ -216,7 +216,7 @@ export namespace fixture {
         co_return read_output{file->text, r.version};
     }
 
-    inline auto list_files(tools::services& s, list_input in, mcp::notifier&, const worlds::actor& actor) -> coroutine::task<list_output> {
+    auto list_files(tools::services& s, list_input in, mcp::notifier&, const worlds::actor& actor) -> coroutine::task<list_output> {
         config::check_name("project", in.project);
         auto tree = co_await tools::main_tree(s, in.project, actor);
         list_output out{.version = tree.version};
@@ -225,7 +225,7 @@ export namespace fixture {
         co_return out;
     }
 
-    inline auto search_files(tools::services& s, search_input in, mcp::notifier&, const worlds::actor& actor) -> coroutine::task<search_output> {
+    auto search_files(tools::services& s, search_input in, mcp::notifier&, const worlds::actor& actor) -> coroutine::task<search_output> {
         config::check_name("project", in.project);
         auto tree = co_await tools::main_tree(s, in.project, actor, true);
         search_output out{.version = tree.version};

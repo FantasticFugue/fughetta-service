@@ -217,11 +217,11 @@ export namespace test {
         int status;
         std::string body;
     };
-    inline auto request(std::uint16_t port, http::method method, std::string path, std::string body = {}, std::string token = "sk_test") -> response {
+    auto request(std::uint16_t port, http::method method, std::string path, std::string body = {}, std::string token = "sk_test") -> response {
         native::context context;
         auto run = [&]() -> coroutine::task<response> {
             auto peer = co_await io::connect(context.get_scheduler(), {net::ip::address_v4{{127, 0, 0, 1}}, port});
-            web::stream<native::socket> stream{peer};
+            http_stream stream{peer};
             http::v1::client client{stream};
             http::request head{
                 .method = method, .target = std::move(path), .scheme = "http", .authority = "localhost", .fields = {{"content-type", "application/json"}}};

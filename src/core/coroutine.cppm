@@ -550,14 +550,7 @@ export namespace coroutine {
 
     class scope {
     public:
-        void spawn(task<> child) {
-            execution::spawn(execution::upon_error(std::move(child),
-                                                   [this](std::exception_ptr e) noexcept {
-                                                       if (!failure_)
-                                                           failure_ = std::move(e);
-                                                   }),
-                             scope_.get_token(), execution::prop{execution::get_allocator, memory::frame_allocator<std::byte>{}});
-        }
+        void spawn(task<> child);
 
         void request_stop() noexcept { scope_.request_stop(); }
 
@@ -575,6 +568,15 @@ export namespace coroutine {
         execution::counting_scope scope_;
         std::exception_ptr failure_{};
     };
+
+    void scope::spawn(task<> child) {
+        execution::spawn(execution::upon_error(std::move(child),
+                                               [this](std::exception_ptr e) noexcept {
+                                                   if (!failure_)
+                                                       failure_ = std::move(e);
+                                               }),
+                         scope_.get_token(), execution::prop{execution::get_allocator, memory::frame_allocator<std::byte>{}});
+    }
 
     template <class Body>
         requires detail::is_task<std::invoke_result_t<Body&, scope&>>
