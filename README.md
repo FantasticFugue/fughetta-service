@@ -64,36 +64,6 @@ installation prefix (`build/package`). Configuration requires no shell exports
 or extra `-D` arguments. `release` disables tests and sanitizers and enables
 benchmarks and interprocedural optimization.
 
-## Nightly builds
-
-The nightly workflow builds `main` on each push and every day at 19:00 UTC
-(03:00 Asia/Taipei). It can also be started manually on `main`.
-Release builds run on native Linux, macOS, and Windows runners for both x64 and
-arm64, producing these assets:
-
-- `fughetta-service-linux-x64`
-- `fughetta-service-linux-arm64`
-- `fughetta-service-darwin-x64`
-- `fughetta-service-darwin-arm64`
-- `fughetta-service-win32-x64.exe`
-- `fughetta-service-win32-arm64.exe`
-
-All six builds must succeed before publication. The workflow uploads the binaries
-to a draft release, then publishes it as Latest. A failed build leaves the
-previous published release available. Nightlies are development builds; they are
-published without GitHub's prerelease flag so the CLI's default `releases/latest`
-endpoint returns them.
-
-Run `fug worker` to download the build for the current platform automatically.
-Each run uses a distinct `nightly-<run-id>-<attempt>` tag and names the source
-commit in its release notes. The CLI caches downloads by tag, so a new nightly
-gets a new cache directory without manual removal. To use a binary you downloaded
-yourself, pass its path:
-
-```sh
-fug worker --service /path/to/fughetta-service
-```
-
 ## Service lifecycle and workspace boundary
 
 One workspace is one execution environment, shared by its projects and repositories.
