@@ -23,9 +23,12 @@ export namespace nodes {
         std::vector<std::string> missing;
         std::vector<std::string> conflicts;
         error(std::string_view c, std::string message) : std::runtime_error(std::move(message)), code(c) {}
+        ~error() override;
     };
 
-    [[noreturn]] inline void fail(std::string_view code, std::string reason) { throw error{code, std::move(reason)}; }
+    error::~error() = default;
+
+    [[noreturn]] void fail(std::string_view code, std::string reason) { throw error{code, std::move(reason)}; }
     inline void checked_path(std::string_view path) {
         try {
             content::checked_path(path);

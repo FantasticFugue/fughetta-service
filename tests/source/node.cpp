@@ -870,7 +870,7 @@ namespace {
             expect(inspect(audited).source_digest == changed.source_digest);
             expect(inspect(audited).files.size() == 518u);
             sqlite3* raw = nullptr;
-            if (sqlite3_open_v2((tmp.dir / "a/repository.sqlite").c_str(), &raw, SQLITE_OPEN_READONLY, nullptr) != SQLITE_OK)
+            if (sqlite3_open_v2((tmp.dir / "a/repository.sqlite").string().c_str(), &raw, SQLITE_OPEN_READONLY, nullptr) != SQLITE_OK)
                 throw std::runtime_error("open state evidence");
             std::unique_ptr<sqlite3, decltype(&sqlite3_close)> database{raw, sqlite3_close};
             sqlite3_stmt* query = nullptr;
@@ -895,7 +895,7 @@ namespace {
             }
             {
                 sqlite3* raw = nullptr;
-                if (sqlite3_open_v2((tmp.dir / "a/repository.sqlite").c_str(), &raw, SQLITE_OPEN_READWRITE, nullptr) != SQLITE_OK)
+                if (sqlite3_open_v2((tmp.dir / "a/repository.sqlite").string().c_str(), &raw, SQLITE_OPEN_READWRITE, nullptr) != SQLITE_OK)
                     throw std::runtime_error("open state fixture");
                 std::unique_ptr<sqlite3, decltype(&sqlite3_close)> database{raw, sqlite3_close};
                 expect(sqlite3_exec(raw, "UPDATE state_values SET data=x'00'", nullptr, nullptr, nullptr) == SQLITE_OK);

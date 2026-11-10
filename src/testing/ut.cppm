@@ -16,3 +16,17 @@ export import std;
 #if defined(__clang__)
 #pragma clang diagnostic pop
 #endif
+
+namespace {
+    struct stream_initialization {
+        stream_initialization() {
+            static std::ios_base::Init streams;
+        }
+    };
+
+    // Base classes initialize in order, before the reporter reads cout.
+    struct initialized_reporter : stream_initialization, boost::ut::reporter_junit<> {};
+}
+
+export template <>
+inline auto boost::ut::cfg<boost::ut::override> = boost::ut::runner<initialized_reporter>{};
