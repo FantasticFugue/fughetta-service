@@ -1,0 +1,193 @@
+name: nightly
+
+on:
+  push:
+    branches: [main]
+  schedule:
+    - cron: "0 19 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: nightly
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  XCLANG_VERSION: 23.1.3.6
+  VCPKG_REGISTRY_URL: https://github.com/FantasticFugue/vcpkg-registry
+  HTTPANT_GIT_URL: https://github.com/tsurumi-yizhou/httpant
+
+jobs:
+  build:
+    if: github.ref == 'refs/heads/main'
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 150
+    defaults:
+      run:
+        working-directory: fughetta-service
+        shell: bash
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-x64
+            os: ubuntu-24.04
+            xclang_triple: x86_64-unknown-linux-gnu
+            target: x86_64-unknown-linux-gnu
+            asset: fughetta-service-linux-x64
+            binary: fughetta-service
+          - name: linux-arm64
+            os: ubuntu-24.04-arm
+            xclang_triple: aarch64-unknown-linux-gnu
+            target: aarch64-unknown-linux-gnu
+            asset: fughetta-service-linux-arm64
+            binary: fughetta-service
+          - name: macos-x64
+            os: macos-15-intel
+            xclang_triple: x86_64-apple-darwin
+            target: x86_64-apple-darwin
+            asset: fughetta-service-darwin-x64
+            binary: fughetta-service
+          - name: macos-arm64
+            os: macos-15
+            xclang_triple: aarch64-apple-darwin
+            target: aarch64-apple-darwin
+            asset: fughetta-service-darwin-arm64
+            binary: fughetta-service
+          - name: windows-x64
+            os: windows-2025
+            xclang_triple: x86_64-w64-mingw32
+            target: x86_64-pc-windows-msvc
+            asset: fughetta-service-win32-x64.exe
+            binary: fughetta-service.exe
+          - name: windows-arm64
+            os: windows-11-arm
+            xclang_triple: aarch64-w64-mingw32
+            target: aarch64-pc-windows-msvc
+            asset: fughetta-service-win32-arm64.exe
+            binary: fughetta-service.exe
+    env:
+      VCPKG_ROOT: ${{ github.workspace }}/.vcpkg
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          path: fughetta-service
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.x"
+
+      - name: Install build tools
+        run: python -m pip install --upgrade 'cmake>=4.0' ninja
+
+      - name: Fetch xclang
+        run: |
+          set -euo pipefail
+          name="xclang-$XCLANG_VERSION-${{ matrix.xclang_triple }}.tar.xz"
+          curl -fsSL --retry 3 "https://github.com/clice-io/xclang/releases/download/$XCLANG_VERSION/$name" -o "$RUNNER_TEMP/$name"
+          tar -xf "$RUNNER_TEMP/$name" -C "$RUNNER_TEMP"
+          root="$RUNNER_TEMP/xclang"
+          if [ "$RUNNER_OS" = Windows ]; then
+            root="$(cygpath -m "$root")"
+          fi
+          echo "XCLANG_ROOT=$root" >> "$GITHUB_ENV"
+
+      - name: Install vcpkg
+        run: |
+          set -euo pipefail
+          git clone --depth 1 https://github.com/microsoft/vcpkg "$VCPKG_ROOT"
+          if [ "$RUNNER_OS" = Windows ]; then
+            cmd //c "$(cygpath -w "$VCPKG_ROOT/bootstrap-vcpkg.bat")" -disableMetrics
+          else
+            "$VCPKG_ROOT/bootstrap-vcpkg.sh" -disableMetrics
+          fi
+
+      - name: Cache vcpkg downloads
+        uses: actions/cache@v4
+        with:
+          path: fughetta-service/build/release/vcpkg-downloads
+          key: vcpkg-downloads-${{ runner.os }}-${{ runner.arch }}-${{ github.run_id }}
+          restore-keys: vcpkg-downloads-${{ runner.os }}-${{ runner.arch }}-
+
+      - name: Fetch current dependency sources
+        run: |
+          set -euo pipefail
+          git clone --depth 1 "$VCPKG_REGISTRY_URL" ../vcpkg-registry
+          git clone --depth 1 "$HTTPANT_GIT_URL" ../httpant
+
+      - name: Configure
+        run: >-
+          cmake -B build/release -G Ninja
+          -DCMAKE_TOOLCHAIN_FILE=cmake/toolchain.cmake
+          -DXCLANG_TARGET=${{ matrix.target }}
+          -DCMAKE_BUILD_TYPE=Release
+          -DBUILD_TESTING=OFF
+          -DBUILD_BENCHMARKS=OFF
+          -DCMAKE_INTERPROCEDURAL_OPTIMIZATION=ON
+
+      - name: Build
+        run: cmake --build build/release --target fughetta-service --parallel 2
+
+      - name: Package
+        run: |
+          set -euo pipefail
+          binary="build/release/${{ matrix.binary }}"
+          if [ "$RUNNER_OS" != Windows ]; then
+            "$XCLANG_ROOT/bin/llvm-strip" "$binary"
+          fi
+          if [ "$RUNNER_OS" = macOS ]; then
+            codesign --force --sign - "$binary"
+          fi
+          mkdir -p dist
+          cp "$binary" "dist/${{ matrix.asset }}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: nightly-${{ matrix.name }}
+          path: fughetta-service/dist/${{ matrix.asset }}
+          if-no-files-found: error
+
+      - name: Upload logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: logs-nightly-${{ matrix.name }}
+          path: fughetta-service/build/release/vcpkg-manifest-install.log
+          if-no-files-found: ignore
+
+  publish:
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      GH_REPO: ${{ github.repository }}
+      RELEASE_TAG: nightly-${{ github.run_id }}-${{ github.run_attempt }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: nightly-*
+          path: dist
+          merge-multiple: true
+
+      - name: Publish nightly as the latest release
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > notes.md <<EOF
+          Nightly build from main at $GITHUB_SHA.
+
+          Includes Linux, macOS, and Windows binaries for x64 and arm64.
+          Run \`fug worker\` to download the binary for your machine automatically.
+
+          This nightly is published as Latest so fughetta-cli's default
+          releases/latest endpoint can find it. It is a development build.
+          Each build has its own tag so the CLI downloads it into a new cache directory.
+          EOF
+          gh release create "$RELEASE_TAG" dist/* --draft \
+            --target "$GITHUB_SHA" --title "Nightly $RELEASE_TAG" --notes-file notes.md
+          gh release edit "$RELEASE_TAG" --draft=false --latest
