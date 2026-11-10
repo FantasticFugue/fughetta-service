@@ -2,13 +2,13 @@ name: nightly
 
 on:
   push:
-    branches: [main]
+    branches: [main, ci/native-platforms]
   schedule:
     - cron: "0 19 * * *"
   workflow_dispatch:
 
 concurrency:
-  group: nightly
+  group: nightly-${{ github.ref }}
   cancel-in-progress: false
 
 permissions:
@@ -23,7 +23,6 @@ env:
 
 jobs:
   build:
-    if: github.ref == 'refs/heads/main'
     name: ${{ matrix.name }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 150
@@ -192,6 +191,7 @@ jobs:
           if-no-files-found: ignore
 
   publish:
+    if: github.ref == 'refs/heads/main'
     needs: build
     runs-on: ubuntu-24.04
     permissions:

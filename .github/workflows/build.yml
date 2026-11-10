@@ -2,7 +2,7 @@ name: build
 
 on:
   push:
-    branches: [main]
+    branches: [main, ci/native-platforms]
   pull_request:
   workflow_dispatch:
 

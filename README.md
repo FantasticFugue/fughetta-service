@@ -66,6 +66,11 @@ benchmarks and interprocedural optimization.
 
 ## Nightly builds
 
+The native-platform CI rollout is developed on `ci/native-platforms` until its
+builds and tests pass. Pushes to that branch run the Debug checks and all six
+Release builds, uploading artifacts without publishing a release. Release
+publication is restricted to `main`.
+
 The nightly workflow builds `main` on each push and every day at 19:00 UTC
 (03:00 Asia/Taipei). It can also be started manually on `main`.
 Release builds run on native Linux, macOS, and Windows runners for both x64 and
