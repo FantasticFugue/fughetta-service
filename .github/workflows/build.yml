@@ -15,7 +15,7 @@ env:
   VCPKG_REGISTRY_URL: https://github.com/FantasticFugue/vcpkg-registry
   VCPKG_REGISTRY_REF: tls-msquic-openssl
   HTTPANT_GIT_URL: https://github.com/tsurumi-yizhou/httpant
-  HTTPANT_GIT_REF: tls-quic-native-io
+  HTTPANT_GIT_REF: ci/native-platforms
 
 jobs:
   build:

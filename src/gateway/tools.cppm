@@ -1434,7 +1434,7 @@ export namespace tools {
     }
 
     // A compact result of worker preparation and analysis.
-    inline auto prepared(const language::plan& plan, const content::manifest& files, std::string version, jobs::build_report& report) -> language::result {
+    auto prepared(const language::plan& plan, const content::manifest& files, std::string version, jobs::build_report& report) -> language::result {
         language::result out{.status = report.ok() ? "prepared" : "failed",
                              .revision = std::move(version),
                              .snapshot = files.id(),

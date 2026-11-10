@@ -23,6 +23,11 @@ import signals;
 
 // The REST endpoints, each with the access it needs, and the table that routes a request to one.
 namespace front {
+    // Avoid constexpr format-handle instantiation in this module, which crashes the ARM64 compiler.
+    template <class... Args> auto format_text(std::string_view pattern, Args&&... args) -> std::string {
+        return std::vformat(pattern, std::make_format_args(args...));
+    }
+
     // The role an endpoint needs; each role may do what the ones before it may.
     enum class access { open, member, owner, host };
 
@@ -48,7 +53,7 @@ namespace front {
         template <class T> auto read_save(std::string_view body, std::string_view what) -> std::pair<std::uint64_t, T> {
             auto s = config::parse_as<section_save<T>>(body, what);
             if (!s.revision)
-                throw coded_error(400, "missing_revision", std::format("{}: 'revision' is required; read the section first", what));
+                throw coded_error(400, "missing_revision", format_text("{}: 'revision' is required; read the section first", what));
             return {*s.revision, std::move(s.value)};
         }
     } // namespace api
@@ -192,7 +197,7 @@ namespace front {
                 auto doc = c.config.current(c.core);
                 auto* s = doc->find(p[0]);
                 if (!s)
-                    throw config::not_found(std::format("unknown project '{}'", p[0]));
+                    throw config::not_found(format_text("unknown project '{}'", p[0]));
                 co_return ok(section_view{config::revision_of(*doc, p[0]), *s});
             }
         };
@@ -208,7 +213,7 @@ namespace front {
         struct delete_project : endpoint<"DELETE", "/api/v1/projects/{project}", access::member> {
             static auto handle(context& c, params p, const web::target&, std::string_view) -> coroutine::task<web::reply> {
                 co_await c.config.edit(c.core, [project = p[0]](config::store& st) { st.remove_project(project); });
-                co_return ok(message{std::format("project '{}' removed from the configuration; its files are kept", p[0])});
+                co_return ok(message{format_text("project '{}' removed from the configuration; its files are kept", p[0])});
             }
         };
 
@@ -455,7 +460,7 @@ namespace front {
                 std::string project{p[0]};
                 config::check_name("project", project);
                 if (!c.config.current(c.core)->find(project))
-                    throw config::not_found(std::format("unknown project '{}'", project));
+                    throw config::not_found(format_text("unknown project '{}'", project));
                 if (in.preview)
                     co_return ok(tools::generation_result{std::move(plan)});
                 if (in.operation_id.empty())
@@ -715,43 +720,43 @@ namespace front {
                 auto metric = [](std::string_view suffix) { return std::string{constants::metrics_prefix} + std::string{suffix}; };
                 std::string out;
                 auto family = [&](std::string_view name, std::string_view type, std::string_view help) {
-                    out += std::format("# HELP {} {}\n# TYPE {} {}\n", name, help, name, type);
+                    out += format_text("# HELP {} {}\n# TYPE {} {}\n", name, help, name, type);
                 };
                 family(metric("up"), "gauge", "The gateway is serving.");
-                out += std::format("{} 1\n", metric("up"));
+                out += format_text("{} 1\n", metric("up"));
                 family(metric("workers"), "gauge", "Workers connected.");
-                out += std::format("{} {}\n", metric("workers"), workers.size());
+                out += format_text("{} {}\n", metric("workers"), workers.size());
                 family(metric("worker_inflight"), "gauge", "Requests served by workers with the same identity labels.");
                 std::map<std::pair<std::string, std::string>, std::uint64_t> inflight;
                 for (const auto& w : workers)
                     inflight[{w.name, w.worker_id.value_or("")}] += w.inflight;
                 for (const auto& [identity, count] : inflight)
-                    out += std::format("{}{{worker=\"{}\",worker_id=\"{}\"}} {}\n", metric("worker_inflight"), label(identity.first), label(identity.second),
+                    out += format_text("{}{{worker=\"{}\",worker_id=\"{}\"}} {}\n", metric("worker_inflight"), label(identity.first), label(identity.second),
                                        count);
                 family(metric("builds_total"), "counter", "Builds, by result: ok, failed, not_run, unknown, cancelled.");
                 for (auto& [p, t] : ledger.totals.projects)
                     for (auto [result, n] : {std::pair{"ok", t.builds_ok}, std::pair{"failed", t.builds_failed}, std::pair{"not_run", t.builds_not_run},
                                              std::pair{"unknown", t.builds_unknown}, std::pair{"cancelled", t.builds_cancelled}})
-                        out += std::format("{}{{project=\"{}\",result=\"{}\"}} {}\n", metric("builds_total"), p, result, n);
+                        out += format_text("{}{{project=\"{}\",result=\"{}\"}} {}\n", metric("builds_total"), p, result, n);
                 family(metric("build_seconds_total"), "counter", "Wall time spent in builds.");
                 for (auto& [p, t] : ledger.totals.projects)
-                    out += std::format("{}{{project=\"{}\"}} {}\n", metric("build_seconds_total"), p, t.build_seconds);
+                    out += format_text("{}{{project=\"{}\"}} {}\n", metric("build_seconds_total"), p, t.build_seconds);
                 family(metric("synced_bytes_total"), "counter", "Bytes sent to workers to sync projects.");
                 for (auto& [p, t] : ledger.totals.projects)
-                    out += std::format("{}{{project=\"{}\"}} {}\n", metric("synced_bytes_total"), p, t.bytes_synced);
+                    out += format_text("{}{{project=\"{}\"}} {}\n", metric("synced_bytes_total"), p, t.bytes_synced);
                 family(metric("tool_calls_total"), "counter", "MCP tool calls, by tool and result.");
                 for (auto& [tool, t] : ledger.totals.tools) {
-                    out += std::format("{}{{tool=\"{}\",result=\"ok\"}} {}\n", metric("tool_calls_total"), tool, t.calls - t.errors);
-                    out += std::format("{}{{tool=\"{}\",result=\"error\"}} {}\n", metric("tool_calls_total"), tool, t.errors);
+                    out += format_text("{}{{tool=\"{}\",result=\"ok\"}} {}\n", metric("tool_calls_total"), tool, t.calls - t.errors);
+                    out += format_text("{}{{tool=\"{}\",result=\"error\"}} {}\n", metric("tool_calls_total"), tool, t.errors);
                 }
                 family(metric("running_builds"), "gauge", "Builds running now.");
-                out += std::format("{} {}\n", metric("running_builds"), ledger.running);
+                out += format_text("{} {}\n", metric("running_builds"), ledger.running);
                 family(metric("project_bytes"), "gauge", "Bytes of a project's files.");
                 for (auto& [p, bytes, _] : ledger.project_bytes)
-                    out += std::format("{}{{project=\"{}\"}} {}\n", metric("project_bytes"), p, bytes);
+                    out += format_text("{}{{project=\"{}\"}} {}\n", metric("project_bytes"), p, bytes);
                 family(metric("project_bytes_limit"), "gauge", "A project's storage quota.");
                 for (auto& [p, _, limit] : ledger.project_bytes)
-                    out += std::format("{}{{project=\"{}\"}} {}\n", metric("project_bytes_limit"), p, limit);
+                    out += format_text("{}{{project=\"{}\"}} {}\n", metric("project_bytes_limit"), p, limit);
                 co_return web::reply{.head = {.status = 200, .fields = {{"content-type", "text/plain; version=0.0.4; charset=utf-8"}}}, .body = std::move(out)};
             }
         };
@@ -847,7 +852,7 @@ namespace front {
             } catch (const std::exception& e) {
                 status = 500;
                 why = e.what();
-                logging::error(std::format("{} {}: {}", method, t.path, why));
+                logging::error(format_text("{} {}: {}", method, t.path, why));
             }
             if (out)
                 co_return std::move(*out);
