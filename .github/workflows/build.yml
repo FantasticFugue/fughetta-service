@@ -13,7 +13,9 @@ concurrency:
 env:
   XCLANG_VERSION: 23.1.3.6
   VCPKG_REGISTRY_URL: https://github.com/FantasticFugue/vcpkg-registry
+  VCPKG_REGISTRY_REF: tls-msquic-openssl
   HTTPANT_GIT_URL: https://github.com/tsurumi-yizhou/httpant
+  HTTPANT_GIT_REF: tls-quic-native-io
 
 jobs:
   build:
@@ -50,15 +52,23 @@ jobs:
         shell: bash
         run: python -m pip install --upgrade 'cmake>=4.0' ninja
 
+      - name: Install macOS dependency build tools
+        if: runner.os == 'macOS'
+        shell: bash
+        run: brew install autoconf autoconf-archive automake libtool
+
       - name: Fetch xclang
         shell: bash
         run: |
           set -euo pipefail
           name="xclang-$XCLANG_VERSION-${{ matrix.xclang_triple }}.tar.xz"
-          curl -fsSL "https://github.com/clice-io/xclang/releases/download/$XCLANG_VERSION/$name" -o "$RUNNER_TEMP/$name"
-          cd "$RUNNER_TEMP"
-          tar -xf "$name" -C "$RUNNER_TEMP"
-          root="$RUNNER_TEMP/xclang"
+          temporary="$RUNNER_TEMP"
+          if [ "$RUNNER_OS" = Windows ]; then
+            temporary="$(cygpath -u "$temporary")"
+          fi
+          curl -fsSL --retry 3 "https://github.com/clice-io/xclang/releases/download/$XCLANG_VERSION/$name" -o "$temporary/$name"
+          tar -xf "$temporary/$name" -C "$temporary"
+          root="$temporary/xclang"
           if [ "$RUNNER_OS" = Windows ]; then
             root="$(cygpath -m "$root")"
           fi
@@ -86,12 +96,27 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          git clone --depth 1 "$VCPKG_REGISTRY_URL" ../vcpkg-registry
-          git clone --depth 1 "$HTTPANT_GIT_URL" ../httpant
+          git clone --depth 1 --branch "$VCPKG_REGISTRY_REF" "$VCPKG_REGISTRY_URL" ../vcpkg-registry
+          git clone --depth 1 --branch "$HTTPANT_GIT_REF" "$HTTPANT_GIT_URL" ../httpant
+
+      - name: Restore installed vcpkg dependencies
+        id: vcpkg-installed
+        uses: actions/cache/restore@v4
+        with:
+          path: fughetta-service/build/debug/vcpkg_installed
+          key: vcpkg-installed-${{ runner.os }}-${{ runner.arch }}-debug-${{ env.XCLANG_VERSION }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: vcpkg-installed-${{ runner.os }}-${{ runner.arch }}-debug-${{ env.XCLANG_VERSION }}-
 
       - name: Configure
         shell: bash
         run: cmake -B build/debug -G Ninja -DCMAKE_TOOLCHAIN_FILE=cmake/toolchain.cmake -DCMAKE_BUILD_TYPE=Debug -DSANITIZERS=address,undefined
+
+      - name: Cache installed vcpkg dependencies
+        if: steps.vcpkg-installed.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: fughetta-service/build/debug/vcpkg_installed
+          key: ${{ steps.vcpkg-installed.outputs.cache-primary-key }}
 
       - name: Build
         shell: bash
