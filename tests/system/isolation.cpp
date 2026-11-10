@@ -161,9 +161,9 @@ namespace {
                 << "the console's source view is main: " << source_view.body;
 
             auto listed = test::request(http_port, http::method::POST, "/mcp", R"({"jsonrpc":"2.0","id":1,"method":"tools/list"})");
-            for (auto name : {"language", "build", "test", "run", "configurations"})
+            for (auto name : {"language", "build", "test", "run", "configurations", "worldline"})
                 expect(listed.body.contains(std::format(R"("name":"{}")", name))) << name;
-            for (auto name : {"read", "write", "edit", "worldline", "generate", "receipt", "jobs"})
+            for (auto name : {"read", "write", "edit", "generate", "receipt", "jobs"})
                 expect(!listed.body.contains(std::format(R"("name":"{}")", name))) << name;
             auto offered = test::request(http_port, http::method::GET, "/api/v1/templates");
             expect(offered.status == 200 && offered.body.contains("cpp-class") && !offered.body.contains("console")) << offered.body;

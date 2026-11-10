@@ -62,7 +62,8 @@ namespace native_process {
     namespace {
         constexpr long open_pid_call = 434;
         constexpr long close_range_call = 436;
-        [[noreturn]] void exec_child(char** args, char** envp, const char* dir, int out, int in, int file, const io::command& cmd, int parent) {
+        [[noreturn]] void exec_child(char** args, char** envp, const char* dir, int out, int in, int file, const io::command& cmd, int parent,
+                                    [[maybe_unused]] int descriptor_limit) {
 #ifdef __linux__
             if (::prctl(PR_SET_PDEATHSIG, SIGKILL) != 0 || ::getppid() != parent)
                 ::_exit(126);
@@ -85,6 +86,9 @@ namespace native_process {
                 ::write(2, error, sizeof(error) - 1);
                 ::_exit(126);
             }
+#elif defined(__APPLE__)
+            for (int fd = 3; fd < descriptor_limit; ++fd)
+                ::close(fd);
 #else
             ::closefrom(3);
 #endif
@@ -154,6 +158,11 @@ namespace native_process {
                 throw std::system_error(err, std::system_category(), "open child standard output");
             }
         }
+        // Query libc before fork; the child only closes descriptors before exec.
+        int descriptor_limit = 0;
+#ifdef __APPLE__
+        descriptor_limit = ::getdtablesize();
+#endif
         auto parent = ::getpid();
         auto pid = ::fork();
         if (pid < 0) {
@@ -167,7 +176,7 @@ namespace native_process {
             throw std::system_error(err, std::system_category(), "fork");
         }
         if (pid == 0)
-            exec_child(args.data(), envp, dir.c_str(), out[1], in, file, cmd, parent);
+            exec_child(args.data(), envp, dir.c_str(), out[1], in, file, cmd, parent, descriptor_limit);
         ::setpgid(pid, pid);
         ::close(out[1]);
         if (!cmd.interactive)

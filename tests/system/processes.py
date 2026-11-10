@@ -69,12 +69,12 @@ with tempfile.TemporaryDirectory(prefix="managed-budget-", dir=build) as directo
     for interrupt in (True, False):
         log = root / ("failure.log" if interrupt else "restart.log")
         notifications = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
-        notify_path = root / ("failure.sock" if interrupt else "restart.sock")
-        notifications.bind(str(notify_path))
+        notify_name = f"fughetta-{os.getpid()}-{'failure' if interrupt else 'restart'}"
+        notifications.bind("\0" + notify_name)
         notifications.setblocking(False)
         with log.open("w") as output:
             process = subprocess.Popen([str(binary), "--instance", "lifecycle-test", "config.json"], cwd=root, stdout=output, stderr=subprocess.STDOUT,
-                                       env={**os.environ, "NOTIFY_SOCKET": str(notify_path)})
+                                       env={**os.environ, "NOTIFY_SOCKET": "@" + notify_name})
             try:
                 ready(process, http, log)
                 pids = children(process.pid)

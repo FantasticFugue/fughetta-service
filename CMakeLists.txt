@@ -20,6 +20,12 @@ set(SANITIZERS "" CACHE STRING "Comma-separated sanitizers")
 if(SANITIZERS)
   add_compile_options("-fsanitize=${SANITIZERS}")
   add_link_options("-fsanitize=${SANITIZERS}")
+  if(CMAKE_CXX_COMPILER_TARGET MATCHES "windows-msvc$" AND SANITIZERS MATCHES "address")
+    # xclang's /MT build imports UCRT by default. ASan's static CRT thunk
+    # owns the heap entry points, so link UCRT statically for these builds.
+    add_link_options("LINKER:/nodefaultlib:ucrt.lib")
+    link_libraries(libucrt.lib)
+  endif()
 endif()
 
 if(WIN32)

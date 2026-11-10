@@ -608,7 +608,7 @@ namespace front {
                 auto actor = worlds::identity_key(*c.who);
                 auto result = co_await io::blocking(c.rt.get_scheduler(c.core), *c.pool,
                                                     [&store, actor, name = std::move(input->name)] { return store.add(name, actor); });
-                logging::info(std::format("worker.identity registered workspace_id={} worker_id={}", store.workspace_id(), result.worker_id));
+                logging::info("worker.identity registered workspace_id=" + store.workspace_id() + " worker_id=" + result.worker_id);
                 auto out = ok(result, 201);
                 out.head.fields.push_back({"cache-control", "no-store"});
                 co_return out;

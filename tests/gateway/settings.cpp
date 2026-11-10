@@ -127,7 +127,7 @@ namespace {
         auto config_tools = extract(configuration);
         expect(config_tools.size() == 4u);
         for (const auto& tool : config_tools) {
-            expect(!std::ranges::contains(business_tools, tool.name, &mcp::tool::name)) << tool.name;
+            expect(std::ranges::contains(business_tools, tool.name, &mcp::tool::name)) << tool.name;
             if (tool.name == "save_project") {
                 auto schema = rfl::json::write(tool.inputSchema);
                 expect(schema.contains("default_configurations") && schema.contains("Revision returned") && schema.size() < 2000) << schema.size();
@@ -203,7 +203,7 @@ namespace {
             });
         };
 
-        "configuration MCP shares REST operations and separates tool catalogs"_test = [] {
+        "configuration MCP shares REST operations and joins the workspace tool catalog"_test = [] {
             harness h;
             h.rt.run([&](ctx& io, std::size_t) -> coroutine::task<> {
                 return [](harness& h, ctx& io) -> coroutine::task<> {

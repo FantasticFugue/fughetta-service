@@ -80,6 +80,10 @@ jobs:
             root="$(cygpath -m "$root")"
           fi
           echo "XCLANG_ROOT=$root" >> "$GITHUB_ENV"
+          echo "$root/bin" >> "$GITHUB_PATH"
+          if [ "$RUNNER_OS" = Windows ]; then
+            "$root/bin/clang" --target=x86_64-pc-windows-msvc -print-runtime-dir >> "$GITHUB_PATH"
+          fi
 
       - name: Install vcpkg (latest)
         shell: bash

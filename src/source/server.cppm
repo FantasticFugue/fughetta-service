@@ -243,11 +243,13 @@ export namespace source_server {
                 for (auto& entry : std::filesystem::directory_iterator(storage_ / ".nodes", ec)) {
                     if (!entry.is_directory(ec) || entry.is_symlink(ec))
                         continue;
-                    jobs::project_usage u{.project = entry.path().filename().string(), .storage_bytes = stored(entry.path())};
+                    jobs::project_usage u{.project = entry.path().filename().string()};
                     auto tree =
                         repositories_.with(entry.path(), [](nodes::local_node& node) { return node.call({.action = "tree", .worldline = "main"}); }, true);
                     for (auto& file : tree.files)
                         u.source_bytes += file.size;
+                    // Opening the node can create SQLite's shared-memory file.
+                    u.storage_bytes = stored(entry.path());
                     out.projects.push_back(std::move(u));
                 }
                 std::ranges::sort(out.projects, {}, &jobs::project_usage::project);
