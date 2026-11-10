@@ -1,6 +1,7 @@
 import launch;
 import boost.ut;
 import protocol;
+import toolchain;
 
 namespace {
     using namespace boost::ut;
@@ -31,6 +32,10 @@ namespace {
             config::worker config;
             config.gateway = std::format("127.0.0.1:{}", server.endpoint().port());
             config.work_root = (tmp.dir / "worker").string();
+            // This session executes no jobs; host SDK discovery is outside its lifecycle.
+            config.inherit_env = false;
+            for (const auto& tool : toolchain::required_tools())
+                config.tools[tool] = (tmp.dir / "no-tools" / tool).string();
             test::spit(tmp.dir / "worker.json", rfl::json::write(config));
             test::child process{test::worker_command(SERVICE_EXECUTABLE, tmp.dir, {"worker.json"})};
             expect(process.wait() == 1) << process.output();

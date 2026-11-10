@@ -620,7 +620,7 @@ namespace front {
                 auto& store = identities(c);
                 auto id = p[0];
                 co_await io::blocking(c.rt.get_scheduler(c.core), *c.pool, [&store, id] { store.revoke(id); });
-                logging::info(std::format("worker.identity revoked workspace_id={} worker_id={}", store.workspace_id(), id));
+                logging::info("worker.identity revoked workspace_id=" + store.workspace_id() + " worker_id=" + id);
                 co_await c.workers.update_identity(c.core, id);
                 co_return ok(message{"Worker identity revoked"});
             }

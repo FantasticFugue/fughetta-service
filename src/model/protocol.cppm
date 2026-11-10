@@ -454,17 +454,7 @@ export namespace transport {
         channel(channel&&) = delete;
 
         template <class T> auto send(std::uint32_t kind, std::uint64_t corr, const T& value) -> coroutine::task<> {
-            auto body = codec<T>::encode(value);
-            if (body.size() > max_payload)
-                throw std::length_error("frame too large");
-            std::vector<std::byte> out(header_size + body.size());
-            auto len = static_cast<std::uint32_t>(body.size());
-            std::memcpy(out.data(), &len, 4);
-            std::memcpy(out.data() + 4, &kind, 4);
-            std::memcpy(out.data() + 8, &corr, 8);
-            std::memcpy(out.data() + header_size, body.data(), body.size());
-            auto turn = co_await writing_.lock();
-            co_await io::async_write(*peer_, out);
+            co_await send_frame(kind, corr, codec<T>::encode(value));
         }
 
         auto recv(std::size_t limit = max_payload) -> coroutine::task<frame> {
@@ -556,6 +546,19 @@ export namespace transport {
         }
 
     private:
+        auto send_frame(std::uint32_t kind, std::uint64_t corr, std::vector<std::byte> body) -> coroutine::task<> {
+            if (body.size() > max_payload)
+                throw std::length_error("frame too large");
+            std::vector<std::byte> out(header_size + body.size());
+            auto len = static_cast<std::uint32_t>(body.size());
+            std::memcpy(out.data(), &len, 4);
+            std::memcpy(out.data() + 4, &kind, 4);
+            std::memcpy(out.data() + 8, &corr, 8);
+            std::memcpy(out.data() + header_size, body.data(), body.size());
+            auto turn = co_await writing_.lock();
+            co_await io::async_write(*peer_, out);
+        }
+
         struct pending {
             jobs::progress_log* progress = nullptr;
             std::optional<frame> value;

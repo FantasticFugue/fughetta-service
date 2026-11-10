@@ -43,7 +43,7 @@ export namespace nodes::archive {
         std::uint64_t size = 0;
         for (int i = 7; i >= 0; --i)
             size = (size << 8) | static_cast<unsigned char>(stored[4 + i]);
-        if (size > std::min(most, limit))
+        if (size > std::min<std::uint64_t>(most, limit))
             fail(nodes::code::resource_limit, "compressed object plaintext limit");
         std::string out(size, '\0');
         static thread_local std::unique_ptr<ZSTD_DCtx, decltype(&ZSTD_freeDCtx)> decompressor{ZSTD_createDCtx(), ZSTD_freeDCtx};
