@@ -85,6 +85,13 @@ jobs:
       - name: Install build tools
         run: python -m pip install --upgrade 'cmake>=4.0' ninja
 
+      - name: Install Linux dependency build tools
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y autoconf autoconf-archive automake libtool
+
       - name: Install macOS dependency build tools
         if: runner.os == 'macOS'
         shell: bash
