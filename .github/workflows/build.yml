@@ -1,13 +1,5 @@
 name: build
 
-# The two things this build needs cannot come from a public registry:
-#
-#   vars.XCLANG_URL              tarball of the xclang tree (C++23 modules)
-#   vars.HTTPANT_REGISTRY_URL    git URL of the vcpkg registry that serves httpant
-#   vars.HTTPANT_GIT_URL         current httpant source repository
-#
-# Until they are set the job skips with a notice instead of failing: the compiler
-# and one of the dependencies are not public.
 on:
   push:
     branches: [main]
@@ -18,10 +10,14 @@ concurrency:
   group: build-${{ github.ref }}
   cancel-in-progress: true
 
+env:
+  XCLANG_VERSION: 23.1.3.6
+  VCPKG_REGISTRY_URL: https://github.com/FantasticFugue/vcpkg-registry
+  HTTPANT_GIT_URL: https://github.com/tsurumi-yizhou/httpant
+
 jobs:
   build:
     name: ${{ matrix.name }}
-    if: vars.XCLANG_URL != '' && vars.HTTPANT_REGISTRY_URL != '' && vars.HTTPANT_GIT_URL != ''
     runs-on: ${{ matrix.os }}
     defaults:
       run:
@@ -32,58 +28,65 @@ jobs:
         include:
           - name: linux-x64
             os: ubuntu-24.04
+            xclang_triple: x86_64-unknown-linux-gnu
           - name: macos-arm64
             os: macos-15
+            xclang_triple: aarch64-apple-darwin
           - name: windows-x64
             os: windows-2025
+            xclang_triple: x86_64-w64-mingw32
     env:
-      # Everything else is derived from these two: the xclang target from the host,
-      # the vcpkg triplet from the target.
       VCPKG_ROOT: ${{ github.workspace }}/.vcpkg
-      HTTPANT_GIT_URL: ${{ vars.HTTPANT_GIT_URL }}
     steps:
       - uses: actions/checkout@v5
         with:
           path: fughetta-service
 
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.x"
+
+      - name: Install build tools
+        shell: bash
+        run: python -m pip install --upgrade 'cmake>=4.0' ninja
 
       - name: Fetch xclang
         shell: bash
         run: |
           set -euo pipefail
-          url="${{ vars.XCLANG_URL }}"
-          case "$url" in
-            *.tar.zst) curl -fsSL "$url" -o "$RUNNER_TEMP/xclang.tar"; tar --use-compress-program=unzstd -xf "$RUNNER_TEMP/xclang.tar" -C "$RUNNER_TEMP" ;;
-            *.tar.xz)  curl -fsSL "$url" -o "$RUNNER_TEMP/xclang.tar"; tar -xf "$RUNNER_TEMP/xclang.tar" -C "$RUNNER_TEMP" ;;
-            *)         curl -fsSL "$url" -o "$RUNNER_TEMP/xclang.tar"; tar -xzf "$RUNNER_TEMP/xclang.tar" -C "$RUNNER_TEMP" ;;
-          esac
-          # The archive holds one top-level xclang/ directory.
-          echo "XCLANG_ROOT=$RUNNER_TEMP/xclang" >> "$GITHUB_ENV"
-          echo "XCLANG_ROOT=$RUNNER_TEMP/xclang" >> "$GITHUB_PATH"
+          name="xclang-$XCLANG_VERSION-${{ matrix.xclang_triple }}.tar.xz"
+          curl -fsSL "https://github.com/clice-io/xclang/releases/download/$XCLANG_VERSION/$name" -o "$RUNNER_TEMP/$name"
+          cd "$RUNNER_TEMP"
+          tar -xf "$name" -C "$RUNNER_TEMP"
+          root="$RUNNER_TEMP/xclang"
+          if [ "$RUNNER_OS" = Windows ]; then
+            root="$(cygpath -m "$root")"
+          fi
+          echo "XCLANG_ROOT=$root" >> "$GITHUB_ENV"
 
       - name: Install vcpkg (latest)
         shell: bash
         run: |
           set -euo pipefail
           git clone --depth 1 https://github.com/microsoft/vcpkg "$VCPKG_ROOT"
-          if [ -f "$VCPKG_ROOT/bootstrap-vcpkg.sh" ]; then
-            "$VCPKG_ROOT/bootstrap-vcpkg.sh" -disableMetrics
+          if [ "$RUNNER_OS" = Windows ]; then
+            cmd //c "$(cygpath -w "$VCPKG_ROOT/bootstrap-vcpkg.bat")" -disableMetrics
           else
-            "$VCPKG_ROOT/bootstrap-vcpkg.bat" -disableMetrics
+            "$VCPKG_ROOT/bootstrap-vcpkg.sh" -disableMetrics
           fi
 
-      - name: Cache vcpkg binaries
+      - name: Cache vcpkg downloads
         uses: actions/cache@v4
         with:
-          path: ${{ github.workspace }}/.vcpkg/downloads
-          key: vcpkg-${{ runner.os }}-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json') }}
-          restore-keys: vcpkg-${{ runner.os }}-
+          path: fughetta-service/build/debug/vcpkg-downloads
+          key: vcpkg-downloads-${{ runner.os }}-${{ runner.arch }}-${{ github.run_id }}
+          restore-keys: vcpkg-downloads-${{ runner.os }}-${{ runner.arch }}-
 
       - name: Fetch current dependency sources
         shell: bash
         run: |
           set -euo pipefail
-          git clone --depth 1 "${{ vars.HTTPANT_REGISTRY_URL }}" ../vcpkg-registry
+          git clone --depth 1 "$VCPKG_REGISTRY_URL" ../vcpkg-registry
           git clone --depth 1 "$HTTPANT_GIT_URL" ../httpant
 
       - name: Configure
