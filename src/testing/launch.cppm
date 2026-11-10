@@ -249,9 +249,14 @@ export namespace test {
         };
         return request(port, http::method::PUT, path, std::format(R"({{"revision":{},"value":{}}})", decode<revision>(current.body).revision, value));
     }
-    inline auto tool(std::uint16_t port, std::string name, std::string args, bool error = false) -> std::string {
+    inline auto tool(std::uint16_t port, std::string name, std::string args, bool error = false, std::string credential = "sk_test") -> std::string {
+        if (credential == "sk_test" && (name == "worldline" || name == "language" || name == "scope" || name == "build" || name == "test" || name == "run")) {
+            auto object = decode<rfl::Generic>(args).to_object().value();
+            if (!object.get("worldline")) object["worldline"] = "main";
+            args = rfl::json::write(object);
+        }
         auto response = request(port, http::method::POST, "/mcp",
-                                std::format(R"({{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{{"name":"{}","arguments":{}}}}})", name, args));
+                                std::format(R"({{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{{"name":"{}","arguments":{}}}}})", name, args), credential);
         require(response.status == 200, response.body);
         struct payload {
             bool isError = false;
@@ -266,6 +271,7 @@ export namespace test {
     }
     inline constexpr std::string_view project = "/api/v1/projects/app";
     inline auto worldline(std::uint16_t port, std::string project, std::string action, std::string fields = {}, bool error = false) -> std::string {
+        if (!fields.contains("\"worldline\"")) { if (!fields.empty()) fields += ","; fields += "\"worldline\":\"main\""; }
         auto response = request(port, http::method::POST, "/api/v1/projects/" + project + "/worldline",
                                 std::format(R"({{"project":{},"action":{}{}}})", rfl::json::write(project), rfl::json::write(action),
                                             fields.empty() ? "" : "," + fields));

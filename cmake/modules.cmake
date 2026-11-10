@@ -39,7 +39,7 @@ add_modules(core core async coroutine reflection meta constants utility mpmc)
 
 # platform: operating system providers
 add_layer(platform)
-add_modules(platform platform environment host signals affinity durability process isolation)
+add_modules(platform platform environment host signals affinity durability process)
 
 # io
 add_layer(io)
@@ -73,14 +73,12 @@ add_modules(worker worker executor dependencies)
 
 if(WIN32)
   add_modules(platform platform/windows winapi)
-  add_implementation(platform platform/windows create job machine console group flush)
+  add_implementation(platform platform/windows create machine console group flush)
   target_compile_definitions(platform PRIVATE NTDDI_VERSION=0x0A00000C)
   target_link_libraries(platform PRIVATE advapi32)
-elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux")
-  add_modules(platform platform/linux cgroup)
+elseif(CMAKE_SYSTEM_NAME MATCHES "Linux|Darwin")
   add_modules(platform platform/posix descriptor)
-  add_implementation(platform platform/linux pidfd hierarchy pthread fsync)
-  add_implementation(platform platform/posix uname sigwait)
+  add_implementation(platform platform/posix uname sigwait create affinity flush)
 else()
   message(FATAL_ERROR "No platform provider for ${CMAKE_SYSTEM_NAME}")
 endif()

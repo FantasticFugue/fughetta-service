@@ -1,0 +1,17 @@
+[Unit]
+Description=Fughetta workspace task scheduler
+After=network.target
+
+[Service]
+Type=simple
+User=fughetta
+Group=fughetta
+StateDirectory=fughetta-service
+WorkingDirectory=/var/lib/fughetta-service
+ExecStart=@CMAKE_INSTALL_FULL_BINDIR@/fughetta-service @CMAKE_INSTALL_FULL_SYSCONFDIR@/fughetta-service/config.json
+Restart=on-failure
+TimeoutStopSec=15
+KillMode=mixed
+
+[Install]
+WantedBy=multi-user.target

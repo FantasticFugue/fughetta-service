@@ -59,12 +59,17 @@ export namespace tools {
 
     template <class In>
     concept on_project = requires(const In& in) {
-        { in.project.value() } -> std::convertible_to<std::string>;
+        in.project.value();
     };
 
+    template <on_project In> auto project_name(const In& in) -> std::string {
+        if constexpr (requires { in.project.value().value_or(""); }) return in.project.value().value_or("");
+        else return in.project.value();
+    }
     template <on_project In> auto project_of(const In& in) -> std::string {
-        config::check_name("project", in.project.value());
-        return in.project.value();
+        auto name = project_name(in);
+        config::check_name("project", name);
+        return name;
     }
 
     // A refusal from the node engine, kept with its code so MCP callers get { code, message }.
@@ -108,13 +113,29 @@ export namespace tools {
 
             template <class T> auto invoke(rfl::Generic args, mcp::notifier& note, const worlds::actor& who) -> coroutine::task<mcp::tool_outcome> {
                 auto started = std::chrono::steady_clock::now();
+                if (!who.run.empty()) {
+                    if constexpr (T::name == "task") co_return refused({nodes::code::permission_denied, "execution cannot administer tasks"});
+                    auto object = args.to_object();
+                    if (!object) co_return refused({nodes::code::invalid_record, "arguments must be an object"});
+                    if (auto project = object->get("project")) {
+                        auto value = project->to_string();
+                        if (!value || *value != who.project) co_return refused({nodes::code::permission_denied, "project differs from task binding"});
+                    } else (*object)["project"] = who.project;
+                    if constexpr (requires(typename T::input input) { input.worldline; }) {
+                        if (auto line = object->get("worldline")) {
+                            auto value = line->to_string();
+                            if (!value || *value != who.worldline) co_return refused({nodes::code::permission_denied, "worldline differs from task binding"});
+                        } else (*object)["worldline"] = who.worldline;
+                    }
+                    args = *object;
+                }
                 auto in = rfl::from_generic<typename T::input>(args);
                 if (!in)
                     co_return refused({nodes::code::invalid_record, std::format("{}: bad arguments: {}", T::name, in.error().what())});
                 std::optional<std::string> where;
                 if constexpr (on_project<typename T::input>)
-                    if (config::valid_name(in->project.value()))
-                        where = in->project.value();
+                    if (config::valid_name(project_name(*in)))
+                        where = project_name(*in);
                 auto& actor = who;
 
                 std::optional<typename T::output> value;
@@ -315,6 +336,33 @@ export namespace tools {
             throw tool_error(reply.code, reply.reason);
         co_return reply;
     }
+    auto execution_actor(services& s, std::string credential) -> coroutine::task<worlds::actor> {
+        if (!credential.starts_with("fugrun.")) throw tool_error("unauthenticated", "invalid execution credential");
+        auto text = std::string_view{credential}.substr(7);
+        auto dot = text.rfind('.');
+        if (dot == std::string_view::npos) throw tool_error("unauthenticated", "invalid execution credential");
+        auto project = std::string{text.substr(0, dot)}, token = std::string{text.substr(dot + 1)};
+        config::check_name("project", project);
+        if (token.size() != 64) throw tool_error("unauthenticated", "invalid execution credential");
+        auto reply = co_await node_call(s, project, {.action = "task_lookup", .execution_token = token}, worlds::service_actor("execution"));
+        if (!reply.execution) throw tool_error("unauthenticated", "execution not found");
+        auto identity = rfl::json::read<worlds::actor>(reply.execution->identity);
+        if (!identity) throw tool_error("unauthenticated", "invalid execution identity");
+        auto who = *identity;
+        who.run = reply.execution->run; who.task = reply.execution->task;
+        who.project = project; who.worldline = reply.execution->worldline; who.execution_token = token;
+        co_return who;
+    }
+
+    inline auto execution_line(const worlds::actor& actor, const std::optional<std::string>& selected) -> std::string {
+        if (!actor.run.empty()) {
+            if (selected && *selected != actor.worldline) throw tool_error(nodes::code::permission_denied, "worldline differs from task binding");
+            return actor.worldline;
+        }
+        if (!selected || selected->empty()) throw tool_error("context_required", "start a task execution or select a worldline explicitly");
+        return *selected;
+    }
+
     // The frontier of a version of a worldline, or of its current state when no version is named.
     auto selected(services& s, const std::string& project, const std::string& worldline, const std::string& version, const worlds::actor& actor)
         -> coroutine::task<nodes::node_reply> {
@@ -438,22 +486,26 @@ export namespace tools {
     }
 
     struct worldline
-        : tool<"worldline", "Work in an explicit worldline: list, inspect, read, fork, apply, receipt, history, reverse or redo. "
+        : tool<"worldline", "Work in an explicit worldline: list, inspect, read, compare, diff, promote, fork, apply, receipt, history, reverse or redo. "
                            "Concurrent edits within a worldline converge; worldlines never merge. Writes name the observed version and "
                            "use Unicode scalar offsets. Repeat an operation_id with identical input to recover its recorded result."> {
         struct input {
-            rfl::Description<"Project name", std::string> project;
-            rfl::Description<"list, inspect, read, fork, apply, receipt, history, contribution, reverse, redo, export or restore",
+            rfl::Description<"Project; supplied by the execution context when absent", std::optional<std::string>> project;
+            rfl::Description<"list, inspect, read, compare, diff, promote, fork, apply, receipt, history, contribution, reverse, redo, export or restore",
                              std::string>
                 action;
-            rfl::Description<"Worldline name; main when absent", std::optional<std::string>> worldline;
-            rfl::Description<"inspect/read/fork/export: the version to use; the current one when absent", std::optional<std::string>> version;
-            rfl::Description<"apply/reverse/redo: the version this change was made against", std::optional<std::string>> observed;
+            rfl::Description<"Worldline name; task binding when absent; explicit selection required without a task", std::optional<std::string>> worldline;
+            rfl::Description<"inspect/read/fork/export: selected version; diff/promote: source version (required for promote)", std::optional<std::string>> version;
+            rfl::Description<"apply/reverse/redo/compare: observed version; diff/promote: target version (required for promote)", std::optional<std::string>> observed;
+            rfl::Description<"read: first Unicode scalar to return in a text file", std::optional<std::uint64_t>> offset;
+            rfl::Description<"read: Unicode scalars to return; bounded by the project read_max_bytes", std::optional<std::uint64_t>> count;
+            rfl::Description<"read: omit content when this digest is unchanged", std::optional<std::string>> known_digest;
+            rfl::Description<"apply/promote/reverse/redo: held scope lease tokens; an expired token refuses the write", std::optional<std::vector<std::string>>> leases;
             rfl::Description<"read: file path", std::optional<std::string>> path;
             rfl::Description<"fork/restore: name of the new worldline", std::optional<std::string>> name;
-            rfl::Description<"fork: worldline to fork from; this call's worldline when absent", std::optional<std::string>> from;
-            rfl::Description<"apply/fork/reverse/redo/restore: caller-chosen ID of this operation", std::optional<std::string>> operation_id;
-            rfl::Description<"apply/fork/reverse/redo: what this change is for", std::optional<std::string>> intent;
+            rfl::Description<"fork/diff/promote: source worldline; diff/promote compare or copy into worldline", std::optional<std::string>> from;
+            rfl::Description<"apply/promote/fork/reverse/redo/restore: caller-chosen ID of this operation", std::optional<std::string>> operation_id;
+            rfl::Description<"apply/promote/fork/reverse/redo: what this change is for", std::optional<std::string>> intent;
             rfl::Description<"apply: one atomic batch", std::optional<std::vector<change>>> changes;
             rfl::Description<"export: replace a package of that name", std::optional<bool>> force;
             rfl::Description<"export/restore: package name, shared by the workspace's projects", std::optional<std::string>> package;
@@ -482,9 +534,9 @@ export namespace tools {
             std::optional<file_side> before, after;
         };
         struct output {
-            std::optional<std::string> worldline, version, written_version, base_version, path, digest, kind, data_base64, receipt, operation_id;
-            std::optional<std::uint64_t> size;
-            std::optional<bool> executable, replayed, truncated;
+            std::optional<std::string> worldline, version, written_version, base_version, path, digest, kind, data_base64, receipt, operation_id, text;
+            std::optional<std::uint64_t> size, offset, count, total_scalars, next_offset;
+            std::optional<bool> executable, replayed, truncated, unchanged;
             std::optional<std::vector<line_entry>> worldlines;
             std::optional<std::vector<lines::entry>> files;
             std::optional<std::vector<std::string>> conflicts;
@@ -496,10 +548,83 @@ export namespace tools {
             std::optional<std::string> configuration;
         };
 
+        // Source text is valid UTF-8. Scan disjoint portions once, and only
+        // copy/encode the selected byte window after applying the output limit.
+        static auto render_read(const nodes::file_view& file, std::optional<std::uint64_t> offset_input,
+                                std::optional<std::uint64_t> count_input, std::uint64_t max_bytes) -> output {
+            std::string decoded;
+            if (file.encoding == "hex") decoded = lines::unhex(file.text);
+            const std::string_view bytes = file.encoding == "hex" ? decoded : std::string_view{file.text};
+            output out{.path = file.path, .digest = file.digest, .kind = file.kind,
+                       .size = bytes.size(), .executable = file.executable};
+            auto selected = bytes;
+            if (offset_input || count_input) {
+                if (file.kind != "text")
+                    throw tool_error(nodes::code::invalid_record, "source scalar ranges require a text file");
+                const auto offset = offset_input.value_or(0);
+                const auto wanted = count_input.value_or(std::numeric_limits<std::uint64_t>::max());
+                std::uint64_t total = 0, returned = 0;
+                std::size_t at = 0, start = bytes.size(), end = bytes.size();
+                // Count leading bytes in blocks so the prefix scan can be
+                // vectorized. A block has at most this many scalars, so it
+                // cannot overshoot the requested offset. Finish a character
+                // crossing the block boundary before starting the next one.
+                constexpr std::size_t block = 256;
+                while (offset - total >= block && bytes.size() - at >= block) {
+                    total += lines::scalars(bytes.substr(at, block));
+                    at += block;
+                    while (at < bytes.size() && (static_cast<unsigned char>(bytes[at]) & 0xc0) == 0x80) ++at;
+                }
+                while (at < bytes.size()) {
+                    if (total == offset) start = end = at;
+                    auto next = at + 1;
+                    while (next < bytes.size() && (static_cast<unsigned char>(bytes[next]) & 0xc0) == 0x80) ++next;
+                    if (total >= offset) {
+                        if (returned == wanted || next - start > max_bytes) break;
+                        end = next;
+                        ++returned;
+                    }
+                    at = next;
+                    ++total;
+                }
+                // Only the unvisited suffix is counted; neither endpoint is
+                // searched from the beginning again. No offset+count overflow.
+                total += lines::scalars(bytes.substr(at));
+                if (offset > total) throw tool_error(nodes::code::invalid_record, "read offset is beyond the text");
+                const auto requested = std::min(wanted, total - offset);
+                selected = bytes.substr(start, end - start);
+                out.offset = offset; out.count = returned; out.total_scalars = total;
+                out.next_offset = offset + returned; out.truncated = returned < requested;
+            }
+            if (file.kind == "text") out.text = std::string{selected};
+            out.data_base64 = lines::base64(selected);
+            return out;
+        }
+
+        static auto delta(services& s, const std::string& project, const std::string& line,
+                          const std::string& before, const std::string& after, const worlds::actor& actor, std::string from = {}) -> coroutine::task<output> {
+            auto base = co_await node_call(s, project, {.action = "head", .worldline = from.empty() ? line : from, .revision = before}, actor, true);
+            auto diff = co_await node_call(s, project, {.action = from.empty() ? "compare" : "diff", .worldline = line, .revision = after,
+                .expected = base.frontier, .target = from, .max_bytes = 0}, actor, true);
+            output out{.worldline = line, .version = diff.version, .base_version = diff.base_version};
+            out.changes.emplace(); out.files.emplace(); out.conflicts = diff.conflicts;
+            auto side = [](const auto& file) { return file_side{.path = file.path, .digest = file.digest, .kind = file.kind,
+                .size = file.size, .executable = file.executable}; };
+            for (const auto& change : diff.changes) {
+                out.changes->push_back({change.type, change.before ? std::optional{side(*change.before)} : std::nullopt,
+                    change.after ? std::optional{side(*change.after)} : std::nullopt});
+                if (change.after) { const auto& f = *change.after; out.files->push_back({f.path, f.digest, f.kind, f.size, f.executable}); }
+            }
+            co_return out;
+        }
+
         static auto run(services& s, input in, mcp::notifier&, const worlds::actor& actor) -> coroutine::task<output> {
             auto project = project_of(in);
-            auto line = in.worldline.value().value_or("main");
             auto& action = in.action.value();
+            auto selection = in.worldline.value();
+            if (!selection && action == "fork") selection = in.from.value();
+            if (!selection && action == "restore") selection = in.name.value();
+            auto line = action == "list" && actor.run.empty() && !selection ? std::string{} : execution_line(actor, selection);
             output out{.worldline = line};
             if (action == "list") {
                 auto r = co_await node_call(s, project, {.action = "worldlines"}, actor, true);
@@ -521,20 +646,43 @@ export namespace tools {
             } else if (action == "read") {
                 if (!in.path.value())
                     throw tool_error(nodes::code::invalid_record, "read names a path");
+                std::string selected_version = in.version.value().value_or("");
+                if (in.known_digest.value()) {
+                    auto tree = co_await node_call(s, project, {.action = "stat", .worldline = line, .revision = selected_version, .target = *in.path.value()}, actor, true);
+                    auto found = std::ranges::find(tree.files, *in.path.value(), &nodes::file_view::path);
+                    if (found == tree.files.end()) throw tool_error(nodes::code::missing_objects, "file not in this version");
+                    if (found->digest == *in.known_digest.value())
+                        co_return output{.worldline = line, .version = tree.version, .path = found->path, .digest = found->digest,
+                            .kind = found->kind, .size = found->size, .executable = found->executable, .unchanged = true};
+                    selected_version = tree.version;
+                }
                 auto r = co_await node_call(
-                    s, project, {.action = "read", .worldline = line, .revision = in.version.value().value_or(""), .target = *in.path.value()}, actor, true);
+                    s, project, {.action = "read", .worldline = line, .revision = selected_version, .target = *in.path.value()}, actor, true);
                 auto file = std::ranges::find(r.files, *in.path.value(), &nodes::file_view::path);
                 if (file == r.files.end())
                     throw tool_error(nodes::code::missing_objects, *in.path.value() + " is not in this version");
-                auto bytes = lines::bytes_of(*file);
-                out = {.worldline = line,
-                       .version = r.version,
-                       .path = file->path,
-                       .digest = file->digest,
-                       .kind = file->kind,
-                       .data_base64 = lines::base64(bytes),
-                       .size = bytes.size(),
-                       .executable = file->executable};
+                out = render_read(*file, in.offset.value(), in.count.value(),
+                    (in.offset.value() || in.count.value()) ? config::resolve(*s.snapshot(), project).limits.read_max_bytes : 0);
+                out.worldline = line;
+                out.version = r.version;
+            } else if (action == "compare") {
+                if (!in.observed.value()) throw tool_error(nodes::code::invalid_record, "compare requires observed");
+                co_return co_await delta(s, project, line, *in.observed.value(), in.version.value().value_or(""), actor);
+            } else if (action == "diff") {
+                if (!in.from.value()) throw tool_error(nodes::code::invalid_record, "diff requires from");
+                co_return co_await delta(s, project, line, in.version.value().value_or(""), in.observed.value().value_or(""), actor, *in.from.value());
+            } else if (action == "promote") {
+                if (!in.from.value() || !in.version.value() || !in.observed.value() || !in.operation_id.value())
+                    throw tool_error(nodes::code::invalid_record, "promote requires from, version, observed and operation_id");
+                auto source = co_await node_call(s, project, {.action = "head", .worldline = *in.from.value(), .revision = *in.version.value()}, actor, true);
+                auto base = co_await node_call(s, project, {.action = "head", .worldline = line, .revision = *in.observed.value()}, actor, true);
+                auto r = co_await node_call(s, project, {.action = "promote", .worldline = line,
+                    .leases = in.leases.value().value_or(std::vector<std::string>{}),
+                    .operation = lines::operation_of(*in.operation_id.value()), .caller_operation = *in.operation_id.value(),
+                    .expected = base.frontier, .source = source.frontier, .target = *in.from.value(), .intent = in.intent.value().value_or("")}, actor);
+                out = co_await delta(s, project, line, r.base_version, r.version, actor);
+                out.receipt = r.receipt; out.operation_id = in.operation_id.value(); out.replayed = r.replayed;
+                out.written_version = r.written_version;
             } else if (action == "fork") {
                 if (!in.name.value())
                     throw tool_error(nodes::code::invalid_record, "fork names the new worldline");
@@ -572,9 +720,17 @@ export namespace tools {
                     throw tool_error(nodes::code::invalid_record, action + " names an operation_id");
                 if (!in.observed.value())
                     throw tool_error(nodes::code::invalid_record, action + " names the version it observed");
-                auto observed = co_await selected(s, project, line, *in.observed.value(), actor);
+                auto observed = co_await node_call(s, project, {.action = "head", .worldline = line, .revision = *in.observed.value()}, actor, true);
+                std::set<std::string> loaded;
+                for (const auto& change : in.changes.value().value_or(std::vector<change>{}))
+                    if ((change.kind.value() == "edit" || change.kind.value() == "write") && loaded.insert(change.path.value()).second) {
+                        auto file = co_await node_call(s, project, {.action = "read", .worldline = line,
+                            .revision = observed.version, .target = change.path.value()}, actor, true);
+                        observed.files.insert(observed.files.end(), file.files.begin(), file.files.end());
+                    }
                 nodes::node_request request{.action = action,
                                             .worldline = line,
+                                            .leases = in.leases.value().value_or(std::vector<std::string>{}),
                                             .operation = lines::operation_of(in.operation_id.value().value_or("")),
                                             .caller_operation = std::string{in.operation_id.value().value_or("")},
                                             .expected = observed.frontier,
@@ -587,10 +743,9 @@ export namespace tools {
                         throw tool_error(nodes::code::invalid_record, "apply needs at least one change");
                 }
                 auto r = co_await node_call(s, project, std::move(request), actor);
-                auto tree = co_await selected(s, project, line, r.version, actor);
-                out = {.worldline = line, .version = r.version, .receipt = r.receipt, .operation_id = in.operation_id.value(), .replayed = r.replayed};
+                out = co_await delta(s, project, line, r.base_version, r.version, actor);
+                out.receipt = r.receipt; out.operation_id = in.operation_id.value(); out.replayed = r.replayed;
                 out.written_version = r.written_version;
-                out.files = lines::manifest(tree);
             } else if (action == "receipt") {
                 auto r = co_await node_call(s, project,
                                             {.action = "receipt",
@@ -598,10 +753,9 @@ export namespace tools {
                                              .operation = lines::operation_of(in.operation_id.value().value_or("")),
                                              .caller_operation = std::string{in.operation_id.value().value_or("")}},
                                             actor, true);
-                auto tree = co_await selected(s, project, line, r.version, actor);
-                out = {.worldline = r.worldline, .version = r.version, .receipt = r.receipt, .operation_id = in.operation_id.value(), .replayed = true};
+                out = co_await delta(s, project, r.worldline, r.base_version, r.version, actor);
+                out.receipt = r.receipt; out.operation_id = in.operation_id.value(); out.replayed = true;
                 out.written_version = r.written_version;
-                out.files = lines::manifest(tree);
             } else if (action == "history") {
                 auto limit = std::min<std::uint64_t>(in.limit.value().value_or(100), config::resolve(*s.snapshot(), project).limits.list_max_entries);
                 auto r = co_await node_call(s, project, {.action = "history", .worldline = line, .target = in.cursor.value().value_or(""), .limit = limit},
@@ -740,6 +894,7 @@ export namespace tools {
         std::string export_error;
         std::vector<std::string> export_skipped;
         std::string dependency_cache;
+        builds::timings timings;
     };
 
     // Build, test and run jobs of the workspace, kept on core zero. As many run at once as the limits and the workers allow; waiting
@@ -796,6 +951,7 @@ export namespace tools {
             friend class backlog;
             std::string actor_;
             std::string reuse_ = "executed";
+            std::chrono::steady_clock::time_point submitted_ = std::chrono::steady_clock::now();
             std::atomic<bool> done_{false}, left_{false};
             std::atomic<std::size_t> ahead_{0};
             std::atomic<std::uint64_t> job_{0};
@@ -834,7 +990,7 @@ export namespace tools {
             runner run;
             bool running = false;
             // After every eligible worker was busy, the job is not tried again before this.
-            std::chrono::steady_clock::time_point retry_at{};
+            std::chrono::steady_clock::time_point retry_at{}, started_at{};
             std::vector<std::shared_ptr<ticket>> tickets;
             std::shared_ptr<jobs::progress_log> progress = std::make_shared<jobs::progress_log>();
             coroutine::stop_source stop;
@@ -922,6 +1078,7 @@ export namespace tools {
     struct sync_stats {
         std::uint64_t blobs = 0;
         std::uint64_t bytes = 0;
+        double seconds = 0;
     };
 
     inline constexpr std::chrono::seconds offer_deadline{60};
@@ -947,6 +1104,17 @@ export namespace tools {
         std::mutex mutex;
         std::pair<std::string, std::optional<std::string>> value;
         bool began = false;
+        builds::timings timings;
+        std::optional<std::chrono::steady_clock::time_point> syncing;
+        void sync_begin() {
+            std::lock_guard held{mutex};
+            syncing = std::chrono::steady_clock::now();
+        }
+        void sync_end() {
+            std::lock_guard held{mutex};
+            timings.sync_seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - *syncing).count();
+            syncing.reset();
+        }
         void begin() {
             std::lock_guard held{mutex};
             began = true;
@@ -963,6 +1131,10 @@ export namespace tools {
             std::lock_guard held{mutex};
             result.worker = value.first;
             result.worker_id = value.second;
+            if constexpr (requires { result.timings; }) {
+                result.timings = timings;
+                if (syncing) result.timings.sync_seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - *syncing).count();
+            }
         }
     };
 
@@ -982,6 +1154,8 @@ export namespace tools {
                 progress->push(jobs::progress{done, total, std::move(stage)});
         };
         sync_stats stats;
+        const auto sync_started = std::chrono::steady_clock::now();
+        executor->sync_begin();
 
         std::unordered_map<content::hash, std::uint64_t> sizes;
         for (auto& e : tree.files)
@@ -1036,7 +1210,9 @@ export namespace tools {
             co_await within(io, push_deadline, "a push", worker.call(jobs::source_bytes{std::move(parts)}));
             report(stats.bytes, total, "sync");
         }
+        executor->sync_end();
         stats.blobs = plan.missing.size();
+        stats.seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - sync_started).count();
 
         report(0, 0, request.steps.empty() ? "run" : request.steps.front().name);
         request.snapshot = expected_snapshot;
@@ -1120,9 +1296,10 @@ export namespace tools {
                   jobs::build_request request, std::string worldline, std::string version, worlds::actor actor, jobs::progress_log& progress,
                   std::string operation, std::shared_ptr<execution_identity> executor, std::string toolchain)
         -> coroutine::task<std::optional<backlog::outcome>> {
+        if (!actor.run.empty()) co_await selected(s, project, worldline, version, actor);
         config_result r{.configuration = config.name, .snapshot = version};
         auto workspace = s.snapshot()->server.auth.workspace;
-        auto who = worlds::identity_key(actor);
+        auto who = worlds::execution_key(actor);
         auto started = std::chrono::steady_clock::now();
         std::optional<std::uint64_t> id;
         try {
@@ -1196,6 +1373,8 @@ export namespace tools {
             r.worker_id = rep.worker_id;
             r.ok = rep.ok();
             r.seconds = rep.seconds;
+            r.timings.sync_seconds = sync.seconds;
+            r.timings.worker_seconds = rep.seconds;
             std::tie(r.diagnostics, r.tests) = detail::read(rep);
             for (auto& st : rep.steps)
                 r.steps.push_back({st.name, st.exit_code, st.timed_out, st.seconds, std::move(st.output), st.truncated, std::move(st.log), st.log_truncated, std::move(st.log_error), std::move(st.cache_error)});
@@ -1367,7 +1546,7 @@ export namespace tools {
                 const auto key = content::hash_of(rfl::json::write(std::tuple{std::string{"dependency.fill"}, toolchain, request})).str();
                 if (!filled.insert(key).second) { record_status("same dependencies as an earlier step"); continue; }
                 backlog::entry entry{.key = key, .project = project, .configuration = "dependencies", .operation = "dependencies",
-                    .actor = worlds::identity_key(actor), .cacheable = false};
+                    .actor = worlds::execution_key(actor), .cacheable = false};
                 auto ticket = co_await s.queue->submit(s.core, std::move(entry),
                     [request, toolchain, project, actor, worldline, version, snapshot_id = snapshot.id().str()](services& zero, jobs::progress_log& progress, std::string) -> coroutine::task<std::optional<backlog::outcome>> {
                         config_result out{.configuration = "dependencies"};
@@ -1382,7 +1561,7 @@ export namespace tools {
                         admission held{&zero.files, zero.core, admission_id,
                             usage::build_event{.project = project, .target = "dependencies", .workspace_id = zero.snapshot()->server.auth.workspace,
                                 .worldline = worldline, .version = version, .snapshot = snapshot_id, .operation = "dependencies",
-                                .actor = worlds::identity_key(actor), .error_code = "cancelled"},
+                                .actor = worlds::execution_key(actor), .error_code = "cancelled"},
                             std::chrono::steady_clock::now()};
                         std::int32_t exit_code = -1;
                         bool timed_out = false;
@@ -1440,7 +1619,7 @@ export namespace tools {
         } catch (const std::invalid_argument& error) {
             throw tool_error(nodes::code::invalid_record, error.what());
         }
-        auto line = request.worldline.empty() ? std::string{"main"} : request.worldline;
+        auto line = execution_line(actor, std::optional{request.worldline});
         auto selected_tree = co_await selected(zero, project, line, request.revision, actor);
         content::manifest files;
         for (auto& f : lines::manifest(selected_tree))
@@ -1492,7 +1671,7 @@ export namespace tools {
                                           .version = selected_tree.version,
                                           .snapshot = files.id().str(),
                                           .operation = "prepare",
-                                          .actor = worlds::identity_key(actor)},
+                                          .actor = worlds::execution_key(actor)},
                        started,
                        executor};
         auto record = [&](const language::result& result, const sync_stats& sync) {
@@ -1560,6 +1739,8 @@ export namespace tools {
         auto& report = done->first;
         auto result = prepared(plan, files, selected_tree.version, report);
         result.worldline = line;
+        result.timings.sync_seconds = done->second.seconds;
+        result.timings.worker_seconds = report.seconds;
         if (report.survey_error) {
             result.analysis = "failed";
             result.analysis_error = report.survey_error;
@@ -1579,8 +1760,7 @@ export namespace tools {
     // Each caller owns a waiting ticket; preparation has no durable receipt or separate user operation.
     auto prepare(services& s, std::string project, std::string configuration, language::request request, const worlds::actor& actor,
                  mcp::notifier* note = nullptr, semantic::query requested = {}) -> coroutine::task<language::result> {
-        if (request.worldline.empty())
-            request.worldline = "main";
+        if (request.worldline.empty()) throw tool_error("context_required", "worldline is required");
         auto source = co_await selected(s, project, request.worldline, request.revision, actor);
         request.revision = source.version;
         auto plan = language::prepare(request.config, request.build);
@@ -1596,7 +1776,7 @@ export namespace tools {
                             {.project = project,
                              .configuration = configuration,
                              .operation = requested.action,
-                             .actor = worlds::identity_key(actor),
+                             .actor = worlds::execution_key(actor),
                              .worldline = request.worldline,
                              .version = source.version,
                              .snapshot = manifest.id().str(),
@@ -1615,7 +1795,10 @@ export namespace tools {
         normalized.config.build_configuration.clear();
         auto key = content::hash_of(rfl::json::write(std::tuple{std::string{"language"}, manifest.id().str(), toolchain, normalized})).str();
         const auto dependency_deadline = std::chrono::steady_clock::now() + std::chrono::seconds{language::timeout(request.build)};
+        const auto dependency_started = std::chrono::steady_clock::now();
         co_await fill_dependencies(s, project, plan.build.steps, manifest, toolchain, actor, request.worldline, source.version, dependency_deadline, note);
+        const auto dependency_seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - dependency_started).count();
+        observed.event.timings.dependency_seconds = dependency_seconds;
         const auto left = std::chrono::ceil<std::chrono::seconds>(dependency_deadline - std::chrono::steady_clock::now()).count();
         if (left <= 0) throw tool_error("timeout", "execution deadline exceeded while filling dependencies");
         request.build.limits.timeout_s = static_cast<std::uint32_t>(left);
@@ -1623,7 +1806,7 @@ export namespace tools {
                             .project = project,
                             .configuration = configuration,
                             .operation = "prepare",
-                            .actor = worlds::identity_key(actor),
+                            .actor = worlds::execution_key(actor),
                             .trees = trees,
                             .cacheable = true,
                             .worldline = request.worldline};
@@ -1640,10 +1823,14 @@ export namespace tools {
                 (*note)(progress_note(progress));
         });
         if (auto* refused = std::get_if<config_result>(&done)) {
+            observed.event.timings = refused->timings;
+            observed.event.timings.dependency_seconds = dependency_seconds;
             observed.event.state = "failed";
             throw tool_error(refused->error_code, refused->error);
         }
         auto result = std::get<language::result>(std::move(done));
+        result.timings.dependency_seconds = dependency_seconds;
+        observed.event.timings = result.timings;
         observed.event.state = result.status == "prepared" && result.analysis == "analyzed" ? "succeeded" : "failed";
         result.worldline = request.worldline;
         result.revision = source.version;
@@ -1664,7 +1851,7 @@ export namespace tools {
                                     .max_cpu_seconds = config.limits.max_cpu_seconds,
                                     .fresh = fresh};
         request.exports = config.build.operations.at(operation).exports;
-        auto trees = hot_key(project, worldline.empty() ? "main" : worldline, config.name);
+        auto trees = hot_key(project, worldline, config.name);
         auto required = config.needs.get().value_or(config::requirements{});
         auto needs = routing::requirements{.tools = required.tools, .os = required.platform.os, .arch = required.platform.arch};
         invocation observed{s.files,
@@ -1672,7 +1859,7 @@ export namespace tools {
                             {.project = project,
                              .configuration = config.name,
                              .operation = operation,
-                             .actor = worlds::identity_key(actor),
+                             .actor = worlds::execution_key(actor),
                              .worldline = worldline,
                              .version = version,
                              .snapshot = snapshot.id().str(),
@@ -1698,9 +1885,13 @@ export namespace tools {
         if (!cacheable)
             key += "/call/" + std::to_string(calls.fetch_add(1));
         const auto dependency_deadline = std::chrono::steady_clock::now() + std::chrono::seconds{request.timeout_s};
+        const auto dependency_started = std::chrono::steady_clock::now();
         const auto dependency_status = co_await fill_dependencies(s, project, steps, snapshot, toolchain, actor, worldline, version, dependency_deadline, &note);
+        const auto dependency_seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - dependency_started).count();
+        observed.event.timings.dependency_seconds = dependency_seconds;
         const auto left = std::chrono::ceil<std::chrono::seconds>(dependency_deadline - std::chrono::steady_clock::now()).count();
         if (left <= 0) {
+            r.timings.dependency_seconds = dependency_seconds;
             r.configuration = config.name;
             r.snapshot = version;
             r.dependency_cache = dependency_status;
@@ -1715,7 +1906,7 @@ export namespace tools {
                             .project = project,
                             .configuration = config.name,
                             .operation = operation,
-                            .actor = worlds::identity_key(actor),
+                            .actor = worlds::execution_key(actor),
                             .trees = trees,
                             .cacheable = cacheable,
                             .fresh = fresh,
@@ -1742,6 +1933,8 @@ export namespace tools {
             note(progress_note(named));
         }));
         r.dependency_cache = dependency_status;
+        r.timings.dependency_seconds = dependency_seconds;
+        observed.event.timings = r.timings;
         observed.event.state = r.ok ? "succeeded" : "failed";
         r.configuration = config.name;
         r.snapshot = version;
@@ -1756,15 +1949,14 @@ export namespace tools {
             co_await s.queue->forget(s.core, key);
     }
 
-    // Builds always run one fixed version of a worldline, the current one of main when nothing is named.
+    // Builds run one fixed version of the selected task worldline.
     // Only the build tool's results are cached; `fresh` rebuilds from a clean tree.
     auto execute_all(services& s, std::string project, std::string operation, bool cacheable, bool fresh,
                      std::vector<std::pair<config::effective_config, std::vector<jobs::step>>> jobs, mcp::notifier& note, std::string worldline,
                      std::string version, const worlds::actor& actor) -> coroutine::task<results> {
         results out;
         out.results.resize(jobs.size());
-        if (worldline.empty())
-            worldline = "main";
+        if (worldline.empty()) throw tool_error("context_required", "worldline is required");
         auto tree = co_await selected(s, project, worldline, version, actor);
         content::manifest snapshot;
         for (auto& f : lines::manifest(tree))
@@ -1784,7 +1976,7 @@ export namespace tools {
 
     struct configurations : tool<"configurations", "List build and run configurations and the operations each build configuration provides."> {
         struct input {
-            rfl::Description<"Project name", std::string> project;
+            rfl::Description<"Project; supplied by the execution context when absent", std::optional<std::string>> project;
         };
         struct config_view {
             std::string name;
@@ -1820,16 +2012,16 @@ export namespace tools {
         }
     };
 
-    struct build : tool<"build", "Build a project with one or more configurations at once: sync its files "
+    struct build : tool<"build", "Build a fixed server-side worldline version with one or more configurations: send its files "
                                  "to an eligible worker (matching each configuration's requirements), "
                                  "execute its build steps, and return each configuration's "
                                  "steps, output and diagnostics in one result."> {
         struct input {
-            rfl::Description<"Project name", std::string> project;
+            rfl::Description<"Project; supplied by the execution context when absent", std::optional<std::string>> project;
             rfl::Description<"Configurations to build at once; the defaults if absent; [\"*\"] for all enabled", std::optional<std::vector<std::string>>>
                 configurations;
             rfl::Description<"Targets accepted by the selected build operation; configured targets if absent", std::optional<std::vector<std::string>>> targets;
-            rfl::Description<"Worldline to build; main when absent", std::optional<std::string>> worldline;
+            rfl::Description<"Worldline to build; task binding when absent; explicit selection required without a task", std::optional<std::string>> worldline;
             rfl::Description<"Version of the worldline to build; its current one when absent", std::optional<std::string>> version;
             rfl::Description<"Rebuild from a clean working tree, bypassing cached and in-flight build results", std::optional<bool>> fresh;
         };
@@ -1843,7 +2035,7 @@ export namespace tools {
             for (auto* c : e.pick(in.configurations.value().value_or(std::vector<std::string>{}), "build"))
                 jobs.push_back(detail::operation(*c, {.operation = "build", .parameters = {.targets = targets}}));
             co_return co_await execute_all(s, project, "build", true, in.fresh.value().value_or(false), std::move(jobs), note,
-                                           in.worldline.value().value_or(""), in.version.value().value_or(""), actor);
+                                           execution_line(actor, in.worldline.value()), in.version.value().value_or(""), actor);
         }
     };
 
@@ -1851,12 +2043,12 @@ export namespace tools {
                                "returns steps, diagnostics and output, plus a test summary when the test runner is one the "
                                "service reads (CTest, Bazel, pytest)."> {
         struct input {
-            rfl::Description<"Project name", std::string> project;
+            rfl::Description<"Project; supplied by the execution context when absent", std::optional<std::string>> project;
             rfl::Description<"Configurations to test on at once; the defaults if absent; [\"*\"] for all enabled", std::optional<std::vector<std::string>>>
                 configurations;
             rfl::Description<"Test filter, if the selected operation accepts one", std::optional<std::string>> filter;
             rfl::Description<"Test labels, if the selected operation accepts them", std::optional<std::string>> labels;
-            rfl::Description<"Worldline to build; main when absent", std::optional<std::string>> worldline;
+            rfl::Description<"Worldline to build; task binding when absent; explicit selection required without a task", std::optional<std::string>> worldline;
             rfl::Description<"Version of the worldline to build; its current one when absent", std::optional<std::string>> version;
         };
         using output = results;
@@ -1868,17 +2060,17 @@ export namespace tools {
             for (auto* c : e.pick(in.configurations.value().value_or(std::vector<std::string>{}), "test")) {
                 jobs.push_back(detail::operation(*c, {.operation = "test", .parameters = {.filter = in.filter.value(), .labels = in.labels.value()}}));
             }
-            co_return co_await execute_all(s, project, "test", false, false, std::move(jobs), note, in.worldline.value().value_or(""),
+            co_return co_await execute_all(s, project, "test", false, false, std::move(jobs), note, execution_line(actor, in.worldline.value()),
                                            in.version.value().value_or(""), actor);
         }
     };
 
     struct launch : tool<"run", "Invoke a saved run configuration's operation on its selected build configurations."> {
         struct input {
-            rfl::Description<"Project name", std::string> project;
+            rfl::Description<"Project; supplied by the execution context when absent", std::optional<std::string>> project;
             rfl::Description<"The run configuration", std::string> configuration;
             rfl::Description<"Build configurations to run on; the run configuration's own if absent", std::optional<std::vector<std::string>>> configurations;
-            rfl::Description<"Worldline to build; main when absent", std::optional<std::string>> worldline;
+            rfl::Description<"Worldline to build; task binding when absent; explicit selection required without a task", std::optional<std::string>> worldline;
             rfl::Description<"Version of the worldline to build; its current one when absent", std::optional<std::string>> version;
         };
         using output = results;
@@ -1896,28 +2088,30 @@ export namespace tools {
                 config::detail::apply(build.limits, r.spec.limits);
                 jobs.push_back(detail::operation(std::move(build), {.operation = r.spec.operation, .parameters = r.spec.parameters}));
             }
-            co_return co_await execute_all(s, project, r.spec.operation, false, false, std::move(jobs), note, in.worldline.value().value_or(""),
+            co_return co_await execute_all(s, project, r.spec.operation, false, false, std::move(jobs), note, execution_line(actor, in.worldline.value()),
                                            in.version.value().value_or(""), actor);
         }
     };
 
-    struct language_query : tool<"language", "Query symbols, definitions, references or diagnostics for a worldline version. "
+    struct language_query : tool<"language", "Query scopes, symbols, definitions, references or diagnostics for a worldline version. "
                                              "Analysis is prepared automatically within the call when missing or stale."> {
         struct input {
-            rfl::Description<"Project name", std::string> project;
-            rfl::Description<"Worldline; main when absent", std::optional<std::string>> worldline;
+            rfl::Description<"Project; supplied by the execution context when absent", std::optional<std::string>> project;
+            rfl::Description<"Worldline; task binding when absent; explicit selection required without a task", std::optional<std::string>> worldline;
             rfl::Description<"Version to query; the current one when absent", std::optional<std::string>> version;
             rfl::Description<"Analysis configuration; the project's only one when absent", std::optional<std::string>> configuration;
-            rfl::Description<"symbols, definitions, references or diagnostics (default)", std::optional<std::string>> action;
+            rfl::Description<"scopes, symbols, definitions, references or diagnostics (default)", std::optional<std::string>> action;
             rfl::Description<"File path; required for definitions and references", std::optional<std::string>> path;
             rfl::Description<"Symbol name; a prefix for symbols, an exact name for definitions/references", std::optional<std::string>> symbol;
             rfl::Description<"One-based source line to disambiguate a symbol", std::optional<std::uint64_t>> line;
         };
         struct output {
-            std::string configuration;
+            builds::timings timings;
+            std::string configuration, worldline;
             std::optional<std::string> environment, version;
             bool stale = false;
             bool analyzed = false;
+            std::optional<std::vector<semantic::scope>> scopes;
             std::optional<std::vector<semantic::symbol>> symbols;
             std::optional<std::vector<semantic::location>> definitions, references;
             std::optional<std::vector<semantic::diagnostic>> diagnostics;
@@ -1937,10 +2131,9 @@ export namespace tools {
             if (found == settings.analysis.end())
                 throw tool_error(nodes::code::invalid_record, "analysis configuration not found: " + name);
             output out{.configuration = name};
-            auto line = in.worldline.value().value_or("main");
-            if (line.empty())
-                line = "main";
-            static const std::set<std::string> queries{"symbols", "definitions", "references", "diagnostics"};
+            auto line = execution_line(actor, in.worldline.value());
+            out.worldline = line;
+            static const std::set<std::string> queries{"scopes", "symbols", "definitions", "references", "diagnostics"};
             if (!queries.contains(action))
                 throw tool_error(nodes::code::invalid_record, "unknown language action " + action);
             auto bound = settings.config(found->second.build_configuration).build;
@@ -1952,7 +2145,7 @@ export namespace tools {
                 throw tool_error(nodes::code::invalid_record, "definitions and references require path and symbol");
             if (query.line && !*query.line)
                 throw tool_error(nodes::code::invalid_record, "line must be positive");
-            auto calculation = action == "symbols" || action == "diagnostics" ? semantic::query{} : query;
+            auto calculation = action == "scopes" || action == "symbols" || action == "diagnostics" ? semantic::query{} : query;
             auto prepared = co_await prepare(
                 s, project, name,
                 {.worldline = line, .revision = in.version.value().value_or(""), .config = found->second, .build = bound, .query = calculation}, actor, &note,
@@ -1960,11 +2153,23 @@ export namespace tools {
             if (prepared.status != "prepared" || prepared.analysis != "analyzed" || !prepared.outline)
                 throw tool_error(prepared.status == "prepared" || prepared.status == "failed" ? prepared.analysis_error_code : prepared.status,
                                  prepared.analysis_error.value_or(prepared.error));
+            out.timings = prepared.timings;
             out.version = prepared.revision;
             out.analyzed = true;
             auto& report = *prepared.outline;
             out.stale = !report.complete;
-            if (action == "symbols") {
+            if (action == "scopes") {
+                if (out.stale) throw tool_error("scope_stale", "scope references require complete analysis of the selected version");
+                std::erase_if(report.scopes, [&](const auto& scope) {
+                    return !query.path.empty() && (!scope.range.place || scope.range.place->path != query.path);
+                });
+                nodes::node_request register_scopes{.action = "scope_register", .worldline = line, .revision = prepared.revision};
+                register_scopes.configuration = name;
+                register_scopes.environment = *out.environment;
+                register_scopes.analyzed_scopes = std::move(report.scopes);
+                auto registered = co_await node_call(s, project, std::move(register_scopes), actor);
+                out.scopes = std::move(registered.scopes);
+            } else if (action == "symbols") {
                 std::erase_if(report.symbols, [&](const auto& value) {
                     if (!query.symbol.empty() && !value.name.starts_with(query.symbol))
                         return true;
@@ -2023,5 +2228,123 @@ export namespace tools {
         co_return co_await generate_files(s, project, std::move(parameters), actor, std::move(operation_id), false);
     }
 
-    using standard = toolbox<configurations, build, test, launch, language_query>;
+    struct scope : tool<"scope", "Acquire an atomic set of exclusive scope leases using references returned by language(scopes). Pass tokens to worldline(apply); renew or release each token. Conflicts return immediately."> {
+        struct input {
+            rfl::Description<"Project; supplied by the execution context when absent", std::optional<std::string>> project;
+            rfl::Description<"acquire, renew, release or list", std::string> action;
+            rfl::Description<"Task worldline; explicit selection required without execution context", std::optional<std::string>> worldline;
+            rfl::Description<"acquire: scope references returned by language", std::optional<std::vector<std::string>>> scopes;
+            rfl::Description<"acquire: whole files, including empty and binary files", std::optional<std::vector<std::string>>> files;
+            rfl::Description<"acquire: path entries for create/remove/move", std::optional<std::vector<std::string>>> entries;
+            rfl::Description<"acquire with files/entries: observed version", std::optional<std::string>> version;
+            rfl::Description<"acquire: unique operation ID", std::optional<std::string>> operation_id;
+            rfl::Description<"renew/release: lease token", std::optional<std::string>> token;
+            rfl::Description<"Lease duration, 1 through 600 seconds; default 120", std::optional<std::uint64_t>> seconds;
+        };
+        struct output {
+            std::string worldline, version;
+            std::vector<nodes::scope_lease> leases;
+        };
+        static auto run(services& s, input in, mcp::notifier&, const worlds::actor& actor) -> coroutine::task<output> {
+            auto project = project_of(in), action = in.action.value();
+            if (action != "acquire" && action != "renew" && action != "release" && action != "list")
+                throw tool_error(nodes::code::invalid_record, "unknown scope action");
+            auto line = execution_line(actor, in.worldline.value());
+            nodes::node_request request{.action = "scope_" + action, .worldline = line};
+            request.lease_token = in.token.value().value_or("");
+            request.lease_seconds = in.seconds.value().value_or(constants::scope_lease_seconds);
+            if (action == "acquire") {
+                if (!in.operation_id.value()) throw tool_error(nodes::code::invalid_record, "acquire requires operation_id");
+                request.scope_refs = in.scopes.value().value_or(std::vector<std::string>{});
+                request.scope_files = in.files.value().value_or(std::vector<std::string>{});
+                request.scope_entries = in.entries.value().value_or(std::vector<std::string>{});
+                request.revision = in.version.value().value_or("");
+                request.operation = lines::operation_of(*in.operation_id.value());
+            }
+            auto result = co_await node_call(s, project, std::move(request), actor, action == "list");
+            co_return output{line, result.version, std::move(result.leases)};
+        }
+    };
+
+    struct artifact : tool<"artifact", "Retrieve a build/test/run export or execution log by its project and digest. "
+                                      "Use the export metadata returned by execution tools. Read bounded base64 chunks, "
+                                      "decode them in offset order into a local file, and preserve its executable flag. "
+                                      "Continue at next_offset until eof; no source synchronization is required."> {
+        struct input {
+            rfl::Description<"Project that produced the artifact; supplied by execution context when absent", std::optional<std::string>> project;
+            rfl::Description<"Digest returned in exports or a step log", std::string> digest;
+            rfl::Description<"Byte offset; defaults to zero", std::optional<std::uint64_t>> offset;
+            rfl::Description<"Bytes to retrieve, 1 through 65536; defaults to 65536", std::optional<std::uint64_t>> length;
+        };
+        struct output {
+            std::string digest;
+            std::uint64_t offset, total, next_offset;
+            bool eof;
+            std::string data_base64;
+        };
+        static auto run(services& s, input in, mcp::notifier&, const worlds::actor&) -> coroutine::task<output> {
+            auto project = project_of(in);
+            auto length = in.length.value().value_or(constants::mcp_artifact_bytes);
+            if (!length || length > constants::mcp_artifact_bytes)
+                throw tool_error(nodes::code::invalid_record, "artifact length must be 1 through 65536 bytes");
+            auto bytes = co_await s.files.read_export(s.core, project,
+                {in.digest.value(), in.offset.value().value_or(0), length});
+            const auto& part = bytes.parts.at(0);
+            const auto next = part.offset + part.bytes.size();
+            co_return output{part.digest.str(), part.offset, part.total, next, next == part.total,
+                lines::base64({reinterpret_cast<const char*>(part.bytes.data()), part.bytes.size()})};
+        }
+    };
+
+    struct task : tool<"task", "Create a task on an explicit worldline, fork a task worldline, start an execution, stop a run or close a task. Only the orchestrator's account credential can administer tasks."> {
+        struct input {
+            rfl::Description<"Project", std::string> project;
+            rfl::Description<"create, fork, start, stop or close", std::string> action;
+            rfl::Description<"Task identifier", std::string> task;
+            rfl::Description<"create/fork: task worldline", std::optional<std::string>> worldline;
+            rfl::Description<"fork: source worldline", std::optional<std::string>> from;
+            rfl::Description<"fork: source version", std::optional<std::string>> version;
+            rfl::Description<"create/fork/start: unique operation ID", std::optional<std::string>> operation_id;
+            rfl::Description<"stop: execution identifier", std::optional<std::string>> run;
+            rfl::Description<"start: permit source writes; default true", std::optional<bool>> writable;
+        };
+        struct output {
+            std::string task, worldline;
+            std::optional<std::string> run, credential;
+            bool active = true;
+        };
+        static auto run(services& s, input in, mcp::notifier&, const worlds::actor& actor) -> coroutine::task<output> {
+            if (!actor.run.empty()) throw tool_error(nodes::code::permission_denied, "execution credentials cannot administer tasks");
+            auto project = project_of(in), action = in.action.value();
+            config::check_name("task", in.task.value());
+            if (action != "create" && action != "fork" && action != "start" && action != "stop" && action != "close")
+                throw tool_error(nodes::code::invalid_record, "unknown task action");
+            nodes::node_request request{.action = "task_" + action};
+            request.task_id = in.task.value();
+            request.run_id = in.run.value().value_or("");
+            request.execution_writable = in.writable.value().value_or(true);
+            if (action == "create" || action == "fork" || action == "start") {
+                if (!in.operation_id.value()) throw tool_error(nodes::code::invalid_record, "operation_id is required");
+                request.operation = lines::operation_of(*in.operation_id.value());
+            }
+            if (action == "create" || action == "fork") {
+                if (!in.worldline.value() || in.worldline.value()->empty()) throw tool_error("context_required", "select a task worldline explicitly");
+                request.worldline = *in.worldline.value();
+            }
+            if (action == "fork") {
+                if (!in.from.value() || !in.version.value()) throw tool_error(nodes::code::invalid_record, "fork requires from and version");
+                auto base = co_await selected(s, project, *in.from.value(), *in.version.value(), actor);
+                request.action = "fork";
+                request.source = base.frontier;
+                request.result = rfl::json::write(std::tuple{in.task.value(), *in.from.value(), *in.version.value()});
+            }
+            auto result = co_await node_call(s, project, std::move(request), actor);
+            if (!result.execution) co_return output{in.task.value(), result.worldline};
+            const auto& e = *result.execution;
+            co_return output{e.task, e.worldline, e.run.empty() ? std::nullopt : std::optional{e.run},
+                e.token.empty() ? std::nullopt : std::optional{"fugrun." + project + "." + e.token}, e.active};
+        }
+    };
+
+    using standard = toolbox<task, configurations, worldline, scope, build, test, launch, language_query, artifact>;
 } // namespace tools

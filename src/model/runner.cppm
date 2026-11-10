@@ -3,7 +3,6 @@ import std;
 import native;
 import async;
 import coroutine;
-import isolation;
 import protocol;
 import constants;
 
@@ -53,7 +52,7 @@ export namespace runner {
     }
 
     auto run_step(native::scheduler& io, io::command cmd, std::chrono::milliseconds timeout, std::uint64_t output_limit, std::string name,
-                  isolation::scope* resources = nullptr, std::optional<std::filesystem::path> log_path = {},
+                  std::optional<std::filesystem::path> log_path = {},
                   std::uint64_t log_limit = constants::log_bytes) -> coroutine::task<jobs::step_report> {
         auto started = std::chrono::steady_clock::now();
         std::optional<native::file> log;
@@ -65,8 +64,6 @@ export namespace runner {
         auto proc = io::spawn_process(io, cmd);
         tail out{output_limit};
         bool timed_out = false;
-        bool cpu_exhausted = false;
-        auto memory_before = resources ? resources->memory_failures() : 0;
         int code = -1;
         co_await coroutine::with_scope([&](coroutine::scope& children) -> coroutine::task<> {
             children.spawn([](native::scheduler& io, native::process& proc, std::chrono::milliseconds timeout, bool& timed_out) -> coroutine::task<> {
@@ -74,17 +71,6 @@ export namespace runner {
                 timed_out = true;
                 proc.kill();
             }(io, proc, timeout, timed_out));
-            if (resources && cmd.max_cpu_seconds)
-                children.spawn([](native::scheduler& io, native::process& proc, isolation::scope& resources, bool& exhausted) -> coroutine::task<> {
-                    for (;;) {
-                        if (resources.cpu_exhausted()) {
-                            exhausted = true;
-                            proc.kill();
-                            co_return;
-                        }
-                        co_await execution::schedule_after(io, std::chrono::milliseconds{100});
-                    }
-                }(io, proc, *resources, cpu_exhausted));
             co_await execution::when_all(
                 [](native::process& proc, tail& out, std::optional<native::file>& log, std::uint64_t& size,
                    std::uint64_t limit, bool& truncated, std::string& error) -> coroutine::task<> {
@@ -96,18 +82,6 @@ export namespace runner {
                 }(proc, out, log, log_size, log_limit, log_truncated, log_error),
                 [](native::process& proc, int& code) -> coroutine::task<> { code = co_await io::async_wait(proc); }(proc, code));
         });
-        std::string diagnostics;
-        auto diagnostic = [&](std::string_view message) {
-            diagnostics += message;
-            out.append(std::as_bytes(std::span{message}));
-            code = 137;
-        };
-        if (resources && (cpu_exhausted || resources->cpu_exhausted()))
-            diagnostic("\nworker: build process-tree CPU budget exhausted\n");
-        if (resources && resources->memory_failures() > memory_before)
-            diagnostic("\nworker: build process-tree memory limit exceeded (OOM)\n");
-        if (!diagnostics.empty())
-            co_await append_log(log, std::as_bytes(std::span{diagnostics}), log_size, log_limit, log_truncated, log_error);
         auto [text, truncated] = out.take();
         co_return jobs::step_report{.name = std::move(name),
                                     .exit_code = code,
@@ -119,24 +93,4 @@ export namespace runner {
                                     .log_error = std::move(log_error)};
     }
 
-    auto prepared_step(native::scheduler& io, io::command command, std::chrono::milliseconds timeout, std::uint64_t output_limit, std::string name,
-                       isolation::pool& pool) -> coroutine::task<jobs::step_report> {
-        auto resource = pool.start({}, {});
-        resource->concurrency(1);
-        command.isolation = resource->target();
-        auto token = co_await coroutine::current_token;
-        std::optional<jobs::step_report> result;
-        std::exception_ptr error;
-        try {
-            result = co_await coroutine::under(token, run_step(io, std::move(command), timeout, output_limit, std::move(name), resource.get()));
-        } catch (...) {
-            error = std::current_exception();
-        }
-        resource->close();
-        if (error)
-            std::rethrow_exception(error);
-        if (!result)
-            co_await coroutine::stop;
-        co_return std::move(*result);
-    }
 } // namespace runner

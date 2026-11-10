@@ -235,9 +235,8 @@ export namespace nodes {
             if (std::string_view{actual[index++].first} != name)
                 fail(nodes::code::invalid_record, "incorrect record fields");
     }
-    inline auto scalars(std::string_view text) -> std::u32string {
-        std::u32string out;
-        out.reserve(text.size());
+    template <class F> inline auto scan_scalars(std::string_view text, F emit) -> std::uint64_t {
+        std::uint64_t count = 0;
         for (std::size_t i = 0; i < text.size();) {
             auto b = static_cast<unsigned char>(text[i++]);
             char32_t cp = b;
@@ -267,8 +266,18 @@ export namespace nodes {
             }
             if (cp < minimum || cp > 0x10ffff || (cp >= 0xd800 && cp <= 0xdfff))
                 fail(nodes::code::invalid_record, "invalid Unicode scalar");
-            out.push_back(cp);
+            emit(cp);
+            ++count;
         }
+        return count;
+    }
+    inline auto scalar_count(std::string_view text) -> std::uint64_t {
+        return scan_scalars(text, [](char32_t) {});
+    }
+    inline auto scalars(std::string_view text) -> std::u32string {
+        std::u32string out;
+        out.reserve(text.size());
+        scan_scalars(text, [&](char32_t cp) { out.push_back(cp); });
         return out;
     }
     inline void append_scalar(std::string& out, char32_t c) {

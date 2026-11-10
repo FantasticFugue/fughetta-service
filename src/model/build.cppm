@@ -16,6 +16,10 @@ export import ty;
 export import ruff;
 
 export namespace builds {
+    struct timings {
+        std::optional<double> sync_seconds, queue_seconds, dependency_seconds, worker_seconds;
+    };
+
     // One builder of a configuration: a build system by name and that system's options.
     template <meta::fixed_string Name> struct with {
         using implementation = builds::adapter<Name>;

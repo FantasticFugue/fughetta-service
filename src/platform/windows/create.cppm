@@ -55,7 +55,7 @@ namespace native_process {
     } // namespace
     struct child::state {
         native_io::engine<concurrent::queue>* engine;
-        winapi::handle process, out, in, job, control;
+        winapi::handle process, out, in, job;
         DWORD pid = 0;
         std::atomic<bool> reaped{false};
         explicit state(native_io::engine<concurrent::queue>& e) : engine(&e) {}
@@ -77,12 +77,7 @@ namespace native_process {
         s->job = winapi::handle{::CreateJobObjectW(nullptr, nullptr)};
         if (!s->job.value)
             winapi::fail("CreateJobObject child");
-        winapi::limits(s->job.value, cmd.isolation ? std::nullopt : cmd.max_memory_bytes, cmd.isolation ? std::nullopt : cmd.max_cpu_seconds);
-        if (cmd.isolation) {
-            s->control = winapi::handle{::OpenJobObjectW(JOB_OBJECT_ASSIGN_PROCESS | JOB_OBJECT_QUERY, FALSE, winapi::wide(cmd.isolation->identity).c_str())};
-            if (!s->control.value)
-                winapi::fail("OpenJobObject isolation");
-        }
+        winapi::limits(s->job.value, cmd.max_memory_bytes, cmd.max_cpu_seconds);
         static std::atomic<std::uint64_t> serial{0};
         auto name = std::format(L"\\\\.\\pipe\\child-{}-{}", ::GetCurrentProcessId(), serial.fetch_add(1));
         s->out = winapi::handle{::CreateNamedPipeW(name.c_str(), PIPE_ACCESS_INBOUND | FILE_FLAG_OVERLAPPED | FILE_FLAG_FIRST_PIPE_INSTANCE,
@@ -157,8 +152,7 @@ namespace native_process {
         s->process = winapi::handle{process.hProcess};
         winapi::handle thread{process.hThread};
         s->pid = process.dwProcessId;
-        if ((s->control.value && !::AssignProcessToJobObject(s->control.value, process.hProcess)) ||
-            !::AssignProcessToJobObject(s->job.value, process.hProcess)) {
+        if (!::AssignProcessToJobObject(s->job.value, process.hProcess)) {
             auto error = ::GetLastError();
             ::TerminateProcess(process.hProcess, 126);
             winapi::fail("AssignProcessToJobObject", error);

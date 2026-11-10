@@ -2,6 +2,11 @@ export module constants;
 import std;
 
 export namespace constants {
+    inline constexpr std::uint64_t scope_lease_seconds = 120;
+    inline constexpr std::uint64_t scope_max_seconds = 600;
+    inline constexpr std::uint64_t scope_reference_limit = 16384;
+    inline constexpr std::size_t scope_lease_limit = 1024;
+    inline constexpr std::uint64_t mcp_artifact_bytes = 64u << 10;
     inline constexpr std::size_t dependency_manifest_bytes = 1u << 20;
     inline constexpr std::size_t dependency_manifest_entries = 4096;
     inline constexpr std::size_t dependency_request_bytes = 2u << 20;

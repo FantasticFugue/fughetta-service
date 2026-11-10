@@ -180,7 +180,7 @@ export namespace nodes {
             auto next = remove(p->right, key);
             return next == p->right ? p : make(p->item.first, p->item.second, p->value_digest, p->left, std::move(next));
         }
-        template <class F> static void compare(pointer a, pointer b, F& f) {
+        template <class F> static void compare(const pointer& a, const pointer& b, F& f) {
             if (a == b || (a && b && !a->object.empty() && a->object == b->object))
                 return;
             if (!a) {
@@ -202,26 +202,57 @@ export namespace nodes {
                 compare(a->right, b->right, f);
                 return;
             }
-            if (rank(a) < rank(b)) {
-                auto [left, right] = split(b, a->item.first);
-                const T* value = nullptr;
-                auto it = iterator{right, a->item.first};
-                if (it != iterator{} && it->first == a->item.first)
-                    value = &it->second;
-                compare(a->left, left, f);
-                if (!value || a->item.second != *value)
-                    f(a->item.first, &a->item.second, value);
-                compare(a->right, remove(right, a->item.first), f);
-            } else {
-                auto [left, right] = split(a, b->item.first);
-                const T* value = nullptr;
-                auto it = iterator{right, b->item.first};
-                if (it != iterator{} && it->first == b->item.first)
-                    value = &it->second;
-                compare(left, b->left, f);
-                if (!value || *value != b->item.second)
-                    f(b->item.first, value, &b->item.second);
-                compare(remove(right, b->item.first), b->right, f);
+            compare_frontiers(a, b, f);
+        }
+        // In-order frontiers align differently shaped trees without constructing
+        // temporary split/remove results. A frame is an unopened subtree or its
+        // root row. Equal subtrees disappear before loading; only traversal state
+        // is allocated, bounded by the two tree heights. Matching root keys above
+        // keep the allocation-free recursive path for ordinary value changes.
+        template <class F> static void compare_frontiers(pointer a, pointer b, F& f) {
+            struct frame { pointer node; bool row = false; };
+            std::vector<frame> left{{std::move(a)}}, right{{std::move(b)}};
+            auto expand = [](auto& stack) {
+                auto p = std::move(stack.back().node);
+                stack.pop_back();
+                ensure(p);
+                if (p->right) stack.push_back({p->right});
+                stack.push_back({p, true});
+                if (p->left) stack.push_back({p->left});
+            };
+            while (!left.empty() || !right.empty()) {
+                if (!left.empty() && !right.empty() && !left.back().row && !right.back().row) {
+                    const auto& x = left.back().node;
+                    const auto& y = right.back().node;
+                    if (x == y || (!x->object.empty() && x->object == y->object)) {
+                        left.pop_back();
+                        right.pop_back();
+                        continue;
+                    }
+                    // Expose the lower-priority treap root first so unchanged
+                    // children can meet as whole subtrees on both frontiers.
+                    const auto order = rank(x) <=> rank(y);
+                    if (order <= 0) expand(left);
+                    if (order >= 0) expand(right);
+                    continue;
+                }
+                if (!left.empty() && !left.back().row) { expand(left); continue; }
+                if (!right.empty() && !right.back().row) { expand(right); continue; }
+                if (right.empty() || (!left.empty() && left.back().node->item.first < right.back().node->item.first)) {
+                    const auto& x = left.back().node->item;
+                    f(x.first, &x.second, static_cast<const T*>(nullptr));
+                    left.pop_back();
+                } else if (left.empty() || right.back().node->item.first < left.back().node->item.first) {
+                    const auto& y = right.back().node->item;
+                    f(y.first, static_cast<const T*>(nullptr), &y.second);
+                    right.pop_back();
+                } else {
+                    const auto& x = left.back().node->item;
+                    const auto& y = right.back().node->item;
+                    if (x.second != y.second) f(x.first, &x.second, &y.second);
+                    left.pop_back();
+                    right.pop_back();
+                }
             }
         }
         static void flush(const pointer& p, const std::shared_ptr<backend>& storage, std::uint64_t& visits) {
@@ -381,7 +412,12 @@ export namespace nodes {
             root_ = insert(root_, key, item, hash, priority);
         }
         void erase(std::string_view key) { root_ = remove(root_, key); }
-        template <class F> void difference(const persistent_index& after, F f) const { compare(root_, after.root_, f); }
+        template <class F> void difference(const persistent_index& after, F f) const {
+            // Retain both snapshots once; recursive comparisons borrow their
+            // children rather than updating shared ownership at every node.
+            auto before_root = root_, after_root = after.root_;
+            compare(before_root, after_root, f);
+        }
         void persist(std::shared_ptr<backend> storage) const {
             if (!storage || (storage_ && storage_ != storage))
                 fail(nodes::code::invalid_record, "persistent index backend identity changed");

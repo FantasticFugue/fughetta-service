@@ -47,7 +47,12 @@ namespace durability {
 
     void sync_filesystem(const std::filesystem::path& path) {
         auto f = open(path, O_RDONLY | O_DIRECTORY);
+#ifdef __linux__
         if (::syncfs(f.get()) != 0)
+#else
+        ::sync();
+        if (::fsync(f.get()) != 0)
+#endif
             fail("cannot sync the filesystem of", path);
         f.close(path);
     }

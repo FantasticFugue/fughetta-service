@@ -253,6 +253,21 @@ namespace front {
             return reply;
         }
         // Local clients use this route to synchronize files and select explicit worldlines.
+        // The hosted front resolves a run before applying its current account and membership policy.
+        struct post_execution_identity : endpoint<"POST", "/api/v1/executions/identity", access::host> {
+            struct input { std::string credential; };
+            static auto handle(context& c, params, const web::target&, std::string_view body) -> coroutine::task<web::reply> {
+                auto in = rfl::json::read<input, rfl::NoExtraFields>(body);
+                if (!in) throw coded_error(400, nodes::code::invalid_record, "execution credential is required");
+                try {
+                    auto actor = co_await tools::execution_actor(*c.services, std::move(in->credential));
+                    actor.execution_token.clear();
+                    auto response = ok(actor);
+                    response.head.fields.push_back({"cache-control", "no-store"});
+                    co_return response;
+                } catch (const std::exception& error) { throw coded_error(401, "unauthenticated", error.what()); }
+            }
+        };
         struct post_worldline : endpoint<"POST", "/api/v1/projects/{project}/worldline", access::member> {
             static auto handle(context& c, params p, const web::target&, std::string_view body) -> coroutine::task<web::reply> {
                 auto in = rfl::json::read<tools::worldline::input, rfl::NoExtraFields>(body);
@@ -319,6 +334,10 @@ namespace front {
                 auto in = rfl::json::read<nodes::node_request, rfl::DefaultIfMissing, rfl::NoExtraFields>(body);
                 if (!in)
                     throw coded_error(400, nodes::code::invalid_record, in.error().what());
+                if (in->action.starts_with("scope_") || in->action.starts_with("task_") || !in->task_id.empty() || !in->run_id.empty() ||
+                    !in->execution_token.empty() || !in->execution_identity.empty() || !in->execution_owner.empty() ||
+                    !in->analyzed_scopes.empty() || !in->scope_refs.empty() || !in->scope_files.empty() || !in->scope_entries.empty())
+                    throw coded_error(403, nodes::code::permission_denied, "task and scope coordination require their typed tools");
                 in->caller_operation.clear();
                 auto reply = co_await c.files.node(c.core, p[0], *in, *c.who, in->action == "receipt");
                 co_return ok(node_result(std::move(reply)));
@@ -533,6 +552,14 @@ namespace front {
                 auto days = static_cast<std::uint32_t>(t.number("days", 7, 32));
                 co_return ok(co_await c.files.with_ledger(
                     c.core, [days, project = project_filter(t)](usage::ledger& ledger, const config::document&) { return ledger.days(days, project); }));
+            }
+        };
+
+        struct get_calls : endpoint<"GET", "/api/v1/calls", access::member> {
+            static auto handle(context& c, params, const web::target& t, std::string_view) -> coroutine::task<web::reply> {
+                auto limit = t.number("limit", 50, 1000);
+                co_return ok(co_await c.files.with_ledger(
+                    c.core, [limit, project = project_filter(t)](usage::ledger& ledger, const config::document&) { return ledger.calls(project, limit); }));
             }
         };
 
@@ -847,10 +874,10 @@ namespace front {
     };
 
     using admin_api = routes<api::get_config, api::get_server, api::put_server, api::get_limits, api::put_limits, api::get_granted, api::put_granted,
-                             api::get_runtime, api::put_runtime, api::post_worldline, api::get_export, api::post_mail, api::get_mail, api::get_source, api::post_node,
+                             api::get_runtime, api::put_runtime, api::post_execution_identity, api::post_worldline, api::get_export, api::post_mail, api::get_mail, api::get_source, api::post_node,
                              api::post_node_capture, api::get_node_source, api::get_node_file, api::get_templates, api::post_generate, api::list_projects,
                              api::get_project, api::put_project, api::delete_project, api::get_effective, api::get_build_adapters, api::get_settings_schema,
-                             api::plan_build, api::abandon_operation, api::get_builds, api::get_workers, api::register_worker, api::delete_worker,
+                             api::plan_build, api::abandon_operation, api::get_calls, api::get_builds, api::get_workers, api::register_worker, api::delete_worker,
                              api::rename_worker, api::get_usage, api::get_events, api::get_stats, api::get_me, api::get_health, api::get_metrics>;
 
     auto route(context& c, std::string_view method, const web::target& target, std::string_view body) -> coroutine::task<web::reply> {

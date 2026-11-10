@@ -10,7 +10,6 @@ import configuration;
 import durability;
 import host;
 import constants;
-import isolation;
 import toolchain;
 
 namespace worker {
@@ -43,8 +42,6 @@ namespace worker {
                                        .env = cfg_.env,
                                        .inherit_env = cfg_.inherit_env,
                                        .tools = cfg_.tools,
-                                       .isolate = true,
-                                       .isolation_root = cfg_.worker_id ? std::optional{isolation::delegated()} : std::nullopt,
                                        .parallel = cfg_.parallel,
                                        .dependency_cache = cfg_.dependency_cache ? std::optional{std::filesystem::path{*cfg_.dependency_cache}} : std::nullopt,
                                        .dependency_upstream = cfg_.dependency_upstream ? std::optional{std::filesystem::path{*cfg_.dependency_upstream}} : std::nullopt,
@@ -55,7 +52,6 @@ namespace worker {
         auto run(native::scheduler& io, std::size_t core) -> coroutine::task<> { co_await builds_.run(core, connected(io, core)); }
 
         auto connected(native::scheduler& io, std::size_t core) -> coroutine::task<> {
-            co_await builds_.prepare(core);
             auto identity = co_await offload(io, [this] {
                 auto env = cfg_.inherit_env ? host::environment() : std::map<std::string, std::string>{};
                 for (const auto& [name, value] : cfg_.env)

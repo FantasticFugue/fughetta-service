@@ -18,33 +18,8 @@ namespace {
             }
         };
 
-        "worker reports the unavailable isolation root"_test = [] {
-#ifdef __linux__
-            if (std::filesystem::exists("/sys/fs/cgroup/workers")) {
-                std::println("SKIP: unavailable isolation root test requires /sys/fs/cgroup/workers to be absent");
-                return;
-            }
-            test::scratch tmp{"isolation"};
-            config::worker config;
-            config.compute_threads = 1;
-            config.work_root = (tmp.dir / "worker").string();
-            test::spit(tmp.dir / "worker.json", rfl::json::write(config));
-            test::child process{test::worker_command(SERVICE_EXECUTABLE, tmp.dir, {(tmp.dir / "worker.json").string()})};
-            expect(process.wait(std::chrono::seconds{5}) == 1);
-            expect(process.output().contains("cannot inspect isolation root"));
-            expect(process.output().contains("/sys/fs/cgroup/workers"));
-#else
-            std::println("SKIP: cgroup isolation root diagnostics require Linux");
-#endif
-        };
-
         "worker exits when its gateway connection closes"_test = [] {
-#ifdef __linux__
-            if (!std::filesystem::exists("/sys/fs/cgroup/workers")) {
-                skip / "worker connection loss requires delegated cgroups"_test = [] {};
-                return;
-            }
-#endif
+
             test::scratch tmp{"worker-exit"};
             std::atomic<unsigned> attempts = 0;
             test::listener server{[&](native::scheduler&, native::socket peer) -> coroutine::task<> {

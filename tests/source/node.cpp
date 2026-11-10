@@ -2,6 +2,7 @@
 import std;
 import boost.ut;
 import content;
+import semantic;
 import codec;
 import kernel;
 import archive;
@@ -91,10 +92,13 @@ namespace {
             expect(nodes::digest_of("abc") == content::hash_of("abc"));
             expect(throws<nodes::error>([&] { nodes::codec::decode(bytes + "x"); }));
             expect(throws<nodes::error>([&] { nodes::codec::decode(std::string_view(bytes).substr(0, bytes.size() - 1)); }));
-            for (auto invalid : {std::string{"\xc0\xaf", 2}, std::string{"\xed\xa0\x80", 3}, std::string{"\xf4\x90\x80\x80", 4}})
+            for (auto invalid : {std::string{"\xc0\xaf", 2}, std::string{"\xed\xa0\x80", 3}, std::string{"\xf4\x90\x80\x80", 4}}) {
                 expect(throws<nodes::error>([&] { nodes::scalars(invalid); }));
+                expect(throws<nodes::error>([&] { nodes::scalar_count(invalid); }));
+            }
             auto unicode = nodes::scalars("a😀é");
             expect(unicode.size() == 3u);
+            expect(nodes::scalar_count("a😀é") == unicode.size());
             std::string out;
             for (auto cp : unicode)
                 nodes::append_scalar(out, cp);
@@ -163,6 +167,67 @@ namespace {
             expect(serial.ranges.size() == 1u);
             expect(serial.contains(9999u));
             expect(!serial.contains(10000u));
+        };
+        "structural index differences stream exact ordered changes from cold shared trees"_test = [] {
+            using index = nodes::persistent_index<std::uint64_t>;
+            using rows = std::map<std::string, std::uint64_t>;
+            using entry = std::tuple<std::string, std::optional<std::uint64_t>, std::optional<std::uint64_t>>;
+            struct backing final : index::backend {
+                std::map<std::string, index::node_data> saved;
+                auto load(std::string_view id) -> index::node_data override { return saved.at(std::string{id}); }
+                auto digest(const std::uint64_t& value) const -> std::string override { return nodes::digest_of(std::to_string(value)); }
+                auto store(const index::node_data& node) -> std::string override {
+                    auto id = std::to_string(saved.size());
+                    saved.emplace(id, node);
+                    return id;
+                }
+            };
+            auto storage = std::make_shared<backing>();
+            auto cold = [&](const index& tree) {
+                tree.persist(storage);
+                index out;
+                out.adopt(tree.digest(), tree.object(), tree.size(), tree.content_bound(), tree.mass(), storage);
+                return out;
+            };
+            auto check = [&](const index& left, const index& right, const rows& a, const rows& b) {
+                std::vector<entry> expected, actual;
+                std::set<std::string> keys;
+                for (const auto& [key, _] : a) keys.insert(key);
+                for (const auto& [key, _] : b) keys.insert(key);
+                for (const auto& key : keys) {
+                    auto x = a.contains(key) ? std::optional{a.at(key)} : std::nullopt;
+                    auto y = b.contains(key) ? std::optional{b.at(key)} : std::nullopt;
+                    if (x != y) expected.emplace_back(key, x, y);
+                }
+                auto before = cold(left), after = cold(right);
+                before.difference(after, [&](const auto& key, const auto* x, const auto* y) {
+                    actual.emplace_back(key, x ? std::optional{*x} : std::nullopt, y ? std::optional{*y} : std::nullopt);
+                });
+                const bool same = actual == expected;
+                expect(same);
+            };
+            index left, right;
+            rows a, b;
+            for (unsigned step = 0; step < 12; ++step) {
+                for (unsigned i = 0; i < 48; ++i) {
+                    auto key = "file/" + std::to_string((step * 71 + i * 37) % 256);
+                    if (i % 4 == 0) {
+                        right.erase(key);
+                        b.erase(key);
+                    } else {
+                        right.set(key, step, storage->digest(step));
+                        b[key] = step;
+                    }
+                }
+                check(left, right, a, b);
+                check(right, left, b, a);
+                if (step % 3 == 0) {
+                    left = right;
+                    a = b;
+                }
+            }
+            check(right, right, b, b);
+            check(right, index{}, b, rows{});
         };
         "cold counted sequence edits match an independent complete archive renderer"_test = [] {
             peers p;
@@ -355,10 +420,14 @@ namespace {
                                          .expected = seed.frontier,
                                          .edits = {{.kind = "directory_move", .path = "d", .target = "x"}, {.kind = "move", .path = "a", .target = "x/e"}}});
             expect(inward.code == "source_conflict") << inward.reason;
+            auto parent = attempt(node, {.action = "apply", .operation = op("parent"), .expected = seed.frontier,
+                .edits = {{.kind = "create", .path = "z/child", .text = "child"}, {.kind = "create", .path = "z", .text = "parent"}}});
+            expect(parent.code == "source_conflict") << parent.reason;
             auto swapped = good(node, {.action = "apply",
                                        .operation = op("swapped"),
                                        .expected = seed.frontier,
-                                       .edits = {{.kind = "remove", .path = "b"}, {.kind = "move", .path = "a", .target = "b"}}});
+                                       .edits = {{.kind = "remove", .path = "b"}, {.kind = "move", .path = "a", .target = "b"},
+                                                 {.kind = "create", .path = "z-one", .text = "sibling"}, {.kind = "create", .path = "z/two", .text = "child"}}});
             expect(text(good(node, {.action = "inspect"}), "b") == "A") << "a path the batch empties takes another file";
             expect(inspect(node).frontier == swapped.frontier);
         };
@@ -557,6 +626,91 @@ namespace {
             expect(hidden.code == "worldline_boundary" && !hidden.frontier.empty()) << "the losing state stays reachable for a new fork";
             auto renamed = good(loser, {.action = "fork", .worldline = "twin-2", .operation = op("twin-rename"), .source = hidden.frontier});
             expect(good(loser, {.action = "read", .worldline = "twin-2", .target = "x"}).files.size() == 1u);
+        };
+        "one caller edits independently leased regions without exposing either to another caller"_test = [] {
+            test::scratch tmp{"scope-batch"};
+            nodes::local_node node{tmp.dir / "a"};
+            good(node, {.action = "initialize"});
+            std::vector<nodes::edit> seed{{.kind = "create", .path = "x", .text = "abcdefghij"}};
+            for (unsigned i = 0; i < 9; ++i)
+                seed.push_back({.kind = "create", .path = "spare/" + std::to_string(i), .text = "spare"});
+            auto base = good(node, {.action = "apply", .operation = op("scope-seed"), .edits = std::move(seed)});
+            auto references = good(node, {.action = "scope_register", .revision = base.version,
+                .analyzed_scopes = {{.id = "first", .range = {.place = semantic::place{"x", 1, 3}}},
+                                    {.id = "second", .range = {.place = semantic::place{"x", 6, 8}}}}});
+            auto refs = std::vector<std::string>{*references.scopes[0].reference, *references.scopes[1].reference};
+            auto occupied = good(node, {.action = "scope_acquire", .lease_owner = "run-b", .operation = op("occupied"), .scope_refs = {refs[1]}});
+            expect(attempt(node, {.action = "scope_acquire", .lease_owner = "run-a", .operation = op("conflicting-set"), .scope_refs = refs}).code == "scope_conflict");
+            auto unchanged = good(node, {.action = "scope_list"});
+            expect(unchanged.leases.size() == 1u && unchanged.leases[0].owner == "run-b");
+            good(node, {.action = "scope_release", .lease_owner = "run-b", .lease_token = occupied.leases[0].token});
+            auto leased = good(node, {.action = "scope_acquire", .lease_owner = "run-a", .operation = op("both-scopes"), .scope_refs = refs});
+            auto first = leased.leases[0].token, second = leased.leases[1].token;
+            good(node, {.action = "apply", .lease_owner = "run-a", .leases = {first, second}, .operation = op("unrelated"),
+                .expected = base.frontier, .edits = {{.kind = "edit", .path = "spare/0", .text = "!", .offset = 1}}});
+            auto refused = attempt(node, {.action = "apply", .lease_owner = "run-b", .operation = op("intruder"),
+                .expected = base.frontier, .edits = {{.kind = "edit", .path = "x", .text = "!", .offset = 1, .count = 1}}});
+            expect(refused.code == "scope_conflict");
+            auto edited = good(node, {.action = "apply", .lease_owner = "run-a", .leases = {first, second}, .operation = op("edit-first"),
+                .expected = base.frontier, .edits = {{.kind = "edit", .path = "x", .text = "B", .offset = 1, .count = 1}}});
+            good(node, {.action = "apply", .lease_owner = "run-a", .leases = {first, second}, .operation = op("edit-second"),
+                .expected = edited.frontier, .edits = {{.kind = "edit", .path = "x", .text = "G", .offset = 6, .count = 1}}});
+            expect(text(good(node, {.action = "read", .target = "x"}), "x") == "aBcdefGhij");
+            good(node, {.action = "scope_release", .lease_owner = "run-a", .lease_token = first});
+            expect(attempt(node, {.action = "apply", .lease_owner = "run-a", .leases = {first}, .operation = op("unrelated-expired"),
+                .expected = edited.frontier, .edits = {{.kind = "edit", .path = "spare/0", .text = "!", .offset = 1}}}).code == "scope_expired");
+            expect(attempt(node, {.action = "scope_acquire", .lease_owner = "run-a", .operation = op("both-scopes"), .scope_refs = refs}).code == "scope_expired");
+            expect(good(node, {.action = "scope_list"}).leases.size() == 1u);
+        };
+        "lease grouping protects directory ancestors and move destinations"_test = [] {
+            test::scratch tmp{"scope-paths"};
+            nodes::local_node node{tmp.dir / "a"};
+            good(node, {.action = "initialize"});
+            auto state = good(node, {.action = "apply", .operation = op("path-seed"),
+                .edits = {{.kind = "create", .path = "dir/x", .text = "text"}}});
+            auto held = good(node, {.action = "scope_acquire", .lease_owner = "owner", .operation = op("path-lease"),
+                .revision = state.version, .scope_files = {"dir/x"}, .scope_entries = {"target"}});
+            auto apply = [&](std::string id, nodes::edit edit, bool owns = false) {
+                std::vector<std::string> tokens;
+                if (owns) for (const auto& lease : held.leases) tokens.push_back(lease.token);
+                return attempt(node, {.action = "apply", .lease_owner = owns ? "owner" : "other", .leases = std::move(tokens),
+                    .operation = op(id), .expected = state.frontier, .edits = {std::move(edit)}});
+            };
+            auto sibling = apply("sibling", {.kind = "create", .path = "target-other/x", .text = "free"});
+            expect(sibling.code == "ok");
+            state = sibling;
+            expect(apply("ancestor", {.kind = "directory_move", .path = "dir", .target = "elsewhere"}).code == "scope_conflict");
+            expect(apply("destination", {.kind = "move", .path = "target-other/x", .target = "target/x"}).code == "scope_conflict");
+            auto moved = apply("owner-move", {.kind = "directory_move", .path = "dir", .target = "target"}, true);
+            expect(moved.code == "ok");
+            state = moved;
+            expect(apply("moved-file", {.kind = "edit", .path = "target/x", .text = "!", .offset = 1}).code == "scope_conflict");
+            auto edited = apply("owner-edit", {.kind = "edit", .path = "target/x", .text = "!", .offset = 1}, true);
+            expect(edited.code == "ok");
+            expect(text(good(node, {.action = "read", .target = "target/x"}), "target/x") == "t!ext");
+        };
+        "task revocation fences delayed source writes and fork binding is atomic"_test = [] {
+            test::scratch tmp{"task-source"};
+            nodes::local_node node{tmp.dir / "a"};
+            good(node, {.action = "initialize"});
+            auto base = change(node, "task-seed", {}, {.kind = "create", .path = "x", .text = "text"});
+            good(node, {.action = "task_create", .operation = op("task-create"), .task_id = "task", .execution_owner = "owner"});
+            auto started = good(node, {.action = "task_start", .operation = op("task-start"), .task_id = "task",
+                .execution_identity = "identity", .execution_owner = "owner"});
+            const auto run = *started.execution;
+            auto lease = good(node, {.action = "scope_acquire", .revision = base.version, .lease_owner = run.run,
+                .operation = op("task-lease"), .run_id = run.run, .execution_token = run.token, .scope_files = {"x"}});
+            nodes::node_request delayed{.action = "apply", .lease_owner = run.run, .leases = {lease.leases[0].token},
+                .operation = op("delayed"), .expected = base.frontier,
+                .edits = {{.kind = "write", .path = "x", .text = "late"}}, .run_id = run.run, .execution_token = run.token};
+            good(node, {.action = "task_stop", .task_id = "task", .run_id = run.run, .execution_owner = "owner"});
+            expect(attempt(node, delayed).code == "execution_expired");
+            expect(good(node, {.action = "scope_list"}).leases.empty());
+            expect(text(good(node, {.action = "read", .target = "x"}), "x") == "text");
+            auto failed = attempt(node, {.action = "fork", .worldline = "unbound", .operation = op("fork-bound-task"), .source = base.frontier,
+                .task_id = "task", .execution_owner = "owner"});
+            expect(failed.code == "identity_conflict");
+            expect(!good(node, {.action = "worldlines"}).worldlines.contains("unbound"));
         };
         "source rejects removed semantic and syntax-scope operations"_test = [] {
             test::scratch tmp{"no-semantics"};
@@ -944,6 +1098,41 @@ namespace {
             expect(fixed.source_digest == before.source_digest);
             expect(text(fixed, "x") == "abcd");
             expect(inspect(p.a).frontier == after.frontier);
+        };
+        "cross-worldline promotion publishes one independent atomic contribution"_test = [] {
+            peers p;
+            auto seed = p.seed();
+            auto fork = good(p.a, {.action = "fork", .worldline = "experiment", .operation = op("promotion-fork"), .source = seed.frontier});
+            auto edited = good(p.a, {.action = "apply", .worldline = "experiment", .operation = op("promotion-edit"), .expected = fork.frontier,
+                .edits = {{.kind = "write", .path = "x", .text = "experiment"}, {.kind = "binary_create", .path = "asset", .text = "00ff", .executable = true}}});
+            auto independent = change(p.a, "promotion-independent", seed.frontier, {.kind = "create", .path = "local", .text = "retained"});
+            auto diff = good(p.a, {.action = "diff", .worldline = "main", .expected = edited.frontier, .target = "experiment"});
+            expect(diff.changes.size() == 3u);
+            nodes::node_request request{.action = "promote", .operation = op("promotion-accept"), .expected = independent.frontier,
+                .source = edited.frontier, .target = "experiment", .intent = "Adopt the experiment"};
+            auto promoted = good(p.a, request);
+            auto current = inspect(p.a);
+            expect(text(current, "x") == "experiment");
+            expect(text(current, "local") == "retained");
+            expect(text(current, "asset") == "00ff");
+            expect(current.files[0].executable || current.files[1].executable || current.files[2].executable);
+            auto history = good(p.a, {.action = "history"});
+            expect(history.history.size() == 3u);
+            expect(history.history.back().parents == independent.frontier);
+            auto replay = good(p.a, request);
+            expect(replay.replayed && replay.version == promoted.version);
+            exchange(p.a, *p.b);
+            good(*p.b, {.action = "integrate", .operation = op("promotion-replicate"), .expected = seed.frontier, .source = promoted.frontier});
+            expect(text(inspect(*p.b), "asset") == "00ff");
+            auto source = good(p.a, {.action = "inspect", .worldline = "experiment"});
+            expect(source.version == edited.version);
+            auto remaining = good(p.a, {.action = "diff", .worldline = "main", .expected = edited.frontier, .target = "experiment"});
+            expect(remaining.changes.size() == 1u && remaining.changes.front().after->path == "local");
+            auto divergent = good(p.a, {.action = "apply", .worldline = "experiment", .operation = op("promotion-diverge"), .expected = edited.frontier,
+                .edits = {{.kind = "write", .path = "x", .text = "different"}}});
+            request.operation = op("promotion-conflict"); request.expected = promoted.frontier; request.source = divergent.frontier;
+            expect(attempt(p.a, request).code == nodes::code::source_conflict);
+            expect(inspect(p.a).version == promoted.version);
         };
         "fixed-version comparison and history retain exact source and tool evidence"_test = [] {
             peers p;

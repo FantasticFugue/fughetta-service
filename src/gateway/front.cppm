@@ -109,7 +109,7 @@ export namespace front {
 
     // Clients choose JSON-RPC IDs and repeat them, so a cancellation names a request of the same caller and endpoint.
     inline auto request_key(const worlds::actor& who, bool configuration, const mcp::key& id) -> std::string {
-        return std::format("{}\n{}\n{}\n{}", worlds::identity_key(who), who.client.value_or(""), configuration ? "config" : "business", mcp::key_text(id));
+        return std::format("{}\n{}\n{}\n{}\n{}", worlds::identity_key(who), who.client.value_or(""), who.run, configuration ? "config" : "business", mcp::key_text(id));
     }
 
     class in_flight {
@@ -235,13 +235,35 @@ export namespace front {
         }
     };
 
+    // One agent connection covers project setup, source editing, execution and delivery.
+    class workspace_tools {
+        tools::standard::bound execution_;
+        settings::bound<dispatch> settings_;
+        std::vector<mcp::tool> tools_;
+    public:
+        workspace_tools(context ctx, tools::services& services) : execution_(services), settings_(dispatch{ctx}) {
+            tools_ = execution_.list();
+            const auto& configuration = settings_.list();
+            tools_.insert(tools_.end(), configuration.begin(), configuration.end());
+        }
+        auto list() const -> const std::vector<mcp::tool>& { return tools_; }
+        auto call(std::string_view name, rfl::Generic args, mcp::notifier& note, const worlds::actor& who)
+            -> coroutine::task<mcp::tool_outcome> {
+            if (std::ranges::any_of(settings_.list(), [name](const auto& tool) { return tool.name == name; })) {
+                if (!who.run.empty()) co_return mcp::tool_outcome{.text = "execution credentials cannot access project settings", .error = true};
+                co_return co_await settings_.call(name, std::move(args), note, who);
+            }
+            co_return co_await execution_.call(name, std::move(args), note, who);
+        }
+    };
+
     class server {
     public:
         using socket = native::socket;
-        using toolset = tools::standard::bound;
+        using toolset = workspace_tools;
 
         server(context ctx, tools::services& services, std::chrono::milliseconds heartbeat = constants::mcp_heartbeat)
-            : ctx_(ctx), heartbeat_(heartbeat), mcp_{std::string{constants::mcp_server_name}, "0.1.0", toolset{services}},
+            : ctx_(ctx), heartbeat_(heartbeat), mcp_{std::string{constants::mcp_server_name}, "0.1.0", toolset{ctx, services}},
               settings_{"Fughetta configuration", "0.1.0", settings::bound{dispatch{ctx}}} {}
 
         auto serve(socket peer) -> coroutine::task<> {
@@ -282,7 +304,18 @@ export namespace front {
                     std::optional<worlds::actor> who;
                     std::optional<web::reply> refused;
                     if (!(method == "OPTIONS" && origin) && t.path != "/healthz") {
-                        refused = authenticate(doc->server.auth, in.head, who);
+                        auto authorization = web::header(in.head, "authorization").value_or("");
+                        const bool execution = authorization.size() > 14 && authorization.substr(7).starts_with("fugrun.") &&
+                            std::ranges::equal(authorization.substr(0, 7), std::string_view{"bearer "}, {},
+                                [](char c) { return static_cast<char>(std::tolower(static_cast<unsigned char>(c))); });
+                        if (execution) {
+                            if (t.path != "/mcp") refused = error(403, "execution credentials are restricted to the task MCP endpoint");
+                            else {
+                                try {
+                                    who = co_await tools::execution_actor(*ctx_.services, std::string{authorization.substr(7)});
+                                } catch (const std::exception& e) { refused = error(401, e.what()); }
+                            }
+                        } else refused = authenticate(doc->server.auth, in.head, who);
                         if (who)
                             c.who = &*who;
                     }

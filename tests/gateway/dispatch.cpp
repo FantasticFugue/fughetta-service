@@ -188,7 +188,7 @@ int main(int argc, char** argv) {
             const worlds::actor tester{.issuer = "token", .user = "tester", .caller = "test-suite", .role = "owner"};
             auto build = [&](bool fresh = false) -> coroutine::task<tools::config_result> {
                 auto out =
-                    co_await tools::build::run(s, {.project = "app", .configurations = std::nullopt, .targets = std::nullopt, .fresh = fresh}, note, tester);
+                    co_await tools::build::run(s, {.project = "app", .configurations = std::nullopt, .targets = std::nullopt, .worldline = std::string{"main"}, .fresh = fresh}, note, tester);
                 co_return out.results.at(0);
             };
 
@@ -213,7 +213,7 @@ int main(int argc, char** argv) {
                 out.builds.push_back(co_await build(true));
                 out.quota = (co_await build(true)).error;
                 try {
-                    co_await tools::build::run(s, {.project = "nope", .configurations = std::nullopt, .targets = std::nullopt}, note, tester);
+                    co_await tools::build::run(s, {.project = "nope", .configurations = std::nullopt, .targets = std::nullopt, .worldline = std::string{"main"}}, note, tester);
                 } catch (const config::not_found& e) {
                     out.unknown_project = e.what();
                 }
@@ -229,7 +229,7 @@ int main(int argc, char** argv) {
                 co_await fixture::write_file(s, {.project = "cm", .path = "hello.c", .content = std::string{hello_c}, .operation_id = "write-19"}, note,
                                              tester);
                 auto started = std::chrono::steady_clock::now();
-                out.both = co_await tools::build::run(s, {.project = "cm", .configurations = std::nullopt, .targets = std::nullopt}, note, tester);
+                out.both = co_await tools::build::run(s, {.project = "cm", .configurations = std::nullopt, .targets = std::nullopt, .worldline = std::string{"main"}}, note, tester);
                 out.both_seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
                 co_await fixture::edit_text(s,
                                             {.project = "cm",
@@ -239,7 +239,7 @@ int main(int argc, char** argv) {
                                              .replace_all = std::nullopt,
                                              .operation_id = "edit-20"},
                                             note, tester);
-                out.broken = co_await tools::build::run(s, {.project = "cm", .configurations = std::nullopt, .targets = std::nullopt}, note, tester);
+                out.broken = co_await tools::build::run(s, {.project = "cm", .configurations = std::nullopt, .targets = std::nullopt, .worldline = std::string{"main"}}, note, tester);
                 co_await fixture::edit_text(s,
                                             {.project = "cm",
                                              .path = "hello.c",
@@ -248,13 +248,13 @@ int main(int argc, char** argv) {
                                              .replace_all = std::nullopt,
                                              .operation_id = "edit-21"},
                                             note, tester);
-                out.tested = co_await tools::test::run(s, {.project = "cm", .configurations = std::nullopt, .filter = std::nullopt, .labels = std::nullopt},
+                out.tested = co_await tools::test::run(s, {.project = "cm", .configurations = std::nullopt, .filter = std::nullopt, .labels = std::nullopt, .worldline = std::string{"main"}},
                                                        note, tester);
                 out.filtered = co_await tools::test::run(
                     s,
-                    {.project = "cm", .configurations = std::vector<std::string>{"Debug-alternate"}, .filter = std::string{"greets"}, .labels = std::nullopt},
+                    {.project = "cm", .configurations = std::vector<std::string>{"Debug-alternate"}, .filter = std::string{"greets"}, .labels = std::nullopt, .worldline = std::string{"main"}},
                     note, tester);
-                out.ran = co_await tools::launch::run(s, {.project = "cm", .configuration = "hello", .configurations = std::nullopt}, note, tester);
+                out.ran = co_await tools::launch::run(s, {.project = "cm", .configuration = "hello", .configurations = std::nullopt, .worldline = std::string{"main"}}, note, tester);
 
                 if (check_commands) {
                     co_await fixture::write_file(
@@ -265,15 +265,15 @@ int main(int argc, char** argv) {
                          .operation_id = "write-22"},
                         note, tester);
                     out.command_tested = co_await tools::test::run(
-                        s, {.project = "commands", .configurations = std::nullopt, .filter = std::nullopt, .labels = std::nullopt}, note, tester);
+                        s, {.project = "commands", .configurations = std::nullopt, .filter = std::nullopt, .labels = std::nullopt, .worldline = std::string{"main"}}, note, tester);
                     out.command_failed = co_await tools::test::run(
-                        s, {.project = "commands", .configurations = std::vector<std::string>{"bad"}, .filter = std::nullopt, .labels = std::nullopt}, note,
+                        s, {.project = "commands", .configurations = std::vector<std::string>{"bad"}, .filter = std::nullopt, .labels = std::nullopt, .worldline = std::string{"main"}}, note,
                         tester);
                     out.command_ran =
-                        co_await tools::launch::run(s, {.project = "commands", .configuration = "app", .configurations = std::nullopt}, note, tester);
+                        co_await tools::launch::run(s, {.project = "commands", .configuration = "app", .configurations = std::nullopt, .worldline = std::string{"main"}}, note, tester);
                     try {
                         co_await tools::test::run(
-                            s, {.project = "commands", .configurations = std::nullopt, .filter = std::string{"unit"}, .labels = std::nullopt}, note, tester);
+                            s, {.project = "commands", .configurations = std::nullopt, .filter = std::string{"unit"}, .labels = std::nullopt, .worldline = std::string{"main"}}, note, tester);
                     } catch (const std::invalid_argument&) {
                         out.command_options_rejected = true;
                     }
@@ -281,7 +281,7 @@ int main(int argc, char** argv) {
 
                 co_await fixture::write_file(s, {.project = "slow", .path = "x", .content = "x", .operation_id = "write-23"}, note, tester);
                 auto stopped = co_await coroutine::deadline(
-                    io, 800ms, tools::build::run(s, {.project = "slow", .configurations = std::nullopt, .targets = std::nullopt}, note, tester));
+                    io, 800ms, tools::build::run(s, {.project = "slow", .configurations = std::nullopt, .targets = std::nullopt, .worldline = std::string{"main"}}, note, tester));
                 out.slow_stopped = !stopped;
                 co_await execution::schedule_after(io, std::chrono::milliseconds{3500});
                 out.slow_finished_anyway = std::filesystem::exists(tree_of(tmp.dir / "work", "slow") / "out/late");
@@ -330,7 +330,7 @@ int main(int argc, char** argv) {
                     co_await execution::schedule_after(io, 1ms);
                 for (const auto& [path, text] : sources)
                     co_await fixture::write_file(services, {.project = "app", .path = path, .content = text, .operation_id = "write " + path}, note, actor);
-                auto result = co_await tools::build::run(services, {.project = "app"}, note, actor);
+                auto result = co_await tools::build::run(services, {.project = "app", .worldline = std::string{"main"}}, note, actor);
                 expect(result.ok >> fatal) << config::write(result);
                 std::vector<std::string> names;
                 for (const auto& step : result.results.at(0).steps)
@@ -526,7 +526,7 @@ int main(int argc, char** argv) {
                     co_await fixture::write_file(
                         services, {.project = "deps", .path = "vcpkg-configuration.json", .content = "{}\n", .operation_id = "deps-registries"},
                         note, actor);
-                out.first = co_await tools::build::run(services, {.project = "deps", .configurations = std::nullopt, .targets = std::nullopt},
+                out.first = co_await tools::build::run(services, {.project = "deps", .configurations = std::nullopt, .targets = std::nullopt, .worldline = std::string{"main"}},
                                                        note, actor);
                 if (repin) {
                     co_await fixture::write_file(
@@ -538,7 +538,7 @@ int main(int argc, char** argv) {
                         {.project = "deps",
                          .configurations = std::nullopt,
                          .targets = std::nullopt,
-                         .version = std::optional<std::string>{out.first.revision},
+                         .worldline = std::string{"main"}, .version = std::optional<std::string>{out.first.revision},
                          .fresh = true},
                         note, actor);
                 }
@@ -768,6 +768,10 @@ int main(int argc, char** argv) {
             expect(both.results[0].configuration == "Debug-primary" && both.results[1].configuration == "Debug-alternate");
             expect(!both.snapshot.empty() && both.results[0].snapshot == both.snapshot && both.results[1].snapshot == both.snapshot)
                 << "one call, one snapshot";
+            for (const auto& result : both.results) {
+                expect(result.timings.sync_seconds.value_or(-1) >= 0 && result.timings.queue_seconds.value_or(-1) >= 0);
+                expect(result.timings.worker_seconds.value_or(-1) > 0 && result.timings.dependency_seconds.value_or(-1) >= 0);
+            }
             expect(names(both.results[0]) == std::vector<std::string>{"configure", "build"});
             auto built = [&](std::string_view directory) {
                 for (auto& tree : std::filesystem::directory_iterator(h.tmp.dir / "work/trees/cm"))

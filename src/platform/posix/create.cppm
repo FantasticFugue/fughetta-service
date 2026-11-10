@@ -1,8 +1,14 @@
 module;
+#ifdef __APPLE__
+#include <crt_externs.h>
+#define environ (*_NSGetEnviron())
+#endif
 #include <errno.h>
 #include <fcntl.h>
 #include <signal.h>
+#ifdef __linux__
 #include <sys/prctl.h>
+#endif
 #include <sys/resource.h>
 #include <sys/socket.h>
 #include <sys/wait.h>
@@ -13,15 +19,12 @@ import std;
 import mpmc;
 import async;
 import httpant.io;
-import cgroup;
 
 namespace native_process {
     struct child::state {
-        state(native_io::engine<concurrent::queue>* engine, int pid, int out, bool conversation, int pidfd, std::unique_ptr<cgroup::membership> control)
-            : engine(engine), pid(pid), out(out), conversation(conversation), exit(pidfd), control(std::move(control)) {}
+        state(native_io::engine<concurrent::queue>* engine, int pid, int out, bool conversation, int pidfd)
+            : engine(engine), pid(pid), out(out), conversation(conversation), exit(pidfd) {}
         ~state() {
-            if (control)
-                control->kill();
             if (!reaped) {
                 ::kill(-pid, SIGKILL);
                 while (::waitpid(pid, nullptr, 0) < 0 && errno == EINTR) {
@@ -29,8 +32,7 @@ namespace native_process {
             }
             engine->cancel_file(out);
             ::close(out);
-            engine->cancel_file(exit);
-            ::close(exit);
+            if (exit >= 0) { engine->cancel_file(exit); ::close(exit); }
         }
         native_io::engine<concurrent::queue>* engine;
         int pid;
@@ -38,11 +40,8 @@ namespace native_process {
         // A conversation is one socket for both directions, so the engine's stream operations apply to it.
         bool conversation;
         int exit;
-        std::unique_ptr<cgroup::membership> control;
         bool reaped = false;
         auto reap() noexcept -> int {
-            if (control)
-                control->kill();
             ::kill(-pid, SIGKILL);
             int status = 0;
             pid_t got;
@@ -63,9 +62,13 @@ namespace native_process {
     namespace {
         constexpr long open_pid_call = 434;
         constexpr long close_range_call = 436;
-        [[noreturn]] void exec_child(char** args, char** envp, const char* dir, int out, int in, int file, const io::command& cmd, int join, int parent) {
+        [[noreturn]] void exec_child(char** args, char** envp, const char* dir, int out, int in, int file, const io::command& cmd, int parent) {
+#ifdef __linux__
             if (::prctl(PR_SET_PDEATHSIG, SIGKILL) != 0 || ::getppid() != parent)
                 ::_exit(126);
+#else
+            if (::getppid() != parent) ::_exit(126);
+#endif
             ::setpgid(0, 0);
             ::dup2(in, 0);
             ::dup2(file >= 0 ? file : out, 1);
@@ -76,31 +79,16 @@ namespace native_process {
                     ::_exit(126);
             } else
                 ::dup2(out, 2);
-            if (join >= 0) {
-                char text[32];
-                char* end = text + sizeof(text);
-                char* begin = end;
-                auto pid = ::getpid();
-                do {
-                    *--begin = static_cast<char>('0' + pid % 10);
-                    pid /= 10;
-                } while (pid);
-                ssize_t n;
-                do {
-                    n = ::write(join, begin, end - begin);
-                } while (n < 0 && errno == EINTR);
-                if (n != end - begin) {
-                    constexpr char error[] = "worker: cannot join build cgroup; command not started\n";
-                    ::write(2, error, sizeof(error) - 1);
-                    ::_exit(126);
-                }
-            }
+#ifdef __linux__
             if (::syscall(close_range_call, 3u, ~0u, 0) != 0) {
                 constexpr char error[] = "worker: cannot close inherited descriptors; command not started\n";
                 ::write(2, error, sizeof(error) - 1);
                 ::_exit(126);
             }
-            if (!cmd.isolation && cmd.max_memory_bytes) {
+#else
+            ::closefrom(3);
+#endif
+            if (cmd.max_memory_bytes) {
                 rlimit l{*cmd.max_memory_bytes, *cmd.max_memory_bytes};
                 if (::setrlimit(RLIMIT_AS, &l) != 0) {
                     constexpr char message[] = "worker: cannot set RLIMIT_AS; command not started\n";
@@ -108,7 +96,7 @@ namespace native_process {
                     ::_exit(126);
                 }
             }
-            if (!cmd.isolation && cmd.max_cpu_seconds) {
+            if (cmd.max_cpu_seconds) {
                 rlimit l{*cmd.max_cpu_seconds, *cmd.max_cpu_seconds};
                 if (::setrlimit(RLIMIT_CPU, &l) != 0) {
                     constexpr char message[] = "worker: cannot set RLIMIT_CPU; command not started\n";
@@ -118,14 +106,14 @@ namespace native_process {
             }
             if (::chdir(dir) != 0)
                 ::_exit(126);
-            ::execvpe(args[0], args, envp);
+            environ = envp;
+            ::execvp(args[0], args);
             ::_exit(127);
         }
     } // namespace
     auto child::spawn(native_io::engine<concurrent::queue>& engine, const io::command& cmd) -> child {
         if (cmd.argv.empty())
             throw std::invalid_argument("spawn: empty command");
-        auto control = cmd.isolation ? std::make_unique<cgroup::membership>(*cmd.isolation) : nullptr;
         std::vector<char*> args;
         for (auto& a : cmd.argv)
             args.push_back(const_cast<char*>(a.c_str()));
@@ -143,8 +131,10 @@ namespace native_process {
         auto dir = cmd.cwd.string();
 
         int out[2];
-        if (cmd.interactive ? ::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, out) < 0 : ::pipe2(out, O_CLOEXEC) < 0)
+        if (cmd.interactive ? ::socketpair(AF_UNIX, SOCK_STREAM, 0, out) < 0 : ::pipe(out) < 0)
             throw std::system_error(errno, std::system_category(), "child output");
+        ::fcntl(out[0], F_SETFD, FD_CLOEXEC);
+        ::fcntl(out[1], F_SETFD, FD_CLOEXEC);
         int in = cmd.interactive ? out[1] : ::open("/dev/null", O_RDONLY | O_CLOEXEC);
         if (in < 0) {
             auto err = errno;
@@ -177,24 +167,25 @@ namespace native_process {
             throw std::system_error(err, std::system_category(), "fork");
         }
         if (pid == 0)
-            exec_child(args.data(), envp, dir.c_str(), out[1], in, file, cmd, control ? control->join_fd() : -1, parent);
+            exec_child(args.data(), envp, dir.c_str(), out[1], in, file, cmd, parent);
         ::setpgid(pid, pid);
         ::close(out[1]);
         if (!cmd.interactive)
             ::close(in);
         if (file >= 0)
             ::close(file);
-        int pidfd = static_cast<int>(::syscall(open_pid_call, pid, 0));
+        int pidfd = -1;
+#ifdef __linux__
+        pidfd = static_cast<int>(::syscall(open_pid_call, pid, 0));
         if (pidfd < 0) {
             auto err = errno;
-            if (control)
-                control->kill();
             ::kill(-pid, SIGKILL);
             ::waitpid(pid, nullptr, 0);
             ::close(out[0]);
             throw std::system_error(err, std::system_category(), "pidfd_open");
         }
-        return child{std::make_unique<state>(&engine, pid, out[0], cmd.interactive, pidfd, std::move(control))};
+#endif
+        return child{std::make_unique<state>(&engine, pid, out[0], cmd.interactive, pidfd)};
     }
 
     child::child(std::unique_ptr<state> state) : state_(std::move(state)) {}
@@ -214,12 +205,16 @@ namespace native_process {
             ::kill(state_->pid, SIGTERM);
     }
     void child::kill() noexcept {
-        if (state_->control)
-            state_->control->kill();
         if (!state_->reaped)
             ::kill(-state_->pid, SIGKILL);
     }
     void child::begin_wait(native_io::request& request) noexcept {
+        if (state_->exit < 0) {
+            request.kind = native_io::operation::timer;
+            request.deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds{10};
+            state_->engine->start(request);
+            return;
+        }
         request.kind = native_io::operation::readable;
         request.file = state_->exit;
         state_->engine->start(request);

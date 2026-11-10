@@ -93,7 +93,13 @@ namespace {
     };
 
     auto call(std::string_view tool, std::string_view args, std::string_view meta = "") -> std::string {
-        return std::format(R"({{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{{"name":"{}","arguments":{}{}}}}})", tool, args,
+        std::string selected{args};
+        if (tool == "worldline" || tool == "language" || tool == "scope" || tool == "build" || tool == "test" || tool == "run") {
+            auto object = rfl::json::read<rfl::Generic>(selected)->to_object().value();
+            if (!object.get("worldline")) object["worldline"] = "main";
+            selected = rfl::json::write(object);
+        }
+        return std::format(R"({{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{{"name":"{}","arguments":{}{}}}}})", tool, selected,
                            meta.empty() ? "" : std::format(R"(,"_meta":{})", meta));
     }
 
@@ -311,7 +317,7 @@ namespace {
                     project.default_configurations = {"test"};
                     co_await h.save(io, "/api/v1/projects/app", config::write(project));
                     co_await h.ask(io, http::method::POST, "/api/v1/projects/app/worldline",
-                                   R"({"project":"app","action":"apply","observed":"","operation_id":"seed","changes":[{"kind":"create","path":"a.txt","text":"a"}]})");
+                                   R"({"project":"app","worldline":"main","action":"apply","observed":"","operation_id":"seed","changes":[{"kind":"create","path":"a.txt","text":"a"}]})");
                     auto blocker = co_await h.queue.submit(
                         0, {.key = "blocker", .project = "app", .configuration = "blocker", .operation = "blocker", .actor = "blocker", .trees = "blocker"},
                         [&io](tools::services&, jobs::progress_log&, std::string) -> coroutine::task<std::optional<tools::backlog::outcome>> {
@@ -827,7 +833,7 @@ namespace {
                         co_await h.save(io, "/api/v1/config/limits", R"({"max_file_bytes": 100})");
                         co_await h.save(io, "/api/v1/projects/app", "{}");
                         a.push_back(co_await h.mcp(io, R"({"jsonrpc":"2.0","id":1,"method":"tools/list"})"));
-                        for (const auto name : {"read", "write", "edit", "remove", "move", "list", "glob", "search", "worldline", "generate", "jobs"}) {
+                        for (const auto name : {"read", "write", "edit", "remove", "move", "list", "glob", "search", "generate", "jobs"}) {
                             auto refused = co_await h.mcp(io, call(name, R"({"project":"app"})"));
                             expect(refused.body.contains("unknown tool")) << refused.body;
                         }
@@ -840,15 +846,15 @@ namespace {
                         a.push_back(co_await h.mcp(io, call("configurations", R"({"project":"app"})", R"({"progressToken":"p1"})"),
                                                    {{"accept", "application/json, text/event-stream"}}));
                         const auto endpoint = "/api/v1/projects/app/worldline";
-                        const auto inspected = co_await h.ask(io, http::method::POST, endpoint, R"({"project":"app","action":"inspect"})");
+                        const auto inspected = co_await h.ask(io, http::method::POST, endpoint, R"({"project":"app","worldline":"main","action":"inspect"})");
                         const auto initial = rfl::json::read<tools::worldline::output>(inspected.body).value().version.value();
-                        const auto apply = std::format(R"({{"project":"app","action":"apply","observed":"{}","operation_id":"op-a","changes":[{{"kind":"create","path":"a.txt","text":"hi\n"}}]}})", initial);
+                        const auto apply = std::format(R"({{"project":"app","worldline":"main","action":"apply","observed":"{}","operation_id":"op-a","changes":[{{"kind":"create","path":"a.txt","text":"hi\n"}}]}})", initial);
                         a.push_back(co_await h.ask(io, http::method::POST, endpoint, apply));
-                        a.push_back(co_await h.ask(io, http::method::POST, endpoint, R"({"project":"app","action":"receipt","operation_id":"op-a"})"));
+                        a.push_back(co_await h.ask(io, http::method::POST, endpoint, R"({"project":"app","worldline":"main","action":"receipt","operation_id":"op-a"})"));
                         a.push_back(co_await h.ask(io, http::method::POST, endpoint, apply));
-                        a.push_back(co_await h.ask(io, http::method::POST, endpoint, R"({"project":"app","action":"fork","name":"wl","operation_id":"op-fork"})"));
+                        a.push_back(co_await h.ask(io, http::method::POST, endpoint, R"({"project":"app","worldline":"main","action":"fork","name":"wl","operation_id":"op-fork"})"));
                         a.push_back(co_await h.ask(io, http::method::POST, endpoint, R"({"project":"app","action":"history","worldline":"wl"})"));
-                        a.push_back(co_await h.ask(io, http::method::POST, endpoint, R"({"project":"app","action":"read","path":"a.txt"})"));
+                        a.push_back(co_await h.ask(io, http::method::POST, endpoint, R"({"project":"app","worldline":"main","action":"read","path":"a.txt"})"));
                         a.push_back(co_await h.ask(io, GET, "/api/v1/usage"));
                         a.push_back(co_await h.ask(io, GET, "/metrics"));
                     });
@@ -857,9 +863,11 @@ namespace {
             expect((a.size() == 16u) >> fatal);
             for (const auto name : {"configurations", "build", "test", "run", "language"})
                 expect(a[0].body.contains(std::format(R"("name":"{}")", name)));
-            for (const auto name : {"read", "write", "edit", "remove", "move", "list", "glob", "search", "worldline", "generate", "jobs"})
+            for (const auto name : {"read", "write", "edit", "remove", "move", "list", "glob", "search", "generate", "jobs"})
                 expect(!a[0].body.contains(std::format(R"("name":"{}")", name)));
             expect(a[0].status == 200 && a[0].body.contains("outputSchema"));
+            for (auto name : {"worldline", "artifact", "project", "save_project", "schema", "effective"})
+                expect(a[0].body.contains(std::format(R"("name":"{}")", name)));
             expect(a[1].status == 405);
             expect(a[2].status == 400 && a[2].body.contains("-32700"));
             expect(a[3].status == 400);

@@ -1,5 +1,6 @@
 export module nodes;
 import std;
+import constants;
 export import semantic;
 
 export namespace nodes {
@@ -29,12 +30,25 @@ export namespace nodes {
         std::uint64_t id = 0, at = 0;
         std::string sender, worldline, recipient, body, operation;
     };
+    struct scope_lease {
+        std::string token, scope, path, worldline, version, owner;
+        std::uint64_t begin = 0, end = 0, expires_at = 0;
+        bool valid = true;
+        std::string kind = "scope";
+    };
+    struct execution_view {
+        std::string task, run, worldline, token, identity;
+        bool active = true;
+    };
     struct node_request {
         std::string action;
         std::optional<mail_input> mail;
         std::uint64_t after = 0;
         std::string worldline = "main";
         std::string revision, snapshot;
+        std::string lease_owner, lease_token;
+        std::vector<std::string> leases;
+        std::uint64_t lease_seconds = constants::scope_lease_seconds;
         std::string operation;
         std::string owner;
         std::string actor;
@@ -65,6 +79,10 @@ export namespace nodes {
         std::uint64_t file_limit = 0, project_limit = 0, workspace_limit = 0;
         std::uint64_t max_bytes = 1024 * 1024;
         std::uint64_t limit = 100;
+        std::string task_id, run_id, execution_token, execution_identity, execution_owner;
+        bool execution_writable = true;
+        std::vector<std::string> scope_refs, scope_files, scope_entries;
+        std::vector<semantic::scope> analyzed_scopes;
     };
     struct file_view {
         std::string id, path, kind, digest, text;
@@ -101,6 +119,7 @@ export namespace nodes {
         std::vector<history_entry> history;
         std::map<std::string, std::vector<std::string>> worldlines;
         std::vector<line_view> lines;
+        std::vector<scope_lease> leases;
         std::vector<mail_message> messages;
         // restore: the project configuration the package held, as JSON.
         std::string configuration;
@@ -110,6 +129,8 @@ export namespace nodes {
         bool truncated = false;
         std::string completeness_scope = "none";
         std::uint64_t storage_bytes = 0;
+        std::vector<semantic::scope> scopes;
+        std::optional<execution_view> execution;
         std::string state_snapshot;
         std::uint64_t loaded_records = 0, replayed_events = 0, snapshot_events = 0;
     };

@@ -6,7 +6,6 @@ import replica;
 import runner;
 import protocol;
 import host;
-import isolation;
 import lsp;
 import constants;
 import reflection;
@@ -22,9 +21,6 @@ export namespace replica {
         std::map<std::string, std::string> env;
         bool inherit_env = true;
         builds::toolset tools;
-        bool isolate = false;
-        // Build groups go under this cgroup instead of the shared Worker root.
-        std::optional<std::filesystem::path> isolation_root;
         std::uint32_t parallel = 1;
         std::optional<std::filesystem::path> dependency_cache;
         std::optional<std::filesystem::path> dependency_upstream;
@@ -39,13 +35,6 @@ export namespace replica {
 
         service(cores::context<native::scheduler>& rt, options o, execution::thread_pool& pool, std::size_t home = 0)
             : rt_(rt), store_(o.root, o.limits), options_(std::move(o)), pool_(pool), home_(home) {}
-
-        auto prepare(std::size_t core) -> coroutine::task<> {
-            if (core == home_)
-                co_await prepare_resources();
-            else
-                co_await cores::call(rt_.get_scheduler(core), rt_.get_scheduler(home_), [this] { return prepare_resources(); });
-        }
 
         // The owner keeps the I/O runtime alive until all context-owned children are gone.
         auto run(std::size_t core, coroutine::task<> work) -> coroutine::task<> {
@@ -168,7 +157,6 @@ export namespace replica {
         }
 
         struct context {
-            std::shared_ptr<isolation::scope> resources;
             std::unique_ptr<lsp::session> server;
             std::string identity;
             std::chrono::steady_clock::time_point used;
@@ -187,8 +175,6 @@ export namespace replica {
                 failed = std::current_exception();
             }
             old->server.reset();
-            if (old->resources)
-                co_await close_resources(std::move(old->resources));
             if (failed)
                 std::rethrow_exception(failed);
         }
@@ -202,21 +188,6 @@ export namespace replica {
                     delivery::collect(root / "exports");
                 });
             }
-            std::vector<std::pair<std::string, std::shared_ptr<isolation::scope>>> groups;
-            for (const auto& [key, value] : contexts_)
-                if (!active_.contains(key) && value->resources)
-                    groups.emplace_back(key, value->resources);
-            auto pressured = co_await io::blocking(rt_.get_scheduler(home_), pool_, [groups] {
-                std::map<std::string, std::shared_ptr<isolation::scope>> result;
-                for (const auto& [key, group] : groups) {
-                    try {
-                        if (group->memory_pressure())
-                            result.emplace(key, group);
-                    } catch (const std::exception&) { /* A concurrently retired group has no processes left to reclaim. */
-                    }
-                }
-                return result;
-            });
             std::vector<std::pair<std::chrono::steady_clock::time_point, std::string>> idle;
             for (const auto& [key, value] : contexts_)
                 if (!active_.contains(key))
@@ -226,21 +197,10 @@ export namespace replica {
             for (const auto& [used, key] : idle) {
                 auto found = contexts_.find(key);
                 if (found != contexts_.end() && found->second->used == used && !active_.contains(key) &&
-                    (pressure || (pressured.contains(key) && pressured.at(key) == found->second->resources) || now - used >= constants::language_idle ||
+                    (pressure || now - used >= constants::language_idle ||
                      contexts_.size() >= constants::language_sessions))
                     co_await retire(key);
             }
-        }
-
-        auto prepare_resources() -> coroutine::task<> {
-            if (!options_.isolate)
-                co_return;
-            auto held = co_await resources_lock_.lock();
-            if (!resources_)
-                resources_ = co_await io::blocking(rt_.get_scheduler(home_), pool_, [this] {
-                    auto key = content::hash_of(std::filesystem::canonical(options_.root).string());
-                    return options_.isolation_root ? std::make_shared<isolation::pool>(*options_.isolation_root, key) : std::make_shared<isolation::pool>(key);
-                });
         }
 
         template <class F> auto at_home(std::size_t core, F f) -> coroutine::task<std::invoke_result_t<F&, store&>> {
@@ -320,23 +280,12 @@ export namespace replica {
             });
             if (!retired.empty())
                 co_await io::blocking(rt_.get_scheduler(home_), pool_, [retired] { store::discard(retired); });
-            std::shared_ptr<isolation::scope> resources;
-            if (options_.isolate) {
-                co_await prepare_resources();
-                resources = co_await io::blocking(rt_.get_scheduler(home_), pool_, [this, &r] {
-                    auto resource = resources_->start(r.max_memory_bytes, r.max_cpu_seconds);
-                    resource->concurrency(options_.parallel);
-                    return resource;
-                });
-            } else if (r.max_memory_bytes || r.max_cpu_seconds) {
-                throw std::runtime_error("build resource limits require isolation; command not started");
-            }
             auto deadline = started + std::chrono::seconds{r.timeout_s};
             auto token = co_await coroutine::current_token;
             std::optional<jobs::build_report> report;
             std::exception_ptr failed;
             try {
-                report = co_await coroutine::under(token, run_steps(r, dir, reports, resources.get(), deadline));
+                report = co_await coroutine::under(token, run_steps(r, dir, reports, deadline));
                 if (report && report->ok() && preparation) {
                     auto io = rt_.get_scheduler(home_);
                     auto remaining = std::max(std::chrono::steady_clock::duration::zero(), deadline - std::chrono::steady_clock::now());
@@ -352,13 +301,6 @@ export namespace replica {
             }
             if (r.survey && (failed || !report || !report->ok()))
                 co_await coroutine::under(coroutine::stop_token{}, retire(key));
-            if (resources) {
-                try {
-                    co_await coroutine::under(coroutine::stop_token{}, close_resources(resources));
-                } catch (...) {
-                    failed = std::current_exception();
-                }
-            }
             if (failed)
                 std::rethrow_exception(failed);
             if (!report)
@@ -440,17 +382,9 @@ export namespace replica {
                     auto value = std::make_unique<context>();
                     value->identity = identity;
                     value->used = std::chrono::steady_clock::now();
-                    if (options_.isolate) {
-                        value->resources = co_await io::blocking(rt_.get_scheduler(home_), pool_, [&] {
-                            auto scope = resources_->start(r.max_memory_bytes.value_or(constants::language_memory_bytes), {});
-                            scope->concurrency(options_.parallel);
-                            return scope;
-                        });
-                    }
                     io::command command{.argv = std::move(local.argv),
                                         .cwd = dir,
-                                        .env = std::move(env),
-                                        .isolation = value->resources ? std::optional{value->resources->target()} : std::nullopt};
+                                        .env = std::move(env)};
                     value->server = std::make_unique<lsp::session>(rt_.get_scheduler(home_), std::move(command));
                     auto& created = *contexts_.emplace(key, std::move(value)).first->second;
                     co_await created.server->start(dir, r.survey->initialization);
@@ -490,11 +424,7 @@ export namespace replica {
         }
 
         // Close the process group after its processes have been released.
-        auto close_resources(std::shared_ptr<isolation::scope> resources) -> coroutine::task<> {
-            co_await io::blocking(rt_.get_scheduler(home_), pool_, [resources] { resources->close(); });
-        }
-
-        auto run_steps(const jobs::build_request& r, const std::filesystem::path& dir, const std::filesystem::path& reports, isolation::scope* resources,
+        auto run_steps(const jobs::build_request& r, const std::filesystem::path& dir, const std::filesystem::path& reports,
                        std::chrono::steady_clock::time_point deadline) -> coroutine::task<jobs::build_report> {
             jobs::build_report report{.worker = options_.worker, .tree = dir.string()};
             const auto logs = reports.parent_path() / (reports.filename().string() + ".logs");
@@ -549,12 +479,11 @@ export namespace replica {
                                 .cwd = cwd,
                                 .env = environment(r.env, local.env),
                                 .max_memory_bytes = r.max_memory_bytes,
-                                .max_cpu_seconds = r.max_cpu_seconds,
-                                .isolation = resources ? std::optional{resources->target()} : std::nullopt};
+                                .max_cpu_seconds = r.max_cpu_seconds};
                 if (local.standard_output)
                     cmd.standard_output = reports / *local.standard_output;
                 const auto log_name = std::to_string(report.steps.size()) + ".log";
-                report.steps.push_back(co_await runner::run_step(rt_.get_scheduler(home_), std::move(cmd), left, r.output_limit, step.name, resources,
+                report.steps.push_back(co_await runner::run_step(rt_.get_scheduler(home_), std::move(cmd), left, r.output_limit, step.name,
                     log_setup_error.empty() ? std::optional{logs / log_name} : std::nullopt, constants::log_bytes - log_bytes));
                 auto& last = report.steps.back();
                 if (dependency_lock && options_.dependency_publish && last.exit_code == 0 && !last.timed_out) {
@@ -597,8 +526,6 @@ export namespace replica {
         cores::context<native::scheduler>& rt_;
         store store_;
         options options_;
-        std::shared_ptr<isolation::pool> resources_;
-        coroutine::mutex resources_lock_;
         execution::thread_pool& pool_;
         std::size_t home_;
         coroutine::mutex store_lock_;

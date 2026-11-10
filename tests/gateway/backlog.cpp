@@ -198,6 +198,10 @@ namespace {
                 expect(harness::built(first).configuration == "first" && harness::built(second).configuration == "first");
                 auto cached = co_await h.queue.submit(0, harness::entry("same", "z"), h.job(io, "third"));
                 expect(cached->done() && harness::built(cached).configuration == "first") << "from the cache, at once";
+                expect(harness::built(first).timings.queue_seconds.value_or(-1) >= 0);
+                expect(harness::built(second).timings.queue_seconds.value_or(-1) >= 0);
+                const auto& timing = harness::built(cached).timings;
+                expect(timing.sync_seconds == 0 && timing.queue_seconds == 0 && timing.worker_seconds == 0);
                 auto fresh = harness::entry("same", "z");
                 fresh.fresh = true;
                 auto again = co_await h.queue.submit(0, fresh, h.job(io, "fresh"));
@@ -397,6 +401,25 @@ namespace {
                 for (auto& ticket : {blocker, a, b})
                     expect(co_await harness::done(io, ticket) && harness::built(ticket).ok);
             });
+            expect(h.ran == std::vector<std::string>{"block", "first", "second"});
+        };
+
+        "concurrent task runs sharing a caller and worldline keep both queued builds"_test = [] {
+            harness h{1};
+            h.run([&](ctx& io) -> coroutine::task<> {
+                auto blocker = co_await h.queue.submit(0, harness::entry("block", "other"), h.job(io, "block", 100ms));
+                worlds::actor caller{.issuer = "token", .user = "same", .caller = "agent", .role = "member", .run = "first"};
+                auto first = harness::entry("first", worlds::execution_key(caller));
+                caller.run = "second";
+                auto second = harness::entry("second", worlds::execution_key(caller));
+                first.worldline = second.worldline = "main";
+                auto a = co_await h.queue.submit(0, first, h.job(io, "first"));
+                auto b = co_await h.queue.submit(0, second, h.job(io, "second"));
+                for (auto& ticket : {blocker, a, b}) expect(co_await harness::done(io, ticket) && harness::built(ticket).ok);
+            });
+            expect((h.ran.size() == 3u) >> fatal);
+            expect(h.ran.front() == "block");
+            std::ranges::sort(h.ran);
             expect(h.ran == std::vector<std::string>{"block", "first", "second"});
         };
 

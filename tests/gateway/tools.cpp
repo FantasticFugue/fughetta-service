@@ -48,6 +48,42 @@ namespace {
         }());
     }
     static constexpr auto cases = [] {
+        "source range replies preserve Unicode positions and byte-limited output"_test = [] {
+            nodes::file_view file{.path = "text", .kind = "text", .text = "a😀é\nZ", .encoding = "utf8"};
+            std::string joined;
+            std::uint64_t offset = 0;
+            do {
+                auto result = tools::worldline::render_read(file, offset, {}, 5);
+                expect(result.total_scalars == 5u && result.text->size() <= 5u &&
+                       result.data_base64 == tools::lines::base64(*result.text));
+                expect(*result.next_offset > offset);
+                joined += *result.text;
+                offset = *result.next_offset;
+            } while (offset < 5);
+            expect(joined == file.text);
+            auto limited = tools::worldline::render_read(file, 1, std::numeric_limits<std::uint64_t>::max(), 3);
+            expect(limited.text == std::string{} && limited.count == 0u && limited.next_offset == 1u && limited.truncated == true);
+            auto empty = tools::worldline::render_read(file, 2, 0, 100);
+            expect(empty.text == std::string{} && empty.count == 0u && empty.next_offset == 2u && empty.truncated == false);
+            auto end = tools::worldline::render_read(file, 5, 1, 100);
+            expect(end.text == std::string{} && end.total_scalars == 5u && end.truncated == false);
+            expect(throws<tools::tool_error>([&] { tools::worldline::render_read(file, 6, 1, 32); }));
+            auto whole = tools::worldline::render_read(file, {}, {}, 0);
+            expect(whole.text == file.text && !whole.offset && !whole.truncated);
+            file.text = std::string(255, 'a') + "😀";
+            for (unsigned i = 0; i < 300; ++i) file.text += "é";
+            file.text += "Z";
+            auto boundary = tools::worldline::render_read(file, 256, 3, 6);
+            expect(boundary.text == "ééé" && boundary.count == 3u && boundary.total_scalars == 557u);
+            auto tail = tools::worldline::render_read(file, 556, 10, 10);
+            expect(tail.text == "Z" && tail.next_offset == 557u && tail.truncated == false);
+            file.text.clear();
+            expect(tools::worldline::render_read(file, 0, {}, 10).text == std::string{});
+            file.kind = "binary"; file.text = "00ff"; file.encoding = "hex";
+            auto binary = tools::worldline::render_read(file, {}, {}, 0);
+            expect(binary.data_base64 == "AP8=" && binary.size == 2u && !binary.text);
+            expect(throws<tools::tool_error>([&] { tools::worldline::render_read(file, 0, 1, 32); }));
+        };
         "preparation errors retain a bounded diagnostic tail"_test = [] {
             jobs::build_report report;
             report.steps.push_back({.name = "configure", .exit_code = 2, .output = std::string(5000, 'x') + "missing compiler"});
@@ -98,6 +134,7 @@ namespace {
                         co_await execution::schedule_after(io, 1ms);
                     auto line = [&](tools::worldline::input in) -> coroutine::task<tools::worldline::output> {
                         in.project = std::string{"app"};
+                        if (!in.worldline.value()) in.worldline = std::string{"main"};
                         co_return co_await tools::worldline::run(services, std::move(in), note, tester);
                     };
                     auto refused = [&](auto run) -> coroutine::task<std::string> {
@@ -134,26 +171,26 @@ namespace {
                                                              "source\n",
                                                   .operation_id = "write-3"},
                                                  note, tester);
-                    auto first = co_await tools::build::run(services, {.project = "app"}, note, tester);
+                    auto first = co_await tools::build::run(services, {.project = "app", .worldline = std::string{"main"}}, note, tester);
                     expect(first.ok && first.results.at(0).steps.at(0).output == "hello source\n") << config::write(first);
                     expect(first.results.at(0).bytes_sent == 13u && first.worldline == "main");
-                    auto cached = co_await tools::build::run(services, {.project = "app"}, note, tester);
+                    auto cached = co_await tools::build::run(services, {.project = "app", .worldline = std::string{"main"}}, note, tester);
                     expect(cached.ok &&
                            cached.results.at(0).steps.at(0).output == "hello "
                                                                       "source\n" &&
                            cached.results.at(0).bytes_sent == 13u)
                         << "an equal build answers from the first one's result";
-                    auto fresh = co_await tools::build::run(services, {.project = "app", .fresh = true}, note, tester);
+                    auto fresh = co_await tools::build::run(services, {.project = "app", .worldline = std::string{"main"}, .fresh = true}, note, tester);
                     expect(fresh.ok && fresh.results.at(0).bytes_sent == 0u) << "a fresh build runs again, on the worker that has the files";
-                    auto pinned = co_await tools::build::run(services, {.project = "app", .version = first.revision}, note, tester);
+                    auto pinned = co_await tools::build::run(services, {.project = "app", .worldline = std::string{"main"}, .version = first.revision}, note, tester);
                     co_await fixture::edit_text(
                         services, {.project = "app", .path = "src/message.txt", .old_string = "hello", .new_string = "goodbye", .operation_id = "edit-4"},
                         note, tester);
-                    auto changed = co_await tools::build::run(services, {.project = "app"}, note, tester);
+                    auto changed = co_await tools::build::run(services, {.project = "app", .worldline = std::string{"main"}}, note, tester);
                     expect(changed.ok && changed.results.at(0).steps.at(0).output == "goodbye "
                                                                                      "source\n");
                     expect(changed.results.at(0).bytes_sent == 15u);
-                    auto older = co_await tools::build::run(services, {.project = "app", .version = pinned.revision}, note, tester);
+                    auto older = co_await tools::build::run(services, {.project = "app", .worldline = std::string{"main"}, .version = pinned.revision}, note, tester);
                     expect(older.ok && older.results.at(0).steps.at(0).output == "hello source\n") << "a named version builds exactly that version";
                     auto hits = co_await fixture::search_files(services, {.project = "app", .query = "source"}, note, tester);
                     expect(hits.matches.size() == 1u && hits.matches.at(0).path == "src/message.txt");
@@ -175,7 +212,7 @@ namespace {
                     expect(oversized == "resource_limit") << oversized;
                     co_await fixture::write_file(
                         services, {.project = "app", .path = "big.bin", .content = std::string(9u << 20, 'z'), .operation_id = "write-8"}, note, tester);
-                    auto multipart = co_await tools::build::run(services, {.project = "app"}, note, tester);
+                    auto multipart = co_await tools::build::run(services, {.project = "app", .worldline = std::string{"main"}}, note, tester);
                     expect(!multipart.ok && multipart.results.at(0).bytes_sent == (9u << 20));
                     co_await fixture::remove_file(services, {.project = "app", .path = "big.bin", .operation_id = "remove-9"}, note, tester);
                     auto history = co_await registry.with_ledger(0, [](usage::ledger& ledger, const auto&) { return ledger.builds("app", 20); });
@@ -255,6 +292,7 @@ namespace {
                     with_limits({.max_file_bytes = 64, .max_project_bytes = 100});
                     auto tiny = [&](tools::worldline::input in) -> coroutine::task<tools::worldline::output> {
                         in.project = std::string{"tiny"};
+                        if (!in.worldline.value()) in.worldline = std::string{"main"};
                         co_return co_await tools::worldline::run(services, std::move(in), note, tester);
                     };
                     co_await fixture::write_file(services, {.project = "tiny", .path = "full.txt", .content = std::string(64, 'x'), .operation_id = "write-14"},
@@ -352,7 +390,7 @@ namespace {
                     });
                     expect(beyond == "resource_limit") << beyond;
                     auto exported_full = co_await refused([&]() -> coroutine::task<> {
-                        co_await tools::worldline::run(services, {.project = "full", .action = "export", .package = std::string{"copy"}}, note, tester);
+                        co_await tools::worldline::run(services, {.project = "full", .action = "export", .package = std::string{"copy"}, .worldline = std::string{"main"}}, note, tester);
                     });
                     expect(exported_full == "resource_limit") << "an export counts toward the workspace's storage: " << exported_full;
                     if (std::filesystem::exists(tmp.dir / "source/.packages"))
@@ -490,7 +528,7 @@ while True:
                         co_await coroutine::with_scope([&](coroutine::scope& calls) -> coroutine::task<> {
                             auto query = [&](std::string action, tools::language_query::output& out) -> coroutine::task<> {
                                 out =
-                                    co_await tools::language_query::run(services, {.project = "app", .configuration = "Query", .action = action}, note, tester);
+                                    co_await tools::language_query::run(services, {.project = "app", .worldline = std::string{"main"}, .configuration = "Query", .action = action}, note, tester);
                             };
                             calls.spawn(query("diagnostics", diagnostic));
                             calls.spawn(query("symbols", symbols));
@@ -503,7 +541,7 @@ while True:
                         expect(symbols.analyzed);
                         auto jobs = co_await queue.list(0);
                         expect(std::ranges::count(jobs, std::string{"Query"}, &tools::backlog::view::configuration) == 1);
-                        auto cached = co_await tools::language_query::run(services, {.project = "app", .configuration = "Query"}, note, tester);
+                        auto cached = co_await tools::language_query::run(services, {.project = "app", .worldline = std::string{"main"}, .configuration = "Query"}, note, tester);
                         expect(cached.analyzed && cached.diagnostics && cached.diagnostics->size() == 1u);
                         auto branch = co_await line({.action="fork", .name=std::string{"cache-branch"}, .operation_id=std::string{"cache-fork"}});
                         auto reader = tester;
@@ -517,12 +555,12 @@ while True:
                             return event.call && event.call->actor==worlds::identity_key(reader) && event.call->worldline=="cache-branch" && event.call->reuse=="cache";
                         })) << "a cache hit keeps the new caller and worldline in its own record";
 
-                        auto warm = co_await tools::build::run(services, {.project = "app", .configurations = std::vector<std::string>{"Query"}}, note, tester);
+                        auto warm = co_await tools::build::run(services, {.project = "app", .configurations = std::vector<std::string>{"Query"}, .worldline = std::string{"main"}}, note, tester);
                         expect(warm.ok && warm.results.front().steps.front().output.contains("warm build tree"));
                         auto changed_environment = *config.current(0);
                         changed_environment.projects.at("app").build_configurations.at("Query").env["ANALYSIS_ENV"] = "changed";
                         config.set(0, std::make_shared<const config::document>(std::move(changed_environment)));
-                        auto refreshed = co_await tools::language_query::run(services, {.project = "app", .configuration = "Query"}, note, tester);
+                        auto refreshed = co_await tools::language_query::run(services, {.project = "app", .worldline = std::string{"main"}, .configuration = "Query"}, note, tester);
                         expect(refreshed.analyzed && refreshed.environment != cached.environment);
                         auto activity = co_await registry.with_ledger(0, [](usage::ledger& ledger, const auto&) { return ledger.builds("app", 100); });
                         expect(std::ranges::count_if(activity,
@@ -533,12 +571,12 @@ while True:
                         bool invalid_symbol = false;
                         try {
                             co_await tools::language_query::run(services,
-                                {.project = "app", .configuration = "Query", .action = "definitions", .path = "analysis.c", .symbol = "absent"}, note, tester);
+                                {.project = "app", .worldline = std::string{"main"}, .configuration = "Query", .action = "definitions", .path = "analysis.c", .symbol = "absent"}, note, tester);
                         } catch (const tools::tool_error& error) { invalid_symbol = error.code == "invalid_record"; }
                         expect(invalid_symbol);
                         for (const auto& action : {"definitions", "references"}) {
                             auto locations = co_await tools::language_query::run(services,
-                                {.project = "app", .configuration = "Query", .action = action, .path = "analysis.c", .symbol = "probe"}, note, tester);
+                                {.project = "app", .worldline = std::string{"main"}, .configuration = "Query", .action = action, .path = "analysis.c", .symbol = "probe"}, note, tester);
                             const auto& found = std::string_view{action} == "definitions" ? locations.definitions : locations.references;
                             expect(locations.analyzed && found && found->size() == 1u);
                             if (found && !found->empty())
@@ -552,16 +590,16 @@ while True:
                         config.set(0, std::make_shared<const config::document>(std::move(denied)));
                         bool limited = false;
                         try {
-                            co_await tools::language_query::run(services, {.project = "app", .configuration = "Query"}, note, tester);
+                            co_await tools::language_query::run(services, {.project = "app", .worldline = std::string{"main"}, .configuration = "Query"}, note, tester);
                         } catch (const tools::tool_error& error) {
                             limited = error.code == "resource_limit";
                         }
                         expect(limited) << "language preparation observes the build quota";
                         config.set(0, allowed);
-                        for (auto action : {"plan", "prepare", "receipt", "scopes"}) {
+                        for (auto action : {"plan", "prepare", "receipt"}) {
                             bool denied = false;
                             try {
-                                co_await tools::language_query::run(services, {.project = "app", .configuration = "Query", .action = action}, note, tester);
+                                co_await tools::language_query::run(services, {.project = "app", .worldline = std::string{"main"}, .configuration = "Query", .action = action}, note, tester);
                             } catch (const tools::tool_error& error) {
                                 denied = error.code == "invalid_record";
                             }

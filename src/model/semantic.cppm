@@ -27,6 +27,7 @@ export namespace semantic {
     struct scope {
         std::string id, parent, kind, symbol;
         span range;
+        std::optional<std::string> reference;
     };
     struct symbol {
         std::string id, name, kind, scope;

@@ -4,7 +4,6 @@ import native;
 import coroutine;
 import reflection;
 import semantic;
-import isolation;
 
 // The Language Server Protocol is spoken only inside this module.
 namespace lsp::detail {
@@ -945,27 +944,6 @@ export namespace lsp {
         if (failed)
             std::rethrow_exception(failed);
         co_return out;
-    }
-
-    auto bounded_survey(native::scheduler io, io::command server, rfl::Generic initialization, std::filesystem::path tree, std::vector<document> documents,
-                        limits bounds, isolation::pool& pool) -> coroutine::task<semantic::outline> {
-        auto resource = pool.start({}, {});
-        resource->concurrency(1);
-        server.isolation = resource->target();
-        auto token = co_await coroutine::current_token;
-        std::optional<semantic::outline> result;
-        std::exception_ptr error;
-        try {
-            result = co_await coroutine::under(token, survey(io, std::move(server), std::move(initialization), std::move(tree), std::move(documents), bounds));
-        } catch (...) {
-            error = std::current_exception();
-        }
-        resource->close();
-        if (error)
-            std::rethrow_exception(error);
-        if (!result)
-            co_await coroutine::stop;
-        co_return std::move(*result);
     }
 
 } // namespace lsp

@@ -65,6 +65,9 @@ namespace tools {
                 cache_.splice(cache_.begin(), cache_, hit);
                 held->reuse_ = "cache";
                 held->result_ = hit->second;
+                std::visit([](auto& result) {
+                    result.timings = {.sync_seconds = 0, .queue_seconds = 0, .dependency_seconds = 0, .worker_seconds = 0};
+                }, held->result_);
                 held->done_.store(true, std::memory_order_release);
                 return held;
             }
@@ -160,6 +163,7 @@ namespace tools {
         auto* tree = j->what.trees.empty() ? nullptr : &choose(j->what);
         if (tree)
             tree->busy = true;
+        j->started_at = std::chrono::steady_clock::now();
         std::optional<std::optional<outcome>> out;
         std::string failure, failure_code;
         try {
@@ -200,6 +204,7 @@ namespace tools {
             finish(j, refused(j->what, "cancelled"), "cancelled");
         else if (!*out) {
             j->running = false;
+            j->started_at = {};
             j->retry_at = std::chrono::steady_clock::now() + busy_pause;
         } else
             finish(j, std::move(**out), "done");
@@ -235,6 +240,10 @@ namespace tools {
             finished_.pop_back();
         for (auto& t : j->tickets) {
             t->result_ = r;
+            const auto end = j->started_at == std::chrono::steady_clock::time_point{} ? std::chrono::steady_clock::now() : j->started_at;
+            std::visit([&](auto& result) {
+                result.timings.queue_seconds = std::max(0.0, std::chrono::duration<double>(end - t->submitted_).count());
+            }, t->result_);
             t->done_.store(true, std::memory_order_release);
         }
         jobs_.remove(j);
@@ -264,8 +273,8 @@ namespace tools {
         if (found == jobs_.end())
             throw config::not_found(std::format("no queued or running job {}", id));
         auto j = *found;
-        auto asker = worlds::identity_key(who);
-        if (worlds::rank(who.role) < worlds::rank("owner") && !std::ranges::all_of(j->tickets, [&](auto& t) { return t->actor_ == asker; }))
+        auto asker = worlds::execution_key(who);
+        if ((!who.run.empty() || worlds::rank(who.role) < worlds::rank("owner")) && !std::ranges::all_of(j->tickets, [&](auto& t) { return t->actor_ == asker; }))
             throw tool_error(nodes::code::permission_denied, "another caller waits for this job too; only an owner cancels it");
         if (j->running) {
             j->stop.request_stop();

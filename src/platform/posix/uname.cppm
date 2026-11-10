@@ -1,14 +1,32 @@
 module;
+#ifdef __APPLE__
+#include <crt_externs.h>
+#define environ (*_NSGetEnviron())
+#endif
 #include <errno.h>
 #include <stdlib.h>
 #include <sys/utsname.h>
 #include <unistd.h>
+#ifdef __APPLE__
+#include <mach-o/dyld.h>
+#endif
 
 module host;
 import std;
 
 namespace host {
-    auto executable() -> std::filesystem::path { return std::filesystem::canonical("/proc/self/exe"); }
+    auto executable() -> std::filesystem::path {
+#ifdef __APPLE__
+        std::uint32_t size = 0;
+        ::_NSGetExecutablePath(nullptr, &size);
+        std::string buffer(size, '\0');
+        if (::_NSGetExecutablePath(buffer.data(), &size) != 0)
+            throw std::runtime_error("cannot locate executable");
+        return std::filesystem::canonical(buffer.c_str());
+#else
+        return std::filesystem::canonical("/proc/self/exe");
+#endif
+    }
     const std::string_view default_data_root = "/srv/data";
     namespace {
         const struct utsname machine = [] {

@@ -14,3 +14,8 @@ export namespace cores {
         std::unique_ptr<state> state_;
     };
 } // namespace cores
+
+// The platform host owns the service-manager handshake; the application owns scheduling.
+export namespace daemon {
+    auto run(int argc, char** argv, int (*application)(int, char**), bool service) -> int;
+}

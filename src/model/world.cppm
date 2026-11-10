@@ -11,12 +11,21 @@ export namespace worlds {
         std::string role;
         std::string email;
         std::optional<std::string> client;
+        // Set only after the source resolves a task execution credential.
+        std::string run, task, project, worldline, execution_token;
     };
 
     // The caller as one string: issuer, user and caller name, each length-prefixed so no two callers share a key.
     inline auto identity_key(const actor& who) -> std::string {
         return std::to_string(who.issuer.size()) + ":" + who.issuer + std::to_string(who.user.size()) + ":" + who.user + std::to_string(who.caller.size()) +
                ":" + who.caller;
+    }
+
+    // Work queues and execution audit records distinguish concurrent runs of one caller.
+    inline auto execution_key(const actor& who) -> std::string {
+        auto key = identity_key(who);
+        if (!who.run.empty()) key += "\nrun:" + who.run;
+        return key;
     }
 
     // What a role may do, in increasing order: a member uses the workspace, an owner also administers it, and the host that runs this

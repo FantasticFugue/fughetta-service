@@ -81,6 +81,7 @@ export namespace language {
         // The worker that prepared and analyzed the snapshot.
         std::string worker;
         std::optional<std::string> worker_id;
+        builds::timings timings;
     };
     struct request {
         std::string worldline;

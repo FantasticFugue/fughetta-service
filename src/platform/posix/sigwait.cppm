@@ -30,3 +30,9 @@ namespace cores {
     signal_watch::signal_watch(void* owner, void (*stop)(void*) noexcept) : state_(std::make_unique<state>(owner, stop)) {}
     signal_watch::~signal_watch() = default;
 } // namespace cores
+
+namespace daemon {
+    auto run(int argc, char** argv, int (*application)(int, char**), bool) -> int {
+        return application(argc, argv);
+    }
+}

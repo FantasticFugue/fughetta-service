@@ -9,14 +9,11 @@ diagnostics and test results instead of terminal scrollback. Capability is
 fine-grained (one provider per toolchain), while the agent-facing interface
 stays a few MCP tools.
 
-The first release serves builds, tests, and runs: agents edit files on their
-own machine, [fug](../fughetta-cli) sends them, and several agents share one
-queue of deduplicated, cached jobs on warm workers. Behind that sits the
-longer-term layer the service is built on: worldlines that hold each project's
-code and let agents work on it together, and language analysis that reads
-symbols and scopes from those versions. The business MCP exposes only
-`configurations`, `language`, `build`, `test`, and `run`. Clients sync source and
-read worldline history through the member REST API; agents edit their local copy.
+Orchestrators configure projects and bind tasks to server-side worldlines.
+Agents use task execution credentials through `/mcp` to read and edit source,
+inspect syntax, build and test a fixed revision, and retrieve its outputs. Source stays on the service; a local checkout or
+`fug push` is not required. Agents share incremental worker trees and a queue
+of deduplicated, cached jobs.
 
 The `fughetta-service` executable runs a gateway process that manages one
 source process and a worker pool for one workspace. The hosted platform places
@@ -34,7 +31,7 @@ the component library `@fantasticfugue/components` (`../components`):
 
 ## Dependencies and build
 
-Requires Linux, CMake 4.0+, Ninja, vcpkg, and the xclang toolchain.
+Requires CMake 4.0+, Ninja, vcpkg, and the xclang toolchain.
 The debug and release presets select httpant's `asio` I/O backend.
 Keep `httpant` and `vcpkg-registry` beside this repository. The manifest selects
 `httpant[io,tls]`; `vcpkg-configuration.json` loads `../vcpkg-registry/ports`.
@@ -57,14 +54,7 @@ cmake --build build/debug --target front-test -j2
 python3 tests/run.py --test-dir build/debug -- -R '^front$' --output-on-failure
 ```
 
-The test entry requires the existing writable CPU/memory delegation at
-`/sys/fs/cgroup/workers` and `sudo` authorization (`sudo -v` if needed). Run the
-entry as your normal user. It creates a private leaf, uses a privileged launcher
-only to place itself there, and executes CTest with your UID, GID, groups, and
-environment. It does not build or create build directories. CTest arguments
-follow `--`; `--launcher-timeout SECONDS` bounds the entire invocation. The
-supervisor cleans up its own leaf and descendants on completion, timeout, and
-handled signals while preserving the test exit status.
+The test entry runs CTest as the current user; no cgroup delegation or sudo is required.
 
 The debug preset uses line-table debug information with address and
 undefined-behavior sanitizers. File/line backtraces are available; full type and
@@ -74,9 +64,36 @@ installation prefix (`build/package`). Configuration requires no shell exports
 or extra `-D` arguments. `release` disables tests and sanitizers and enables
 benchmarks and interprocedural optimization.
 
+## Service lifecycle and workspace boundary
+
+One workspace is one execution environment, shared by its projects and repositories.
+It groups related repositories so they can use one another without requiring a single
+large monorepo. Project names and source histories organize work; they are not OS
+security boundaries. The service schedules jobs, owns source and worker processes,
+and handles cancellation and shutdown. It does not provision isolated environments.
+Container and VM lifecycle management belongs to cloud-gateway in the future and
+is not implemented here. Run untrusted work only in an externally managed environment.
+
+The `daemon::run` platform interface hosts the application. POSIX service managers
+run it in the foreground and stop it with SIGTERM; Windows SCM runs `--service`
+and translates stop/shutdown controls to the same application cancellation path.
+Use absolute configuration and executable paths and set the working directory.
+CMake installs a configured systemd unit or launchd plist under
+`share/fughetta-service/daemon`. Create the `fughetta` service account, its writable
+`/var/lib/fughetta-service` directory, and the configuration before registration.
+For systemd, configure `Type=simple`, `ExecStart=/path/fughetta-service /path/config.json`,
+`WorkingDirectory=/path`, `Restart=on-failure`, and `TimeoutStopSec=15`.
+For Windows, register the executable with `--service C:\path\config.json` using SCM.
+The registered service name is `fughetta-service`.
+launchd uses the same foreground contract through `ProgramArguments`,
+`WorkingDirectory`, and `KeepAlive`. Darwin uses the POSIX process provider with
+asynchronous wait polling. Windows and Darwin require native build verification.
+
 ## Run
 
-Create an owner token, keep its printed value, and start the service:
+For self-hosting, set `server.auth.mode` to `"token"` in your configuration;
+`"trusted"` is for cores behind an authenticated hosted gateway. Create an owner
+token, keep its printed value, and start the service:
 
 ```sh
 build/debug/fughetta-service token local owner config.json
@@ -197,10 +214,6 @@ the current user with mode 0600 on Linux; Windows uses an owner-only ACL. Work
 and data roots are partitioned by immutable Workspace ID and Worker ID. The
 Worker opens no inbound listener.
 
-On Linux a registered Worker isolates builds under the cgroup it starts in.
-`fug` starts it with `systemd-run --user --scope -p Delegate=yes`; the Worker
-moves itself into a `service` child, enables `cpu` and `memory` for its
-children, and refuses to start when the cgroup is not delegated to the user.
 Exit status 2 means the Core refused the identity (revoked, unknown, or for
 another Workspace); `fug` does not restart a Worker that exits with it.
 
@@ -306,7 +319,7 @@ reserved for the managed source string. CMake-driven manifest installation does
 not use this path; use the vcpkg provider and disable CMake's manifest install as
 described above.
 Shared cache mounts must belong to the deployment's trusted build environment;
-the current process isolation does not make a writable mount safe for mutually
+a writable mount is unsafe for mutually
 untrusted build commands. Workers serialize vcpkg installations with a lock in
 the shared cache directory, so a waiting install can restore packages published
 by the preceding one. Waiting is cancellable and counts against the execution
@@ -387,7 +400,7 @@ operators may remove them while publisher processes are stopped.
 The recommended deployment boundary is one runtime per tenant or trust domain,
 with a separate runtime for trusted dependency publishing. A runtime can be a
 virtual machine or a sandboxed container; the service does not require a
-particular orchestrator. Resource cgroups and vcpkg's `read` mode do not enforce
+particular orchestrator. Scheduling hints and vcpkg's `read` mode do not enforce
 this filesystem boundary. The deployment owns it; the worker owns validation,
 coordination and no-replace publication.
 
@@ -458,15 +471,125 @@ CMake and tests it with pytest reports both. Compiler messages are not parsed:
 they stay in the step's output for the agent to read. A new tool joins with its
 own adapter module, and a new protocol only when no existing one fits.
 
+Execution results and the member endpoint `GET /api/v1/calls?project=NAME&limit=50`
+include `timings` in seconds: `sync_seconds` measures source transfer from the
+service to the Worker, `queue_seconds` the caller's wait for a job to start,
+`dependency_seconds` dependency preparation (including its own scheduling), and
+`worker_seconds` execution on the Worker, including checkout and analysis.
+Dependency time is measured before the main job enters its queue. Missing stages
+are absent; a cache hit reports zero work for that call. Shared callers receive
+the shared execution's sync and Worker times, and their own queue wait. The call's
+`reuse` identifies executed, shared and cached results. These stages do not
+include local CLI scanning/upload or result delivery and do not sum to the full
+request duration. Call records retain the same bounded recent history as builds.
+
 Agents configure projects with the `project`, `schema`, and `save_project` tools of
-the configuration MCP. `schema` returns the settings schema with the options of
+`/mcp` (also available on the configuration endpoint). `schema` returns the settings schema with the options of
 every adapter and language server, so the tool list stays small; a refused save
 names the field.
+
+The orchestrator uses its account credential to configure the project and assign
+work. `task(create)` binds a named task to an explicitly selected `worldline`.
+`task(fork)` takes `task`, the new `worldline`, `from`, `version` and
+`operation_id`; the fork and task binding commit together. A task's binding never
+changes. Several tasks can share a worldline, and each task can have several runs.
+
+`task(start)` takes `project`, `task` and `operation_id`, and returns a `run` and
+`credential`. Give the agent this credential as its Bearer token on `/mcp`, rather
+than the orchestrator's account token. The credential binds the project and
+worldline on every call; omitted fields come from that binding and conflicting
+explicit fields are refused. An account call without a run must select its
+worldline explicitly: there is no implicit fallback to main. Run credentials
+cannot administer tasks, access settings, fork other lines, or use REST routes.
+`writable: false` on start restricts the run to source reads and computations.
+
+Runs own their leases and queued requests independently, even when they share an
+account, client or task. Task administration belongs to the authenticated account,
+so changing the orchestrator client does not change task ownership. Reconnecting with the same credential resumes that run. `task(stop)` names
+a `run`; `task(close)` closes all runs of the task. Both revoke source access and
+release owned leases in one transaction. A delayed write is checked again by
+source at publication. Revoked runs cannot be resurrected by replaying start;
+a new execution needs a new operation ID. Source restart preserves tasks, runs,
+references and live leases. Closing a task does not merge or delete its worldline.
+
+The agent loop uses the execution credential on `/mcp`:
+
+1. The orchestrator configures toolchains, analysis, tests and named operation
+   `exports` using `schema`, `project` and `save_project` before starting the run.
+   The agent can read available operations through `configurations`.
+2. `worldline` with `inspect` lists files and returns a version; `read` returns
+   text and file metadata. Pass `known_digest` on later cached whole-file reads to receive
+   `unchanged: true` without repeating content. For a function-sized read, pass
+   its scalar `offset` and `count`; `next_offset` supports byte-limited reads.
+   Binary reads expose base64. `compare` takes `observed` and an optional target
+   `version` and returns changed file metadata without contents. Successful
+   edits and receipts also return only changed files, with before/after metadata
+   recording deletions and renames; `inspect` lists a whole version.
+   `diff` compares `from` at `version` against `worldline` at `observed` (each
+   defaults to the current version). `promote` requires both fixed versions,
+   `from`, and `operation_id`. It copies the source changes since the common
+   history into one atomic target contribution, retaining unrelated target files.
+   A path changed differently on both sides refuses the entire operation with
+   `source_conflict`; a moved target head returns `stale_frontier`. Scope leases,
+   publication policy, quotas and receipt recovery apply. The source history is
+   not added to the target's parents.
+3. `language` with `action: "scopes"` returns scope IDs, hierarchy, Unicode
+   scalar ranges `[begin,end)` and opaque `reference` values. A reference binds
+   one analysis configuration, source version, worldline, file identity and range;
+   it expires after 600 seconds. IDs alone do not identify a lockable range.
+4. `scope` with `action: "acquire"`, `scopes: [reference, ...]` and `operation_id`
+   acquires the whole set atomically and returns `leases`. Source resolves the
+   references; callers cannot supply coordinates. For whole-file changes use
+   `files: [path, ...]`; for creation or path changes use `entries: [path, ...]`.
+   File and entry requests also name the current `version`. File leases cover
+   empty and binary files; entry leases cover the named path and descendants,
+   including move destinations. Resource lists may accompany scope references.
+   Overlap within one worldline returns `scope_conflict` immediately, with no
+   partially acquired set. References must describe the current version;
+   `scope_stale` means query the current source/scopes again.
+5. Submit `worldline` `apply` with `observed`, `operation_id`, `leases: [token]`
+   and range edits (`kind: "edit"`, `offset`, `count`, `text`). Offsets count
+   Unicode scalars in `observed`. An edit must stay inside its held scope;
+   whole-file replacement requires a lease covering the whole file. Other
+   callers cannot edit leased ranges or their boundary anchors. Unleased,
+   disjoint work remains possible. Renew the lease while working and release
+   it when finished. Defaults are 120 seconds, with a maximum of 600 seconds.
+   Renewing never changes the protected region. Replaying an acquisition after
+   any token has expired or been released returns `scope_expired`; a new
+   acquisition requires a new operation ID.
+6. Pass the returned `version` explicitly to `language`, `build`, `test` and
+   `run`. Concurrent edits advancing the worldline do not change that job's
+   input. Read `receipt` with the same operation ID after an interrupted write;
+   replaying identical input retrieves the recorded result without another edit.
+7. Successful execution returns `exports` with project-scoped digests, paths,
+   sizes and executable flags. Use `artifact` with project, digest, offset and
+   optional length to retrieve base64 chunks (at most 64 KiB each). Decode
+   them to a local file, continue at `next_offset` until `eof`, preserve the
+   executable flag, and deploy using the local machine's tools.
+
+Source checks leases in the same write transaction as publication. Their
+boundaries use source character identities, so disjoint edits can move a scope
+without invalidating its lease. Lease ranges returned by `scope` are relative
+to that response's current version. A lease whose anchors disappeared is
+invalid and must be released before acquiring a fresh analyzed range. Leases
+survive source restarts until expiry; a missing/expired token returns
+`scope_expired`. History-changing operations require leases on that worldline
+to be released first. Forking remains available. A changed input after a
+refused operation uses a new operation ID.
+
+Leases live in local coordination metadata, outside worldline history, source
+versions and build cache keys. Acquiring or renewing a lease does not invalidate
+analysis or build results. Range edits reuse the source engine's incremental
+history; workers receive missing source objects and update their existing
+language sessions. Equal immutable inputs retain job deduplication and build
+cache reuse. `fresh` explicitly requests a clean build. Artifact grants remain
+project-scoped even when the content is shared internally.
 
 Worker language sessions negotiate symbol, diagnostic, definition, and reference
 capabilities. Sessions remain attached to their hot directories and receive file
 updates between requests. Queries return results for the selected source snapshot;
-source nodes store no semantic results or character anchors for analysis. Definitions
+source nodes retain only temporary scope descriptors and coordination anchors,
+not language-server sessions or complete semantic analysis results. Definitions
 and references accept a file path, symbol name, and optional one-based line.
 Executable mappings and prepared-tree environment bindings apply on workers. Each analysis configuration
 contains `server` and a `build_configuration` reference. The provider selects
@@ -511,7 +634,7 @@ behavioral acceptance, and remaining deployment limits are recorded once in the
 
 ## Concurrency budget
 
-The configuration owns the execution thread budget and subprocess CPU budget:
+The configuration owns the execution thread count and subprocess parallelism:
 
 ```json
 "runtime": { "threads": 10, "jobs": 3, "workers": 2 }
@@ -520,7 +643,7 @@ The configuration owns the execution thread budget and subprocess CPU budget:
 | Setting | Allocation |
 | --- | --- |
 | `threads` | Execution threads across gateway, source, and workers. Each process gets one I/O thread. Gateway and source each reserve two blocking workers; each compute worker gets one. Remaining threads are split between the gateway and source blocking pools. Sleeping main and signal-watcher threads are outside this count. |
-| `jobs` | CPU execution shares for subprocess work. All shares are divided evenly among workers; source runs no subprocess work. |
+| `jobs` | Parallel build jobs, divided evenly among workers and passed to toolchains as parallelism hints; source runs no subprocess work. |
 | `workers` | Worker process count. Each worker admits one task at a time, including its language-analysis phase. |
 
 `threads` must be at least `6 + 2 * workers`; `jobs` must be positive and at least `workers`.
@@ -541,12 +664,7 @@ PID and loads the persisted budget for the next process group. See the hosted
 The top-level `tools` map supplies executable paths to workers.
 
 Build environments receive the assigned parallelism for CMake, CTest, Make,
-and OpenMP. Linux cgroup CPU quotas apply to the task process tree, including
-language servers. Compute workers require a writable
-cgroup v2 delegation at `/sys/fs/cgroup/workers` with CPU and memory controllers.
-Run the service and tests from a leaf inside that delegation so children can
-enter their task cgroups. Directory ownership alone does not permit moving a
-child from a process outside the delegated tree.
+and OpenMP. These are scheduling hints within the shared execution environment.
 
 Gateway metadata stays in `server.storage`; source data lives in its `source/`
 subdirectory, and worker caches in `workers/local-<index>/`. Internal listeners

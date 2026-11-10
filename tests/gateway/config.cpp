@@ -326,8 +326,15 @@ namespace {
                 usage::ledger log{tmp.dir};
                 auto ticket = log.admit_build("app", limits);
                 log.record(ticket, {.project = "app", .ok = true, .seconds = 3});
+                log.record(usage::call_event{.project = "app", .operation = "build", .reuse = "executed", .state = "succeeded",
+                    .seconds = 3, .timings = {.sync_seconds = 0.25, .queue_seconds = 0.5, .dependency_seconds = 0.75, .worker_seconds = 1.5}});
+                expect(log.calls("app", 1).size() == 1u && log.calls("other", 1).empty());
             }
             usage::ledger restored{tmp.dir};
+            const auto calls = restored.calls("app", 1);
+            expect(calls.size() == 1u >> fatal);
+            expect(calls.front().timings.sync_seconds == 0.25 && calls.front().timings.queue_seconds == 0.5 &&
+                calls.front().timings.dependency_seconds == 0.75 && calls.front().timings.worker_seconds == 1.5);
             expect(restored.build_seconds_this_month() == 3.0);
             expect(throws<usage::quota_exceeded>([&] { restored.admit_build("lib", limits); }));
             expect(restored.counters().projects.at("app").builds_ok == 1u);

@@ -12,6 +12,7 @@ import durability;
 import usage;
 import package;
 import constants;
+import reflection;
 
 export namespace source_server {
     class service {
@@ -125,7 +126,7 @@ export namespace source_server {
         // so each user gets its own operation space in the node.
         static auto author_key(const worlds::actor& who) -> std::string { return who.issuer + ":" + who.user; }
         static auto scoped(const worlds::actor& who, const std::string& operation) -> std::string {
-            return content::hash_of(worlds::identity_key({.issuer = who.issuer, .user = who.user}) + "\n" + operation).str();
+            return content::hash_of(worlds::identity_key({.issuer = who.issuer, .user = who.user}) + "\n" + (who.run.empty() ? std::string{} : who.run + "\n") + operation).str();
         }
 
         // The bytes a project's node repository holds on disk, its whole history included.
@@ -261,7 +262,7 @@ export namespace source_server {
             co_return co_await io::blocking(rt_.get_scheduler(core), pool_, [this, root, request = std::move(request)]() mutable {
                 authorize(request.actor);
                 // A workspace at its storage limit accepts reversals but no additional source history.
-                static const std::set<std::string, std::less<>> growing{"mail_send", "apply", "fork",    "integrate", "admit",
+                static const std::set<std::string, std::less<>> growing{"mail_send", "apply", "promote", "fork",    "integrate", "admit",
                                                                         "resolve",   "redo",  "receive", "restore"};
                 auto stores = growing.contains(request.request.action) ? request.request.workspace_limit : 0;
                 return repositories_.with(
@@ -271,7 +272,22 @@ export namespace source_server {
                         if (request.request.owner.empty())
                             request.request.owner = node.node_id();
                         // History names the authenticated user.
-                        request.request.actor = author_key(request.actor);
+                        request.request.actor = author_key(request.actor) + (request.actor.run.empty() ? "" : "/task/" + request.actor.task + "/run/" + request.actor.run);
+                        request.request.lease_owner = worlds::identity_key(request.actor) + "\n" + request.actor.client.value_or("");
+                        request.request.execution_owner = worlds::identity_key({.issuer = request.actor.issuer, .user = request.actor.user});
+                        if (request.request.action == "task_lookup" && !(request.actor.issuer == "source" && request.actor.role == "service" && request.actor.caller == "execution"))
+                            throw transport::coded_error(nodes::code::permission_denied, "execution lookup is internal");
+                        if (!request.actor.execution_token.empty()) {
+                            if (request.actor.project != request.project)
+                                throw transport::coded_error(nodes::code::permission_denied, "execution belongs to another project");
+                            request.request.execution_token = request.actor.execution_token;
+                            request.request.run_id = request.actor.run;
+                            request.request.lease_owner = request.actor.run;
+                        } else if (request.request.action != "task_lookup") {
+                            request.request.execution_token.clear();
+                        }
+                        if (request.request.action == "task_start")
+                            request.request.execution_identity = rfl::json::write(request.actor);
                         request.request.capture = false;
                         // The gateway may name the caller's own operation ID for display; the engine keys on the scoped identity.
                         if (content::is_hash(request.request.operation)) {

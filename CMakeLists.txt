@@ -51,6 +51,17 @@ target_link_libraries(fughetta-service PRIVATE service)
 # are not portable. The services and the test support are not part of it.
 
 include(GNUInstallDirs)
+# Service-manager definitions are installed as templates; registration belongs to deployment.
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  set(DAEMON_DEFINITION fughetta-service.service)
+elseif(APPLE)
+  set(DAEMON_DEFINITION dev.fughetta.service.plist)
+endif()
+if(DAEMON_DEFINITION)
+  configure_file("cmake/daemon/${DAEMON_DEFINITION}.in" "${DAEMON_DEFINITION}" @ONLY)
+  install(FILES "${CMAKE_CURRENT_BINARY_DIR}/${DAEMON_DEFINITION}"
+    DESTINATION "${CMAKE_INSTALL_DATADIR}/fughetta-service/daemon")
+endif()
 install(TARGETS fughetta-service RUNTIME DESTINATION "${CMAKE_INSTALL_BINDIR}")
 include(CMakePackageConfigHelpers)
 install(DIRECTORY src/ DESTINATION "${CMAKE_INSTALL_DATADIR}/fughetta-service/src"

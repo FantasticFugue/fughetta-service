@@ -48,6 +48,7 @@ export namespace usage {
         std::string project, configuration, operation, actor, worldline, version, snapshot, calculation;
         std::string reuse = "executed", state = "cancelled", parameters;
         double seconds = 0;
+        builds::timings timings;
     };
 
     // One line of the ledger. `seq` grows by one per event, so a reader resumes after the last one it has.
@@ -148,7 +149,8 @@ export namespace usage {
         void record(call_event e) {
             if (!e.at)
                 e.at = now();
-            append(event{.seq = next_seq_++, .call = std::move(e)}, e.at);
+            append(event{.seq = next_seq_++, .call = e}, e.at);
+            apply(e);
             if (changed)
                 changed();
         }
@@ -199,6 +201,14 @@ export namespace usage {
             std::vector<build_event> out;
             for (auto it = builds_.rbegin(); it != builds_.rend() && out.size() < n; ++it)
                 if (!project || it->project == *project)
+                    out.push_back(*it);
+            return out;
+        }
+
+        auto calls(std::optional<std::string_view> project, std::size_t n) const -> std::vector<call_event> {
+            std::vector<call_event> out;
+            for (auto it = calls_.rbegin(); it != calls_.rend() && out.size() < n; ++it)
+                if ((!project || it->project == *project) && it->at >= now() - static_cast<std::int64_t>(keep_days_) * 86400)
                     out.push_back(*it);
             return out;
         }
@@ -300,6 +310,8 @@ export namespace usage {
                     apply(*e->build);
                 if (e->tool)
                     apply(*e->tool);
+                if (e->call)
+                    apply(*e->call);
                 kept.push_back(std::move(*e));
             }
             if (bad) {
@@ -368,12 +380,18 @@ export namespace usage {
                 ++t.errors;
         }
 
+        void apply(const call_event& e) {
+            calls_.push_back(e);
+            if (calls_.size() > max_builds_kept) calls_.pop_front();
+        }
+
         static constexpr std::size_t max_builds_kept = 10000;
 
         std::filesystem::path dir_;
         std::uint32_t keep_days_;
         std::optional<std::string> recovery_;
         std::deque<build_event> builds_;
+        std::deque<call_event> calls_;
         std::map<std::pair<std::int64_t, std::string>, day> days_;
         std::map<std::uint64_t, std::string> running_;
         totals totals_;

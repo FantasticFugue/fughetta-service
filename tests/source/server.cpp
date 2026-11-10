@@ -50,8 +50,8 @@ namespace {
                     }(io, listener, source, tasks));
                     tools::standard::bound toolbox{services};
                     expect(std::ranges::none_of(toolbox.list(), [](const auto& tool) { return tool.name == "jobs"; }));
-                    expect(toolbox.list().size() == 5u);
-                    for (const auto name : {"build", "test", "run", "configurations", "language"})
+                    expect(toolbox.list().size() == 9u);
+                    for (const auto name : {"build", "test", "run", "configurations", "language", "worldline", "scope", "artifact", "task"})
                         expect(std::ranges::any_of(toolbox.list(), [name](const auto& tool) { return tool.name == name; }));
                     co_await fixture::write_file(services, {.project = "app", .path = "a.cpp", .content = "int a;\n", .operation_id = "write"}, note,
                                                  tester);
@@ -61,15 +61,15 @@ namespace {
                     expect(!first.replayed && repeated.replayed && repeated.replacements == 1u);
                     bool failed = false;
                     try {
-                        co_await tools::language_query::run(services, {.project = "app", .configuration = "Cpp", .action = "diagnostics"}, note, tester);
+                        co_await tools::language_query::run(services, {.project = "app", .worldline = std::string{"main"}, .configuration = "Cpp", .action = "diagnostics"}, note, tester);
                     } catch (const tools::tool_error& error) {
                         failed = error.code == "no_worker";
                     }
                     expect(failed) << "analysis without workers never falls back to source execution";
                     auto receipt =
-                        co_await tools::worldline::run(services, {.project = "app", .action = "receipt", .operation_id = std::string{"edit"}}, note, tester);
+                        co_await tools::worldline::run(services, {.project = "app", .action = "receipt", .worldline = std::string{"main"}, .operation_id = std::string{"edit"}}, note, tester);
                     expect(receipt.version == first.version && receipt.files->at(0).digest == content::hash_of("int alpha;\n"));
-                    auto history = co_await tools::worldline::run(services, {.project = "app", .action = "history"}, note, tester);
+                    auto history = co_await tools::worldline::run(services, {.project = "app", .action = "history", .worldline = std::string{"main"}}, note, tester);
                     auto authored = std::ranges::find(*history.entries, std::string{"edit"}, &tools::worldline::history_entry::operation_id);
                     expect(authored != history.entries->end() && authored->actor == "token:tester") << "history names the caller's own operation ID";
                     co_await fixture::move_file(services, {.project = "app", .from = "a.cpp", .to = "src/a.cpp", .operation_id = "move-26"}, note, tester);
