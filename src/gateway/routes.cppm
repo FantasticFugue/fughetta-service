@@ -19,6 +19,7 @@ import client;
 import nodes;
 import codec;
 import enrollment;
+import signals;
 
 // The REST endpoints, each with the access it needs, and the table that routes a request to one.
 namespace front {
@@ -82,6 +83,8 @@ namespace front {
     };
 
     struct health {
+        std::string lifecycle;
+        std::string instance;
         std::string status = "ok";
         // Whether the source answered a read-only probe taken for this request; absent when the gateway cannot probe.
         std::optional<bool> source;
@@ -773,7 +776,7 @@ namespace front {
             static auto handle(context& c, params, const web::target&, std::string_view) -> coroutine::task<web::reply> {
                 auto workers = co_await all_workers(c);
                 // Observed for this request, so a restart or the gap between two syncs cannot report a stale answer.
-                health out{.source = co_await probe_source(c), .workers = workers.size(), .protocol = jobs::protocol_version};
+                health out{.lifecycle = std::string{daemon::name(daemon::current.load())}, .instance = daemon::identity, .source = co_await probe_source(c), .workers = workers.size(), .protocol = jobs::protocol_version};
                 for (auto& w : workers)
                     if (w.online)
                         ++out.online_workers;

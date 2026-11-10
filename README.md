@@ -74,20 +74,83 @@ and handles cancellation and shutdown. It does not provision isolated environmen
 Container and VM lifecycle management belongs to cloud-gateway in the future and
 is not implemented here. Run untrusted work only in an externally managed environment.
 
-The `daemon::run` platform interface hosts the application. POSIX service managers
-run it in the foreground and stop it with SIGTERM; Windows SCM runs `--service`
-and translates stop/shutdown controls to the same application cancellation path.
-Use absolute configuration and executable paths and set the working directory.
-CMake installs a configured systemd unit or launchd plist under
-`share/fughetta-service/daemon`. Create the `fughetta` service account, its writable
-`/var/lib/fughetta-service` directory, and the configuration before registration.
-For systemd, configure `Type=simple`, `ExecStart=/path/fughetta-service /path/config.json`,
-`WorkingDirectory=/path`, `Restart=on-failure`, and `TimeoutStopSec=15`.
-For Windows, register the executable with `--service C:\path\config.json` using SCM.
-The registered service name is `fughetta-service`.
-launchd uses the same foreground contract through `ProgramArguments`,
-`WorkingDirectory`, and `KeepAlive`. Darwin uses the POSIX process provider with
-asynchronous wait polling. Windows and Darwin require native build verification.
+### Native lifecycle design
+
+The application publishes `starting`, `initialized`, `ready`, `draining`,
+`stopping`, and `stopped` through the platform `daemon` interface. Initialization
+completes after source and worker children start; readiness follows worker
+registration and task admission. `/healthz` returns `lifecycle` and `instance`
+alongside source and worker observations. Process existence does not imply readiness.
+Budget changes publish draining and return to ready after rebuilding children;
+they never report a final native stop. Final shutdown closes admission, allows
+up to five seconds for accepted work, then cancels work and gives children ten
+seconds to exit before killing them. Native definitions allow twenty seconds.
+A startup stop cancels initialization. Unexpected child exits fail the process.
+
+Each process has one direct restart owner. On bare hosts and within VMs, the
+native service manager owns the service. In containers, run it as the foreground
+main process, send SIGTERM, allow twenty seconds, and let the container runtime
+own restarts; do not also run a native manager in that container. The service
+owns its source and worker children. Cloud-gateway coordinates environment
+recovery without racing the direct owner. Provisioning remains outside this
+repository; see the [gateway environment design](../cloud-gateway/README.md#workspace-environment-control-design).
+
+#### Instance registration and operation
+
+Use a stable workspace slug of letters, digits, underscores or hyphens as
+`--instance NAME`. The process identity and Windows SCM name are
+`fughetta-service-NAME`. Without the option, foreground use has identity
+`fughetta-service`. Every same-host workspace needs its own configuration,
+storage, working directory, logs and listener ports, including internal source
+and worker ports. `server.storage` should be absolute. Do not share writable
+workspace directories. Create the service account and directories before
+registration, grant only that account access to configuration secrets and data,
+and keep the installed executable read-only. Registration requires host operator
+privileges and is separate from `cmake --install`.
+
+- **Linux / systemd:** installation supplies `fughetta-service@.service`. Copy it
+  to `/etc/systemd/system/`, place configuration at the configured installation
+  sysconf directory under `fughetta-service/NAME/config.json`, then run
+  `systemctl daemon-reload` and `systemctl enable --now fughetta-service@NAME`.
+  The template uses `Type=notify`, `NotifyAccess=main`, `READY=1` after admission
+  opens, and `STOPPING=1` when final cancellation begins. `STATUS` reports
+  application transitions. `StateDirectory` creates `/var/lib/fughetta-service/NAME`;
+  stdout/stderr go to journald. `Restart=on-failure` owns recovery and
+  `KillMode=mixed` gives the application the first opportunity to reap children.
+  `FUGHETTA_SERVICE_USER` chooses the account and group at configure time.
+  Stop with `systemctl stop fughetta-service@NAME`; disable before removal.
+- **macOS / launchd:** configure with `-DFUGHETTA_INSTANCE=NAME` and optionally
+  `-DFUGHETTA_SERVICE_USER=ACCOUNT`. Installation supplies
+  `dev.fughetta.service.NAME.plist`. Copy it into `/Library/LaunchDaemons/`,
+  owned by root and not writable by the service account, then run
+  `launchctl bootstrap system /Library/LaunchDaemons/dev.fughetta.service.NAME.plist`.
+  Pre-create `/var/lib/fughetta-service/NAME` and `/var/log/fughetta-service`
+  with appropriate ownership, and the configured per-instance config path.
+  launchd runs the foreground process, sends SIGTERM, and restarts failed exits;
+  application readiness is available from `/healthz`. Logs use per-instance
+  `.out.log` and `.err.log` files in `/var/log/fughetta-service`; arrange rotation.
+  Remove with `launchctl bootout system/dev.fughetta.service.NAME` before deleting
+  its plist. A configure without an instance does not emit a LaunchDaemon.
+- **Windows / SCM:** pre-create a dedicated data directory, configuration and log
+  directory, granting the service account access. Register an own-process service
+  named `fughetta-service-NAME` with an absolute, correctly quoted command line:
+  `"C:\Fughetta\fughetta-service.exe" --service --instance NAME --log-dir C:\FughettaData\NAME\logs C:\FughettaConfig\NAME.json`.
+  Use `sc.exe create` with that `binPath` and `obj` set to the intended service
+  identity, then `sc.exe start fughetta-service-NAME`. Configure SCM failure
+  actions as the sole process restart owner. The host reports START_PENDING
+  with progress checkpoints until application readiness, RUNNING afterwards,
+  STOP_PENDING on stop/shutdown controls, and STOPPED with the application result.
+  Pending states have wait hints and periodic checkpoints; INTERROGATE returns
+  current status. Use absolute paths throughout: SCM does not provide a workspace
+  working directory. `--log-dir` appends stdout/stderr to `service.out.log` and
+  `service.err.log`; arrange rotation. Stop with `sc.exe stop` and remove with
+  `sc.exe delete` using the same instance name. The Windows lifecycle adapter was built with
+  xclang 23.1.3.6 on a Windows host and passed native SCM startup, interrogation,
+  and shutdown tests. Full service execution on Windows and macOS remains untested.
+
+Native references: [systemd notifications](https://www.freedesktop.org/software/systemd/man/latest/sd_notify.html),
+[SCM state transitions](https://learn.microsoft.com/en-us/windows/win32/services/service-status-transitions),
+and [launchd hosting](https://developer.apple.com/library/archive/documentation/MacOSX/Conceptual/BPSystemStartup/Chapters/CreatingLaunchdJobs.html).
 
 ## Run
 

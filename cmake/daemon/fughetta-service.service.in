@@ -1,16 +1,20 @@
 [Unit]
-Description=Fughetta workspace task scheduler
+Description=Fughetta workspace %i task scheduler
 After=network.target
 
 [Service]
-Type=simple
-User=fughetta
-Group=fughetta
-StateDirectory=fughetta-service
-WorkingDirectory=/var/lib/fughetta-service
-ExecStart=@CMAKE_INSTALL_FULL_BINDIR@/fughetta-service @CMAKE_INSTALL_FULL_SYSCONFDIR@/fughetta-service/config.json
+Type=notify
+NotifyAccess=main
+User=@FUGHETTA_SERVICE_USER@
+Group=@FUGHETTA_SERVICE_USER@
+StateDirectory=fughetta-service/%i
+WorkingDirectory=/var/lib/fughetta-service/%i
+ExecStart=@CMAKE_INSTALL_FULL_BINDIR@/fughetta-service --instance %i @CMAKE_INSTALL_FULL_SYSCONFDIR@/fughetta-service/%i/config.json
 Restart=on-failure
-TimeoutStopSec=15
+TimeoutStartSec=120
+TimeoutStopSec=20
+StandardOutput=journal
+StandardError=journal
 KillMode=mixed
 
 [Install]

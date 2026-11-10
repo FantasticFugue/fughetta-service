@@ -23,8 +23,8 @@ namespace gateway {
         using socket = native::socket;
         using listener = native::listener;
 
-        node(config::document doc, std::optional<std::filesystem::path> file, cores::context<native::scheduler>& rt, std::filesystem::path executable = {})
-            : executable_(std::move(executable)), doc_(doc), server_(doc.server), rt_(rt), control_(doc.runtime, doc.revisions.runtime),
+        node(config::document doc, std::optional<std::filesystem::path> file, cores::context<native::scheduler>& rt, std::filesystem::path executable = {}, std::atomic<bool>* interrupted = nullptr)
+            : interrupted_(interrupted), executable_(std::move(executable)), doc_(doc), server_(doc.server), rt_(rt), control_(doc.runtime, doc.revisions.runtime),
               io_pool_(allocation::distribute(doc.runtime).gateway_disk), hub_(rt, config::store(std::move(doc), std::move(file)), io_pool_),
               identities_(server_.storage, server_.auth.workspace), router_(rt, routing::stale_after, &hub_),
               files_(rt, server_.storage, hub_, io_pool_, io::parse_endpoint(server_.source)) {
@@ -55,6 +55,7 @@ namespace gateway {
             co_await coroutine::with_scope([&](coroutine::scope& children) -> coroutine::task<> {
                 if (core == 0 && !executable_.empty()) {
                     co_await processes.start(io, children, executable_, doc_);
+                    daemon::publish(daemon::phase::initialized);
                     children.spawn(supervise(io, processes));
                 }
                 children.spawn(router_.workers(core).watch(io));
@@ -78,16 +79,31 @@ namespace gateway {
             try {
                 co_await processes.supervise(io);
             } catch (...) {
+                daemon::publish(daemon::phase::stopping);
                 rt_.stop();
                 throw;
             }
         }
 
         auto watch_runtime(native::scheduler& io) -> coroutine::task<> {
+            std::optional<std::chrono::steady_clock::time_point> deadline;
             for (;;) {
+                if (interrupted_ && interrupted_->load()) {
+                    control_.drain();
+                    daemon::publish(daemon::phase::draining);
+                    if (!deadline) deadline = std::chrono::steady_clock::now() + std::chrono::seconds{5};
+                    if ((control_.idle() && queue_->idle()) || std::chrono::steady_clock::now() >= *deadline) {
+                        daemon::publish(daemon::phase::stopping);
+                        rt_.stop();
+                        co_return;
+                    }
+                    co_await execution::schedule_after(io, std::chrono::milliseconds{50});
+                    continue;
+                }
                 auto current = hub_.current(0);
                 if (current->runtime != doc_.runtime) {
                     control_.drain();
+                    daemon::publish(daemon::phase::draining);
                     if (control_.idle() && queue_->idle()) {
                         reconfigure_ = true;
                         rt_.stop();
@@ -97,6 +113,7 @@ namespace gateway {
                     auto workers = router_.workers(0).describe(0);
                     if (std::ranges::count_if(workers, [](const auto& w) { return w.online; }) == doc_.runtime.workers) {
                         control_.ready(current->revisions.runtime);
+                        daemon::publish(daemon::phase::ready);
                     }
                 }
                 co_await execution::schedule_after(io, std::chrono::milliseconds{50});
@@ -126,6 +143,7 @@ namespace gateway {
                                                            [this, core] { return hub_.current(core)->server.remote_worker_enrollment; }));
         }
 
+        std::atomic<bool>* interrupted_;
         std::filesystem::path executable_;
         config::document doc_;
         config::server server_;
@@ -169,6 +187,7 @@ export int run_gateway(int argc, char** argv, bool managed) {
         environment::load(file.parent_path() / ".env");
         std::atomic<bool> interrupted{false};
         for (;;) {
+            daemon::publish(daemon::phase::starting);
             config::document doc;
             if (argc > 1 || std::filesystem::exists(file))
                 doc = config::load(file);
@@ -180,20 +199,24 @@ export int run_gateway(int argc, char** argv, bool managed) {
             struct shutdown {
                 cores::context<native::scheduler>& context;
                 std::atomic<bool>& interrupted;
+                bool managed;
                 void stop() noexcept {
                     interrupted.store(true);
-                    context.stop();
+                    if (!managed || daemon::current.load() == daemon::phase::starting || daemon::current.load() == daemon::phase::initialized)
+                        context.stop();
                 }
-            } stop{context, interrupted};
+            } stop{context, interrupted, managed};
             cores::signal_watch signals{stop};
-            gateway::node node{std::move(doc), file, context, managed ? host::executable() : std::filesystem::path{}};
+            gateway::node node{std::move(doc), file, context, managed ? host::executable() : std::filesystem::path{}, &interrupted};
             context.run([&](auto& io, std::size_t core) { return node.run(io, core); });
             if (interrupted.load() || !node.reconfiguring())
                 break;
         }
     } catch (const std::exception& e) {
+        daemon::publish(daemon::phase::stopping);
         logging::error(std::format("gateway: {}", e.what()));
         return 1;
     }
+    daemon::publish(daemon::phase::stopping);
     return 0;
 }

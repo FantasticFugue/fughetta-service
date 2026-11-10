@@ -1,6 +1,16 @@
 module;
 #include <pthread.h>
 #include <signal.h>
+#ifdef __linux__
+#include <sys/socket.h>
+#include <sys/un.h>
+// Keep the POSIX daemon() declaration out of the application host namespace.
+#define daemon posix_daemon
+#include <unistd.h>
+#undef daemon
+#include <cstdlib>
+#include <cstring>
+#endif
 
 module signals;
 import std;
@@ -32,7 +42,33 @@ namespace cores {
 } // namespace cores
 
 namespace daemon {
-    auto run(int argc, char** argv, int (*application)(int, char**), bool) -> int {
-        return application(argc, argv);
+    void publish(phase value) {
+        if (current.exchange(value) == value) return;
+#ifdef __linux__
+        auto path = ::getenv("NOTIFY_SOCKET");
+        if (!path || !*path) return;
+        sockaddr_un address{};
+        address.sun_family = AF_UNIX;
+        auto length = std::strlen(path);
+        if (length >= sizeof(address.sun_path))
+            throw std::runtime_error("NOTIFY_SOCKET path too long");
+        std::memcpy(address.sun_path, path, length + 1);
+        if (path[0] == '@') address.sun_path[0] = '\0';
+        std::string message = "STATUS=" + std::string{name(value)};
+        if (value == phase::ready) message += "\nREADY=1";
+        if (value == phase::stopping) message += "\nSTOPPING=1";
+        auto fd = ::socket(AF_UNIX, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+        if (fd < 0) throw std::runtime_error("cannot open systemd notification socket");
+        auto sent = ::sendto(fd, message.data(), message.size(), MSG_NOSIGNAL,
+            reinterpret_cast<sockaddr*>(&address), offsetof(sockaddr_un, sun_path) + length + (path[0] != '@'));
+        ::close(fd);
+        if (sent < 0) throw std::runtime_error("cannot send systemd lifecycle notification");
+#endif
+    }
+    auto run(int argc, char** argv, int (*application)(int, char**), bool, std::string_view instance) -> int {
+        identity = instance;
+        auto result = application(argc, argv);
+        if (current.load() != phase::starting) publish(phase::stopped);
+        return result;
     }
 }
