@@ -1,0 +1,26 @@
+{
+    "dependencies": [
+        "argparse",
+        "c-ares",
+        "asio",
+        "bext-ut",
+        "llhttp",
+        "nghttp2",
+        "nghttp3",
+        "libsodium",
+        {
+            "name": "reflectcpp",
+            "features": [
+                "xml"
+            ]
+        },
+        "sqlite3",
+        "stdexec",
+        "wolfssl",
+        "zstd",
+        {
+            "name": "liburing",
+            "platform": "linux"
+        }
+    ]
+}

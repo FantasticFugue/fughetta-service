@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>dev.fughetta.service.@FUGHETTA_INSTANCE@</string>
+  <key>ProgramArguments</key><array>
+    <string>@CMAKE_INSTALL_FULL_BINDIR@/fughetta-service</string>
+    <string>--instance</string><string>@FUGHETTA_INSTANCE@</string>
+    <string>@CMAKE_INSTALL_FULL_SYSCONFDIR@/fughetta-service/@FUGHETTA_INSTANCE@/config.json</string>
+  </array>
+  <key>UserName</key><string>@FUGHETTA_SERVICE_USER@</string>
+  <key>WorkingDirectory</key><string>/var/lib/fughetta-service/@FUGHETTA_INSTANCE@</string>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>
+  <key>ExitTimeOut</key><integer>20</integer>
+  <key>StandardOutPath</key><string>/var/log/fughetta-service/@FUGHETTA_INSTANCE@.out.log</string>
+  <key>StandardErrorPath</key><string>/var/log/fughetta-service/@FUGHETTA_INSTANCE@.err.log</string>
+</dict></plist>
