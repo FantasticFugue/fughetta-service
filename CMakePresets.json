@@ -18,7 +18,6 @@
             "inherits": "base",
             "cacheVariables": {
                 "CMAKE_BUILD_TYPE": "Debug",
-                "CMAKE_CXX_FLAGS_DEBUG": "-g0",
                 "CMAKE_CXX_FLAGS": "-fno-omit-frame-pointer",
                 "XCLANG_SANITIZER": "address,undefined"
             }

@@ -25,7 +25,9 @@ on Linux, IOCP on Windows, and kqueue on macOS. The layers link
 `httpant::httpant`, `httpant::io` and `httpant::tls`.
 
 `cmake/toolchain.cmake` reads `XCLANG_ROOT` and `VCPKG_ROOT` from the
-environment; the xclang triplets live in `cmake/triplets`.
+environment and writes the vcpkg triplet for `XCLANG_TARGET` into the build
+directory. CI checks vcpkg out at the baseline in `vcpkg-configuration.json`,
+which must be a microsoft/vcpkg commit.
 
 ## Build and verify
 
