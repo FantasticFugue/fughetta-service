@@ -34,8 +34,10 @@ export namespace runtime {
                 pending.append(text);
                 for (auto end = pending.find('\n'); end != pending.npos; end = pending.find('\n')) {
                     auto line = std::string_view{pending}.substr(0, end);
-                    if (line.ends_with('\r')) line.remove_suffix(1);
-                    if (line == "service-ready:" + c.role) c.ready = true;
+                    if (line.ends_with('\r'))
+                        line.remove_suffix(1);
+                    if (line == "service-ready:" + c.role)
+                        c.ready = true;
                     pending.erase(0, end + 1);
                 }
                 if (pending.size() > 8192)

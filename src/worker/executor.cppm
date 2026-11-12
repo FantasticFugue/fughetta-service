@@ -89,11 +89,10 @@ export namespace replica {
                 });
             };
             d.template on<jobs::export_read>(std::move(handle_export_read));
-            d.template on<jobs::sync_offer>(
-                [this, core](jobs::sync_offer o, auto&) {
-                    require_consumer();
-                    return at_home(core, [o = std::move(o)](store& s) { return s.offer(o); });
-                });
+            d.template on<jobs::sync_offer>([this, core](jobs::sync_offer o, auto&) {
+                require_consumer();
+                return at_home(core, [o = std::move(o)](store& s) { return s.offer(o); });
+            });
             auto handle_source_bytes = [this, core](jobs::source_bytes p, auto&) -> coroutine::task<jobs::authority_ack> {
                 require_consumer();
                 if (core == home_)
@@ -111,16 +110,18 @@ export namespace replica {
             d.template on<jobs::build_request>(std::move(handle_build_request));
             auto handle_dependency_fill = [this, core](jobs::dependency_fill request, auto& ex) -> coroutine::task<jobs::build_report> {
                 co_await ex.progress({.stage = "dependencies"});
-                if (core == home_) co_return co_await fill(std::move(request));
+                if (core == home_)
+                    co_return co_await fill(std::move(request));
                 co_return co_await cores::call(rt_.get_scheduler(core), rt_.get_scheduler(home_),
-                    [this, request = std::move(request)] { return fill(request); });
+                                               [this, request = std::move(request)] { return fill(request); });
             };
             d.template on<jobs::dependency_fill>(std::move(handle_dependency_fill));
         }
 
     private:
         void require_consumer() const {
-            if (options_.dependency_publish) throw std::invalid_argument("dependency publishers only accept dependency.fill");
+            if (options_.dependency_publish)
+                throw std::invalid_argument("dependency publishers only accept dependency.fill");
         }
 
         auto fill(jobs::dependency_fill request) -> coroutine::task<jobs::build_report> {
@@ -129,14 +130,18 @@ export namespace replica {
             const auto recipe = *options_.dependency_recipe;
             builds::validate(recipe);
             builds::validate(request.manifest);
-            if (request.triplet.empty()) request.triplet = recipe.triplets.front();
-            if (request.host_triplet.empty()) request.host_triplet = recipe.triplets.front();
+            if (request.triplet.empty())
+                request.triplet = recipe.triplets.front();
+            if (request.host_triplet.empty())
+                request.host_triplet = recipe.triplets.front();
             if (!std::ranges::contains(recipe.triplets, request.triplet) || !std::ranges::contains(recipe.triplets, request.host_triplet))
                 throw std::invalid_argument("dependency triplet is not admitted by the publisher");
             if (request.features.size() > constants::dependency_manifest_entries)
                 throw std::invalid_argument("too many dependency features");
-            for (const auto& feature : request.features) builds::dependency_name(feature);
-            if (!request.timeout_s) throw std::invalid_argument("dependency fill deadline expired");
+            for (const auto& feature : request.features)
+                builds::dependency_name(feature);
+            if (!request.timeout_s)
+                throw std::invalid_argument("dependency fill deadline expired");
             const auto text = rfl::json::write(request.manifest);
             const auto digest = content::hash_of(text);
             const content::manifest snapshot{{content::entry{.path = "vcpkg.json", .digest = digest, .size = text.size()}}};
@@ -145,18 +150,30 @@ export namespace replica {
                 auto bytes = std::as_bytes(std::span{text});
                 cache.put(jobs::source_bytes{{jobs::source_part{digest, 0, text.size(), {bytes.begin(), bytes.end()}}}});
             });
-            builds::adapter<"vcpkg">::options options{.executable = recipe.executable, .root = recipe.root,
-                .install_dir = "installed", .triplet = request.triplet, .host_triplet = request.host_triplet,
-                .features = request.features, .buildtrees_dir = "buildtrees", .packages_dir = "packages", .env = recipe.env, .offline = recipe.offline,
-                .default_features = request.default_features};
+            builds::adapter<"vcpkg">::options options{.executable = recipe.executable,
+                                                      .root = recipe.root,
+                                                      .install_dir = "installed",
+                                                      .triplet = request.triplet,
+                                                      .host_triplet = request.host_triplet,
+                                                      .features = request.features,
+                                                      .buildtrees_dir = "buildtrees",
+                                                      .packages_dir = "packages",
+                                                      .env = recipe.env,
+                                                      .offline = recipe.offline,
+                                                      .default_features = request.default_features};
             builds::adapter<"vcpkg">::validate(options);
             const auto key = content::hash_of(rfl::json::write(std::tuple{request, recipe}));
-            jobs::build_request build_request{.project = "dependencies", .tree = key.str(), .snapshot = snapshot.id(),
-                .steps = builds::adapter<"vcpkg">::expand(options, "install", {}),
-                .timeout_s = std::min(request.timeout_s, recipe.timeout_s), .fresh = true};
+            jobs::build_request build_request{.project = "dependencies",
+                                              .tree = key.str(),
+                                              .snapshot = snapshot.id(),
+                                              .steps = builds::adapter<"vcpkg">::expand(options, "install", {}),
+                                              .timeout_s = std::min(request.timeout_s, recipe.timeout_s),
+                                              .fresh = true};
             build_request.steps.front().dependencies.reset();
-            for (const auto& path : recipe.overlay_ports) build_request.steps.front().argv.push_back("--overlay-ports=" + path);
-            for (const auto& path : recipe.overlay_triplets) build_request.steps.front().argv.push_back("--overlay-triplets=" + path);
+            for (const auto& path : recipe.overlay_ports)
+                build_request.steps.front().argv.push_back("--overlay-ports=" + path);
+            for (const auto& path : recipe.overlay_triplets)
+                build_request.steps.front().argv.push_back("--overlay-triplets=" + path);
             co_return co_await build(std::move(build_request));
         }
 
@@ -201,8 +218,7 @@ export namespace replica {
             for (const auto& [used, key] : idle) {
                 auto found = contexts_.find(key);
                 if (found != contexts_.end() && found->second->used == used && !active_.contains(key) &&
-                    (pressure || now - used >= constants::language_idle ||
-                     contexts_.size() >= constants::language_sessions))
+                    (pressure || now - used >= constants::language_idle || contexts_.size() >= constants::language_sessions))
                     co_await retire(key);
             }
         }
@@ -210,9 +226,7 @@ export namespace replica {
         template <class F> struct home_work {
             service* owner;
             F work;
-            auto operator()() -> coroutine::task<std::invoke_result_t<F&, store&>> {
-                return owner->locked(std::move(work));
-            }
+            auto operator()() -> coroutine::task<std::invoke_result_t<F&, store&>> { return owner->locked(std::move(work)); }
         };
         template <class F> auto at_home(std::size_t core, F f) -> coroutine::task<std::invoke_result_t<F&, store&>> {
             if (core == home_)
@@ -284,11 +298,12 @@ export namespace replica {
                 co_await retire(key);
             bool preparation = !r.measure.empty() || r.survey;
             // A preparation keeps the snapshot's files, which the offer cache may let go while the steps run.
-            auto [dir, reports, files, retired] = co_await locked([project = r.project, snapshot = r.snapshot, tree = r.tree, key, preparation, fresh = r.fresh](store& s) {
-                auto retired = fresh ? s.detach(project, tree) : std::filesystem::path{};
-                auto dir = s.checkout(project, snapshot, tree);
-                return std::tuple{dir, s.reports(key), preparation ? s.files(project, snapshot) : std::vector<content::entry>{}, retired};
-            });
+            auto [dir, reports, files, retired] =
+                co_await locked([project = r.project, snapshot = r.snapshot, tree = r.tree, key, preparation, fresh = r.fresh](store& s) {
+                    auto retired = fresh ? s.detach(project, tree) : std::filesystem::path{};
+                    auto dir = s.checkout(project, snapshot, tree);
+                    return std::tuple{dir, s.reports(key), preparation ? s.files(project, snapshot) : std::vector<content::entry>{}, retired};
+                });
             if (!retired.empty())
                 co_await io::blocking(rt_.get_scheduler(home_), pool_, [retired] { store::discard(retired); });
             auto deadline = started + std::chrono::seconds{r.timeout_s};
@@ -300,7 +315,9 @@ export namespace replica {
                 if (report && report->ok() && preparation) {
                     auto io = rt_.get_scheduler(home_);
                     auto remaining = std::max(std::chrono::steady_clock::duration::zero(), deadline - std::chrono::steady_clock::now());
+                    const auto analysis_started = std::chrono::steady_clock::now();
                     auto finished = co_await coroutine::under(token, coroutine::deadline(io, remaining, afterwards(r, dir, files, *report)));
+                    *report->execution_seconds += std::chrono::duration<double>(std::chrono::steady_clock::now() - analysis_started).count();
                     if (!finished)
                         report.reset();
                     else if (!*finished)
@@ -318,12 +335,13 @@ export namespace replica {
                 co_await coroutine::stop;
             if (!r.exports.empty()) {
                 try {
-                    auto captured = co_await io::blocking(rt_.get_scheduler(home_), pool_, [this, root = options_.root, dir, exports = r.exports, allow_missing = !report->ok()] {
-                        std::shared_lock guard{exports_lock_};
-                        std::vector<std::string> skipped;
-                        auto files = delivery::capture(dir, exports, root / "exports", allow_missing, &skipped);
-                        return std::pair{std::move(files), std::move(skipped)};
-                    });
+                    auto captured = co_await io::blocking(rt_.get_scheduler(home_), pool_,
+                                                          [this, root = options_.root, dir, exports = r.exports, allow_missing = !report->ok()] {
+                                                              std::shared_lock guard{exports_lock_};
+                                                              std::vector<std::string> skipped;
+                                                              auto files = delivery::capture(dir, exports, root / "exports", allow_missing, &skipped);
+                                                              return std::pair{std::move(files), std::move(skipped)};
+                                                          });
                     report->exports = std::move(captured.first);
                     report->export_skipped = std::move(captured.second);
                 } catch (const std::exception& error) {
@@ -393,9 +411,7 @@ export namespace replica {
                     auto value = std::make_unique<context>();
                     value->identity = identity;
                     value->used = std::chrono::steady_clock::now();
-                    io::command command{.argv = std::move(local.argv),
-                                        .cwd = dir,
-                                        .env = std::move(env)};
+                    io::command command{.argv = std::move(local.argv), .cwd = dir, .env = std::move(env)};
                     value->server = std::make_unique<lsp::session>(rt_.get_scheduler(home_), std::move(command));
                     auto& created = *contexts_.emplace(key, std::move(value)).first->second;
                     co_await created.server->start(dir, r.survey->initialization);
@@ -437,7 +453,7 @@ export namespace replica {
         // Close the process group after its processes have been released.
         auto run_steps(const jobs::build_request& r, const std::filesystem::path& dir, const std::filesystem::path& reports,
                        std::chrono::steady_clock::time_point deadline) -> coroutine::task<jobs::build_report> {
-            jobs::build_report report{.worker = options_.worker, .tree = dir.string()};
+            jobs::build_report report{.worker = options_.worker, .tree = dir.string(), .preparation_seconds = 0, .execution_seconds = 0};
             const auto logs = reports.parent_path() / (reports.filename().string() + ".logs");
             std::string log_setup_error;
             try {
@@ -445,12 +461,21 @@ export namespace replica {
                     store::discard(logs);
                     std::filesystem::create_directories(logs);
                 });
-            } catch (const std::exception& error) { log_setup_error = error.what(); }
+            } catch (const std::exception& error) {
+                log_setup_error = error.what();
+            }
             std::uint64_t log_bytes = 0;
+            struct elapsed {
+                double& seconds;
+                std::chrono::steady_clock::time_point started = std::chrono::steady_clock::now();
+                ~elapsed() { seconds += std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count(); }
+            };
             for (auto& step : r.steps) {
+                elapsed measured{step.preparation ? *report.preparation_seconds : *report.execution_seconds};
                 if (step.argv.empty())
                     throw std::invalid_argument(std::format("step '{}' has no command", step.name));
-                const auto cache = options_.dependency_cache.value_or(options_.root / (options_.dependency_publish ? "publisher/dependencies" : "dependencies"));
+                const auto cache =
+                    options_.dependency_cache.value_or(options_.root / (options_.dependency_publish ? "publisher/dependencies" : "dependencies"));
                 auto local = co_await io::blocking(rt_.get_scheduler(home_), pool_, [this, step, dir, reports, cache] {
                     return builds::locate(step, dir, options_.tools, options_.parallel, reports, cache,
                                           options_.dependency_publish.value_or(options_.dependency_upstream.value_or(std::filesystem::path{})));
@@ -462,10 +487,14 @@ export namespace replica {
                     const auto waiting_since = std::chrono::steady_clock::now();
                     while (std::chrono::steady_clock::now() < deadline) {
                         dependency_lock = co_await io::blocking(rt_.get_scheduler(home_), pool_, [cache = options_.dependency_publish.value_or(cache)] {
-                            try { return std::make_unique<durability::dir_lock>(cache / "vcpkg", "dependency cache"); }
-                            catch (const durability::lock_busy&) { return std::unique_ptr<durability::dir_lock>{}; }
+                            try {
+                                return std::make_unique<durability::dir_lock>(cache / "vcpkg", "dependency cache");
+                            } catch (const durability::lock_busy&) {
+                                return std::unique_ptr<durability::dir_lock>{};
+                            }
                         });
-                        if (dependency_lock) break;
+                        if (dependency_lock)
+                            break;
                         cache_waited = true;
                         co_await execution::schedule_after(rt_.get_scheduler(home_), constants::dependency_lock_poll);
                     }
@@ -481,9 +510,12 @@ export namespace replica {
                 });
                 auto left = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - std::chrono::steady_clock::now());
                 if (left <= std::chrono::milliseconds::zero()) {
-                    report.steps.push_back({.name = step.name, .timed_out = true,
-                        .output = cache_waited ? std::format("not started: waited {:.2f} seconds for the shared vcpkg cache lock held by another install; execution deadline exceeded", cache_wait_seconds)
-                                               : "not started: the build's time ran out"});
+                    report.steps.push_back({.name = step.name,
+                                            .timed_out = true,
+                                            .output = cache_waited ? std::format("not started: waited {:.2f} seconds for the shared vcpkg cache lock held by "
+                                                                                 "another install; execution deadline exceeded",
+                                                                                 cache_wait_seconds)
+                                                                   : "not started: the build's time ran out"});
                     break;
                 }
                 io::command cmd{.argv = std::move(local.argv),
@@ -495,32 +527,41 @@ export namespace replica {
                     cmd.standard_output = reports / *local.standard_output;
                 const auto log_name = std::to_string(report.steps.size()) + ".log";
                 report.steps.push_back(co_await runner::run_step(rt_.get_scheduler(home_), std::move(cmd), left, r.output_limit, step.name,
-                    log_setup_error.empty() ? std::optional{logs / log_name} : std::nullopt, constants::log_bytes - log_bytes));
+                                                                 log_setup_error.empty() ? std::optional{logs / log_name} : std::nullopt,
+                                                                 constants::log_bytes - log_bytes));
                 auto& last = report.steps.back();
                 if (dependency_lock && options_.dependency_publish && last.exit_code == 0 && !last.timed_out) {
                     try {
                         co_await io::blocking(rt_.get_scheduler(home_), pool_, [cache, destination = *options_.dependency_publish, deadline] {
                             dependencies::publish(cache, destination, deadline);
                         });
-                    } catch (const std::exception& error) { last.cache_error = std::string{error.what()}.substr(0, 512); }
+                    } catch (const std::exception& error) {
+                        last.cache_error = std::string{error.what()}.substr(0, 512);
+                    }
                 }
                 dependency_lock.reset();
-                if (!log_setup_error.empty()) last.log_error = log_setup_error;
+                if (!log_setup_error.empty())
+                    last.log_error = log_setup_error;
                 try {
                     if (last.log_error.empty()) {
-                        auto saved = co_await io::blocking(rt_.get_scheduler(home_), pool_, [this, logs, log_name, root = options_.root,
-                            publish = !r.survey && r.measure.empty() && (last.truncated || last.output.size() > 8192)] {
-                            std::shared_lock guard{exports_lock_};
-                            const auto size = std::filesystem::file_size(logs / log_name);
-                            std::optional<builds::exported_file> file;
-                            if (publish && size) file = delivery::capture(logs, {{"step-" + log_name, log_name}}, root / "exports").at(0);
-                            std::filesystem::remove(logs / log_name);
-                            return std::pair{size, file};
-                        });
+                        auto saved = co_await io::blocking(rt_.get_scheduler(home_), pool_,
+                                                           [this, logs, log_name, root = options_.root,
+                                                            publish = !r.survey && r.measure.empty() && (last.truncated || last.output.size() > 8192)] {
+                                                               std::shared_lock guard{exports_lock_};
+                                                               const auto size = std::filesystem::file_size(logs / log_name);
+                                                               std::optional<builds::exported_file> file;
+                                                               if (publish && size)
+                                                                   file = delivery::capture(logs, {{"step-" + log_name, log_name}}, root / "exports").at(0);
+                                                               std::filesystem::remove(logs / log_name);
+                                                               return std::pair{size, file};
+                                                           });
                         log_bytes += saved.first;
                         last.log = std::move(saved.second);
                     }
-                } catch (const std::exception& error) { last.log_error = error.what(); log_bytes = constants::log_bytes; }
+                } catch (const std::exception& error) {
+                    last.log_error = error.what();
+                    log_bytes = constants::log_bytes;
+                }
                 auto found = co_await io::blocking(rt_.get_scheduler(home_), pool_, [&] { return builds::collect(local, reports, dir); });
                 last.diagnostics = std::move(found.diagnostics);
                 last.tests = std::move(found.tests);

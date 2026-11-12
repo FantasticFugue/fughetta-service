@@ -68,7 +68,8 @@ export namespace settings {
             }();
             return all;
         }
-        auto call(std::string_view name, rfl::Generic args, mcp::notifier&, const worlds::actor& who) -> coroutine::task<mcp::tool_outcome> {
+        auto call(std::string_view name, rfl::Generic args, mcp::notifier&, const worlds::actor& who, mcp::call_context = {})
+            -> coroutine::task<mcp::tool_outcome> {
             auto found = std::ranges::find_if(catalog(), [name](const entry& e) { return e.tool.name == name; });
             if (found == catalog().end())
                 co_return mcp::tool_outcome{.text = std::format("unknown tool: {}", name), .error = true};
@@ -95,11 +96,10 @@ export namespace settings {
                 co_return mcp::tool_outcome{.text = std::move(error), .error = true};
             auto parsed = rfl::json::read<rfl::Generic>(result->body);
             if (!parsed)
-                co_return mcp::tool_outcome{.text = std::format("the core answered status {} with a body that is not JSON: {}", result->head.status.code(),
-                                                                 parsed.error().what()),
-                                            .error = true};
-            co_return mcp::tool_outcome{
-                .text = result->body, .structured = std::move(*parsed), .error = result->head.status != 200};
+                co_return mcp::tool_outcome{
+                    .text = std::format("the core answered status {} with a body that is not JSON: {}", result->head.status.code(), parsed.error().what()),
+                    .error = true};
+            co_return mcp::tool_outcome{.text = result->body, .structured = std::move(*parsed), .error = result->head.status != 200};
         }
 
     private:

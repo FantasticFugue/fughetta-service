@@ -111,6 +111,7 @@ namespace builds {
         auto& argv = out.argv;
         // Only lock and sync resolve: --locked and --group do not exist for build, and a run without a sync has nothing to lock.
         bool resolves = operation == "lock" || operation == "sync";
+        out.preparation = resolves;
         if (c.offline) {
             argv.push_back("--offline");
             if (resolves)

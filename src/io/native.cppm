@@ -104,9 +104,7 @@ export namespace native {
         std::unique_ptr<state> s_;
     };
 
-    inline auto process::waiting::get_env() const noexcept {
-        return execution::completes_on<scheduler, execution::set_value_t>{scheduler{{s->engine}}};
-    }
+    inline auto process::waiting::get_env() const noexcept { return execution::completes_on<scheduler, execution::set_value_t>{scheduler{{s->engine}}}; }
 
     class context : public http::io::net::basic_io_context<concurrent::queue> {
     public:

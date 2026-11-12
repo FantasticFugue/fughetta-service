@@ -23,18 +23,24 @@ export namespace daemon {
     inline std::string identity;
     auto name(phase value) -> std::string_view;
     void publish(phase value);
-}
+} // namespace daemon
 
 namespace daemon {
     auto name(phase value) -> std::string_view {
         switch (value) {
-        case phase::starting: return "starting";
-        case phase::initialized: return "initialized";
-        case phase::ready: return "ready";
-        case phase::draining: return "draining";
-        case phase::stopping: return "stopping";
-        case phase::stopped: return "stopped";
+        case phase::starting:
+            return "starting";
+        case phase::initialized:
+            return "initialized";
+        case phase::ready:
+            return "ready";
+        case phase::draining:
+            return "draining";
+        case phase::stopping:
+            return "stopping";
+        case phase::stopped:
+            return "stopped";
         }
         return "starting";
     }
-}
+} // namespace daemon

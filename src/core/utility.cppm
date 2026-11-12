@@ -13,9 +13,7 @@ export namespace util {
     // this module unit, so clang records the copy constructor in the throw
     // metadata on the Microsoft ABI (see httpant.exception).
     template <class Error> struct retained_error : http::exceptions::exception_capture {
-        auto capture() const noexcept -> std::exception_ptr override {
-            return http::exceptions::capture(static_cast<const Error&>(*this));
-        }
+        auto capture() const noexcept -> std::exception_ptr override { return http::exceptions::capture(static_cast<const Error&>(*this)); }
     };
 
     // A move-only, type-erased callable with a small buffer, for the places the

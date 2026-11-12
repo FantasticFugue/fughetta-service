@@ -259,6 +259,7 @@ export namespace jobs {
         std::vector<builds::exported_file> exports;
         std::string export_error;
         std::vector<std::string> export_skipped;
+        std::optional<double> preparation_seconds, execution_seconds;
 
         auto ok() const -> bool {
             return std::ranges::all_of(steps, [](auto& s) { return s.exit_code == 0 && !s.timed_out; });

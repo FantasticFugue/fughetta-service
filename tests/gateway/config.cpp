@@ -23,11 +23,11 @@ namespace {
     static constexpr auto cases = [] {
         "worker dependency publisher requires an absolute exclusive destination"_test = [] {
             for (const auto* text : {R"({"dependency_publish":""})", R"({"dependency_publish":"relative"})",
-                    R"({"dependency_publish":"/published","dependency_upstream":"/upstream"})",
-                    R"({"dependency_publish":"/published"})",
-                    R"({"dependency_recipe":{"executable":"/usr/bin/vcpkg","root":"/opt/vcpkg","triplets":["x64-linux"]}})"})
+                                     R"({"dependency_publish":"/published","dependency_upstream":"/upstream"})", R"({"dependency_publish":"/published"})",
+                                     R"({"dependency_recipe":{"executable":"/usr/bin/vcpkg","root":"/opt/vcpkg","triplets":["x64-linux"]}})"})
                 expect(throws<std::invalid_argument>([&] { config::parse_worker(text); }));
-            const auto worker = config::parse_worker(R"({"dependency_publish":"/published","dependency_recipe":{"executable":"/usr/bin/vcpkg","root":"/opt/vcpkg","triplets":["x64-linux"]}})");
+            const auto worker = config::parse_worker(
+                R"({"dependency_publish":"/published","dependency_recipe":{"executable":"/usr/bin/vcpkg","root":"/opt/vcpkg","triplets":["x64-linux"]}})");
             expect(worker.dependency_publish == "/published" && !worker.dependency_upstream);
         };
         "source limits and language profiles resolve independently"_test = [] {
@@ -330,15 +330,19 @@ namespace {
                 usage::ledger log{tmp.dir};
                 auto ticket = log.admit_build("app", limits);
                 log.record(ticket, {.project = "app", .ok = true, .seconds = 3});
-                log.record(usage::call_event{.project = "app", .operation = "build", .reuse = "executed", .state = "succeeded",
-                    .seconds = 3, .timings = {.sync_seconds = 0.25, .queue_seconds = 0.5, .dependency_seconds = 0.75, .worker_seconds = 1.5}});
+                log.record(usage::call_event{.project = "app",
+                                             .operation = "build",
+                                             .reuse = "executed",
+                                             .state = "succeeded",
+                                             .seconds = 3,
+                                             .timings = {.sync_seconds = 0.25, .queue_seconds = 0.5, .dependency_seconds = 0.75, .worker_seconds = 1.5}});
                 expect(log.calls("app", 1).size() == 1u && log.calls("other", 1).empty());
             }
             usage::ledger restored{tmp.dir};
             const auto calls = restored.calls("app", 1);
             expect(calls.size() == 1u >> fatal);
             expect(calls.front().timings.sync_seconds == 0.25 && calls.front().timings.queue_seconds == 0.5 &&
-                calls.front().timings.dependency_seconds == 0.75 && calls.front().timings.worker_seconds == 1.5);
+                   calls.front().timings.dependency_seconds == 0.75 && calls.front().timings.worker_seconds == 1.5);
             expect(restored.build_seconds_this_month() == 3.0);
             expect(throws<usage::quota_exceeded>([&] { restored.admit_build("lib", limits); }));
             expect(restored.counters().projects.at("app").builds_ok == 1u);
@@ -384,10 +388,12 @@ namespace {
         "ledger batches survive segment rotation, retention and restart"_test = [] {
             test::scratch tmp{"usage-segments"};
             auto at = usage::now();
-            test::spit(tmp.dir / "events-00000000000000000001.jsonl",
-                std::format(R"({{"seq":1,"tool":{{"at":{},"project":"app","tool":"read"}}}})" "\n", at - 100 * 86400));
-            test::spit(tmp.dir / "events.jsonl",
-                std::format(R"({{"seq":2,"tool":{{"at":{},"project":"app","tool":"read"}}}})" "\n", at - 86400));
+            test::spit(tmp.dir / "events-00000000000000000001.jsonl", std::format(R"({{"seq":1,"tool":{{"at":{},"project":"app","tool":"read"}}}})"
+                                                                                  "\n",
+                                                                                  at - 100 * 86400));
+            test::spit(tmp.dir / "events.jsonl", std::format(R"({{"seq":2,"tool":{{"at":{},"project":"app","tool":"read"}}}})"
+                                                             "\n",
+                                                             at - 86400));
             {
                 usage::ledger log{tmp.dir};
                 int notified = 0;

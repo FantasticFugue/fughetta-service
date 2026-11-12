@@ -41,7 +41,7 @@ namespace {
         // A job runs on core zero, as the backlog's own jobs do, whichever core asked for it.
         auto job(ctx&, std::string name, std::chrono::milliseconds takes = 30ms) -> tools::backlog::runner {
             auto run_job = [this, name, takes](tools::services&, jobs::progress_log& progress,
-                                             std::string tree) -> coroutine::task<std::optional<tools::backlog::outcome>> {
+                                               std::string tree) -> coroutine::task<std::optional<tools::backlog::outcome>> {
                 ran.push_back(name);
                 trees.push_back(std::move(tree));
                 most = std::max(most, ++running);
@@ -64,12 +64,7 @@ namespace {
 
         // A dependency.fill entry as the gateway writes it: equal keys for equal selector and toolchain input, never cached.
         static auto fill(std::string key, std::string actor) -> tools::backlog::entry {
-            return {.key = key,
-                    .project = "app",
-                    .configuration = "dependencies",
-                    .operation = "dependencies",
-                    .actor = std::move(actor),
-                    .cacheable = false};
+            return {.key = key, .project = "app", .configuration = "dependencies", .operation = "dependencies", .actor = std::move(actor), .cacheable = false};
         }
 
         static auto built(const std::shared_ptr<tools::backlog::ticket>& t) -> const tools::config_result& {
@@ -167,13 +162,12 @@ namespace {
                 auto a = co_await h.queue.submit(0, entry("a", {"old-a"}), h.job(io, "a"));
                 auto b = co_await h.queue.submit(0, entry("b", {"old-b"}), h.job(io, "b"));
                 expect(co_await harness::done(io, a) && co_await harness::done(io, b));
-                auto run_operation = [&prepared](tools::services&, jobs::progress_log&, std::string tree) -> coroutine::task<std::optional<tools::backlog::outcome>> {
+                auto run_operation = [&prepared](tools::services&, jobs::progress_log&,
+                                                 std::string tree) -> coroutine::task<std::optional<tools::backlog::outcome>> {
                     prepared = tree;
                     co_return language::result{.status = "prepared", .worker = "w"};
                 };
-                auto p = co_await h.queue.submit(
-                    0, entry("prepare", {"old-b", "new"}),
-                    std::move(run_operation));
+                auto p = co_await h.queue.submit(0, entry("prepare", {"old-b", "new"}), std::move(run_operation));
                 expect(co_await harness::done(io, p));
                 auto c = co_await h.queue.submit(0, entry("c", {"new"}), h.job(io, "c"));
                 expect(co_await harness::done(io, c));
@@ -210,6 +204,7 @@ namespace {
                 expect(harness::built(second).timings.queue_seconds.value_or(-1) >= 0);
                 const auto& timing = harness::built(cached).timings;
                 expect(timing.sync_seconds == 0 && timing.queue_seconds == 0 && timing.worker_seconds == 0);
+                expect(timing.preparation_seconds == 0 && timing.execution_seconds == 0);
                 auto fresh = harness::entry("same", "z");
                 fresh.fresh = true;
                 auto again = co_await h.queue.submit(0, fresh, h.job(io, "fresh"));
@@ -250,8 +245,10 @@ namespace {
                     ++completed;
                 };
                 auto run_children = [&](coroutine::scope& children) -> coroutine::task<> {
-                    for (auto name : {"one", "two"}) children.spawn(flow(name));
-                    for (int n = 0; n < 400 && completed != 2; ++n) co_await execution::schedule_after(io, 5ms);
+                    for (auto name : {"one", "two"})
+                        children.spawn(flow(name));
+                    for (int n = 0; n < 400 && completed != 2; ++n)
+                        co_await execution::schedule_after(io, 5ms);
                     expect(completed == 2u);
                 };
                 co_await coroutine::with_scope(std::move(run_children));
@@ -292,18 +289,23 @@ namespace {
             auto exercise = [&](ctx& io) -> coroutine::task<> {
                 auto work = [&](tools::services&, jobs::progress_log&, std::string) -> coroutine::task<std::optional<tools::backlog::outcome>> {
                     started = true;
-                    struct finish { bool& value; ~finish() { value = true; } } finished{exited};
+                    struct finish {
+                        bool& value;
+                        ~finish() { value = true; }
+                    } finished{exited};
                     co_await execution::schedule_after(io, 5s);
                     completed = true;
                     co_return tools::config_result{.ok = true};
                 };
                 auto first = co_await h.queue.submit(0, harness::fill("cancel", "one"), work);
                 auto second = co_await h.queue.submit(0, harness::fill("cancel", "two"), work);
-                for (int n = 0; n < 400 && !started; ++n) co_await execution::schedule_after(io, 5ms);
+                for (int n = 0; n < 400 && !started; ++n)
+                    co_await execution::schedule_after(io, 5ms);
                 expect(started);
                 first->leave();
                 second->leave();
-                for (int n = 0; n < 400 && !exited; ++n) co_await execution::schedule_after(io, 5ms);
+                for (int n = 0; n < 400 && !exited; ++n)
+                    co_await execution::schedule_after(io, 5ms);
                 expect(exited && !completed);
                 auto next = co_await h.queue.submit(0, harness::entry("barrier", "three"), h.job(io, "barrier"));
                 expect(co_await harness::done(io, next));
@@ -315,13 +317,13 @@ namespace {
         "dependency publication failures are not cached as completed builds"_test = [] {
             harness h{1};
             auto exercise = [&](ctx& io) -> coroutine::task<> {
-                static constexpr auto run_operation = [](tools::services&, jobs::progress_log&, std::string) -> coroutine::task<std::optional<tools::backlog::outcome>> {
+                static constexpr auto run_operation = [](tools::services&, jobs::progress_log&,
+                                                         std::string) -> coroutine::task<std::optional<tools::backlog::outcome>> {
                     tools::config_result result{.configuration = "first", .worker = "w", .ok = true};
                     result.steps.push_back({.name = "install", .exit_code = 0, .cache_error = "publication failed"});
                     co_return result;
                 };
-                auto first = co_await h.queue.submit(0, harness::entry("publication", "x"),
-                    run_operation);
+                auto first = co_await h.queue.submit(0, harness::entry("publication", "x"), run_operation);
                 expect(co_await harness::done(io, first));
                 expect(harness::built(first).ok && harness::built(first).steps.front().cache_error == "publication failed");
                 auto retry = co_await h.queue.submit(0, harness::entry("publication", "x"), h.job(io, "retry"));
@@ -333,11 +335,11 @@ namespace {
         "export capture failures are not cached as completed builds"_test = [] {
             harness h{1};
             auto exercise = [&](ctx& io) -> coroutine::task<> {
-                static constexpr auto run_operation = [](tools::services&, jobs::progress_log&, std::string) -> coroutine::task<std::optional<tools::backlog::outcome>> {
+                static constexpr auto run_operation = [](tools::services&, jobs::progress_log&,
+                                                         std::string) -> coroutine::task<std::optional<tools::backlog::outcome>> {
                     co_return tools::config_result{.configuration = "first", .worker = "w", .ok = true, .export_error = "disk full"};
                 };
-                auto first = co_await h.queue.submit(0, harness::entry("export", "x"),
-                    run_operation);
+                auto first = co_await h.queue.submit(0, harness::entry("export", "x"), run_operation);
                 expect(co_await harness::done(io, first));
                 expect(harness::built(first).ok && harness::built(first).export_error == "disk full");
                 auto retry = co_await h.queue.submit(0, harness::entry("export", "x"), h.job(io, "retry"));
@@ -386,9 +388,7 @@ namespace {
                         co_return std::nullopt;
                     co_return tools::config_result{.configuration = "busy", .worker = "w", .ok = true};
                 };
-                auto held = co_await h.queue.submit(
-                    0, harness::entry("busy", "x"),
-                    std::move(run_operation));
+                auto held = co_await h.queue.submit(0, harness::entry("busy", "x"), std::move(run_operation));
                 expect(co_await harness::done(io, held) && harness::built(held).ok);
             };
             h.run(std::move(exercise));
@@ -439,7 +439,8 @@ namespace {
                 first.worldline = second.worldline = "main";
                 auto a = co_await h.queue.submit(0, first, h.job(io, "first"));
                 auto b = co_await h.queue.submit(0, second, h.job(io, "second"));
-                for (auto& ticket : {blocker, a, b}) expect(co_await harness::done(io, ticket) && harness::built(ticket).ok);
+                for (auto& ticket : {blocker, a, b})
+                    expect(co_await harness::done(io, ticket) && harness::built(ticket).ok);
             };
             h.run(std::move(exercise));
             expect((h.ran.size() == 3u) >> fatal);

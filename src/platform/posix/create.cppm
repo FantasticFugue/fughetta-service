@@ -26,7 +26,10 @@ namespace native_process {
             }
             engine->cancel_file(out);
             ::close(out);
-            if (exit >= 0) { engine->cancel_file(exit); ::close(exit); }
+            if (exit >= 0) {
+                engine->cancel_file(exit);
+                ::close(exit);
+            }
         }
         native_io::engine<concurrent::queue>* engine;
         int pid;
@@ -55,7 +58,7 @@ namespace native_process {
 
     namespace {
         [[noreturn]] void exec_child(char** args, char** envp, const char* dir, int out, int in, int file, const io::command& cmd, int parent,
-                                    int descriptor_bound) {
+                                     int descriptor_bound) {
             if (!posix::follow_parent(parent))
                 ::_exit(126);
             ::setpgid(0, 0);

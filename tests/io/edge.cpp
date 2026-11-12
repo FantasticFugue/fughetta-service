@@ -108,7 +108,9 @@ namespace {
             bytes.resize(transport::header_size + length, std::byte{0x5a});
         transport::channel<socket> channel{reader};
         auto run_children = [&](coroutine::scope& children) -> coroutine::task<> {
-            static constexpr auto run_child = [](socket& writer, std::vector<std::byte>& bytes) -> coroutine::task<> { co_await io::async_write(writer, bytes); };
+            static constexpr auto run_child = [](socket& writer, std::vector<std::byte>& bytes) -> coroutine::task<> {
+                co_await io::async_write(writer, bytes);
+            };
             children.spawn(run_child(writer, bytes));
             bool rejected = false;
             try {

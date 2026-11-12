@@ -66,12 +66,12 @@ export namespace execution {
 
     using experimental::execution::decay_arguments;
     using experimental::execution::ignore_completion;
+    using experimental::execution::transform_completion_signatures;
     using httpant::stdexec_ext::materialize;
     using httpant::stdexec_ext::now;
     using httpant::stdexec_ext::schedule_after;
     using httpant::stdexec_ext::schedule_at;
     using httpant::stdexec_ext::timed_scheduler;
-    using experimental::execution::transform_completion_signatures;
     using stdexec::associate;
     using stdexec::counting_scope;
     using stdexec::inline_scheduler;
@@ -209,9 +209,7 @@ export namespace execution {
         std::vector<std::thread> workers_;
     };
 
-    inline auto thread_pool::scheduler::sender::get_env() const noexcept {
-        return completes_on<scheduler, set_value_t, set_stopped_t>{scheduler{pool}};
-    }
+    inline auto thread_pool::scheduler::sender::get_env() const noexcept { return completes_on<scheduler, set_value_t, set_stopped_t>{scheduler{pool}}; }
 } // namespace execution
 
 export namespace logging {
@@ -434,8 +432,8 @@ export namespace io {
         template <network_scheduler Scheduler> struct connect_sender {
             using socket_type = socket_t<Scheduler>;
             using sender_concept = execution::sender_t;
-            using completion_signatures = execution::completion_signatures<execution::set_value_t(socket_type),
-                execution::set_error_t(std::error_code), execution::set_error_t(std::exception_ptr), execution::set_stopped_t()>;
+            using completion_signatures = execution::completion_signatures<execution::set_value_t(socket_type), execution::set_error_t(std::error_code),
+                                                                           execution::set_error_t(std::exception_ptr), execution::set_stopped_t()>;
             Scheduler scheduler;
             net::ip::tcp::endpoint to;
             template <execution::receiver R> struct operation {
@@ -456,16 +454,13 @@ export namespace io {
                             execution::set_error(std::move(owner->receiver), util::current_exception());
                         }
                     }
-                    template <class E> void set_error(E&& error) noexcept {
-                        execution::set_error(std::move(owner->receiver), std::forward<E>(error));
-                    }
+                    template <class E> void set_error(E&& error) noexcept { execution::set_error(std::move(owner->receiver), std::forward<E>(error)); }
                     void set_stopped() noexcept { execution::set_stopped(std::move(owner->receiver)); }
                 };
                 using work = decltype(async_connect(std::declval<socket_type&>(), std::declval<net::ip::tcp::endpoint>()));
                 using inner_operation = execution::connect_result_t<work, connected>;
                 std::optional<inner_operation> inner;
-                operation(Scheduler on, net::ip::tcp::endpoint endpoint, R r)
-                    : scheduler(std::move(on)), to(endpoint), receiver(std::move(r)) {}
+                operation(Scheduler on, net::ip::tcp::endpoint endpoint, R r) : scheduler(std::move(on)), to(endpoint), receiver(std::move(r)) {}
                 operation(operation&&) = delete;
                 void start() & noexcept {
                     try {
@@ -474,9 +469,7 @@ export namespace io {
                         socket->set_option(net::socket_base::keep_alive{true});
                         struct connecting {
                             operation* owner;
-                            operator inner_operation() {
-                                return execution::connect(async_connect(*owner->socket, owner->to), connected{owner});
-                            }
+                            operator inner_operation() { return execution::connect(async_connect(*owner->socket, owner->to), connected{owner}); }
                         };
                         inner.emplace(connecting{this});
                     } catch (...) {
@@ -486,11 +479,9 @@ export namespace io {
                     execution::start(*inner);
                 }
             };
-            template <execution::receiver R> auto connect(R receiver) && -> operation<R> {
-                return {std::move(scheduler), to, std::move(receiver)};
-            }
+            template <execution::receiver R> auto connect(R receiver) && -> operation<R> { return {std::move(scheduler), to, std::move(receiver)}; }
         };
-    }
+    } // namespace detail
     template <network_scheduler Scheduler> auto connect(Scheduler scheduler, net::ip::tcp::endpoint to) {
         return detail::connect_sender<Scheduler>{std::move(scheduler), to};
     }
@@ -738,8 +729,8 @@ export namespace cores {
         };
 
         template <class... Values> using call_value = execution::set_value_t(std::decay_t<Values>...);
-        template <class... Values> using call_signatures = execution::completion_signatures<Values...,
-            execution::set_error_t(std::exception_ptr), execution::set_stopped_t()>;
+        template <class... Values>
+        using call_signatures = execution::completion_signatures<Values..., execution::set_error_t(std::exception_ptr), execution::set_stopped_t()>;
 
         template <execution::scheduler Scheduler, class Make, bool CheckStop> struct call_sender;
         template <class Sender> struct make_sender {
@@ -947,8 +938,8 @@ export namespace cores {
             using sender_concept = execution::sender_t;
             Scheduler here, there;
             Make make;
-            template <class Self, class Env> static consteval auto get_completion_signatures()
-                -> execution::value_types_of_t<call_work<Scheduler, Make>, Env, call_value, call_signatures> {
+            template <class Self, class Env>
+            static consteval auto get_completion_signatures() -> execution::value_types_of_t<call_work<Scheduler, Make>, Env, call_value, call_signatures> {
                 return {};
             }
             template <execution::receiver R> auto connect(R receiver) && -> call_op<Scheduler, Make, R, CheckStop> {

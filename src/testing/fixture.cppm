@@ -28,7 +28,7 @@ export namespace fixture {
         options<"command">(build.builders.at("main")).operations.at(operation).argv = std::move(argv);
     }
     auto commands(std::vector<std::string> build, std::vector<std::string> prepare = {}, std::vector<std::string> test = {}, std::string cwd = "",
-                         std::vector<std::string> run = {}) -> builds::configuration {
+                  std::vector<std::string> run = {}) -> builds::configuration {
         builds::config<"command"> c;
         builds::configuration out;
         c.operations["build"] = {.argv = std::move(build), .working_dir = cwd};
@@ -128,13 +128,12 @@ export namespace fixture {
             auto observed = co_await tools::main_tree(s, in.project, actor);
             bool exists = std::ranges::contains(observed.files, in.path, &nodes::file_view::path);
             auto r = co_await tools::main_apply(s, in.project, actor, observed,
-                                                {tools::change{.kind = exists ? "write" : "create", .path = in.path, .text = in.content}},
-                                                in.operation_id, "write " + in.path, rfl::json::write(tools::record{input}));
+                                                {tools::change{.kind = exists ? "write" : "create", .path = in.path, .text = in.content}}, in.operation_id,
+                                                "write " + in.path, rfl::json::write(tools::record{input}));
             co_return tools::mutation{r.version, r.receipt, in.operation_id, r.replayed};
         };
         co_return co_await tools::once<tools::mutation>(
-            s, in.project, actor, std::optional<std::string>{in.operation_id}, input,
-            std::move(apply_once),
+            s, in.project, actor, std::optional<std::string>{in.operation_id}, input, std::move(apply_once),
             [&](const auto& done) { return tools::mutation{done.first.version, done.first.receipt, in.operation_id, true}; });
     }
 
@@ -174,8 +173,7 @@ export namespace fixture {
             co_return edit_output{done.version, done.receipt, in.operation_id, at.size(), done.replayed};
         };
         co_return co_await tools::once<edit_output>(
-            s, in.project, actor, std::optional<std::string>{in.operation_id}, input,
-            std::move(apply_once),
+            s, in.project, actor, std::optional<std::string>{in.operation_id}, input, std::move(apply_once),
             [&](const auto& done) { return edit_output{done.first.version, done.first.receipt, in.operation_id, done.second.replacements, true}; });
     }
 
@@ -189,8 +187,7 @@ export namespace fixture {
             co_return tools::mutation{r.version, r.receipt, in.operation_id, r.replayed};
         };
         co_return co_await tools::once<tools::mutation>(
-            s, in.project, actor, std::optional<std::string>{in.operation_id}, input,
-            std::move(apply_once),
+            s, in.project, actor, std::optional<std::string>{in.operation_id}, input, std::move(apply_once),
             [&](const auto& done) { return tools::mutation{done.first.version, done.first.receipt, in.operation_id, true}; });
     }
 
@@ -204,8 +201,7 @@ export namespace fixture {
             co_return tools::mutation{r.version, r.receipt, in.operation_id, r.replayed};
         };
         co_return co_await tools::once<tools::mutation>(
-            s, in.project, actor, std::optional<std::string>{in.operation_id}, input,
-            std::move(apply_once),
+            s, in.project, actor, std::optional<std::string>{in.operation_id}, input, std::move(apply_once),
             [&](const auto& done) { return tools::mutation{done.first.version, done.first.receipt, in.operation_id, true}; });
     }
 

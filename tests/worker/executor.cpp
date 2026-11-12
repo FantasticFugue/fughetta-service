@@ -30,16 +30,23 @@ namespace {
         return {.path = std::move(path), .digest = content::hash_of(text), .size = text.size(), .executable = exec};
     }
 
-    template <class F> void exercise(F work, std::optional<std::filesystem::path> dependency_cache = {},
-                                    std::optional<std::filesystem::path> dependency_upstream = {},
-                                    std::optional<std::filesystem::path> dependency_publish = {}, std::optional<builds::dependency_recipe> recipe = {}) {
+    template <class F>
+    void exercise(F work, std::optional<std::filesystem::path> dependency_cache = {}, std::optional<std::filesystem::path> dependency_upstream = {},
+                  std::optional<std::filesystem::path> dependency_publish = {}, std::optional<builds::dependency_recipe> recipe = {}) {
         test::scratch tmp{"executor"};
         cores::io_context<native::context> rt{2};
         execution::thread_pool disk{2};
-        replica::service service{
-            rt, {.root = tmp.dir / "cache", .worker = "worker-test", .env = {{"VALUE", "worker"}}, .inherit_env = false,
-                 .dependency_cache = dependency_cache, .dependency_upstream = dependency_upstream, .dependency_publish = dependency_publish,
-                 .dependency_recipe = recipe}, disk, 1};
+        replica::service service{rt,
+                                 {.root = tmp.dir / "cache",
+                                  .worker = "worker-test",
+                                  .env = {{"VALUE", "worker"}},
+                                  .inherit_env = false,
+                                  .dependency_cache = dependency_cache,
+                                  .dependency_upstream = dependency_upstream,
+                                  .dependency_publish = dependency_publish,
+                                  .dependency_recipe = recipe},
+                                 disk,
+                                 1};
         auto run_core = [&](ctx& io, std::size_t core) -> coroutine::task<> {
             if (core != 0)
                 co_return;
@@ -130,25 +137,33 @@ set(VCPKG_ENV_PASSTHROUGH_UNTRACKED PROBE_LEDGER)
                         ++ready;
                         const auto deadline = std::chrono::steady_clock::now() + 10s;
                         while (ready.load() != 2) {
-                            if (std::chrono::steady_clock::now() >= deadline) throw std::runtime_error("other publisher did not reach the start barrier");
+                            if (std::chrono::steady_clock::now() >= deadline)
+                                throw std::runtime_error("other publisher did not reach the start barrier");
                             co_await execution::schedule_after(io, 10ms);
                         }
-                        jobs::dependency_fill request{.manifest = builds::dependency_manifest(manifest),
-                            .triplet = "fug-cache-probe", .host_triplet = "x64-linux", .timeout_s = 100};
+                        jobs::dependency_fill request{
+                            .manifest = builds::dependency_manifest(manifest), .triplet = "fug-cache-probe", .host_triplet = "x64-linux", .timeout_s = 100};
                         auto result = co_await channel.call(request);
-                        if (!result) transport::raise_call_error(std::move(result.error()));
+                        if (!result)
+                            transport::raise_call_error(std::move(result.error()));
                         if (!result->ok() || !result->steps.front().cache_error.empty())
                             throw std::runtime_error(result->steps.front().output + result->steps.front().cache_error);
                         library = test::slurp(std::filesystem::path{result->tree} / "installed/fug-cache-probe/lib/libprobe.a");
                     };
                     exercise(std::move(run_operation), shared.dir / ("private-" + std::to_string(index)), {}, shared.dir / "published",
-                        builds::dependency_recipe{.executable = executable, .root = std::filesystem::path{executable}.parent_path().string(),
-                            .triplets = {"x64-linux", "fug-cache-probe"}, .overlay_ports = {(shared.dir / "ports").string()},
-                            .overlay_triplets = {(shared.dir / "triplets").string()},
-                            .env = {{"PATH", "/usr/local/bin:/usr/bin:/bin"}, {"HOME", std::getenv("HOME") ? std::getenv("HOME") : ""},
-                                {"VCPKG_FORCE_SYSTEM_BINARIES", "1"}, {"VCPKG_DISABLE_METRICS", "1"},
-                                {"VCPKG_DOWNLOADS", std::getenv("TEST_VCPKG_DOWNLOADS")}, {"PROBE_LEDGER", (shared.dir / "compiled").string()}},
-                            .timeout_s = 100, .offline = true});
+                             builds::dependency_recipe{.executable = executable,
+                                                       .root = std::filesystem::path{executable}.parent_path().string(),
+                                                       .triplets = {"x64-linux", "fug-cache-probe"},
+                                                       .overlay_ports = {(shared.dir / "ports").string()},
+                                                       .overlay_triplets = {(shared.dir / "triplets").string()},
+                                                       .env = {{"PATH", "/usr/local/bin:/usr/bin:/bin"},
+                                                               {"HOME", std::getenv("HOME") ? std::getenv("HOME") : ""},
+                                                               {"VCPKG_FORCE_SYSTEM_BINARIES", "1"},
+                                                               {"VCPKG_DISABLE_METRICS", "1"},
+                                                               {"VCPKG_DOWNLOADS", std::getenv("TEST_VCPKG_DOWNLOADS")},
+                                                               {"PROBE_LEDGER", (shared.dir / "compiled").string()}},
+                                                       .timeout_s = 100,
+                                                       .offline = true});
                     return library;
                 };
                 auto first = std::async(std::launch::async, worker, 1);
@@ -158,7 +173,8 @@ set(VCPKG_ENV_PASSTHROUGH_UNTRACKED PROBE_LEDGER)
                 expect(test::slurp(shared.dir / "compiled") == "compiled\n");
                 std::size_t archives = 0;
                 for (const auto& item : std::filesystem::recursive_directory_iterator(shared.dir / "published/vcpkg"))
-                    if (item.path().extension() == ".zip") ++archives;
+                    if (item.path().extension() == ".zip")
+                        ++archives;
                 expect(archives == 1_u);
             };
         } else {
@@ -188,9 +204,7 @@ set(VCPKG_ENV_PASSTHROUGH_UNTRACKED PROBE_LEDGER)
             test::scratch tmp{"expired-publication"};
             const auto cache = tmp.dir / "private", published = tmp.dir / "published";
             std::filesystem::create_directories(cache / "vcpkg");
-            expect(throws<std::runtime_error>([&] {
-                dependencies::publish(cache, published, std::chrono::steady_clock::now());
-            }));
+            expect(throws<std::runtime_error>([&] { dependencies::publish(cache, published, std::chrono::steady_clock::now()); }));
             expect(!std::filesystem::exists(published));
         };
         "trusted publisher only accepts selectors and preserves results on publication failure"_test = [] {
@@ -200,7 +214,8 @@ set(VCPKG_ENV_PASSTHROUGH_UNTRACKED PROBE_LEDGER)
             const auto relative = std::filesystem::path{"vcpkg/bb"} / (abi + ".zip");
             test::spit(cache / relative, "staged archive");
             auto recipe = recipe_script(tmp.dir, "printf done; exit 7");
-            recipe.env["EXPECTED"] = "clear;files," + (published / "vcpkg").generic_string() + ",read;files," + (cache / "vcpkg").generic_string() + ",readwrite";
+            recipe.env["EXPECTED"] =
+                "clear;files," + (published / "vcpkg").generic_string() + ",read;files," + (cache / "vcpkg").generic_string() + ",readwrite";
             auto run_operation = [&](auto& channel, auto&) -> coroutine::task<> {
                 expect(!(co_await channel.call(jobs::sync_offer{"app", {}})).has_value());
                 expect(!(co_await channel.call(jobs::source_bytes{{blob("tenant bytes")}})).has_value());
@@ -235,12 +250,16 @@ set(VCPKG_ENV_PASSTHROUGH_UNTRACKED PROBE_LEDGER)
             auto run_operation = [&](auto& channel, auto&) -> coroutine::task<> {
                 content::manifest tree;
                 co_await channel.call(jobs::sync_offer{"app", tree});
-                auto result = co_await channel.call(jobs::build_request{.project = "app", .snapshot = tree.id(),
-                    .steps = {{.name = "sources", .argv = {test::shell(), "-c", "printf '%s' \"$VCPKG_BINARY_SOURCES\""},
-                        .env = {{"VCPKG_BINARY_SOURCES", "clear;files,${cache:vcpkg},readwrite"}}}}});
+                auto result =
+                    co_await channel.call(jobs::build_request{.project = "app",
+                                                              .snapshot = tree.id(),
+                                                              .steps = {{.name = "sources",
+                                                                         .argv = {test::shell(), "-c", "printf '%s' \"$VCPKG_BINARY_SOURCES\""},
+                                                                         .env = {{"VCPKG_BINARY_SOURCES", "clear;files,${cache:vcpkg},readwrite"}}}}});
                 expect(result.has_value() >> fatal);
                 expect(result->ok());
-                expect(result->steps.front().output == "clear;files," + (upstream / "vcpkg").generic_string() + ",read;files," + (cache / "vcpkg").generic_string() + ",readwrite");
+                expect(result->steps.front().output ==
+                       "clear;files," + (upstream / "vcpkg").generic_string() + ",read;files," + (cache / "vcpkg").generic_string() + ",readwrite");
                 expect(!std::filesystem::exists(upstream));
                 expect(std::filesystem::is_directory(cache / "vcpkg"));
             };
@@ -256,7 +275,7 @@ set(VCPKG_ENV_PASSTHROUGH_UNTRACKED PROBE_LEDGER)
                 expect(result.has_value() >> fatal);
                 expect(result->ok() && result->steps.front().cache_error.empty());
                 expect(result->steps.front().output == "clear;files," + (shared.dir / "vcpkg").generic_string() + ",read;files," +
-                    (root / "cache/publisher/dependencies/vcpkg").generic_string() + ",readwrite");
+                                                           (root / "cache/publisher/dependencies/vcpkg").generic_string() + ",readwrite");
                 expect(!std::filesystem::exists(shared.dir / relative));
                 expect(test::slurp(root / "cache/dependencies" / relative) == "old untrusted archive");
             };
@@ -266,21 +285,26 @@ set(VCPKG_ENV_PASSTHROUGH_UNTRACKED PROBE_LEDGER)
             test::scratch shared{"dependency-overlap"};
             const auto cache = shared.dir / "cache";
             for (bool publishing : {false, true}) {
-            auto run_operation = [&](auto& channel, auto& root) -> coroutine::task<> {
-                content::manifest tree;
-                if (!publishing) co_await channel.call(jobs::sync_offer{"app", tree});
-                auto result = publishing ? co_await channel.call(jobs::dependency_fill{}) : co_await channel.call(jobs::build_request{.project = "app", .snapshot = tree.id(),
-                    .steps = {{.name = "install", .argv = {test::shell(), "-c", "touch installed"},
-                        .env = {{"VCPKG_BINARY_SOURCES", "clear;files,${cache:vcpkg},readwrite"}}}}});
-                expect(!result.has_value() >> fatal);
-                const auto* failure = std::get_if<jobs::failure>(&result.error());
-                expect((failure != nullptr) >> fatal);
-                expect(failure->message.contains("must not overlap"));
-                expect(!std::filesystem::exists(cache));
-                expect(!std::filesystem::exists(root / "cache/trees/app/default/installed"));
-            };
-            exercise(std::move(run_operation), cache, publishing ? std::nullopt : std::optional{cache}, publishing ? std::optional{cache} : std::nullopt,
-                publishing ? std::optional{recipe_script(shared.dir, "touch installed")} : std::nullopt);
+                auto run_operation = [&](auto& channel, auto& root) -> coroutine::task<> {
+                    content::manifest tree;
+                    if (!publishing)
+                        co_await channel.call(jobs::sync_offer{"app", tree});
+                    auto result = publishing ? co_await channel.call(jobs::dependency_fill{})
+                                             : co_await channel.call(
+                                                   jobs::build_request{.project = "app",
+                                                                       .snapshot = tree.id(),
+                                                                       .steps = {{.name = "install",
+                                                                                  .argv = {test::shell(), "-c", "touch installed"},
+                                                                                  .env = {{"VCPKG_BINARY_SOURCES", "clear;files,${cache:vcpkg},readwrite"}}}}});
+                    expect(!result.has_value() >> fatal);
+                    const auto* failure = std::get_if<jobs::failure>(&result.error());
+                    expect((failure != nullptr) >> fatal);
+                    expect(failure->message.contains("must not overlap"));
+                    expect(!std::filesystem::exists(cache));
+                    expect(!std::filesystem::exists(root / "cache/trees/app/default/installed"));
+                };
+                exercise(std::move(run_operation), cache, publishing ? std::nullopt : std::optional{cache}, publishing ? std::optional{cache} : std::nullopt,
+                         publishing ? std::optional{recipe_script(shared.dir, "touch installed")} : std::nullopt);
             }
         };
         "dependency cache lock waiting respects the build deadline and releases for retry"_test = [] {
@@ -289,13 +313,18 @@ set(VCPKG_ENV_PASSTHROUGH_UNTRACKED PROBE_LEDGER)
             auto run_operation = [&](auto& channel, auto& root) -> coroutine::task<> {
                 content::manifest tree;
                 co_await channel.call(jobs::sync_offer{"app", tree});
-                jobs::build_request request{.project = "app", .snapshot = tree.id(),
-                    .steps = {{.name = "install", .argv = {test::shell(), "-c", "printf ready > installed; printf installed"},
-                        .env = {{"VCPKG_BINARY_SOURCES", "clear;files,${cache:vcpkg},readwrite"}}}}, .timeout_s = 1};
+                jobs::build_request request{.project = "app",
+                                            .snapshot = tree.id(),
+                                            .steps = {{.name = "install",
+                                                       .argv = {test::shell(), "-c", "printf ready > installed; printf installed"},
+                                                       .env = {{"VCPKG_BINARY_SOURCES", "clear;files,${cache:vcpkg},readwrite"}},
+                                                       .preparation = true}},
+                                            .timeout_s = 1};
                 const auto start = std::chrono::steady_clock::now();
                 auto blocked = co_await channel.call(request);
                 expect(blocked.has_value() >> fatal);
                 expect(!blocked->ok() && blocked->steps.at(0).timed_out);
+                expect(blocked->preparation_seconds.value_or(-1) > 0 && blocked->execution_seconds == 0);
                 expect(blocked->steps.at(0).output.contains("shared vcpkg cache lock held by another install"));
                 expect(std::chrono::steady_clock::now() - start < 3s);
                 expect(!std::filesystem::exists(root / "cache/trees/app/default/installed"));
@@ -313,9 +342,13 @@ set(VCPKG_ENV_PASSTHROUGH_UNTRACKED PROBE_LEDGER)
             auto run_operation = [&](auto& channel, auto& root, replica::service&, ctx& io) -> coroutine::task<> {
                 content::manifest tree;
                 co_await channel.call(jobs::sync_offer{"app", tree});
-                jobs::build_request request{.project = "app", .snapshot = tree.id(),
-                    .steps = {{.name = "install", .argv = {test::shell(), "-c", "printf ready > installed; printf installed"},
-                        .env = {{"VCPKG_BINARY_SOURCES", "clear;files,${cache:vcpkg},readwrite"}}}}, .timeout_s = 5};
+                jobs::build_request request{.project = "app",
+                                            .snapshot = tree.id(),
+                                            .steps = {{.name = "install",
+                                                       .argv = {test::shell(), "-c", "printf ready > installed; printf installed"},
+                                                       .env = {{"VCPKG_BINARY_SOURCES", "clear;files,${cache:vcpkg},readwrite"}},
+                                                       .preparation = true}},
+                                            .timeout_s = 5};
                 const auto installed = root / "cache/trees/app/default/installed";
                 auto run_timers_2 = [&](coroutine::scope& timers) -> coroutine::task<> {
                     static constexpr auto run_child = [](ctx& io, auto& held, const auto& installed) -> coroutine::task<> {
@@ -360,10 +393,16 @@ set(VCPKG_ENV_PASSTHROUGH_UNTRACKED PROBE_LEDGER)
                     content::manifest tree;
                     const auto project = "project-" + std::to_string(worker);
                     co_await channel.call(jobs::sync_offer{project, tree});
-                    jobs::build_request request{.project = project, .snapshot = tree.id(),
-                        .steps = {{.name = "cache probe", .argv = {test::shell(), "-c",
-                            R"(cache="${VCPKG_BINARY_SOURCES#clear;files,}"; cache="${cache%,readwrite}"; test -f "$cache/package" || printf compiled > "$cache/package"; cat "$cache/package")"},
-                            .env = {{"VCPKG_BINARY_SOURCES", "clear;files,${cache:vcpkg},readwrite"}}}}, .fresh = true};
+                    jobs::build_request request{
+                        .project = project,
+                        .snapshot = tree.id(),
+                        .steps =
+                            {{.name = "cache probe",
+                              .argv =
+                                  {test::shell(), "-c",
+                                   R"(cache="${VCPKG_BINARY_SOURCES#clear;files,}"; cache="${cache%,readwrite}"; test -f "$cache/package" || printf compiled > "$cache/package"; cat "$cache/package")"},
+                              .env = {{"VCPKG_BINARY_SOURCES", "clear;files,${cache:vcpkg},readwrite"}}}},
+                        .fresh = true};
                     auto result = co_await channel.call(request);
                     expect(result.has_value() >> fatal);
                     expect(result->ok() && result->steps.front().output == "compiled");
@@ -376,11 +415,16 @@ set(VCPKG_ENV_PASSTHROUGH_UNTRACKED PROBE_LEDGER)
             static constexpr auto run_operation = [](auto& channel, auto&) -> coroutine::task<> {
                 content::manifest tree;
                 expect((co_await channel.call(jobs::sync_offer{"app", tree})).has_value());
-                auto report = co_await channel.call(jobs::build_request{.project = "app", .snapshot = tree.id(),
-                    .steps = {{.name = "first", .argv = {test::shell(), "-c", "printf first-complete-output"}},
-                              {.name = "failed", .argv = {test::shell(), "-c", "printf second-failure-output; exit 7"}}}, .output_limit = 4});
+                auto report = co_await channel.call(
+                    jobs::build_request{.project = "app",
+                                        .snapshot = tree.id(),
+                                        .steps = {{.name = "first", .argv = {test::shell(), "-c", "printf first-complete-output"}, .preparation = true},
+                                                  {.name = "failed", .argv = {test::shell(), "-c", "printf second-failure-output; exit 7"}}},
+                                        .output_limit = 4});
                 expect(report.has_value() >> fatal);
                 expect(!report->ok() && report->steps.size() == 2u);
+                expect(report->preparation_seconds.value_or(-1) >= report->steps[0].seconds);
+                expect(report->execution_seconds.value_or(-1) >= report->steps[1].seconds);
                 const std::array expected{"first-complete-output", "second-failure-output"};
                 for (std::size_t index = 0; index < report->steps.size(); ++index) {
                     const auto& step = report->steps[index];
@@ -398,10 +442,12 @@ set(VCPKG_ENV_PASSTHROUGH_UNTRACKED PROBE_LEDGER)
             test::scratch tmp{"runner-logs"};
             cores::io_context<native::context> rt{1};
             auto run_core = [&](ctx& io, std::size_t) -> coroutine::task<> {
-                auto capped = co_await ::runner::run_step(io, {.argv = {test::shell(), "-c", "printf abcdef; exit 7"}, .cwd = tmp.dir}, 5s, 4, "capped", tmp.dir / "capped.log", 3);
+                auto capped = co_await ::runner::run_step(io, {.argv = {test::shell(), "-c", "printf abcdef; exit 7"}, .cwd = tmp.dir}, 5s, 4, "capped",
+                                                          tmp.dir / "capped.log", 3);
                 expect(capped.exit_code == 7 && capped.truncated && capped.log_truncated) << capped.exit_code << capped.output << capped.log_error;
                 expect(test::slurp(tmp.dir / "capped.log") == "abc");
-                auto failed = co_await ::runner::run_step(io, {.argv = {test::shell(), "-c", "printf kept; exit 7"}, .cwd = tmp.dir}, 5s, 100, "failed", tmp.dir / "missing/log");
+                auto failed = co_await ::runner::run_step(io, {.argv = {test::shell(), "-c", "printf kept; exit 7"}, .cwd = tmp.dir}, 5s, 100, "failed",
+                                                          tmp.dir / "missing/log");
                 expect(failed.exit_code == 7 && failed.output == "kept" && !failed.log_error.empty()) << failed.exit_code << failed.output << failed.log_error;
             };
             rt.run(std::move(run_core));
@@ -412,10 +458,10 @@ set(VCPKG_ENV_PASSTHROUGH_UNTRACKED PROBE_LEDGER)
                 content::manifest manifest{{entry("output.bin", "stable output")}};
                 auto plan = co_await channel.call(jobs::sync_offer{"app", manifest});
                 co_await channel.call(jobs::source_bytes{{blob("stable output")}});
-                auto report = co_await channel.call(jobs::build_request{.project = "app", .snapshot = plan->snapshot,
-                    .exports = {{"binary", "output.bin"}}});
+                auto report = co_await channel.call(jobs::build_request{.project = "app", .snapshot = plan->snapshot, .exports = {{"binary", "output.bin"}}});
                 expect(report->ok() && report->exports.size() == 1u);
-                if (report->exports.size() != 1) throw std::runtime_error("worker did not return exported file");
+                if (report->exports.size() != 1)
+                    throw std::runtime_error("worker did not return exported file");
                 test::spit(root / "cache/trees/app/default/output.bin", "changed tree");
                 auto bytes = co_await channel.call(jobs::export_read{report->exports.front().digest});
                 expect(bytes->parts.size() == 1u);
@@ -428,9 +474,10 @@ set(VCPKG_ENV_PASSTHROUGH_UNTRACKED PROBE_LEDGER)
             static constexpr auto run_operation = [](auto& channel, auto&) -> coroutine::task<> {
                 content::manifest tree;
                 co_await channel.call(jobs::sync_offer{"app", tree});
-                jobs::build_request request{.project = "app", .snapshot = tree.id(),
-                    .steps = {{.name = "run", .argv = {test::shell(), "-c", "printf crash-report > crash.txt; exit 7"}}},
-                    .exports = {{"crash", "crash.txt"}, {"absent", "not-produced/app"}}};
+                jobs::build_request request{.project = "app",
+                                            .snapshot = tree.id(),
+                                            .steps = {{.name = "run", .argv = {test::shell(), "-c", "printf crash-report > crash.txt; exit 7"}}},
+                                            .exports = {{"crash", "crash.txt"}, {"absent", "not-produced/app"}}};
                 auto failed = co_await channel.call(request);
                 expect(failed.has_value() >> fatal);
                 expect(!failed->ok() && failed->steps.size() == 1u && failed->steps.front().exit_code == 7);
@@ -637,14 +684,15 @@ set(VCPKG_ENV_PASSTHROUGH_UNTRACKED PROBE_LEDGER)
                 expect(first.has_value() && first->stored == 0u);
                 auto last = co_await channel.call(jobs::source_bytes{{part("hello", 2, 3, "hello")}});
                 expect(last.has_value() && last->stored == 1u);
-                jobs::build_request request{
-                    .project = "app",
-                    .tree = "debug",
-                    .snapshot = tree.id(),
-                    .steps = {{.name = "first", .argv = {test::shell(), "-c", "cat input.txt; echo $VALUE; echo output > artifact"}, .env = {{"VALUE", "step"}}},
-                              {.name = "fail", .argv = {test::shell(), "-c", "exit 3"}},
-                              {.name = "unreached", .argv = {test::shell(), "-c", "echo bad > unreached"}}},
-                    .env = {{"VALUE", "build"}}};
+                jobs::build_request request{.project = "app",
+                                            .tree = "debug",
+                                            .snapshot = tree.id(),
+                                            .steps = {{.name = "first",
+                                                       .argv = {test::shell(), "-c", "cat input.txt; echo $VALUE; echo output > artifact"},
+                                                       .env = {{"VALUE", "step"}}},
+                                                      {.name = "fail", .argv = {test::shell(), "-c", "exit 3"}},
+                                                      {.name = "unreached", .argv = {test::shell(), "-c", "echo bad > unreached"}}},
+                                            .env = {{"VALUE", "build"}}};
                 auto report = co_await channel.call(request);
                 expect(report.has_value() >> fatal);
                 expect(report->worker == "worker-test" && report->steps.size() == 2u);

@@ -12,15 +12,21 @@ namespace {
                 test::scratch tmp{"directory-collision"};
                 nodes::local_node node{tmp.dir};
                 expect(node.initialize().code == "ok");
-                auto call = [&](nodes::node_request request) { request.owner = node.node_id(); return node.call(request); };
+                auto call = [&](nodes::node_request request) {
+                    request.owner = node.node_id();
+                    return node.call(request);
+                };
                 auto op = [](std::string_view value) { return content::hash_of(value).str(); };
-                auto seed = call({.action = "apply", .operation = op("seed"),
-                                  .edits = {{.kind = "create", .path = "src/a", .text = "source"}}});
+                auto seed = call({.action = "apply", .operation = op("seed"), .edits = {{.kind = "create", .path = "src/a", .text = "source"}}});
                 expect((seed.code == "ok") >> fatal);
-                auto placed = call({.action = "apply", .operation = op("placed"), .expected = seed.frontier,
+                auto placed = call({.action = "apply",
+                                    .operation = op("placed"),
+                                    .expected = seed.frontier,
                                     .edits = {{.kind = "create", .path = occupied, .text = "concurrent"}}});
                 expect((placed.code == "ok") >> fatal);
-                auto moved = call({.action = "apply", .operation = op("move"), .expected = seed.frontier,
+                auto moved = call({.action = "apply",
+                                   .operation = op("move"),
+                                   .expected = seed.frontier,
                                    .edits = {{.kind = "directory_move", .path = "src", .target = "out"}}});
                 expect(moved.code == (occupied == "out/b" ? "ok" : "source_conflict")) << moved.reason;
                 auto result = call({.action = "inspect"});
@@ -37,22 +43,29 @@ namespace {
                 test::scratch tmp{"path-collision"};
                 nodes::local_node node{tmp.dir};
                 expect(node.initialize().code == "ok");
-                auto call = [&](nodes::node_request request) { request.owner = node.node_id(); return node.call(request); };
+                auto call = [&](nodes::node_request request) {
+                    request.owner = node.node_id();
+                    return node.call(request);
+                };
                 auto op = [](std::string_view value) { return content::hash_of(value).str(); };
                 auto seed = call({.action = "apply", .operation = op("seed"), .edits = {{.kind = "create", .path = "seed", .text = "base"}}});
                 const std::string first = nested_first ? "out/log.txt" : "out", second = nested_first ? "out" : "out/log.txt";
-                auto placed = call({.action = "apply", .operation = op("first"), .expected = seed.frontier,
-                                    .edits = {{.kind = "create", .path = first, .text = "first"}}});
+                auto placed = call(
+                    {.action = "apply", .operation = op("first"), .expected = seed.frontier, .edits = {{.kind = "create", .path = first, .text = "first"}}});
                 expect((placed.code == "ok") >> fatal);
                 for (const auto& observed : {seed.frontier, placed.frontier}) {
-                    auto refused = call({.action = "apply", .operation = op("second" + std::to_string(observed == seed.frontier)), .expected = observed,
+                    auto refused = call({.action = "apply",
+                                         .operation = op("second" + std::to_string(observed == seed.frontier)),
+                                         .expected = observed,
                                          .edits = {{.kind = "create", .path = second, .text = "second"}}});
                     expect(refused.code == "source_conflict") << refused.reason;
                 }
-                auto moved = call({.action = "apply", .operation = op("move"), .expected = seed.frontier,
-                                   .edits = {{.kind = "move", .path = "seed", .target = second}}});
+                auto moved = call(
+                    {.action = "apply", .operation = op("move"), .expected = seed.frontier, .edits = {{.kind = "move", .path = "seed", .target = second}}});
                 expect(moved.code == "source_conflict");
-                auto replaced = call({.action = "apply", .operation = op("replace"), .expected = placed.frontier,
+                auto replaced = call({.action = "apply",
+                                      .operation = op("replace"),
+                                      .expected = placed.frontier,
                                       .edits = {{.kind = "remove", .path = first}, {.kind = "create", .path = second, .text = "replacement"}}});
                 expect(replaced.code == "ok") << replaced.reason;
                 expect(call({.action = "inspect"}).conflicts.empty());
@@ -63,15 +76,18 @@ namespace {
             test::scratch tmp{"optimistic"};
             nodes::local_node node{tmp.dir};
             expect(node.initialize().code == "ok");
-            auto call = [&](nodes::node_request request) { request.owner = node.node_id(); return node.call(request); };
+            auto call = [&](nodes::node_request request) {
+                request.owner = node.node_id();
+                return node.call(request);
+            };
             auto op = [](std::string_view value) { return content::hash_of(value).str(); };
             auto seed = call({.action = "apply", .operation = op("seed"), .edits = {{.kind = "create", .path = "x", .text = "abcd"}}});
             expect((seed.code == "ok") >> fatal) << seed.reason;
             auto first = call({.action = "apply",
-                                    .operation = op("a"),
-                                    .actor = "alice",
-                                    .expected = seed.frontier,
-                                    .edits = {{.kind = "edit", .path = "x", .text = "A", .offset = 0, .count = 1}}});
+                               .operation = op("a"),
+                               .actor = "alice",
+                               .expected = seed.frontier,
+                               .edits = {{.kind = "edit", .path = "x", .text = "A", .offset = 0, .count = 1}}});
             expect((first.code == "ok") >> fatal) << first.reason;
             nodes::node_request request{.action = "apply",
                                         .operation = op("b"),
@@ -88,10 +104,10 @@ namespace {
             expect(replay.replayed && replay.written_version == second.written_version);
             // Bob continued editing before the merged reply could be written locally.
             auto continued = call({.action = "apply",
-                                        .operation = op("continued"),
-                                        .actor = "bob",
-                                        .expected = own.frontier,
-                                        .edits = {{.kind = "edit", .path = "x", .text = "B", .offset = 1, .count = 1}}});
+                                   .operation = op("continued"),
+                                   .actor = "bob",
+                                   .expected = own.frontier,
+                                   .edits = {{.kind = "edit", .path = "x", .text = "B", .offset = 1, .count = 1}}});
             expect(continued.code == "ok");
             expect(call({.action = "inspect", .revision = continued.version}).files.front().text == "ABcZ");
             for (const auto action : {"lock", "unlock", "locks"})

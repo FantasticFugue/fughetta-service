@@ -9,8 +9,7 @@ import content;
 export namespace builds {
     inline auto absolute_path(std::string_view value) -> bool {
         return value.starts_with('/') || value.starts_with("\\\\") ||
-               (value.size() > 2 && std::isalpha(static_cast<unsigned char>(value[0])) && value[1] == ':' &&
-                (value[2] == '/' || value[2] == '\\'));
+               (value.size() > 2 && std::isalpha(static_cast<unsigned char>(value[0])) && value[1] == ':' && (value[2] == '/' || value[2] == '\\'));
     }
 
     using environment = std::map<std::string, std::string>;
@@ -62,6 +61,7 @@ export namespace builds {
         std::optional<std::string> standard_output;
         // A provider-authored description, never an executable command for the publisher.
         std::optional<dependency_input> dependencies;
+        bool preparation = false;
     };
     struct artifact {
         std::string type;

@@ -210,15 +210,20 @@ export namespace nodes {
         // is allocated, bounded by the two tree heights. Matching root keys above
         // keep the allocation-free recursive path for ordinary value changes.
         template <class F> static void compare_frontiers(pointer a, pointer b, F& f) {
-            struct frame { pointer node; bool row = false; };
+            struct frame {
+                pointer node;
+                bool row = false;
+            };
             std::vector<frame> left{{std::move(a)}}, right{{std::move(b)}};
             auto expand = [](auto& stack) {
                 auto p = std::move(stack.back().node);
                 stack.pop_back();
                 ensure(p);
-                if (p->right) stack.push_back({p->right});
+                if (p->right)
+                    stack.push_back({p->right});
                 stack.push_back({p, true});
-                if (p->left) stack.push_back({p->left});
+                if (p->left)
+                    stack.push_back({p->left});
             };
             while (!left.empty() || !right.empty()) {
                 if (!left.empty() && !right.empty() && !left.back().row && !right.back().row) {
@@ -232,12 +237,20 @@ export namespace nodes {
                     // Expose the lower-priority treap root first so unchanged
                     // children can meet as whole subtrees on both frontiers.
                     const auto order = rank(x) <=> rank(y);
-                    if (order <= 0) expand(left);
-                    if (order >= 0) expand(right);
+                    if (order <= 0)
+                        expand(left);
+                    if (order >= 0)
+                        expand(right);
                     continue;
                 }
-                if (!left.empty() && !left.back().row) { expand(left); continue; }
-                if (!right.empty() && !right.back().row) { expand(right); continue; }
+                if (!left.empty() && !left.back().row) {
+                    expand(left);
+                    continue;
+                }
+                if (!right.empty() && !right.back().row) {
+                    expand(right);
+                    continue;
+                }
                 if (right.empty() || (!left.empty() && left.back().node->item.first < right.back().node->item.first)) {
                     const auto& x = left.back().node->item;
                     f(x.first, &x.second, static_cast<const T*>(nullptr));
@@ -249,7 +262,8 @@ export namespace nodes {
                 } else {
                     const auto& x = left.back().node->item;
                     const auto& y = right.back().node->item;
-                    if (x.second != y.second) f(x.first, &x.second, &y.second);
+                    if (x.second != y.second)
+                        f(x.first, &x.second, &y.second);
                     left.pop_back();
                     right.pop_back();
                 }

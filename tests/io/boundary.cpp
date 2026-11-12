@@ -233,9 +233,7 @@ namespace {
                 expect(!failure);
                 expect(failure.error() == std::errc::permission_denied);
             };
-            start_destroying(
-                run_operation(),
-                observed);
+            start_destroying(run_operation(), observed);
             expect(observed.result == channel::value);
         };
 

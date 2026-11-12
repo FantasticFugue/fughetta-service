@@ -387,8 +387,7 @@ export namespace routing {
         }
 
         static auto tools_met(const member& m, const requirements& needs) -> bool {
-            return m.hello.dependency_publisher == needs.dependency_publisher &&
-                   (!needs.toolchain_id || *needs.toolchain_id == m.hello.toolchain_id) &&
+            return m.hello.dependency_publisher == needs.dependency_publisher && (!needs.toolchain_id || *needs.toolchain_id == m.hello.toolchain_id) &&
                    std::ranges::all_of(needs.tools, [&](const std::string& t) { return std::ranges::contains(m.hello.tools, t); });
         }
 

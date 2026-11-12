@@ -115,8 +115,9 @@ export namespace replica {
                 const auto parent = root_ / "discarded";
                 std::filesystem::create_directories(parent);
                 static std::atomic<std::uint64_t> next{0};
-                do { retired = parent / std::to_string(next.fetch_add(1)); }
-                while (!std::filesystem::create_directory(retired));
+                do {
+                    retired = parent / std::to_string(next.fetch_add(1));
+                } while (!std::filesystem::create_directory(retired));
                 std::filesystem::rename(dir, retired / "tree");
             }
             std::filesystem::remove(manifest_path(key));
@@ -124,14 +125,18 @@ export namespace replica {
         }
 
         static void discard(const std::filesystem::path& path) {
-            if (path.empty()) return;
+            if (path.empty())
+                return;
             std::error_code ec;
             auto status = std::filesystem::symlink_status(path, ec);
-            if (ec) return;
-            if (!std::filesystem::exists(status)) return;
+            if (ec)
+                return;
+            if (!std::filesystem::exists(status))
+                return;
             if (std::filesystem::is_directory(status)) {
                 std::filesystem::permissions(path, std::filesystem::perms::owner_all, std::filesystem::perm_options::add, ec);
-                if (ec) return;
+                if (ec)
+                    return;
                 auto it = std::filesystem::directory_iterator(path, ec);
                 while (!ec && it != std::filesystem::directory_iterator{}) {
                     discard(it->path());

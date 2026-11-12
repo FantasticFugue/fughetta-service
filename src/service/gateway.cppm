@@ -23,11 +23,12 @@ namespace gateway {
         using socket = native::socket;
         using listener = native::listener;
 
-        node(config::document doc, std::optional<std::filesystem::path> file, cores::context<native::scheduler>& rt, std::filesystem::path executable = {}, std::atomic<bool>* interrupted = nullptr)
-            : interrupted_(interrupted), executable_(std::move(executable)), doc_(doc), server_(doc.server), rt_(rt), control_(doc.runtime, doc.revisions.runtime),
-              io_pool_(allocation::distribute(doc.runtime).gateway_disk), hub_(rt, config::store(std::move(doc), std::move(file)), io_pool_),
-              identities_(server_.storage, server_.auth.workspace), router_(rt, routing::stale_after, &hub_),
-              files_(rt, server_.storage, hub_, io_pool_, io::parse_endpoint(server_.source)) {
+        node(config::document doc, std::optional<std::filesystem::path> file, cores::context<native::scheduler>& rt, std::filesystem::path executable = {},
+             std::atomic<bool>* interrupted = nullptr)
+            : interrupted_(interrupted), executable_(std::move(executable)), doc_(doc), server_(doc.server), rt_(rt),
+              control_(doc.runtime, doc.revisions.runtime), io_pool_(allocation::distribute(doc.runtime).gateway_disk),
+              hub_(rt, config::store(std::move(doc), std::move(file)), io_pool_), identities_(server_.storage, server_.auth.workspace),
+              router_(rt, routing::stale_after, &hub_), files_(rt, server_.storage, hub_, io_pool_, io::parse_endpoint(server_.source)) {
             files_.changed = [this] { hub_.events().publish(6); };
             identities_.changed = [this] { hub_.events().publish(1); };
             for (std::size_t c = 0; c < rt.size(); ++c)
@@ -92,7 +93,8 @@ namespace gateway {
                 if (interrupted_ && interrupted_->load()) {
                     control_.drain();
                     daemon::publish(daemon::phase::draining);
-                    if (!deadline) deadline = std::chrono::steady_clock::now() + std::chrono::seconds{5};
+                    if (!deadline)
+                        deadline = std::chrono::steady_clock::now() + std::chrono::seconds{5};
                     if ((control_.idle() && queue_->idle()) || std::chrono::steady_clock::now() >= *deadline) {
                         daemon::publish(daemon::phase::stopping);
                         rt_.stop();

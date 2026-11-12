@@ -26,27 +26,28 @@ namespace {
     using ctx = native::scheduler;
     auto worker_loop(ctx& io, std::uint16_t port, replica::service& worker) -> coroutine::task<> {
         auto run_operation = [&]() -> coroutine::task<> {
-        auto sock = co_await io::connect(io, {net::ip::address_v4{{127, 0, 0, 1}}, port});
-        transport::channel<native::socket> chan{sock};
-        transport::dispatcher<native::socket> dispatch;
-        worker.install(dispatch, 0);
-        co_await chan.post(jobs::hello{.name = "source-test-worker",
-                                       .platform = {.os = "linux", .arch = "x86_64"},
-                                       .max_inflight = 4,
-                                       .protocol = jobs::protocol_version,
-                                       .tools = host::detect_tools(test::toolset()), .toolchain_id = std::string(64, 'a')});
-        auto run_handlers = [&](coroutine::scope& handlers) -> coroutine::task<> {
-            static constexpr auto run_child = [](ctx& io, auto& channel) -> coroutine::task<> {
-                for (;;) {
-                    co_await execution::schedule_after(io, 2s);
-                    co_await channel.post(jobs::heartbeat{});
-                }
+            auto sock = co_await io::connect(io, {net::ip::address_v4{{127, 0, 0, 1}}, port});
+            transport::channel<native::socket> chan{sock};
+            transport::dispatcher<native::socket> dispatch;
+            worker.install(dispatch, 0);
+            co_await chan.post(jobs::hello{.name = "source-test-worker",
+                                           .platform = {.os = "linux", .arch = "x86_64"},
+                                           .max_inflight = 4,
+                                           .protocol = jobs::protocol_version,
+                                           .tools = host::detect_tools(test::toolset()),
+                                           .toolchain_id = std::string(64, 'a')});
+            auto run_handlers = [&](coroutine::scope& handlers) -> coroutine::task<> {
+                static constexpr auto run_child = [](ctx& io, auto& channel) -> coroutine::task<> {
+                    for (;;) {
+                        co_await execution::schedule_after(io, 2s);
+                        co_await channel.post(jobs::heartbeat{});
+                    }
+                };
+                handlers.spawn(run_child(io, chan));
+                for (;;)
+                    handlers.spawn(dispatch.handle(chan, co_await chan.recv()));
             };
-            handlers.spawn(run_child(io, chan));
-            for (;;)
-                handlers.spawn(dispatch.handle(chan, co_await chan.recv()));
-        };
-        co_await coroutine::with_scope(std::move(run_handlers));
+            co_await coroutine::with_scope(std::move(run_handlers));
         };
         co_await worker.run(0, run_operation());
     }
@@ -57,8 +58,7 @@ namespace {
             std::uint64_t offset = 0;
             do {
                 auto result = tools::worldline::render_read(file, offset, {}, 5);
-                expect(result.total_scalars == 5u && result.text->size() <= 5u &&
-                       result.data_base64 == tools::lines::base64(*result.text));
+                expect(result.total_scalars == 5u && result.text->size() <= 5u && result.data_base64 == tools::lines::base64(*result.text));
                 expect(*result.next_offset > offset);
                 joined += *result.text;
                 offset = *result.next_offset;
@@ -74,7 +74,8 @@ namespace {
             auto whole = tools::worldline::render_read(file, {}, {}, 0);
             expect(whole.text == file.text && !whole.offset && !whole.truncated);
             file.text = std::string(255, 'a') + "😀";
-            for (unsigned i = 0; i < 300; ++i) file.text += "é";
+            for (unsigned i = 0; i < 300; ++i)
+                file.text += "é";
             file.text += "Z";
             auto boundary = tools::worldline::render_read(file, 256, 3, 6);
             expect(boundary.text == "ééé" && boundary.count == 3u && boundary.total_scalars == 557u);
@@ -82,7 +83,9 @@ namespace {
             expect(tail.text == "Z" && tail.next_offset == 557u && tail.truncated == false);
             file.text.clear();
             expect(tools::worldline::render_read(file, 0, {}, 10).text == std::string{});
-            file.kind = "binary"; file.text = "00ff"; file.encoding = "hex";
+            file.kind = "binary";
+            file.text = "00ff";
+            file.encoding = "hex";
             auto binary = tools::worldline::render_read(file, {}, {}, 0);
             expect(binary.data_base64 == "AP8=" && binary.size == 2u && !binary.text);
             expect(throws<tools::tool_error>([&] { tools::worldline::render_read(file, 0, 1, 32); }));
@@ -139,8 +142,9 @@ namespace {
                         co_await execution::schedule_after(io, 1ms);
                     auto line = [&](tools::worldline::input in) -> coroutine::task<tools::worldline::output> {
                         in.project = std::string{"app"};
-                        if (!in.worldline.value()) in.worldline = std::string{"main"};
-                        co_return co_await tools::worldline::run(services, std::move(in), note, tester);
+                        if (!in.worldline.value())
+                            in.worldline = std::string{"main"};
+                        co_return co_await tools::worldline::run(services, {}, std::move(in), note, tester);
                     };
                     auto refused = [&](auto run) -> coroutine::task<std::string> {
                         try {
@@ -161,11 +165,8 @@ namespace {
                     expect(read.content == "hello "
                                            "source\n" &&
                            read.version == written.version);
-                    auto edit_input = fixture::edit_input{.project = "app",
-                                                          .path = "src/message.txt",
-                                                          .old_string = "hello",
-                                                          .new_string = "hello again",
-                                                          .operation_id = "text-edit"};
+                    auto edit_input = fixture::edit_input{
+                        .project = "app", .path = "src/message.txt", .old_string = "hello", .new_string = "hello again", .operation_id = "text-edit"};
                     auto edited = co_await fixture::edit_text(services, edit_input, note, tester);
                     auto repeated = co_await fixture::edit_text(services, edit_input, note, tester);
                     expect(!edited.replayed && repeated.replayed && repeated.receipt == edited.receipt);
@@ -176,33 +177,35 @@ namespace {
                                                              "source\n",
                                                   .operation_id = "write-3"},
                                                  note, tester);
-                    auto first = co_await tools::build::run(services, {.project = "app", .worldline = std::string{"main"}}, note, tester);
+                    auto first = co_await tools::build::run(services, {}, {.project = "app", .worldline = std::string{"main"}}, note, tester);
                     expect(first.ok && first.results.at(0).steps.at(0).output == "hello source\n") << config::write(first);
                     expect(first.results.at(0).bytes_sent == 13u && first.worldline == "main");
-                    auto cached = co_await tools::build::run(services, {.project = "app", .worldline = std::string{"main"}}, note, tester);
+                    auto cached = co_await tools::build::run(services, {}, {.project = "app", .worldline = std::string{"main"}}, note, tester);
                     expect(cached.ok &&
                            cached.results.at(0).steps.at(0).output == "hello "
                                                                       "source\n" &&
                            cached.results.at(0).bytes_sent == 13u)
                         << "an equal build answers from the first one's result";
-                    auto fresh = co_await tools::build::run(services, {.project = "app", .worldline = std::string{"main"}, .fresh = true}, note, tester);
+                    auto fresh = co_await tools::build::run(services, {}, {.project = "app", .worldline = std::string{"main"}, .fresh = true}, note, tester);
                     expect(fresh.ok && fresh.results.at(0).bytes_sent == 0u) << "a fresh build runs again, on the worker that has the files";
-                    auto pinned = co_await tools::build::run(services, {.project = "app", .worldline = std::string{"main"}, .version = first.revision}, note, tester);
+                    auto pinned =
+                        co_await tools::build::run(services, {}, {.project = "app", .worldline = std::string{"main"}, .version = first.revision}, note, tester);
                     co_await fixture::edit_text(
-                        services, {.project = "app", .path = "src/message.txt", .old_string = "hello", .new_string = "goodbye", .operation_id = "edit-4"},
-                        note, tester);
-                    auto changed = co_await tools::build::run(services, {.project = "app", .worldline = std::string{"main"}}, note, tester);
+                        services, {.project = "app", .path = "src/message.txt", .old_string = "hello", .new_string = "goodbye", .operation_id = "edit-4"}, note,
+                        tester);
+                    auto changed = co_await tools::build::run(services, {}, {.project = "app", .worldline = std::string{"main"}}, note, tester);
                     expect(changed.ok && changed.results.at(0).steps.at(0).output == "goodbye "
                                                                                      "source\n");
                     expect(changed.results.at(0).bytes_sent == 15u);
-                    auto older = co_await tools::build::run(services, {.project = "app", .worldline = std::string{"main"}, .version = pinned.revision}, note, tester);
+                    auto older = co_await tools::build::run(services, {}, {.project = "app", .worldline = std::string{"main"}, .version = pinned.revision},
+                                                            note, tester);
                     expect(older.ok && older.results.at(0).steps.at(0).output == "hello source\n") << "a named version builds exactly that version";
                     auto hits = co_await fixture::search_files(services, {.project = "app", .query = "source"}, note, tester);
                     expect(hits.matches.size() == 1u && hits.matches.at(0).path == "src/message.txt");
                     auto listed = co_await fixture::list_files(services, {.project = "app"}, note, tester);
                     expect(listed.files.size() == 1u);
-                    co_await fixture::move_file(services, {.project = "app", .from = "src/message.txt", .to = "src/moved.txt", .operation_id = "move-5"},
-                                                note, tester);
+                    co_await fixture::move_file(services, {.project = "app", .from = "src/message.txt", .to = "src/moved.txt", .operation_id = "move-5"}, note,
+                                                tester);
                     auto moved = co_await fixture::read_file(services, {.project = "app", .path = "src/moved.txt"}, note, tester);
                     expect(moved.content == "goodbye source\n");
                     auto run_operation_24 = [&]() -> coroutine::task<> {
@@ -219,21 +222,21 @@ namespace {
                     expect(oversized == "resource_limit") << oversized;
                     co_await fixture::write_file(
                         services, {.project = "app", .path = "big.bin", .content = std::string(9u << 20, 'z'), .operation_id = "write-8"}, note, tester);
-                    auto multipart = co_await tools::build::run(services, {.project = "app", .worldline = std::string{"main"}}, note, tester);
+                    auto multipart = co_await tools::build::run(services, {}, {.project = "app", .worldline = std::string{"main"}}, note, tester);
                     expect(!multipart.ok && multipart.results.at(0).bytes_sent == (9u << 20));
                     co_await fixture::remove_file(services, {.project = "app", .path = "big.bin", .operation_id = "remove-9"}, note, tester);
                     auto history = co_await registry.with_ledger(0, [](usage::ledger& ledger, const auto&) { return ledger.builds("app", 20); });
                     expect(history.size() == 4u && std::filesystem::exists(tmp.dir / "state/.source-usage/events.jsonl"))
                         << "builds equal to earlier ones ran once: " << history.size();
-                    co_await fixture::move_file(services, {.project = "app", .from = "src/moved.txt", .to = "src/message.txt", .operation_id = "move-10"},
-                                                note, tester);
+                    co_await fixture::move_file(services, {.project = "app", .from = "src/moved.txt", .to = "src/message.txt", .operation_id = "move-10"}, note,
+                                                tester);
                     auto wa = co_await line({.action = "fork", .name = std::string{"agent-a"}, .operation_id = std::string{"fork-a"}});
                     auto wb = co_await line({.action = "fork", .name = std::string{"agent-b"}, .operation_id = std::string{"fork-b"}});
                     expect(wa.version == wb.version);
                     auto other = tester;
                     other.user = "build-reader";
                     other.caller = "build-reader";
-                    auto shared_build = co_await tools::build::run(services, {.project = "app", .worldline = "agent-a"}, note, other);
+                    auto shared_build = co_await tools::build::run(services, {}, {.project = "app", .worldline = "agent-a"}, note, other);
                     expect(shared_build.ok && shared_build.revision == wa.version && shared_build.worldline == "agent-a");
                     expect(shared_build.results.at(0).snapshot == wa.version);
                     auto shared_calls = co_await registry.with_ledger(0, [](usage::ledger& ledger, const auto&) { return ledger.events(0, 10000); });
@@ -269,9 +272,9 @@ namespace {
                     std::vector<tools::mutation> answers;
                     std::vector<std::string> failures;
                     auto run_both = [&](coroutine::scope& both) -> coroutine::task<> {
-                        for (int i = 0; i < 2; ++i)
-                            {
-                            static constexpr auto run_child = [](auto& services, auto in, auto& note, auto& tester, auto& answers, auto& failures) -> coroutine::task<> {
+                        for (int i = 0; i < 2; ++i) {
+                            static constexpr auto run_child = [](auto& services, auto in, auto& note, auto& tester, auto& answers,
+                                                                 auto& failures) -> coroutine::task<> {
                                 try {
                                     answers.push_back(co_await fixture::write_file(services, std::move(in), note, tester));
                                 } catch (const tools::tool_error& e) {
@@ -304,8 +307,9 @@ namespace {
                     with_limits({.max_file_bytes = 64, .max_project_bytes = 100});
                     auto tiny = [&](tools::worldline::input in) -> coroutine::task<tools::worldline::output> {
                         in.project = std::string{"tiny"};
-                        if (!in.worldline.value()) in.worldline = std::string{"main"};
-                        co_return co_await tools::worldline::run(services, std::move(in), note, tester);
+                        if (!in.worldline.value())
+                            in.worldline = std::string{"main"};
+                        co_return co_await tools::worldline::run(services, {}, std::move(in), note, tester);
                     };
                     co_await fixture::write_file(services, {.project = "tiny", .path = "full.txt", .content = std::string(64, 'x'), .operation_id = "write-14"},
                                                  note, tester);
@@ -408,7 +412,9 @@ namespace {
                     auto beyond = co_await refused(std::move(run_operation_16));
                     expect(beyond == "resource_limit") << beyond;
                     auto run_operation_15 = [&]() -> coroutine::task<> {
-                        co_await tools::worldline::run(services, {.project = "full", .action = "export", .package = std::string{"copy"}, .worldline = std::string{"main"}}, note, tester);
+                        co_await tools::worldline::run(
+                            services, {}, {.project = "full", .action = "export", .package = std::string{"copy"}, .worldline = std::string{"main"}}, note,
+                            tester);
                     };
                     auto exported_full = co_await refused(std::move(run_operation_15));
                     expect(exported_full == "resource_limit") << "an export counts toward the workspace's storage: " << exported_full;
@@ -449,7 +455,7 @@ namespace {
                         language::request ask{.build = analysis_build};
                         ask.config = analysis;
                         ask.worldline = "main";
-                        auto first = co_await tools::prepare(services, "app", "Db", ask, tester);
+                        auto first = co_await tools::prepare(services, {}, "app", "Db", ask, tester);
                         expect(first.status == "prepared" && first.worker == "source-test-worker") << config::write(first);
                         expect(first.inputs.size() == 1u && first.artifacts.size() == 1u && first.tree.contains("replica"));
                         expect(first.analysis == "failed" && first.analysis_error.has_value()) << "the survey's failure is reported";
@@ -464,7 +470,7 @@ namespace {
                         language::request cancelling{.build = slow_build};
                         cancelling.config = slow;
                         cancelling.worldline = "main";
-                        auto cancelled = co_await coroutine::deadline(io, 1s, tools::prepare(services, "app", "Slow", cancelling, tester));
+                        auto cancelled = co_await coroutine::deadline(io, 1s, tools::prepare(services, {}, "app", "Slow", cancelling, tester));
                         expect(!cancelled); // A worker
                         // preparation cannot
                         // rewrite tracked
@@ -486,7 +492,7 @@ namespace {
                         language::request rewriting{.build = mutating_build};
                         rewriting.config = mutating;
                         rewriting.worldline = "main";
-                        auto refused = co_await tools::prepare(services, "app", "Rewrite", rewriting, tester);
+                        auto refused = co_await tools::prepare(services, {}, "app", "Rewrite", rewriting, tester);
                         expect(refused.status == "worker_failed" && refused.error.contains("changed tracked file")) << config::write(refused);
                         co_await fixture::write_file(services,
                                                      {.project = "app",
@@ -545,8 +551,8 @@ while True:
                         config.set(0, std::make_shared<const config::document>(std::move(with_query)));
                         tools::language_query::output diagnostic, symbols;
                         auto query = [&](std::string action, tools::language_query::output& out) -> coroutine::task<> {
-                            out =
-                                co_await tools::language_query::run(services, {.project = "app", .worldline = std::string{"main"}, .configuration = "Query", .action = action}, note, tester);
+                            out = co_await tools::language_query::run(
+                                services, {}, {.project = "app", .worldline = std::string{"main"}, .configuration = "Query", .action = action}, note, tester);
                         };
                         auto run_calls = [&](coroutine::scope& calls) -> coroutine::task<> {
                             calls.spawn(query("diagnostics", diagnostic));
@@ -555,32 +561,40 @@ while True:
                         };
                         co_await coroutine::with_scope(std::move(run_calls));
                         expect(diagnostic.analyzed && !diagnostic.stale);
+                        expect(diagnostic.timings.preparation_seconds == 0 && diagnostic.timings.execution_seconds.value_or(-1) > 0);
                         expect(diagnostic.diagnostics && diagnostic.diagnostics->size() == 1u);
                         if (diagnostic.diagnostics && !diagnostic.diagnostics->empty())
                             expect(diagnostic.diagnostics->front().message == "fixture diagnostic");
                         expect(symbols.analyzed);
                         auto jobs = co_await queue.list(0);
                         expect(std::ranges::count(jobs, std::string{"Query"}, &tools::backlog::view::configuration) == 1);
-                        auto cached = co_await tools::language_query::run(services, {.project = "app", .worldline = std::string{"main"}, .configuration = "Query"}, note, tester);
+                        auto cached = co_await tools::language_query::run(
+                            services, {}, {.project = "app", .worldline = std::string{"main"}, .configuration = "Query"}, note, tester);
                         expect(cached.analyzed && cached.diagnostics && cached.diagnostics->size() == 1u);
-                        auto branch = co_await line({.action="fork", .name=std::string{"cache-branch"}, .operation_id=std::string{"cache-fork"}});
+                        auto branch = co_await line({.action = "fork", .name = std::string{"cache-branch"}, .operation_id = std::string{"cache-fork"}});
                         auto reader = tester;
                         reader.user = "cache-reader";
                         reader.caller = "cache-reader";
-                        auto shared = co_await tools::language_query::run(services,
-                            {.project="app",.worldline="cache-branch",.configuration="Query"},note,reader);
-                        expect(shared.analyzed && shared.version==branch.version);
-                        auto records = co_await registry.with_ledger(0, [](usage::ledger& ledger, const auto&) { return ledger.events(0,10000); });
-                        expect(std::ranges::any_of(records.events,[&](const auto& event) {
-                            return event.call && event.call->actor==worlds::identity_key(reader) && event.call->worldline=="cache-branch" && event.call->reuse=="cache";
+                        auto shared = co_await tools::language_query::run(
+                            services, {.client_sync_seconds = 0.125}, {.project = "app", .worldline = "cache-branch", .configuration = "Query"}, note, reader);
+                        expect(shared.analyzed && shared.version == branch.version);
+                        expect(shared.timings.client_sync_seconds == 0.125);
+                        expect(shared.timings.preparation_seconds == 0 && shared.timings.execution_seconds == 0);
+                        auto records = co_await registry.with_ledger(0, [](usage::ledger& ledger, const auto&) { return ledger.events(0, 10000); });
+                        expect(std::ranges::any_of(records.events, [&](const auto& event) {
+                            return event.call && event.call->actor == worlds::identity_key(reader) && event.call->worldline == "cache-branch" &&
+                                   event.call->reuse == "cache" && event.call->timings.client_sync_seconds == 0.125;
                         })) << "a cache hit keeps the new caller and worldline in its own record";
 
-                        auto warm = co_await tools::build::run(services, {.project = "app", .configurations = std::vector<std::string>{"Query"}, .worldline = std::string{"main"}}, note, tester);
+                        auto warm = co_await tools::build::run(
+                            services, {}, {.project = "app", .configurations = std::vector<std::string>{"Query"}, .worldline = std::string{"main"}}, note,
+                            tester);
                         expect(warm.ok && warm.results.front().steps.front().output.contains("warm build tree"));
                         auto changed_environment = *config.current(0);
                         changed_environment.projects.at("app").build_configurations.at("Query").env["ANALYSIS_ENV"] = "changed";
                         config.set(0, std::make_shared<const config::document>(std::move(changed_environment)));
-                        auto refreshed = co_await tools::language_query::run(services, {.project = "app", .worldline = std::string{"main"}, .configuration = "Query"}, note, tester);
+                        auto refreshed = co_await tools::language_query::run(
+                            services, {}, {.project = "app", .worldline = std::string{"main"}, .configuration = "Query"}, note, tester);
                         expect(refreshed.analyzed && refreshed.environment != cached.environment);
                         auto activity = co_await registry.with_ledger(0, [](usage::ledger& ledger, const auto&) { return ledger.builds("app", 100); });
                         expect(std::ranges::count_if(activity,
@@ -590,13 +604,27 @@ while True:
                             << "shared preparation is admitted and recorded once; changed inputs run again";
                         bool invalid_symbol = false;
                         try {
-                            co_await tools::language_query::run(services,
-                                {.project = "app", .worldline = std::string{"main"}, .configuration = "Query", .action = "definitions", .path = "analysis.c", .symbol = "absent"}, note, tester);
-                        } catch (const tools::tool_error& error) { invalid_symbol = error.code == "invalid_record"; }
+                            co_await tools::language_query::run(services, {},
+                                                                {.project = "app",
+                                                                 .worldline = std::string{"main"},
+                                                                 .configuration = "Query",
+                                                                 .action = "definitions",
+                                                                 .path = "analysis.c",
+                                                                 .symbol = "absent"},
+                                                                note, tester);
+                        } catch (const tools::tool_error& error) {
+                            invalid_symbol = error.code == "invalid_record";
+                        }
                         expect(invalid_symbol);
                         for (const auto& action : {"definitions", "references"}) {
-                            auto locations = co_await tools::language_query::run(services,
-                                {.project = "app", .worldline = std::string{"main"}, .configuration = "Query", .action = action, .path = "analysis.c", .symbol = "probe"}, note, tester);
+                            auto locations = co_await tools::language_query::run(services, {},
+                                                                                 {.project = "app",
+                                                                                  .worldline = std::string{"main"},
+                                                                                  .configuration = "Query",
+                                                                                  .action = action,
+                                                                                  .path = "analysis.c",
+                                                                                  .symbol = "probe"},
+                                                                                 note, tester);
                             const auto& found = std::string_view{action} == "definitions" ? locations.definitions : locations.references;
                             expect(locations.analyzed && found && found->size() == 1u);
                             if (found && !found->empty())
@@ -610,7 +638,8 @@ while True:
                         config.set(0, std::make_shared<const config::document>(std::move(denied)));
                         bool limited = false;
                         try {
-                            co_await tools::language_query::run(services, {.project = "app", .worldline = std::string{"main"}, .configuration = "Query"}, note, tester);
+                            co_await tools::language_query::run(services, {}, {.project = "app", .worldline = std::string{"main"}, .configuration = "Query"},
+                                                                note, tester);
                         } catch (const tools::tool_error& error) {
                             limited = error.code == "resource_limit";
                         }
@@ -619,7 +648,9 @@ while True:
                         for (auto action : {"plan", "prepare", "receipt"}) {
                             bool denied = false;
                             try {
-                                co_await tools::language_query::run(services, {.project = "app", .worldline = std::string{"main"}, .configuration = "Query", .action = action}, note, tester);
+                                co_await tools::language_query::run(
+                                    services, {}, {.project = "app", .worldline = std::string{"main"}, .configuration = "Query", .action = action}, note,
+                                    tester);
                             } catch (const tools::tool_error& error) {
                                 denied = error.code == "invalid_record";
                             }
@@ -629,14 +660,12 @@ while True:
                         config.set(0, roomy);
                     }
                     tools::standard::bound box{services};
-                    auto malformed = co_await box.call(
-                        "build", rfl::json::read<rfl::Generic>(R"({"project":"app","fresh":"not-a-boolean"})").value(),
-                        note, tester);
+                    auto malformed =
+                        co_await box.call("build", rfl::json::read<rfl::Generic>(R"({"project":"app","fresh":"not-a-boolean"})").value(), note, tester);
                     expect(malformed.error && malformed.text.contains(R"("code":"invalid_record")")) << malformed.text;
                     auto run_operation_14 = [&]() -> coroutine::task<> {
                         co_await tools::generate_globally(services, "app",
-                                                          templates::expand(templates::arguments{.template_id = "cpp-class", .name = "Anonymous"}), tester,
-                                                          "");
+                                                          templates::expand(templates::arguments{.template_id = "cpp-class", .name = "Anonymous"}), tester, "");
                     };
                     auto anonymous = co_await refused(std::move(run_operation_14));
                     expect(anonymous == "invalid_record") << "a generation names its operation ID";
@@ -665,17 +694,17 @@ while True:
                         co_await line({.action = "read", .worldline = std::string{"agent-a"}, .version = wa.version, .path = std::string{"src/message.txt"}});
                     expect(content.data_base64 == std::optional<std::string>{"Z29vZGJ5ZSBzb3VyY2UK"} && content.size == std::optional<std::uint64_t>{15u})
                         << "a pinned version stays readable after the worldline moves";
-                    auto built_a = co_await tools::build::run(services, {.project = "app", .worldline = "agent-a"}, note, tester);
-                    auto built_b = co_await tools::build::run(services, {.project = "app", .worldline = "agent-b"}, note, tester);
+                    auto built_a = co_await tools::build::run(services, {}, {.project = "app", .worldline = "agent-a"}, note, tester);
+                    auto built_b = co_await tools::build::run(services, {}, {.project = "app", .worldline = "agent-b"}, note, tester);
                     expect(built_a.ok && built_a.results.at(0).steps.at(0).output == "worldline a\n");
                     expect(built_b.ok && built_b.results.at(0).steps.at(0).output == "goodbye "
                                                                                      "source\n");
-                    auto warm_a = co_await tools::build::run(services, {.project = "app", .worldline = "agent-a", .fresh = true}, note, tester);
+                    auto warm_a = co_await tools::build::run(services, {}, {.project = "app", .worldline = "agent-a", .fresh = true}, note, tester);
                     expect(warm_a.ok && warm_a.results.at(0).bytes_sent == 0u);
                     auto main_read = co_await fixture::read_file(services, {.project = "app", .path = "src/message.txt"}, note, tester);
                     expect(main_read.content == "goodbye source\n");
                     auto run_operation_13 = [&]() -> coroutine::task<> {
-                        co_await tools::language_query::run(services, {.project = "app", .worldline = "agent-a", .action = "diagnostics"}, note, tester);
+                        co_await tools::language_query::run(services, {}, {.project = "app", .worldline = "agent-a", .action = "diagnostics"}, note, tester);
                     };
                     auto analysis = co_await refused(std::move(run_operation_13));
                     expect(analysis == "invalid_record") << "a project without an analysis configuration has nothing to query";
@@ -701,7 +730,7 @@ while True:
                                                                               .text = std::string{"int helper(void) { return 0; }"
                                                                                                   "\n"}}}});
                     auto compiled = co_await tools::build::run(
-                        services, {.project = "app", .configurations = std::vector<std::string>{"Dev"}, .worldline = "agent-a"}, note, tester);
+                        services, {}, {.project = "app", .configurations = std::vector<std::string>{"Dev"}, .worldline = "agent-a"}, note, tester);
                     expect(compiled.ok) << config::write(compiled);
                     expect(compiled.ok >> fatal);
                     std::filesystem::path object;
@@ -719,7 +748,7 @@ while True:
                                                                           .text = std::string{"int helper(void) { return 1; }"
                                                                                               "\n"}}}});
                     auto incremental = co_await tools::build::run(
-                        services, {.project = "app", .configurations = std::vector<std::string>{"Dev"}, .worldline = "agent-a"}, note, tester);
+                        services, {}, {.project = "app", .configurations = std::vector<std::string>{"Dev"}, .worldline = "agent-a"}, note, tester);
                     expect(incremental.ok && incremental.snapshot != compiled.snapshot);
                     expect(incremental.results.at(0).bytes_sent == std::string_view{"int helper(void) { "
                                                                                     "return 1; }\n"}
@@ -1065,8 +1094,8 @@ while True:
                     co_await fixture::remove_file(services, {.project = "app", .path = "src/other.txt", .operation_id = "other-gone"}, note,
                                                   tester); // Reusing an operation ID with another input remains invalid.
                     const worlds::actor rival{.issuer = "token", .user = "rival", .caller = "test-suite", .role = "member"};
-                    auto member_write = co_await fixture::write_file(services,
-                        {.project="app",.path="src/rival.txt",.content="first\n",.operation_id="rival"},note,rival);
+                    auto member_write = co_await fixture::write_file(
+                        services, {.project = "app", .path = "src/rival.txt", .content = "first\n", .operation_id = "rival"}, note, rival);
                     expect(!member_write.replayed) << "members publish without scope locks";
                     auto run_operation = [&]() -> coroutine::task<> {
                         co_await fixture::write_file(services,

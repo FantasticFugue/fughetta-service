@@ -12,8 +12,8 @@ namespace durability {
         // Normalize the file first: a component like "x:executable" is parsed as a drive-relative path.
         auto stream = winapi::path(path);
         stream += L":executable";
-        winapi::handle file{::CreateFileW(stream.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
-                                          OPEN_EXISTING, 0, nullptr)};
+        winapi::handle file{
+            ::CreateFileW(stream.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING, 0, nullptr)};
         if (file.value == INVALID_HANDLE_VALUE) {
             auto error = ::GetLastError();
             if (error == ERROR_FILE_NOT_FOUND)
@@ -34,8 +34,8 @@ namespace durability {
                 winapi::fail("clear executable metadata");
             return;
         }
-        winapi::handle file{::CreateFileW(stream.c_str(), GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
-                                          CREATE_ALWAYS, FILE_FLAG_WRITE_THROUGH, nullptr)};
+        winapi::handle file{::CreateFileW(stream.c_str(), GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, CREATE_ALWAYS,
+                                          FILE_FLAG_WRITE_THROUGH, nullptr)};
         if (file.value == INVALID_HANDLE_VALUE)
             winapi::fail("create executable metadata");
         DWORD count = 0;

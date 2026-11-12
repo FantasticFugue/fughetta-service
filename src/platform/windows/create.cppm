@@ -177,9 +177,7 @@ namespace native_process {
     auto child::id() const noexcept -> int { return static_cast<int>(state_->pid); }
     auto child::output() const noexcept -> native_io::handle { return reinterpret_cast<native_io::handle>(state_->out.value); }
     auto child::input() const noexcept -> native_io::handle { return reinterpret_cast<native_io::handle>(state_->in.value); }
-    void child::close_input() noexcept {
-        state_->close_stream(state_->in);
-    }
+    void child::close_input() noexcept { state_->close_stream(state_->in); }
     auto child::reaped() const noexcept -> bool { return state_->reaped; }
     void child::terminate() noexcept {
         if (!state_->reaped)
