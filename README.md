@@ -39,8 +39,10 @@ httpant is fetched from the head of its main branch with `FetchContent` until
 it has a vcpkg port, and built as a subproject, so its module BMIs use this
 build's compiler; set
 `FETCHCONTENT_SOURCE_DIR_HTTPANT` to build a local checkout instead. The
-remaining dependencies come from the builtin vcpkg registry. Dependencies build
-with xclang through the triplets in `cmake/triplets`.
+remaining dependencies come from the builtin vcpkg registry at the
+microsoft/vcpkg baseline in `vcpkg-configuration.json`; the vcpkg checkout must
+contain that commit. The toolchain writes the dependency triplet for the target
+into the build directory, so dependencies build with the same xclang.
 `cmake/toolchain.cmake` reads two environment variables: `XCLANG_ROOT` names
 the xclang tree and `VCPKG_ROOT` the vcpkg checkout. `XCLANG_TARGET` selects the
 target, the host's by default. `CMakePresets.json` places each build in
