@@ -32,7 +32,7 @@ namespace {
             routing::router router{rt};
             execution::thread_pool gateway_disk{2}, source_disk{2};
             source_server::service source{rt, tmp.dir / "source", source_disk};
-            rt.run([&](ctx& io, std::size_t) -> coroutine::task<> {
+            auto run_core = [&](ctx& io, std::size_t) -> coroutine::task<> {
                 auto listener = native::listener{io, {net::ip::address_v4::loopback(), 0}};
                 storage::registry files{rt, tmp.dir / "state", config, gateway_disk,
                                         net::ip::tcp::endpoint{net::ip::address_v4{{127, 0, 0, 1}}, listener.local_endpoint().port()}};
@@ -41,13 +41,15 @@ namespace {
                 services.queue = &queue;
                 mcp::notifier note;
                 const worlds::actor tester{.issuer = "token", .user = "tester", .caller = "suite", .role = "owner"};
-                co_await coroutine::with_scope([&](coroutine::scope& tasks) -> coroutine::task<> {
+                auto run_tasks = [&](coroutine::scope& tasks) -> coroutine::task<> {
                     tasks.spawn(queue.serve(io));
-                    tasks.spawn([](ctx& io, auto& listener, auto& service, auto& tasks) -> coroutine::task<> {
-                        for (;;)
-                            tasks.spawn(service.serve(
-                                io, co_await execution::then(net::async_accept(listener), [](auto socket, auto) { return std::move(socket); }), 0));
-                    }(io, listener, source, tasks));
+                    static constexpr auto run_child = [](ctx& io, auto& listener, auto& service, auto& tasks) -> coroutine::task<> {
+                        for (;;) {
+                            auto [connection, peer] = co_await net::async_accept(listener);
+                            tasks.spawn(service.serve(io, std::move(connection), 0));
+                        }
+                    };
+                    tasks.spawn(run_child(io, listener, source, tasks));
                     tools::standard::bound toolbox{services};
                     expect(std::ranges::none_of(toolbox.list(), [](const auto& tool) { return tool.name == "jobs"; }));
                     expect(toolbox.list().size() == 9u);
@@ -76,8 +78,10 @@ namespace {
                     auto read = co_await fixture::read_file(services, {.project = "app", .path = "src/a.cpp"}, note, tester);
                     expect(read.content == "int alpha;\n");
                     expect(!std::filesystem::exists(tmp.dir / "state/app"));
-                });
-            });
+                };
+                co_await coroutine::with_scope(std::move(run_tasks));
+            };
+            rt.run(std::move(run_core));
         };
 
         "node RPCs refuse callers without a role and retain capture results in source storage"_test = [] {

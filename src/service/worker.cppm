@@ -108,13 +108,14 @@ namespace worker {
             transport::channel<S> chan{stream};
             transport::dispatcher<S> serve;
             builds_.install(serve, core);
-            serve.template on<jobs::hash_file>([this, &io](jobs::hash_file job, auto&) -> coroutine::task<jobs::digest> {
+            auto handle_hash_file = [this, &io](jobs::hash_file job, auto&) -> coroutine::task<jobs::digest> {
                 if (cfg_.dependency_publish) throw std::invalid_argument("dependency publishers only accept dependency.fill");
                 auto out = co_await offload(io, [this, job = std::move(job)] { return hash(job); });
                 if (!out)
                     throw std::runtime_error(out.error());
                 co_return *out;
-            });
+            };
+            serve.template on<jobs::hash_file>(std::move(handle_hash_file));
             co_await chan.post(jobs::hello{.name = name_,
                                            .auth = cfg_.token.value_or(""),
                                            .platform = {.os = std::string{host::os}, .arch = std::string{host::arch}},
@@ -145,7 +146,7 @@ namespace worker {
             std::cerr << "service-ready:worker\n";
             // Child requests can finish after the scope body; keep their counter alive through the join.
             std::atomic<std::size_t> inflight{0};
-            co_await coroutine::with_scope([&](coroutine::scope& requests) -> coroutine::task<> {
+            auto run_requests = [&](coroutine::scope& requests) -> coroutine::task<> {
                 requests.spawn(beat(io, chan, core));
                 // The Core picks this Worker by the same limit; enforcing it locally keeps a misbehaving Core from driving unbounded concurrency.
                 auto max_inflight = static_cast<std::size_t>(cfg_.max_inflight);
@@ -169,7 +170,8 @@ namespace worker {
                     inflight.fetch_add(1, std::memory_order_relaxed);
                     requests.spawn(tracked(serve, chan, std::move(frame), inflight));
                 }
-            });
+            };
+            co_await coroutine::with_scope(std::move(run_requests));
         }
 
         template <io::stream S>

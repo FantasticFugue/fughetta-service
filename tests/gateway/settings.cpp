@@ -190,35 +190,42 @@ namespace {
     const auto cases = [] {
         "a configuration tool answers a non-JSON core response as an MCP error"_test = [] {
             // The dispatch stands for a REST route that failed before framing JSON.
-            settings::bound bound{[](const worlds::actor&, std::string, std::string, std::string) -> coroutine::task<web::reply> {
+            static constexpr auto run_operation = [](const worlds::actor&, std::string, std::string, std::string) -> coroutine::task<web::reply> {
                 co_return web::reply{.head = {.status = 200}, .body = "<html>gateway busy</html>"};
-            }};
+            };
+            settings::bound bound{run_operation};
             cores::io_context<native::context> rt{1};
-            rt.run([&](ctx&, std::size_t) -> coroutine::task<> {
+            auto run_core = [&](ctx&, std::size_t) -> coroutine::task<> {
                 mcp::notifier drop;
                 const worlds::actor who{.issuer = "token", .user = "tester", .caller = "settings-suite", .role = "owner"};
                 auto outcome = co_await bound.call("schema", rfl::Generic::Object{}, drop, who);
                 expect(outcome.error);
                 expect(outcome.text.contains("not JSON")) << outcome.text;
-            });
+            };
+            rt.run(std::move(run_core));
         };
 
         "configuration MCP shares REST operations and joins the workspace tool catalog"_test = [] {
             harness h;
-            h.rt.run([&](ctx& io, std::size_t) -> coroutine::task<> {
-                return [](harness& h, ctx& io) -> coroutine::task<> {
+            auto run_core = [&](ctx& io, std::size_t) -> coroutine::task<> {
+                static constexpr auto run_operation = [](harness& h, ctx& io) -> coroutine::task<> {
                     auto listener = native::listener{io, {net::ip::address_v4::loopback(), 0}};
                     h.port = listener.local_endpoint().port();
-                    co_await coroutine::with_scope([&](coroutine::scope& children) -> coroutine::task<> {
-                        children.spawn([](harness& h, native::listener& listener, coroutine::scope& children) -> coroutine::task<> {
-                            for (;;)
-                                children.spawn(
-                                    h.server.serve(co_await execution::then(net::async_accept(listener), [](auto socket, auto) { return std::move(socket); })));
-                        }(h, listener, children));
+                    auto run_children = [&](coroutine::scope& children) -> coroutine::task<> {
+                        static constexpr auto run_child = [](harness& h, native::listener& listener, coroutine::scope& children) -> coroutine::task<> {
+                            for (;;) {
+                                auto [connection, peer] = co_await net::async_accept(listener);
+                                children.spawn(h.server.serve(std::move(connection)));
+                            }
+                        };
+                        children.spawn(run_child(h, listener, children));
                         co_await exercise(h, io);
-                    });
-                }(h, io);
-            });
+                    };
+                    co_await coroutine::with_scope(std::move(run_children));
+                };
+                return run_operation(h, io);
+            };
+            h.rt.run(std::move(run_core));
         };
     };
 } // namespace

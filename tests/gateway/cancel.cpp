@@ -19,23 +19,29 @@ namespace {
             front::in_flight requests{rt};
             bool finished = false, cancelled = false;
             auto started = std::chrono::steady_clock::now();
-            rt.run([&](ctx& io, std::size_t core) -> coroutine::task<> {
+            auto run_core = [&](ctx& io, std::size_t core) -> coroutine::task<> {
                 if (core == 1)
-                    return [](ctx& io, front::in_flight& requests, bool& finished, bool& cancelled) -> coroutine::task<> {
+                    {
+                    static constexpr auto run_operation_2 = [](ctx& io, front::in_flight& requests, bool& finished, bool& cancelled) -> coroutine::task<> {
                         coroutine::stop_source source;
                         requests.enter(1, "n:7", &source);
+                        static constexpr auto run_operation = [](ctx& io) -> coroutine::task<> { co_await execution::schedule_after(io, 30s); };
                         auto r = co_await coroutine::under(source.get_token(),
-                                                           [](ctx& io) -> coroutine::task<> { co_await execution::schedule_after(io, 30s); }(io));
+                                                           run_operation(io));
                         requests.leave(1, "n:7", &source);
                         cancelled = !r;
                         finished = true;
-                    }(io, requests, finished, cancelled);
-                return [](ctx& io, front::in_flight& requests) -> coroutine::task<> {
+                    };
+                    return run_operation_2(io, requests, finished, cancelled);
+                }
+                static constexpr auto run_operation = [](ctx& io, front::in_flight& requests) -> coroutine::task<> {
                     co_await execution::schedule_after(io, 100ms);
                     requests.cancel(0, "s:other");
                     requests.cancel(0, "n:7");
-                }(io, requests);
-            });
+                };
+                return run_operation(io, requests);
+            };
+            rt.run(std::move(run_core));
             expect(finished && cancelled);
             expect(std::chrono::steady_clock::now() - started < 5s);
         };

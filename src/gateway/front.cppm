@@ -356,19 +356,20 @@ export namespace front {
                                 head.fields.push_back({"access-control-allow-origin", std::string{*origin}});
                                 head.fields.push_back({"vary", "origin"});
                             }
-                            co_await coroutine::with_scope([&](coroutine::scope& children) -> coroutine::task<> {
-                                auto send = [&]() -> coroutine::task<> {
-                                    struct stop {
-                                        coroutine::scope& children;
-                                        ~stop() { children.request_stop(); }
-                                    } done{children};
-                                    co_await coroutine::deadline(ctx_.rt.get_scheduler(ctx_.core), constants::workspace_event_lifetime,
-                                                                 http::coroutine::respond(conn, std::move(in.token), std::move(head), sub->body));
-                                };
-                                children.spawn(send());
+                            auto send = [&](coroutine::scope& children) -> coroutine::task<> {
+                                struct stop {
+                                    coroutine::scope& children;
+                                    ~stop() { children.request_stop(); }
+                                } done{children};
+                                co_await coroutine::deadline(ctx_.rt.get_scheduler(ctx_.core), constants::workspace_event_lifetime,
+                                                             http::coroutine::respond(conn, std::move(in.token), std::move(head), sub->body));
+                            };
+                            auto run_children = [&](coroutine::scope& children) -> coroutine::task<> {
+                                children.spawn(send(children));
                                 children.spawn(heartbeat(*sub, in.head, *who, children));
                                 co_await children.join();
-                            });
+                            };
+                            co_await coroutine::with_scope(std::move(run_children));
                             break;
                         }
                     } else if (t.path == "/mcp" || t.path == "/mcp/config") {
@@ -479,26 +480,29 @@ export namespace front {
                 head.fields.push_back({"access-control-allow-origin", std::string{*origin}});
                 head.fields.push_back({"vary", "origin"});
             }
-            co_await coroutine::with_scope([&](coroutine::scope& children) -> coroutine::task<> {
+            auto run_children = [&](coroutine::scope& children) -> coroutine::task<> {
+                static constexpr auto run_child_2 = [](Conn& conn, auto token, http::response head, web::event_stream& events, coroutine::stop_source& disconnected) -> coroutine::task<> {
+                    try {
+                        co_await http::coroutine::respond(conn, std::move(token), std::move(head), events);
+                    } catch (...) {
+                        disconnected.request_stop();
+                        throw;
+                    }
+                };
                 children.spawn(
-                    [](Conn& conn, auto token, http::response head, web::event_stream& events, coroutine::stop_source& disconnected) -> coroutine::task<> {
-                        try {
-                            co_await http::coroutine::respond(conn, std::move(token), std::move(head), events);
-                        } catch (...) {
-                            disconnected.request_stop();
-                            throw;
+                    run_child_2(conn, std::move(in.token), std::move(head), events, disconnected));
+                static constexpr auto run_child = [](native::scheduler io, web::event_stream& events, coroutine::stop_token token, std::chrono::milliseconds interval) -> coroutine::task<> {
+                    static constexpr auto run_operation = [](native::scheduler io, web::event_stream& events, std::chrono::milliseconds interval) -> coroutine::task<> {
+                        for (;;) {
+                            co_await execution::schedule_after(io, interval);
+                            events.push(": keepalive\n\n");
                         }
-                    }(conn, std::move(in.token), std::move(head), events, disconnected));
+                    };
+                    co_await coroutine::under(token,
+                                              run_operation(io, events, interval));
+                };
                 children.spawn(
-                    [](native::scheduler io, web::event_stream& events, coroutine::stop_token token, std::chrono::milliseconds interval) -> coroutine::task<> {
-                        co_await coroutine::under(token,
-                                                  [](native::scheduler io, web::event_stream& events, std::chrono::milliseconds interval) -> coroutine::task<> {
-                                                      for (;;) {
-                                                          co_await execution::schedule_after(io, interval);
-                                                          events.push(": keepalive\n\n");
-                                                      }
-                                                  }(io, events, interval));
-                    }(ctx_.rt.get_scheduler(ctx_.core), events, heartbeat_stop.get_token(), heartbeat_));
+                    run_child(ctx_.rt.get_scheduler(ctx_.core), events, heartbeat_stop.get_token(), heartbeat_));
                 struct stop_heartbeat {
                     coroutine::stop_source& source;
                     ~stop_heartbeat() { source.request_stop(); }
@@ -514,7 +518,8 @@ export namespace front {
                 heartbeat_stop.request_stop();
                 events.close();
                 co_await children.join();
-            });
+            };
+            co_await coroutine::with_scope(std::move(run_children));
             co_return std::nullopt;
         }
 

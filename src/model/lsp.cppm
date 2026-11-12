@@ -585,12 +585,13 @@ export namespace lsp {
             std::optional<int> code;
             std::exception_ptr failed;
             try {
-                if (auto finished = co_await coroutine::deadline(io_, std::chrono::seconds{5}, [](session& self) -> coroutine::task<int> {
-                        (void)co_await self.call("shutdown", detail::null);
-                        co_await self.notify("exit", detail::null);
-                        self.child_->close_input();
-                        co_return co_await io::async_wait(*self.child_);
-                    }(*this)))
+                static constexpr auto run_until_deadline = [](session& self) -> coroutine::task<int> {
+                    (void)co_await self.call("shutdown", detail::null);
+                    co_await self.notify("exit", detail::null);
+                    self.child_->close_input();
+                    co_return co_await io::async_wait(*self.child_);
+                };
+                if (auto finished = co_await coroutine::deadline(io_, std::chrono::seconds{5}, run_until_deadline(*this)))
                     code = static_cast<int>(*finished);
             } catch (...) {
                 failed = util::current_exception();

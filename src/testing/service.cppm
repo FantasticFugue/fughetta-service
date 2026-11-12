@@ -13,11 +13,13 @@ namespace test {
         auto serve(native::scheduler& io, std::promise<net::ip::tcp::endpoint>& ready) -> coroutine::task<> {
             auto listener = native::listener{io, {net::ip::address_v4::loopback(), 0}};
             ready.set_value(net::ip::tcp::endpoint{net::ip::address_v4{{127, 0, 0, 1}}, listener.local_endpoint().port()});
-            co_await coroutine::with_scope([&](coroutine::scope& tasks) -> coroutine::task<> {
-                for (;;)
-                    tasks.spawn(service.serve(
-                        io, co_await execution::then(net::async_accept(listener), [](auto socket, auto) { return std::move(socket); }), 0));
-            });
+            auto run_tasks = [&](coroutine::scope& tasks) -> coroutine::task<> {
+                for (;;) {
+                    auto [connection, peer] = co_await net::async_accept(listener);
+                    tasks.spawn(service.serve(io, std::move(connection), 0));
+                }
+            };
+            co_await coroutine::with_scope(std::move(run_tasks));
         }
         struct run_work {
             state* owner;

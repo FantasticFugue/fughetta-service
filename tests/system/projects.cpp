@@ -73,7 +73,7 @@ namespace {
             std::condition_variable forwarded;
             std::set<std::string> applied;
             // Notes each apply the gateway sends, once the source has it.
-            test::listener proxy{[&](native::scheduler& io, native::socket peer) -> coroutine::task<> {
+            auto run_operation = [&](native::scheduler& io, native::socket peer) -> coroutine::task<> {
                 try {
                     auto upstream = co_await io::connect(io, {net::ip::address_v4::loopback(), source_port});
                     transport::channel<native::socket> incoming{peer}, outgoing{upstream};
@@ -91,7 +91,8 @@ namespace {
                     co_await send(peer, co_await outgoing.recv());
                 } catch (const std::exception&) {
                 }
-            }};
+            };
+            test::listener proxy{std::move(run_operation)};
             auto issued = [&](const std::string& path) {
                 std::unique_lock guard{mutex};
                 test::require(forwarded.wait_for(guard, std::chrono::seconds{5}, [&] { return applied.contains(path); }), path + " was not sent to the source");

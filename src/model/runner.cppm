@@ -65,23 +65,27 @@ export namespace runner {
         tail out{output_limit};
         bool timed_out = false;
         int code = -1;
-        co_await coroutine::with_scope([&](coroutine::scope& children) -> coroutine::task<> {
-            children.spawn([](native::scheduler& io, native::process& proc, std::chrono::milliseconds timeout, bool& timed_out) -> coroutine::task<> {
+        auto run_children = [&](coroutine::scope& children) -> coroutine::task<> {
+            static constexpr auto kill_after_timeout = [](native::scheduler& io, native::process& proc, std::chrono::milliseconds timeout, bool& timed_out) -> coroutine::task<> {
                 co_await execution::schedule_after(io, timeout);
                 timed_out = true;
                 proc.kill();
-            }(io, proc, timeout, timed_out));
+            };
+            children.spawn(kill_after_timeout(io, proc, timeout, timed_out));
+            static constexpr auto wait_for_exit = [](native::process& proc, int& code) -> coroutine::task<> { code = co_await io::async_wait(proc); };
+            static constexpr auto read_output = [](native::process& proc, tail& out, std::optional<native::file>& log, std::uint64_t& size,
+                                                 std::uint64_t limit, bool& truncated, std::string& error) -> coroutine::task<> {
+                std::array<std::byte, 16384> buf;
+                while (auto n = co_await io::async_read_some(proc, net::buffer(buf))) {
+                    out.append(std::span{buf}.first(n));
+                    co_await append_log(log, std::span<const std::byte>{buf}.first(n), size, limit, truncated, error);
+                }
+            };
             co_await execution::when_all(
-                [](native::process& proc, tail& out, std::optional<native::file>& log, std::uint64_t& size,
-                   std::uint64_t limit, bool& truncated, std::string& error) -> coroutine::task<> {
-                    std::array<std::byte, 16384> buf;
-                    while (auto n = co_await io::async_read_some(proc, net::buffer(buf))) {
-                        out.append(std::span{buf}.first(n));
-                        co_await append_log(log, std::span<const std::byte>{buf}.first(n), size, limit, truncated, error);
-                    }
-                }(proc, out, log, log_size, log_limit, log_truncated, log_error),
-                [](native::process& proc, int& code) -> coroutine::task<> { code = co_await io::async_wait(proc); }(proc, code));
-        });
+                read_output(proc, out, log, log_size, log_limit, log_truncated, log_error),
+                wait_for_exit(proc, code));
+        };
+        co_await coroutine::with_scope(std::move(run_children));
         auto [text, truncated] = out.take();
         co_return jobs::step_report{.name = std::move(name),
                                     .exit_code = code,

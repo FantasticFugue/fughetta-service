@@ -107,12 +107,12 @@ namespace {
         "export downloads require project grants including shared build cache hits"_test = [] {
             using namespace std::chrono_literals;
             harness h;
-            h.rt.run([&](ctx& io, std::size_t) -> coroutine::task<> {
+            auto run_core = [&](ctx& io, std::size_t) -> coroutine::task<> {
                 auto listener = native::listener{io, {net::ip::address_v4::loopback(), 0}};
                 h.port = listener.local_endpoint().port();
                 auto workers = native::listener{io, {net::ip::address_v4::loopback(), 0}};
                 auto connection = co_await io::connect(io, workers.local_endpoint());
-                auto peer = co_await execution::then(net::async_accept(workers), [](auto socket, auto) { return std::move(socket); });
+                auto [peer, endpoint] = co_await net::async_accept(workers);
                 transport::channel<socket> channel{connection};
                 transport::dispatcher<socket> dispatch;
                 const std::string data = "verified artifact";
@@ -122,34 +122,42 @@ namespace {
                 int builds = 0, downloads = 0;
                 bool fail_download = false;
                 bool remove_project = false;
-                dispatch.on<jobs::sync_offer>([](jobs::sync_offer offer, auto&) -> coroutine::task<jobs::sync_plan> {
+                static constexpr auto handle_sync_offer = [](jobs::sync_offer offer, auto&) -> coroutine::task<jobs::sync_plan> {
                     co_return jobs::sync_plan{.snapshot = offer.tree.id()};
-                });
-                dispatch.on<jobs::build_request>([&](jobs::build_request request, auto&) -> coroutine::task<jobs::build_report> {
+                };
+                dispatch.on<jobs::sync_offer>(handle_sync_offer);
+                auto handle_build_request = [&](jobs::build_request request, auto&) -> coroutine::task<jobs::build_report> {
                     ++builds;
                     expect(request.exports.at("binary") == "out/app");
                     if (remove_project) expect((co_await h.ask(io, DELETE, "/api/v1/projects/app")).status == 200);
                     co_return jobs::build_report{.steps = {{.name = "compile", .exit_code = 0, .output = "log", .truncated = true,
                             .log = builds::exported_file{"step-0.log", "0.log", log_digest, log.size(), false}}},
                         .exports = {{"binary", "app", digest, data.size(), true}}};
-                });
-                dispatch.on<jobs::export_read>([&](jobs::export_read request, auto&) -> coroutine::task<jobs::source_bytes> {
+                };
+                dispatch.on<jobs::build_request>(std::move(handle_build_request));
+                auto handle_export_read = [&](jobs::export_read request, auto&) -> coroutine::task<jobs::source_bytes> {
                     ++downloads;
                     if (fail_download) throw std::runtime_error("artifact transport unavailable");
                     const auto& value = request.digest == log_digest ? log : data;
                     auto part = std::as_bytes(std::span{value}).subspan(request.offset, request.length);
                     co_return jobs::source_bytes{{{request.digest, request.offset, value.size(), {part.begin(), part.end()}}}};
-                });
+                };
+                dispatch.on<jobs::export_read>(std::move(handle_export_read));
                 co_await channel.post(jobs::hello{.name = "export-builder", .protocol = jobs::protocol_version,
                     .tools = {"true"}, .toolchain_id = "export-toolchain"});
-                co_await coroutine::with_scope([&](coroutine::scope& children) -> coroutine::task<> {
-                    children.spawn([](harness& h, native::listener& listener, coroutine::scope& children) -> coroutine::task<> {
-                        for (;;) children.spawn(h.server.serve(co_await execution::then(net::async_accept(listener), [](auto socket, auto) { return std::move(socket); })));
-                    }(h, listener, children));
+                auto run_children = [&](coroutine::scope& children) -> coroutine::task<> {
+                    static constexpr auto run_child_2 = [](harness& h, native::listener& listener, coroutine::scope& children) -> coroutine::task<> {
+                        for (;;) {
+                            auto [connection, peer] = co_await net::async_accept(listener);
+                            children.spawn(h.server.serve(std::move(connection)));
+                        }
+                    };
+                    children.spawn(run_child_2(h, listener, children));
                     children.spawn(h.router.workers(0).admit(io, std::move(peer)));
-                    children.spawn([](auto& channel, auto& dispatch, coroutine::scope& children) -> coroutine::task<> {
+                    static constexpr auto run_child = [](auto& channel, auto& dispatch, coroutine::scope& children) -> coroutine::task<> {
                         for (;;) children.spawn(dispatch.handle(channel, co_await channel.recv()));
-                    }(channel, dispatch, children));
+                    };
+                    children.spawn(run_child(channel, dispatch, children));
                     children.spawn(h.queue.serve(io));
                     while (h.router.workers(0).describe(0).empty()) co_await execution::schedule_after(io, 1ms);
                     config::settings project;
@@ -210,8 +218,10 @@ namespace {
                     expect(completed.steps.at(0).log && !completed.steps.at(0).log->delivery_error.empty());
                     expect((co_await h.ask(io, GET, path)).status != 200);
 
-                });
-            });
+                };
+                co_await coroutine::with_scope(std::move(run_children));
+            };
+            h.rt.run(std::move(run_core));
         };
         "trusted authentication requires a configured workspace identity"_test = [] {
             expect(throws<std::invalid_argument>([] { config::parse(R"({"server":{"auth":{"mode":"trusted"}}})"); }))
@@ -224,7 +234,7 @@ namespace {
         "Workspace event subscriptions reset, coalesce and bound slow consumers"_test = [] {
             cores::io_context<native::context> rt{1};
             front::workspace_events events{rt, "workspace-id"};
-            rt.run([&](ctx& io, std::size_t) -> coroutine::task<> {
+            auto run_core = [&](ctx& io, std::size_t) -> coroutine::task<> {
                 auto first = events.listen(0);
                 expect(first->body.take().contains(R"("workspace_id":"workspace-id","changes":15)"));
                 events.publish(1);
@@ -243,18 +253,22 @@ namespace {
                 first.reset();
                 second.reset();
                 expect(static_cast<bool>(events.listen(0))) << "closed connections release their slots";
-            });
+            };
+            rt.run(std::move(run_core));
         };
         "Workspace SSE streams committed configuration changes before the response ends"_test = [] {
             harness h;
-            h.rt.run([&](ctx& io, std::size_t) -> coroutine::task<> {
+            auto run_core = [&](ctx& io, std::size_t) -> coroutine::task<> {
                 auto l = native::listener{io, {net::ip::address_v4::loopback(), 0}};
                 h.port = l.local_endpoint().port();
-                co_await coroutine::with_scope([&](coroutine::scope& children) -> coroutine::task<> {
-                    children.spawn([](harness& h, native::listener& l, coroutine::scope& children) -> coroutine::task<> {
-                        for (;;)
-                            children.spawn(h.server.serve(co_await execution::then(net::async_accept(l), [](auto socket, auto) { return std::move(socket); })));
-                    }(h, l, children));
+                auto run_children = [&](coroutine::scope& children) -> coroutine::task<> {
+                    static constexpr auto run_child = [](harness& h, native::listener& l, coroutine::scope& children) -> coroutine::task<> {
+                        for (;;) {
+                            auto [connection, peer] = co_await net::async_accept(l);
+                            children.spawn(h.server.serve(std::move(connection)));
+                        }
+                    };
+                    children.spawn(run_child(h, l, children));
                     auto denied = co_await h.ask(io, GET, "/api/v1/events", {}, {}, false);
                     expect(denied.status == 401);
                     auto socket = co_await io::connect(io, l.local_endpoint());
@@ -287,26 +301,30 @@ namespace {
                     }
                     expect(update.contains(R"("changes":8)")) << update;
                     socket.close();
-                });
-            });
+                };
+                co_await coroutine::with_scope(std::move(run_children));
+            };
+            h.rt.run(std::move(run_core));
         };
         "MCP keepalives detect a disconnected caller and release its queued ticket"_test = [] {
             using namespace std::chrono_literals;
             harness h{"token", 10ms};
-            h.rt.run([&](ctx& io, std::size_t) -> coroutine::task<> {
+            auto run_core = [&](ctx& io, std::size_t) -> coroutine::task<> {
                 auto listener = native::listener{io, {net::ip::address_v4::loopback(), 0}};
                 h.port = listener.local_endpoint().port();
                 auto worker_listener = native::listener{io, {net::ip::address_v4::loopback(), 0}};
                 auto worker_socket = co_await io::connect(io, worker_listener.local_endpoint());
-                auto worker_peer = co_await execution::then(net::async_accept(worker_listener), [](auto socket, auto) { return std::move(socket); });
+                auto [worker_peer, endpoint] = co_await net::async_accept(worker_listener);
                 transport::channel<socket> worker_channel{worker_socket};
                 co_await worker_channel.post(jobs::hello{.name = "queued-builder", .protocol = jobs::protocol_version, .tools = {"true"}, .toolchain_id = "test-toolchain"});
-                co_await coroutine::with_scope([&](coroutine::scope& children) -> coroutine::task<> {
-                    children.spawn([](harness& h, native::listener& listener, coroutine::scope& children) -> coroutine::task<> {
-                        for (;;)
-                            children.spawn(
-                                h.server.serve(co_await execution::then(net::async_accept(listener), [](auto socket, auto) { return std::move(socket); })));
-                    }(h, listener, children));
+                auto run_children = [&](coroutine::scope& children) -> coroutine::task<> {
+                    static constexpr auto run_child = [](harness& h, native::listener& listener, coroutine::scope& children) -> coroutine::task<> {
+                        for (;;) {
+                            auto [connection, peer] = co_await net::async_accept(listener);
+                            children.spawn(h.server.serve(std::move(connection)));
+                        }
+                    };
+                    children.spawn(run_child(h, listener, children));
                     children.spawn(h.router.workers(0).admit(io, std::move(worker_peer)));
                     while (h.router.workers(0).describe(0).empty())
                         co_await execution::schedule_after(io, 1ms);
@@ -318,12 +336,13 @@ namespace {
                     co_await h.save(io, "/api/v1/projects/app", config::write(project));
                     co_await h.ask(io, http::method::POST, "/api/v1/projects/app/worldline",
                                    R"({"project":"app","worldline":"main","action":"apply","observed":"","operation_id":"seed","changes":[{"kind":"create","path":"a.txt","text":"a"}]})");
+                    auto run_operation = [&io](tools::services&, jobs::progress_log&, std::string) -> coroutine::task<std::optional<tools::backlog::outcome>> {
+                        co_await execution::schedule_after(io, 30s);
+                        co_return tools::config_result{.ok = true};
+                    };
                     auto blocker = co_await h.queue.submit(
                         0, {.key = "blocker", .project = "app", .configuration = "blocker", .operation = "blocker", .actor = "blocker", .trees = "blocker"},
-                        [&io](tools::services&, jobs::progress_log&, std::string) -> coroutine::task<std::optional<tools::backlog::outcome>> {
-                            co_await execution::schedule_after(io, 30s);
-                            co_return tools::config_result{.ok = true};
-                        });
+                        std::move(run_operation));
                     struct release {
                         std::shared_ptr<tools::backlog::ticket> ticket;
                         ~release() { ticket->leave(); }
@@ -362,21 +381,25 @@ namespace {
                     blocker->leave();
                     while (!h.queue.idle())
                         co_await execution::schedule_after(io, 20ms);
-                });
-            });
+                };
+                co_await coroutine::with_scope(std::move(run_children));
+            };
+            h.rt.run(std::move(run_core));
         };
         "a trusted front names the caller and its role in headers"_test = [] {
             harness h{"trusted"};
-            h.rt.run([&](ctx& io, std::size_t) -> coroutine::task<> {
-                return [](harness& h, ctx& io) -> coroutine::task<> {
+            auto run_core = [&](ctx& io, std::size_t) -> coroutine::task<> {
+                static constexpr auto run_operation = [](harness& h, ctx& io) -> coroutine::task<> {
                     auto l = native::listener{io, {net::ip::address_v4::loopback(), 0}};
                     h.port = l.local_endpoint().port();
-                    co_await coroutine::with_scope([&](coroutine::scope& children) -> coroutine::task<> {
-                        children.spawn([](harness& h, native::listener& l, coroutine::scope& children) -> coroutine::task<> {
-                            for (;;)
-                                children.spawn(
-                                    h.server.serve(co_await execution::then(net::async_accept(l), [](auto socket, auto) { return std::move(socket); })));
-                        }(h, l, children));
+                    auto run_children = [&](coroutine::scope& children) -> coroutine::task<> {
+                        static constexpr auto run_child = [](harness& h, native::listener& l, coroutine::scope& children) -> coroutine::task<> {
+                            for (;;) {
+                                auto [connection, peer] = co_await net::async_accept(l);
+                                children.spawn(h.server.serve(std::move(connection)));
+                            }
+                        };
+                        children.spawn(run_child(h, l, children));
                         auto anonymous = co_await h.ask(io, GET, "/api/v1/me");
                         expect(anonymous.status == 401) << "a bearer token means nothing behind a trusted front: " << anonymous.body;
                         for (const auto& role : {"member", "owner", "host"}) {
@@ -456,22 +479,27 @@ namespace {
                                named.body.contains(R"("issuer":"front")"))
                             << named.body;
                         children.request_stop();
-                    });
-                }(h, io);
-            });
+                    };
+                    co_await coroutine::with_scope(std::move(run_children));
+                };
+                return run_operation(h, io);
+            };
+            h.rt.run(std::move(run_core));
         };
         "token mode ignores caller headers and takes any case of the bearer scheme"_test = [] {
             harness h;
-            h.rt.run([&](ctx& io, std::size_t) -> coroutine::task<> {
-                return [](harness& h, ctx& io) -> coroutine::task<> {
+            auto run_core = [&](ctx& io, std::size_t) -> coroutine::task<> {
+                static constexpr auto run_operation = [](harness& h, ctx& io) -> coroutine::task<> {
                     auto l = native::listener{io, {net::ip::address_v4::loopback(), 0}};
                     h.port = l.local_endpoint().port();
-                    co_await coroutine::with_scope([&](coroutine::scope& children) -> coroutine::task<> {
-                        children.spawn([](harness& h, native::listener& l, coroutine::scope& children) -> coroutine::task<> {
-                            for (;;)
-                                children.spawn(
-                                    h.server.serve(co_await execution::then(net::async_accept(l), [](auto socket, auto) { return std::move(socket); })));
-                        }(h, l, children));
+                    auto run_children = [&](coroutine::scope& children) -> coroutine::task<> {
+                        static constexpr auto run_child = [](harness& h, native::listener& l, coroutine::scope& children) -> coroutine::task<> {
+                            for (;;) {
+                                auto [connection, peer] = co_await net::async_accept(l);
+                                children.spawn(h.server.serve(std::move(connection)));
+                            }
+                        };
+                        children.spawn(run_child(h, l, children));
                         auto forged = co_await h.ask(io, GET, "/api/v1/me", {}, {{"x-fughetta-user", "intruder"}, {"x-fughetta-role", "owner"}}, false);
                         expect(forged.status == 401) << forged.body;
                         auto own = co_await h.ask(io, GET, "/api/v1/me", {}, {{"x-fughetta-user", "intruder"}});
@@ -479,23 +507,28 @@ namespace {
                         auto lower = co_await h.ask(io, GET, "/api/v1/me", {}, {{"authorization", "bearer sk_test"}}, false);
                         expect(lower.status == 200) << lower.body;
                         children.request_stop();
-                    });
-                }(h, io);
-            });
+                    };
+                    co_await coroutine::with_scope(std::move(run_children));
+                };
+                return run_operation(h, io);
+            };
+            h.rt.run(std::move(run_core));
         };
         "the admin API configures limits and projects"_test = [] {
             harness h;
             std::vector<answer> a;
-            h.rt.run([&](ctx& io, std::size_t) -> coroutine::task<> {
-                return [](harness& h, ctx& io, std::vector<answer>& a) -> coroutine::task<> {
+            auto run_core = [&](ctx& io, std::size_t) -> coroutine::task<> {
+                static constexpr auto run_operation = [](harness& h, ctx& io, std::vector<answer>& a) -> coroutine::task<> {
                     auto l = native::listener{io, {net::ip::address_v4::loopback(), 0}};
                     h.port = l.local_endpoint().port();
-                    co_await coroutine::with_scope([&](coroutine::scope& children) -> coroutine::task<> {
-                        children.spawn([](harness& h, native::listener& l, coroutine::scope& children) -> coroutine::task<> {
-                            for (;;)
-                                children.spawn(
-                                    h.server.serve(co_await execution::then(net::async_accept(l), [](auto socket, auto) { return std::move(socket); })));
-                        }(h, l, children));
+                    auto run_children = [&](coroutine::scope& children) -> coroutine::task<> {
+                        static constexpr auto run_child = [](harness& h, native::listener& l, coroutine::scope& children) -> coroutine::task<> {
+                            for (;;) {
+                                auto [connection, peer] = co_await net::async_accept(l);
+                                children.spawn(h.server.serve(std::move(connection)));
+                            }
+                        };
+                        children.spawn(run_child(h, l, children));
                         auto read = co_await h.ask(io, GET, "/api/v1/config/limits");
                         auto at = std::stoull(read.body.substr(read.body.find(R"("revision":)") + 11));
                         a.push_back(
@@ -517,9 +550,12 @@ namespace {
                                                    {{"origin", "http://ok.example"}, {"access-control-request-method", "PUT"}}));
                         a.push_back(co_await h.ask(io, PUT, "/api/v1/projects/web", R"({"revision":0})", {{"origin", "http://ok.example"}}));
                         a.push_back(co_await h.ask(io, PUT, "/api/v1/projects/web", R"({"revision":0})", {{"origin", "http://localhost:5173"}}));
-                    });
-                }(h, io, a);
-            });
+                    };
+                    co_await coroutine::with_scope(std::move(run_children));
+                };
+                return run_operation(h, io, a);
+            };
+            h.rt.run(std::move(run_core));
             expect((a.size() == 17u) >> fatal);
 
             expect(a[14].status == 204 && a[14].allow_origin == "http://ok.example");
@@ -545,14 +581,14 @@ namespace {
             enrollment::store registry{h.tmp.dir / "identities", "workspace-a"};
             auto first = registry.add("same machine", "owner");
             auto second = registry.add("same machine", "owner");
-            h.rt.run([&](ctx& io, std::size_t) -> coroutine::task<> {
+            auto run_core = [&](ctx& io, std::size_t) -> coroutine::task<> {
                 auto listener = native::listener{io, {net::ip::address_v4::loopback(), 0}};
                 std::vector<socket> clients;
                 clients.reserve(2);
-                co_await coroutine::with_scope([&](coroutine::scope& children) -> coroutine::task<> {
+                auto run_children = [&](coroutine::scope& children) -> coroutine::task<> {
                     for (const auto& credential : {first, second}) {
                         clients.push_back(co_await io::connect(io, {net::ip::address_v4{{127, 0, 0, 1}}, listener.local_endpoint().port()}));
-                        auto peer = co_await execution::then(net::async_accept(listener), [](auto socket, auto) { return std::move(socket); });
+                        auto [peer, endpoint] = co_await net::async_accept(listener);
                         transport::channel<socket> channel{clients.back()};
                         co_await channel.post(jobs::hello{.name = "same machine",
                                                           .auth = credential.secret,
@@ -572,20 +608,22 @@ namespace {
                         expect(
                             metrics.body.contains(std::format("gateway_worker_inflight{{worker=\"same machine\",worker_id=\"{}\"}} 0\n", credential.worker_id)))
                             << metrics.body;
-                });
-            });
+                };
+                co_await coroutine::with_scope(std::move(run_children));
+            };
+            h.rt.run(std::move(run_core));
         };
 
         "same-name managed workers report one summed inflight series"_test = [] {
             harness h;
-            h.rt.run([&](ctx& io, std::size_t) -> coroutine::task<> {
+            auto run_core = [&](ctx& io, std::size_t) -> coroutine::task<> {
                 auto listener = native::listener{io, {net::ip::address_v4::loopback(), 0}};
                 std::vector<socket> clients;
                 clients.reserve(2);
-                co_await coroutine::with_scope([&](coroutine::scope& children) -> coroutine::task<> {
+                auto run_children = [&](coroutine::scope& children) -> coroutine::task<> {
                     for (std::size_t n = 0; n < 2; ++n) {
                         clients.push_back(co_await io::connect(io, {net::ip::address_v4{{127, 0, 0, 1}}, listener.local_endpoint().port()}));
-                        auto peer = co_await execution::then(net::async_accept(listener), [](auto socket, auto) { return std::move(socket); });
+                        auto [peer, endpoint] = co_await net::async_accept(listener);
                         transport::channel<socket> channel{clients.back()};
                         co_await channel.post(jobs::hello{.name = "builder", .protocol = jobs::protocol_version});
                         children.spawn(h.router.workers(0).admit(io, std::move(peer)));
@@ -595,8 +633,8 @@ namespace {
                     const worlds::actor actor{.issuer = "token", .user = "tester", .role = "owner"};
                     front::context context{h.hub, h.files, h.router, h.rt, 0, nullptr, &actor, &h.pool, &h.services};
                     auto& fleet = h.router.workers(0);
-                    co_await fleet.with({}, [&](auto&) -> coroutine::task<> {
-                        co_await fleet.with({}, [&](auto&) -> coroutine::task<> {
+                    auto run_operation_2 = [&](auto&) -> coroutine::task<> {
+                        auto run_operation = [&](auto&) -> coroutine::task<> {
                             auto metrics = co_await front::route(context, "GET", web::target::parse("/metrics"), "");
                             const std::string series = "gateway_worker_inflight{worker=\"builder\",worker_id=\"\"} 2\n";
                             auto at = metrics.body.find(series);
@@ -604,15 +642,19 @@ namespace {
                             expect(metrics.body.find("gateway_worker_inflight{worker=\"builder\"", at == std::string::npos ? 0 : at + series.size()) ==
                                    std::string::npos);
                             expect(metrics.body.contains("gateway_workers 2\n"));
-                        });
-                    });
-                });
-            });
+                        };
+                        co_await fleet.with({}, std::move(run_operation));
+                    };
+                    co_await fleet.with({}, std::move(run_operation_2));
+                };
+                co_await coroutine::with_scope(std::move(run_children));
+            };
+            h.rt.run(std::move(run_core));
         };
 
         "build plans and status remain available while manual analysis routes are removed"_test = [] {
             harness h;
-            h.rt.run([&](ctx& io, std::size_t) -> coroutine::task<> {
+            auto run_core = [&](ctx& io, std::size_t) -> coroutine::task<> {
                 co_await h.hub.edit(0, [](config::store& store) {
                     config::settings project;
                     project.build_configurations["Debug"] = fixture::commands({"python3", "-c", "print('built')"});
@@ -676,7 +718,8 @@ namespace {
                     }
                     expect(rejected) << action;
                 }
-            });
+            };
+            h.rt.run(std::move(run_core));
         };
 
         "node source browsing pins files to a durable causal revision"_test = [] {
@@ -686,16 +729,18 @@ namespace {
             test::spit(h.tmp.dir / "source/app/captured.txt", "captured file\n");
             std::ofstream{h.tmp.dir / "source/app/captured.bin", std::ios::binary}.write("\0\xff\x01\x80", 4);
             std::ofstream{h.tmp.dir / "source/app/long.txt"} << std::string(1024 * 1024 - 2, 'x') << "😀tail";
-            h.rt.run([&](ctx& io, std::size_t) -> coroutine::task<> {
-                return [](harness& h, ctx& io, std::vector<answer>& replies) -> coroutine::task<> {
+            auto run_core = [&](ctx& io, std::size_t) -> coroutine::task<> {
+                static constexpr auto run_operation = [](harness& h, ctx& io, std::vector<answer>& replies) -> coroutine::task<> {
                     auto listener = native::listener{io, {net::ip::address_v4::loopback(), 0}};
                     h.port = listener.local_endpoint().port();
-                    co_await coroutine::with_scope([&](coroutine::scope& children) -> coroutine::task<> {
-                        children.spawn([](harness& h, native::listener& listener, coroutine::scope& children) -> coroutine::task<> {
-                            for (;;)
-                                children.spawn(
-                                    h.server.serve(co_await execution::then(net::async_accept(listener), [](auto socket, auto) { return std::move(socket); })));
-                        }(h, listener, children));
+                    auto run_children = [&](coroutine::scope& children) -> coroutine::task<> {
+                        static constexpr auto run_child = [](harness& h, native::listener& listener, coroutine::scope& children) -> coroutine::task<> {
+                            for (;;) {
+                                auto [connection, peer] = co_await net::async_accept(listener);
+                                children.spawn(h.server.serve(std::move(connection)));
+                            }
+                        };
+                        children.spawn(run_child(h, listener, children));
                         co_await h.save(io, "/api/v1/projects/app", "{}");
                         std::string base = "/api/v1/projects/app/node";
                         auto empty = co_await h.ask(io, GET, base + "/source");
@@ -762,9 +807,12 @@ namespace {
                         replies.push_back(co_await h.ask(io, GET, base + "/source/file?revision=" + revision + "&path=src%2Fhello.txt&offset=2&limit=1"));
                         replies.push_back(co_await h.ask(io, GET, base + "/source/file?path=src%2Fhello.txt"));
                         replies.push_back(co_await h.ask(io, GET, base + "/source/file?revision=" + revision + "&path=missing"));
-                    });
-                }(h, io, replies);
-            });
+                    };
+                    co_await coroutine::with_scope(std::move(run_children));
+                };
+                return run_operation(h, io, replies);
+            };
+            h.rt.run(std::move(run_core));
             expect((replies.size() == 6u) >> fatal);
             expect(replies[0].status == 200) << replies[0].body;
             expect(replies[1].status == 200) << replies[1].body;
@@ -782,16 +830,18 @@ namespace {
             harness h;
             std::vector<answer> a;
             std::uint64_t first = 0;
-            h.rt.run([&](ctx& io, std::size_t) -> coroutine::task<> {
-                return [](harness& h, ctx& io, std::vector<answer>& a, std::uint64_t& first) -> coroutine::task<> {
+            auto run_core = [&](ctx& io, std::size_t) -> coroutine::task<> {
+                static constexpr auto run_operation = [](harness& h, ctx& io, std::vector<answer>& a, std::uint64_t& first) -> coroutine::task<> {
                     auto l = native::listener{io, {net::ip::address_v4::loopback(), 0}};
                     h.port = l.local_endpoint().port();
-                    co_await coroutine::with_scope([&](coroutine::scope& children) -> coroutine::task<> {
-                        children.spawn([](harness& h, native::listener& l, coroutine::scope& children) -> coroutine::task<> {
-                            for (;;)
-                                children.spawn(
-                                    h.server.serve(co_await execution::then(net::async_accept(l), [](auto socket, auto) { return std::move(socket); })));
-                        }(h, l, children));
+                    auto run_children = [&](coroutine::scope& children) -> coroutine::task<> {
+                        static constexpr auto run_child = [](harness& h, native::listener& l, coroutine::scope& children) -> coroutine::task<> {
+                            for (;;) {
+                                auto [connection, peer] = co_await net::async_accept(l);
+                                children.spawn(h.server.serve(std::move(connection)));
+                            }
+                        };
+                        children.spawn(run_child(h, l, children));
                         auto read = co_await h.ask(io, GET, "/api/v1/config/limits");
                         first = std::stoull(read.body.substr(read.body.find(R"("revision":)") + 11));
                         a.push_back(std::move(read));
@@ -803,9 +853,12 @@ namespace {
                         a.push_back(co_await h.ask(io, PUT, "/api/v1/config/limits",
                                                    std::format(R"({{"revision":{},"value":{{"search_max_matches": 9}}}})", first + 1)));
                         a.push_back(co_await h.ask(io, GET, "/api/v1/config/limits"));
-                    });
-                }(h, io, a, first);
-            });
+                    };
+                    co_await coroutine::with_scope(std::move(run_children));
+                };
+                return run_operation(h, io, a, first);
+            };
+            h.rt.run(std::move(run_core));
             expect((a.size() == 6u) >> fatal);
             expect(a[0].status == 200) << "read the section before saving it";
             expect(a[1].status == 400 && a[1].body.contains(R"("code":"missing_revision")")) << "a save with no revision is refused: " << a[1].body;
@@ -820,16 +873,18 @@ namespace {
         "the MCP endpoint, over HTTP"_test = [] {
             harness h;
             std::vector<answer> a;
-            h.rt.run([&](ctx& io, std::size_t) -> coroutine::task<> {
-                return [](harness& h, ctx& io, std::vector<answer>& a) -> coroutine::task<> {
+            auto run_core = [&](ctx& io, std::size_t) -> coroutine::task<> {
+                static constexpr auto run_operation = [](harness& h, ctx& io, std::vector<answer>& a) -> coroutine::task<> {
                     auto l = native::listener{io, {net::ip::address_v4::loopback(), 0}};
                     h.port = l.local_endpoint().port();
-                    co_await coroutine::with_scope([&](coroutine::scope& children) -> coroutine::task<> {
-                        children.spawn([](harness& h, native::listener& l, coroutine::scope& children) -> coroutine::task<> {
-                            for (;;)
-                                children.spawn(
-                                    h.server.serve(co_await execution::then(net::async_accept(l), [](auto socket, auto) { return std::move(socket); })));
-                        }(h, l, children));
+                    auto run_children = [&](coroutine::scope& children) -> coroutine::task<> {
+                        static constexpr auto run_child = [](harness& h, native::listener& l, coroutine::scope& children) -> coroutine::task<> {
+                            for (;;) {
+                                auto [connection, peer] = co_await net::async_accept(l);
+                                children.spawn(h.server.serve(std::move(connection)));
+                            }
+                        };
+                        children.spawn(run_child(h, l, children));
                         co_await h.save(io, "/api/v1/config/limits", R"({"max_file_bytes": 100})");
                         co_await h.save(io, "/api/v1/projects/app", "{}");
                         a.push_back(co_await h.mcp(io, R"({"jsonrpc":"2.0","id":1,"method":"tools/list"})"));
@@ -857,9 +912,12 @@ namespace {
                         a.push_back(co_await h.ask(io, http::method::POST, endpoint, R"({"project":"app","worldline":"main","action":"read","path":"a.txt"})"));
                         a.push_back(co_await h.ask(io, GET, "/api/v1/usage"));
                         a.push_back(co_await h.ask(io, GET, "/metrics"));
-                    });
-                }(h, io, a);
-            });
+                    };
+                    co_await coroutine::with_scope(std::move(run_children));
+                };
+                return run_operation(h, io, a);
+            };
+            h.rt.run(std::move(run_core));
             expect((a.size() == 16u) >> fatal);
             for (const auto name : {"configurations", "build", "test", "run", "language"})
                 expect(a[0].body.contains(std::format(R"("name":"{}")", name)));

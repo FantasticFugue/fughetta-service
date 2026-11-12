@@ -109,7 +109,7 @@ while True:
     auto describe(const std::vector<std::string>& argv, const std::filesystem::path& tree, std::string_view settings, const lsp::document& document)
         -> outcome {
         native::context context;
-        auto ran = cores::run(context, [&]() -> coroutine::task<outcome> {
+        auto run_operation = [&]() -> coroutine::task<outcome> {
             lsp::session session{context.get_scheduler(), {.argv = argv, .cwd = tree}};
             outcome out;
             co_await session.start(tree, *rfl::json::read<rfl::Generic>(settings));
@@ -120,7 +120,8 @@ while True:
             }
             out.code = co_await session.stop();
             co_return out;
-        }());
+        };
+        auto ran = cores::run(context, run_operation());
         expect(ran.has_value() >> fatal);
         return std::move(*ran);
     }
@@ -208,7 +209,7 @@ while True:
         "a cancelled query releases its response waiter and stops the background reader"_test = [] {
             mock m{"lsp-cancel", R"({"capabilities":{"diagnosticProvider":true},"hang":true})"};
             native::context context;
-            auto ran = cores::run(context, [&]() -> coroutine::task<bool> {
+            auto run_operation = [&]() -> coroutine::task<bool> {
                 auto io = context.get_scheduler();
                 lsp::session session{io, {.argv = m.argv, .cwd = m.tmp.dir}};
                 co_await session.start(m.tmp.dir, *rfl::json::read<rfl::Generic>("{}"));
@@ -216,14 +217,15 @@ while True:
                 auto result = co_await coroutine::deadline(io, std::chrono::milliseconds{30}, session.describe(document));
                 co_await session.abort();
                 co_return !result;
-            }());
+            };
+            auto ran = cores::run(context, run_operation());
             expect(ran && *ran);
         };
 
         "an idle session answers server requests and keeps only current diagnostics"_test = [] {
             mock m{"lsp-idle", R"({"capabilities":{"documentSymbolProvider":true},"idle":true})"};
             native::context context;
-            auto ran = cores::run(context, [&]() -> coroutine::task<int> {
+            auto run_operation = [&]() -> coroutine::task<int> {
                 auto io = context.get_scheduler();
                 lsp::session session{io, {.argv = m.argv, .cwd = m.tmp.dir}};
                 co_await session.start(m.tmp.dir, *rfl::json::read<rfl::Generic>(R"({"settings":{"mode":"test"}})"));
@@ -243,7 +245,8 @@ while True:
                 expect(current.complete) << "version-matched pushes describe this snapshot";
                 expect(!current.cacheable) << "pushes cannot certify changes to dependencies in other files";
                 co_return co_await session.stop();
-            }());
+            };
+            auto ran = cores::run(context, run_operation());
             expect(ran && *ran == 0);
         };
 
@@ -251,7 +254,7 @@ while True:
             mock m{"lsp-locations", R"({"capabilities":{"definitionProvider":true,"referencesProvider":true},
                 "locations":[{"path":"b.py","range":{"start":{"line":0,"character":10},"end":{"line":0,"character":13}}}]})"};
             native::context context;
-            auto ran = cores::run(context, [&]() -> coroutine::task<int> {
+            auto run_operation = [&]() -> coroutine::task<int> {
                 lsp::session session{context.get_scheduler(), {.argv = m.argv, .cwd = m.tmp.dir}};
                 co_await session.start(m.tmp.dir, *rfl::json::read<rfl::Generic>("{}"));
                 std::vector<lsp::document> documents{{"a.py", "python", "foo()\nfoo()\n"}, {"b.py", "python", "x = '😀'; foo()\n"}};
@@ -270,7 +273,8 @@ while True:
                 auto references = co_await session.lookup({.action = "references", .path = "b.py", .symbol = "foo"});
                 expect(references.size() == 1u);
                 co_return co_await session.stop();
-            }());
+            };
+            auto ran = cores::run(context, run_operation());
             expect(ran && *ran == 0);
             expect(m.sent().contains("\"character\": 10") && m.sent().contains("\"includeDeclaration\": true"));
         };
@@ -278,7 +282,7 @@ while True:
         "a session updates open files without restarting and closes removed files"_test = [] {
             mock m{"lsp-incremental", R"({"capabilities":{"diagnosticProvider":true}, "pull":[]})"};
             native::context context;
-            auto ran = cores::run(context, [&]() -> coroutine::task<int> {
+            auto run_operation = [&]() -> coroutine::task<int> {
                 lsp::session session{context.get_scheduler(), {.argv = m.argv, .cwd = m.tmp.dir}};
                 co_await session.start(m.tmp.dir, *rfl::json::read<rfl::Generic>("{}"));
                 std::vector<lsp::document> documents{{"a.py", "python", "x = '😀'\n"}, {"b.py", "python", "y = 1\n"}};
@@ -291,7 +295,8 @@ while True:
                 (void)co_await session.describe(documents.front());
                 co_await session.synchronize(documents);
                 co_return co_await session.stop();
-            }());
+            };
+            auto ran = cores::run(context, run_operation());
             expect(ran && *ran == 0);
             auto log = m.sent();
             auto occurrences = [&](std::string_view value) {
@@ -314,11 +319,12 @@ while True:
                 "capabilities": {"diagnosticProvider": {"interFileDependencies": false, "workspaceDiagnostics": false}},
                 "pull": [[0, 0, 1, 1, "E3", "bad"]]})"};
             native::context context;
-            auto ran = cores::run(context, [&]() -> coroutine::task<semantic::outline> {
+            auto run_operation = [&]() -> coroutine::task<semantic::outline> {
                 co_return co_await lsp::survey(
                     context.get_scheduler(), {.argv = m.argv, .cwd = m.tmp.dir}, *rfl::json::read<rfl::Generic>("{}"), m.tmp.dir,
                     {{.path = "a.py", .language = "python", .text = "x = 1\n"}, {.path = "b.py", .language = "python", .text = "y = 2\n"}});
-            }());
+            };
+            auto ran = cores::run(context, run_operation());
             expect((ran.has_value()) >> fatal);
             expect((ran->diagnostics.size() == 2u) >> fatal);
             expect(ran->diagnostics.at(0).range.place->path == "a.py" && ran->diagnostics.at(1).range.place->path == "b.py");

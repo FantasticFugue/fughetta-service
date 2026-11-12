@@ -23,7 +23,7 @@ namespace {
             auto http_port = test::port();
             std::atomic<int> mutations{0};
             std::atomic<int> dropped{0};
-            test::listener proxy{[&](native::scheduler& io, native::socket peer) -> coroutine::task<> {
+            auto run_operation = [&](native::scheduler& io, native::socket peer) -> coroutine::task<> {
                 try {
                     auto upstream = co_await io::connect(io, {net::ip::address_v4::loopback(), source_port});
                     transport::channel<native::socket> incoming{peer}, outgoing{upstream};
@@ -46,7 +46,8 @@ namespace {
                     }
                 } catch (const std::exception&) {
                 }
-            }};
+            };
+            test::listener proxy{std::move(run_operation)};
             auto doc = test::document(tmp.dir, http_port, proxy.endpoint().port());
             auto file = tmp.dir / "config.json";
             test::spit(file, rfl::json::write(doc));

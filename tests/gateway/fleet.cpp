@@ -98,15 +98,16 @@ namespace {
         auto host(ctx& io) -> coroutine::task<> {
             auto l = native::listener{io, {net::ip::address_v4::loopback(), 0}};
             auto client = co_await io::connect(io, {net::ip::address_v4{{127, 0, 0, 1}}, l.local_endpoint().port()});
-            auto server = co_await execution::then(net::async_accept(l), [](auto socket, auto) { return std::move(socket); });
-            co_await coroutine::with_scope([&](coroutine::scope& children) -> coroutine::task<> {
+            auto [server, endpoint] = co_await net::async_accept(l);
+            auto run_children = [&](coroutine::scope& children) -> coroutine::task<> {
                 children.spawn(router.workers(2).admit(io, std::move(server)));
                 children.spawn(fake_worker(client, "fake"));
                 while (!router.workers(2).holds({}))
                     co_await execution::schedule_after(io, 1ms);
                 rt.post(0, [this] { ready.fire(); });
                 co_await done.wait();
-            });
+            };
+            co_await coroutine::with_scope(std::move(run_children));
         }
 
         auto submit(ctx&) -> coroutine::task<> {
@@ -147,10 +148,10 @@ namespace {
             cores::io_context<native::context> rt{1};
             routing::router router{rt};
             bool enabled = true;
-            rt.run([&](ctx& io, std::size_t) -> coroutine::task<> {
+            auto run_core = [&](ctx& io, std::size_t) -> coroutine::task<> {
                 auto listener = native::listener{io, {net::ip::address_v4::loopback(), 0}};
                 auto client = co_await io::connect(io, {net::ip::address_v4{{127, 0, 0, 1}}, listener.local_endpoint().port()});
-                auto server = co_await execution::then(net::async_accept(listener), [](auto socket, auto) { return std::move(socket); });
+                auto [server, endpoint] = co_await net::async_accept(listener);
                 transport::channel<socket> channel{client};
                 co_await channel.post(jobs::hello{.name = "untrusted name",
                                                   .auth = credential.secret,
@@ -158,21 +159,22 @@ namespace {
                                                   .worker_id = credential.worker_id,
                                                   .workspace_id = credential.workspace_id,
                                                   .heartbeat_seconds = 15});
-                co_await coroutine::with_scope([&](coroutine::scope& children) -> coroutine::task<> {
+                auto run_children = [&](coroutine::scope& children) -> coroutine::task<> {
                     children.spawn(router.workers(0).admit(io, std::move(server), &registry, &pool, [&] { return enabled; }));
                     auto frame = co_await channel.recv();
                     expect(transport::decode<jobs::admission>(frame).accepted);
                     expect(router.workers(0).holds({}));
-                    co_await router.workers(0).with({}, [&](auto& selected) -> coroutine::task<> {
+                    auto run_operation = [&](auto& selected) -> coroutine::task<> {
                         auto identity = router.workers(0).identity(selected);
                         expect(identity.first == "machine");
                         expect(identity.second == std::optional{credential.worker_id});
                         co_return;
-                    });
+                    };
+                    co_await router.workers(0).with({}, std::move(run_operation));
                     enabled = false;
                     expect(router.workers(0).holds({}));
                     auto next = co_await io::connect(io, {net::ip::address_v4{{127, 0, 0, 1}}, listener.local_endpoint().port()});
-                    auto next_peer = co_await execution::then(net::async_accept(listener), [](auto socket, auto) { return std::move(socket); });
+                    auto [next_peer, endpoint] = co_await net::async_accept(listener);
                     transport::channel<socket> next_channel{next};
                     co_await next_channel.post(jobs::hello{.name = "machine",
                                                            .auth = credential.secret,
@@ -187,70 +189,83 @@ namespace {
                     registry.revoke(credential.worker_id);
                     expect(!router.workers(0).holds({}));
                     expect(!router.workers(0).describe(0).front().online);
-                });
-            });
+                };
+                co_await coroutine::with_scope(std::move(run_children));
+            };
+            rt.run(std::move(run_core));
         };
         "long-lived workers keep bounded recent tree affinity"_test = [] {
             cores::io_context<native::context> rt{1};
             routing::router router{rt};
-            rt.run([&](ctx& io, std::size_t) -> coroutine::task<> {
+            auto run_core = [&](ctx& io, std::size_t) -> coroutine::task<> {
                 auto listener = native::listener{io, {net::ip::address_v4::loopback(), 0}};
                 auto socket = co_await io::connect(io, {net::ip::address_v4{{127, 0, 0, 1}}, listener.local_endpoint().port()});
-                auto peer = co_await execution::then(net::async_accept(listener), [](auto socket, auto) { return std::move(socket); });
+                auto [peer, endpoint] = co_await net::async_accept(listener);
                 auto& fleet = router.workers(0);
-                co_await coroutine::with_scope([&](coroutine::scope& children) -> coroutine::task<> {
+                auto run_children = [&](coroutine::scope& children) -> coroutine::task<> {
                     children.spawn(fleet.admit(io, std::move(peer)));
                     children.spawn(fake_worker(socket, "persistent"));
                     while (!fleet.holds({}))
                         co_await execution::schedule_after(io, 1ms);
                     for (int i = 0; i < 600; ++i)
-                        co_await fleet.with({.tree_key = std::format("app/tree-{}", i)}, [](auto&) -> coroutine::task<> { co_return; });
+                        {
+                        static constexpr auto run_operation = [](auto&) -> coroutine::task<> { co_return; };
+                        co_await fleet.with({.tree_key = std::format("app/tree-{}", i)}, run_operation);
+                    }
                     auto views = fleet.describe(0);
                     expect((views.size() == 1u) >> fatal);
                     expect(views.front().trees.size() <= 256u);
                     expect(std::ranges::contains(views.front().trees, "app/tree-599"));
                     expect(!std::ranges::contains(views.front().trees, "app/tree-0"));
-                });
-            });
+                };
+                co_await coroutine::with_scope(std::move(run_children));
+            };
+            rt.run(std::move(run_core));
         };
         "a worker lease stays valid if it disconnects while the gateway reads source"_test = [] {
             cores::io_context<native::context> rt{1};
             routing::router router{rt};
             bool removed = false, rejected = false;
-            rt.run([&](ctx& io, std::size_t) -> coroutine::task<> {
+            auto run_core = [&](ctx& io, std::size_t) -> coroutine::task<> {
                 auto listener = native::listener{io, {net::ip::address_v4::loopback(), 0}};
                 auto worker = co_await io::connect(io, {net::ip::address_v4{{127, 0, 0, 1}}, listener.local_endpoint().port()});
-                auto peer = co_await execution::then(net::async_accept(listener), [](auto socket, auto) { return std::move(socket); });
+                auto [peer, endpoint] = co_await net::async_accept(listener);
                 transport::channel<socket> chan{worker};
                 co_await chan.post(jobs::hello{.name = "disconnect", .platform = linux_platform(), .protocol = jobs::protocol_version});
-                co_await coroutine::with_scope([&](coroutine::scope& children) -> coroutine::task<> {
+                auto run_children = [&](coroutine::scope& children) -> coroutine::task<> {
                     children.spawn(router.workers(0).admit(io, std::move(peer)));
                     while (!router.workers(0).holds({}))
                         co_await execution::schedule_after(io, 1ms);
-                    co_await router.workers(0).with({}, [&](auto& selected) -> coroutine::task<> {
+                    auto run_operation = [&](auto& selected) -> coroutine::task<> {
                         worker.close();
                         co_await execution::schedule_after(io, 20ms);
                         removed = !router.workers(0).holds({});
-                        auto result = co_await coroutine::deadline(io, 100ms, [](auto& selected, bool& rejected) -> coroutine::task<> {
+                        static constexpr auto run_until_deadline = [](auto& selected, bool& rejected) -> coroutine::task<> {
                             auto result = co_await selected.call(jobs::hash_file{.path = "acme/a"});
                             rejected = !result;
-                        }(selected, rejected));
+                        };
+                        auto result = co_await coroutine::deadline(io, 100ms, run_until_deadline(selected, rejected));
                         expect(result.has_value());
-                    });
-                });
-            });
+                    };
+                    co_await router.workers(0).with({}, std::move(run_operation));
+                };
+                co_await coroutine::with_scope(std::move(run_children));
+            };
+            rt.run(std::move(run_core));
             expect(removed && rejected);
         };
 
         "a job runs where its data is and reports back"_test = [] {
             harness h;
-            h.rt.run([&](ctx& io, std::size_t core) -> coroutine::task<> {
+            auto run_core = [&](ctx& io, std::size_t core) -> coroutine::task<> {
                 if (core == 0)
                     return h.submit(io);
                 if (core == 2)
                     return h.host(io);
-                return [](ctx&) -> coroutine::task<> { co_return; }(io);
-            });
+                static constexpr auto run_operation = [](ctx&) -> coroutine::task<> { co_return; };
+                return run_operation(io);
+            };
+            h.rt.run(std::move(run_core));
             expect(h.out.first_pick == std::optional<std::size_t>{2});
             expect(h.out.hex == "fake:acme/a.txt");
             expect(h.out.progress == std::vector<std::uint64_t>{1, 2, 3});
@@ -270,22 +285,23 @@ namespace {
         pick_outcome out;
 
         auto who(routing::selection sel) -> coroutine::task<std::string> {
-            co_return co_await router.workers(0).with(std::move(sel), [](auto& c) -> coroutine::task<std::string> {
+            static constexpr auto run_operation = [](auto& c) -> coroutine::task<std::string> {
                 auto d = co_await c.call(jobs::hash_file{.path = "who"});
                 expect(d.has_value() >> fatal);
                 co_return d->hex;
-            });
+            };
+            co_return co_await router.workers(0).with(std::move(sel), run_operation);
         }
     };
 
     static constexpr auto selection_suite = [] {
         "dependency publishers cannot receive general work"_test = [] {
             picker h;
-            h.rt.run([&](ctx& io, std::size_t) -> coroutine::task<> {
+            auto run_core = [&](ctx& io, std::size_t) -> coroutine::task<> {
                 auto l = native::listener{io, {net::ip::address_v4::loopback(), 0}};
                 auto client = co_await io::connect(io, {net::ip::address_v4{{127, 0, 0, 1}}, l.local_endpoint().port()});
-                auto peer = co_await execution::then(net::async_accept(l), [](auto socket, auto) { return std::move(socket); });
-                co_await coroutine::with_scope([&](coroutine::scope& children) -> coroutine::task<> {
+                auto [peer, endpoint] = co_await net::async_accept(l);
+                auto run_children = [&](coroutine::scope& children) -> coroutine::task<> {
                     children.spawn(h.router.workers(0).admit(io, std::move(peer)));
                     children.spawn(fake_worker(client, "publisher", {"cmake"}, 1, "", true));
                     while (h.router.workers(0).describe(0).empty())
@@ -300,18 +316,20 @@ namespace {
                     catch (const routing::no_worker& error) { refused = !error.busy; }
                     expect(refused);
                     expect(co_await h.who({.needs = {.dependency_publisher = true}}) == "publisher:who");
-                });
-            });
+                };
+                co_await coroutine::with_scope(std::move(run_children));
+            };
+            h.rt.run(std::move(run_core));
         };
         "affinity beats load, then it is least inflight, bounded by capacity"_test = [] {
             picker h;
-            h.rt.run([&](ctx& io, std::size_t) -> coroutine::task<> {
+            auto run_core = [&](ctx& io, std::size_t) -> coroutine::task<> {
                 auto l = native::listener{io, {net::ip::address_v4::loopback(), 0}};
                 auto a = co_await io::connect(io, {net::ip::address_v4{{127, 0, 0, 1}}, l.local_endpoint().port()});
-                auto pa = co_await execution::then(net::async_accept(l), [](auto socket, auto) { return std::move(socket); });
+                auto [pa, endpoint] = co_await net::async_accept(l);
                 auto b = co_await io::connect(io, {net::ip::address_v4{{127, 0, 0, 1}}, l.local_endpoint().port()});
-                auto pb = co_await execution::then(net::async_accept(l), [](auto socket, auto) { return std::move(socket); });
-                co_await coroutine::with_scope([&](coroutine::scope& children) -> coroutine::task<> {
+                auto [pb, endpoint_2] = co_await net::async_accept(l);
+                auto run_children = [&](coroutine::scope& children) -> coroutine::task<> {
                     children.spawn(h.router.workers(0).admit(io, std::move(pa)));
                     children.spawn(h.router.workers(0).admit(io, std::move(pb)));
                     children.spawn(fake_worker(a, "alpha", {"cmake"}, 1));
@@ -327,12 +345,14 @@ namespace {
                     h.out.second = co_await h.who({.tree_key = "t2"});
                     h.out.third = co_await h.who(t1);
 
-                    children.spawn([&]() -> coroutine::task<> {
-                        co_await h.router.workers(0).with(t1, [&](auto&) -> coroutine::task<std::string> {
+                    static constexpr auto run_child = [](auto& h, routing::selection t1) -> coroutine::task<> {
+                        auto run_operation = [&](auto&) -> coroutine::task<std::string> {
                             co_await h.held.wait();
                             co_return "held";
-                        });
-                    }());
+                        };
+                        co_await h.router.workers(0).with(t1, std::move(run_operation));
+                    };
+                    children.spawn(run_child(h, t1));
                     auto filled = [&] {
                         for (auto& view : h.router.workers(0).describe(0))
                             if (view.name == resident)
@@ -345,8 +365,10 @@ namespace {
                     h.held.fire();
 
                     h.out.capacity_err = other;
-                });
-            });
+                };
+                co_await coroutine::with_scope(std::move(run_children));
+            };
+            h.rt.run(std::move(run_core));
             expect(h.out.first == "alpha:who" || h.out.first == "beta:who") << h.out.first;
             expect(h.out.second != h.out.first) << h.out.second << " least-inflight after the resident";
             expect(h.out.third == h.out.first) << h.out.third << "affinity beats the idle worker";
@@ -355,13 +377,13 @@ namespace {
 
         "requirements exclude workers and name what is missing"_test = [] {
             picker h;
-            h.rt.run([&](ctx& io, std::size_t) -> coroutine::task<> {
+            auto run_core = [&](ctx& io, std::size_t) -> coroutine::task<> {
                 auto l = native::listener{io, {net::ip::address_v4::loopback(), 0}};
                 auto a = co_await io::connect(io, {net::ip::address_v4{{127, 0, 0, 1}}, l.local_endpoint().port()});
-                auto pa = co_await execution::then(net::async_accept(l), [](auto socket, auto) { return std::move(socket); });
+                auto [pa, endpoint] = co_await net::async_accept(l);
                 auto b = co_await io::connect(io, {net::ip::address_v4{{127, 0, 0, 1}}, l.local_endpoint().port()});
-                auto pb = co_await execution::then(net::async_accept(l), [](auto socket, auto) { return std::move(socket); });
-                co_await coroutine::with_scope([&](coroutine::scope& children) -> coroutine::task<> {
+                auto [pb, endpoint_2] = co_await net::async_accept(l);
+                auto run_children = [&](coroutine::scope& children) -> coroutine::task<> {
                     children.spawn(h.router.workers(0).admit(io, std::move(pa)));
                     children.spawn(h.router.workers(0).admit(io, std::move(pb)));
                     children.spawn(fake_worker(a, "gcc-builder", {"gcc", "cmake"}));
@@ -380,8 +402,10 @@ namespace {
                     } catch (const routing::no_worker& e) {
                         h.out.overflow = e.what();
                     }
-                });
-            });
+                };
+                co_await coroutine::with_scope(std::move(run_children));
+            };
+            h.rt.run(std::move(run_core));
             expect(h.out.first == "clang-builder:who") << h.out.first;
             expect(h.out.capacity_err == "no attached worker provides all required tools (missing: mold)") << h.out.capacity_err;
             expect(h.out.overflow == "no attached worker matches the required platform os=windows") << h.out.overflow;
@@ -389,22 +413,24 @@ namespace {
 
         "a full worker is told apart from a missing one"_test = [] {
             picker h;
-            h.rt.run([&](ctx& io, std::size_t) -> coroutine::task<> {
+            auto run_core = [&](ctx& io, std::size_t) -> coroutine::task<> {
                 auto l = native::listener{io, {net::ip::address_v4::loopback(), 0}};
                 auto a = co_await io::connect(io, {net::ip::address_v4{{127, 0, 0, 1}}, l.local_endpoint().port()});
-                auto pa = co_await execution::then(net::async_accept(l), [](auto socket, auto) { return std::move(socket); });
-                co_await coroutine::with_scope([&](coroutine::scope& children) -> coroutine::task<> {
+                auto [pa, endpoint] = co_await net::async_accept(l);
+                auto run_children = [&](coroutine::scope& children) -> coroutine::task<> {
                     children.spawn(h.router.workers(0).admit(io, std::move(pa)));
                     children.spawn(fake_worker(a, "solo", {"cmake"}, 1));
                     while (h.router.workers(0).describe(0).empty())
                         co_await execution::schedule_after(io, 1ms);
 
-                    children.spawn([&]() -> coroutine::task<> {
-                        co_await h.router.workers(0).with({}, [&](auto&) -> coroutine::task<std::string> {
+                    static constexpr auto run_child = [](auto& h) -> coroutine::task<> {
+                        auto run_operation = [&](auto&) -> coroutine::task<std::string> {
                             co_await h.held.wait();
                             co_return "held";
-                        });
-                    }());
+                        };
+                        co_await h.router.workers(0).with({}, std::move(run_operation));
+                    };
+                    children.spawn(run_child(h));
                     while (h.router.workers(0).describe(0).at(0).inflight == 0)
                         co_await execution::schedule_after(io, 1ms);
                     try {
@@ -413,8 +439,10 @@ namespace {
                         h.out.capacity_err = e.what();
                     }
                     h.held.fire();
-                });
-            });
+                };
+                co_await coroutine::with_scope(std::move(run_children));
+            };
+            h.rt.run(std::move(run_core));
             expect(h.out.capacity_err == "every attached worker is at its dispatch limit") << h.out.capacity_err;
         };
     };
@@ -437,10 +465,10 @@ namespace {
     auto watched(ctx& io, routing::router& router, watchdog_result& out) -> coroutine::task<> {
         auto l = native::listener{io, {net::ip::address_v4::loopback(), 0}};
         auto client = co_await io::connect(io, {net::ip::address_v4{{127, 0, 0, 1}}, l.local_endpoint().port()});
-        auto server = co_await execution::then(net::async_accept(l), [](auto socket, auto) { return std::move(socket); });
+        auto [server, endpoint] = co_await net::async_accept(l);
         auto stranger = co_await io::connect(io, {net::ip::address_v4{{127, 0, 0, 1}}, l.local_endpoint().port()});
-        auto stranger_peer = co_await execution::then(net::async_accept(l), [](auto socket, auto) { return std::move(socket); });
-        co_await coroutine::with_scope([&](coroutine::scope& children) -> coroutine::task<> {
+        auto [stranger_peer, endpoint_2] = co_await net::async_accept(l);
+        auto run_children = [&](coroutine::scope& children) -> coroutine::task<> {
             children.spawn(router.workers(0).watch(io));
             children.spawn(router.workers(0).admit(io, std::move(server)));
             children.spawn(mute(client, jobs::protocol_version));
@@ -450,7 +478,7 @@ namespace {
                 co_await execution::schedule_after(io, std::chrono::milliseconds{5});
             out.joined = router.workers(0).holds({}) && router.workers(0).describe(0).size() == 1u;
             out.refused = router.workers(0).describe(0).size() == 1u;
-            children.spawn([](routing::router& router, std::string& outcome) -> coroutine::task<> {
+            static constexpr auto run_child = [](routing::router& router, std::string& outcome) -> coroutine::task<> {
                 outcome = "pending";
                 try {
                     co_await router.run(0, {}, jobs::hash_file{.path = "acme/x"});
@@ -458,10 +486,12 @@ namespace {
                 } catch (const std::exception& e) {
                     outcome = std::string{"failed: "} + e.what();
                 }
-            }(router, out.in_flight));
+            };
+            children.spawn(run_child(router, out.in_flight));
             co_await execution::schedule_after(io, std::chrono::milliseconds{600});
             out.dropped = router.workers(0).describe(0).empty();
-        });
+        };
+        co_await coroutine::with_scope(std::move(run_children));
     }
 
     static constexpr auto watchdog_suite = [] {
@@ -489,15 +519,15 @@ namespace {
             config::slots config{1, std::make_shared<const config::document>(std::move(doc))};
             routing::router router{rt, routing::stale_after, &config};
             gate_outcome out;
-            rt.run([&](ctx& io, std::size_t) -> coroutine::task<> {
+            auto run_core = [&](ctx& io, std::size_t) -> coroutine::task<> {
                 auto l = native::listener{io, {net::ip::address_v4::loopback(), 0}};
                 auto good = co_await io::connect(io, {net::ip::address_v4{{127, 0, 0, 1}}, l.local_endpoint().port()});
-                auto good_peer = co_await execution::then(net::async_accept(l), [](auto socket, auto) { return std::move(socket); });
+                auto [good_peer, endpoint] = co_await net::async_accept(l);
                 auto bad = co_await io::connect(io, {net::ip::address_v4{{127, 0, 0, 1}}, l.local_endpoint().port()});
-                auto bad_peer = co_await execution::then(net::async_accept(l), [](auto socket, auto) { return std::move(socket); });
+                auto [bad_peer, endpoint_2] = co_await net::async_accept(l);
                 auto none = co_await io::connect(io, {net::ip::address_v4{{127, 0, 0, 1}}, l.local_endpoint().port()});
-                auto none_peer = co_await execution::then(net::async_accept(l), [](auto socket, auto) { return std::move(socket); });
-                co_await coroutine::with_scope([&](coroutine::scope& children) -> coroutine::task<> {
+                auto [none_peer, endpoint_3] = co_await net::async_accept(l);
+                auto run_children = [&](coroutine::scope& children) -> coroutine::task<> {
                     children.spawn(router.workers(0).admit(io, std::move(good_peer)));
                     children.spawn(router.workers(0).admit(io, std::move(bad_peer)));
                     children.spawn(router.workers(0).admit(io, std::move(none_peer)));
@@ -508,8 +538,10 @@ namespace {
                         co_await execution::schedule_after(io, std::chrono::milliseconds{5});
                     co_await execution::schedule_after(io, std::chrono::milliseconds{50});
                     out.admitted = router.workers(0).describe(0).size();
-                });
-            });
+                };
+                co_await coroutine::with_scope(std::move(run_children));
+            };
+            rt.run(std::move(run_core));
             expect(out.admitted == 1u) << "only the right token passes; a wrong or missing one does not";
         };
     };

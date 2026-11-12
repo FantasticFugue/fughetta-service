@@ -695,20 +695,21 @@ export namespace tools {
                 std::string input = content::hash_of(rfl::json::write(std::array{name, in.from.value().value_or(line), in.version.value().value_or(""),
                                                                                  in.intent.value().value_or("")}))
                                         .str();
+                auto apply_once = [&]() -> coroutine::task<nodes::node_reply> {
+                    auto base = co_await selected(s, project, in.from.value().value_or(line), in.version.value().value_or(""), actor);
+                    co_return co_await node_call(s, project,
+                                                 {.action = "fork",
+                                                  .worldline = name,
+                                                  .operation = lines::operation_of(id),
+                                                  .caller_operation = id,
+                                                  .source = base.frontier,
+                                                  .intent = in.intent.value().value_or(""),
+                                                  .result = rfl::json::write(record{input})},
+                                                 actor);
+                };
                 auto r = co_await once<nodes::node_reply>(
                     s, project, actor, id, input,
-                    [&]() -> coroutine::task<nodes::node_reply> {
-                        auto base = co_await selected(s, project, in.from.value().value_or(line), in.version.value().value_or(""), actor);
-                        co_return co_await node_call(s, project,
-                                                     {.action = "fork",
-                                                      .worldline = name,
-                                                      .operation = lines::operation_of(id),
-                                                      .caller_operation = id,
-                                                      .source = base.frontier,
-                                                      .intent = in.intent.value().value_or(""),
-                                                      .result = rfl::json::write(record{input})},
-                                                     actor);
-                    },
+                    std::move(apply_once),
                     [](const auto& done) {
                         auto r = done.first;
                         r.replayed = true;
@@ -1329,6 +1330,16 @@ export namespace tools {
         auto& router = s.workers;
         std::optional<std::pair<jobs::build_report, sync_stats>> done;
         try {
+            auto run_on_worker = [&files, &rt, &router, executor = held.executor, project, tree = snapshot, request, worldline, version,
+             actor](auto& worker, jobs::progress_log* progress, std::size_t core) -> coroutine::task<std::pair<jobs::build_report, sync_stats>> {
+                auto identity = router.workers(core).identity(worker);
+                executor->select(identity);
+                auto result = co_await sync_and_run(rt.get_scheduler(core), files, core, worker, project, tree, request, progress, worldline, version,
+                                                    actor, executor);
+                result.first.worker = std::move(identity.first);
+                result.first.worker_id = std::move(identity.second);
+                co_return result;
+            };
             done = co_await s.workers.with_worker(
                 s.core,
                 routing::selection{.needs = config.needs.get() ? routing::requirements{.tools = config.needs.get()->tools,
@@ -1337,16 +1348,7 @@ export namespace tools {
                                                                                        .toolchain_id = toolchain}
                                                                : routing::requirements{.toolchain_id = toolchain},
                                    .tree_key = request.tree},
-                [&files, &rt, &router, executor = held.executor, project, tree = snapshot, request, worldline, version,
-                 actor](auto& worker, jobs::progress_log* progress, std::size_t core) -> coroutine::task<std::pair<jobs::build_report, sync_stats>> {
-                    auto identity = router.workers(core).identity(worker);
-                    executor->select(identity);
-                    auto result = co_await sync_and_run(rt.get_scheduler(core), files, core, worker, project, tree, request, progress, worldline, version,
-                                                        actor, executor);
-                    result.first.worker = std::move(identity.first);
-                    result.first.worker_id = std::move(identity.second);
-                    co_return result;
-                },
+                std::move(run_on_worker),
                 &progress);
         } catch (const routing::no_worker& e) {
             if (e.busy) {
@@ -1548,58 +1550,60 @@ export namespace tools {
                 if (!filled.insert(key).second) { record_status("same dependencies as an earlier step"); continue; }
                 backlog::entry entry{.key = key, .project = project, .configuration = "dependencies", .operation = "dependencies",
                     .actor = worlds::execution_key(actor), .cacheable = false};
-                auto ticket = co_await s.queue->submit(s.core, std::move(entry),
-                    [request, toolchain, project, actor, worldline, version, snapshot_id = snapshot.id().str()](services& zero, jobs::progress_log& progress, std::string) -> coroutine::task<std::optional<backlog::outcome>> {
-                        config_result out{.configuration = "dependencies"};
-                        std::uint64_t admission_id;
-                        try {
-                            admission_id = co_await zero.files.with(zero.core, project,
-                                [](storage::project_ctx& context) { return context.ledger.admit_build(context.settings.project, context.settings.limits); });
-                        } catch (const std::exception& error) {
-                            out.error = std::string{error.what()}.substr(0, 512);
-                            co_return out;
-                        }
-                        admission held{&zero.files, zero.core, admission_id,
-                            usage::build_event{.project = project, .target = "dependencies", .workspace_id = zero.snapshot()->server.auth.workspace,
-                                .worldline = worldline, .version = version, .snapshot = snapshot_id, .operation = "dependencies",
-                                .actor = worlds::execution_key(actor), .error_code = "cancelled"},
-                            std::chrono::steady_clock::now()};
-                        std::int32_t exit_code = -1;
-                        bool timed_out = false;
-                        try {
-                            auto report = co_await zero.workers.with_worker(zero.core,
-                                routing::selection{.needs = {.toolchain_id = toolchain, .dependency_publisher = true}},
-                                [request, &zero, identity = held.executor](auto& worker, jobs::progress_log* progress, std::size_t core) -> coroutine::task<jobs::build_report> {
-                                    identity->select(zero.workers.workers(core).identity(worker));
-                                    identity->begin();
-                                    co_return co_await within(zero.workers.io_context().get_scheduler(core),
-                                        std::chrono::seconds{request.timeout_s} + build_overhead, "dependency fill", worker.call(request, progress));
-                                }, &progress);
-                            out.worker = report.worker;
-                            out.ok = !report.steps.empty() && report.ok() && std::ranges::all_of(report.steps, [](const auto& step) { return step.cache_error.empty(); });
-                            if (!report.steps.empty()) { exit_code = report.steps.back().exit_code; timed_out = report.steps.back().timed_out; }
-                            if (!out.ok) out.error = "trusted dependency fill failed; private build remains available";
-                        } catch (const routing::no_worker& error) {
-                            if (error.busy) {
-                                held.ended = true;
-                                zero.files.post(zero.core, [admission_id](usage::ledger& ledger) { ledger.release(admission_id); });
-                                co_return std::nullopt;
-                            }
-                            out.error = error.what();
-                        } catch (const std::exception& error) { out.error = std::string{error.what()}.substr(0, 512); }
-                        held.executor->stamp(out);
-                        auto event = held.cancelled;
-                        held.executor->stamp(event);
-                        event.ok = out.ok;
-                        event.exit_code = exit_code;
-                        event.timed_out = timed_out;
-                        event.error_code = out.ok ? "" : "dependency_fill_failed";
-                        event.error = out.error;
-                        event.seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - held.started).count();
-                        held.ended = true;
-                        zero.files.post(zero.core, [admission_id, event](usage::ledger& ledger) { ledger.record(admission_id, event); });
+                auto run_operation = [request, toolchain, project, actor, worldline, version, snapshot_id = snapshot.id().str()](services& zero, jobs::progress_log& progress, std::string) -> coroutine::task<std::optional<backlog::outcome>> {
+                    config_result out{.configuration = "dependencies"};
+                    std::uint64_t admission_id;
+                    try {
+                        admission_id = co_await zero.files.with(zero.core, project,
+                            [](storage::project_ctx& context) { return context.ledger.admit_build(context.settings.project, context.settings.limits); });
+                    } catch (const std::exception& error) {
+                        out.error = std::string{error.what()}.substr(0, 512);
                         co_return out;
-                    });
+                    }
+                    admission held{&zero.files, zero.core, admission_id,
+                        usage::build_event{.project = project, .target = "dependencies", .workspace_id = zero.snapshot()->server.auth.workspace,
+                            .worldline = worldline, .version = version, .snapshot = snapshot_id, .operation = "dependencies",
+                            .actor = worlds::execution_key(actor), .error_code = "cancelled"},
+                        std::chrono::steady_clock::now()};
+                    std::int32_t exit_code = -1;
+                    bool timed_out = false;
+                    try {
+                        auto run_on_worker = [request, &zero, identity = held.executor](auto& worker, jobs::progress_log* progress, std::size_t core) -> coroutine::task<jobs::build_report> {
+                            identity->select(zero.workers.workers(core).identity(worker));
+                            identity->begin();
+                            co_return co_await within(zero.workers.io_context().get_scheduler(core),
+                                std::chrono::seconds{request.timeout_s} + build_overhead, "dependency fill", worker.call(request, progress));
+                        };
+                        auto report = co_await zero.workers.with_worker(zero.core,
+                            routing::selection{.needs = {.toolchain_id = toolchain, .dependency_publisher = true}},
+                            std::move(run_on_worker), &progress);
+                        out.worker = report.worker;
+                        out.ok = !report.steps.empty() && report.ok() && std::ranges::all_of(report.steps, [](const auto& step) { return step.cache_error.empty(); });
+                        if (!report.steps.empty()) { exit_code = report.steps.back().exit_code; timed_out = report.steps.back().timed_out; }
+                        if (!out.ok) out.error = "trusted dependency fill failed; private build remains available";
+                    } catch (const routing::no_worker& error) {
+                        if (error.busy) {
+                            held.ended = true;
+                            zero.files.post(zero.core, [admission_id](usage::ledger& ledger) { ledger.release(admission_id); });
+                            co_return std::nullopt;
+                        }
+                        out.error = error.what();
+                    } catch (const std::exception& error) { out.error = std::string{error.what()}.substr(0, 512); }
+                    held.executor->stamp(out);
+                    auto event = held.cancelled;
+                    held.executor->stamp(event);
+                    event.ok = out.ok;
+                    event.exit_code = exit_code;
+                    event.timed_out = timed_out;
+                    event.error_code = out.ok ? "" : "dependency_fill_failed";
+                    event.error = out.error;
+                    event.seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - held.started).count();
+                    held.ended = true;
+                    zero.files.post(zero.core, [admission_id, event](usage::ledger& ledger) { ledger.record(admission_id, event); });
+                    co_return out;
+                };
+                auto ticket = co_await s.queue->submit(s.core, std::move(entry),
+                    std::move(run_operation));
                 const auto remaining = std::max(std::chrono::steady_clock::duration::zero(), deadline - std::chrono::steady_clock::now());
                 auto done = co_await coroutine::deadline(s.workers.io_context().get_scheduler(s.core), remaining,
                     follow(s, ticket, [note](const jobs::progress& progress) { if (note) (*note)(progress_note(progress)); }));
@@ -1696,19 +1700,20 @@ export namespace tools {
         bool stopped = false;
         auto token = co_await coroutine::current_token;
         try {
+            auto run_on_worker = [&registry, &rt, &router, executor, project, files, build, line, version = selected_tree.version,
+             actor](auto& worker, jobs::progress_log* progress, std::size_t core) -> coroutine::task<std::pair<jobs::build_report, sync_stats>> {
+                auto identity = router.workers(core).identity(worker);
+                executor->select(identity);
+                auto result = co_await sync_and_run(rt.get_scheduler(core), registry, core, worker, project, files, build, progress, line,
+                                                    version, actor, executor);
+                result.first.worker = std::move(identity.first);
+                result.first.worker_id = std::move(identity.second);
+                co_return result;
+            };
             done = co_await coroutine::under(
                 token, zero.workers.with_worker(
                            zero.core, routing::selection{.needs = needs, .tree_key = build.tree},
-                           [&registry, &rt, &router, executor, project, files, build, line, version = selected_tree.version,
-                            actor](auto& worker, jobs::progress_log* progress, std::size_t core) -> coroutine::task<std::pair<jobs::build_report, sync_stats>> {
-                               auto identity = router.workers(core).identity(worker);
-                               executor->select(identity);
-                               auto result = co_await sync_and_run(rt.get_scheduler(core), registry, core, worker, project, files, build, progress, line,
-                                                                   version, actor, executor);
-                               result.first.worker = std::move(identity.first);
-                               result.first.worker_id = std::move(identity.second);
-                               co_return result;
-                           },
+                           std::move(run_on_worker),
                            progress));
             stopped = !done;
         } catch (const routing::no_worker& e) {
@@ -1965,12 +1970,13 @@ export namespace tools {
         out.worldline = worldline;
         out.revision = tree.version;
         out.snapshot = tree.version;
-        co_await coroutine::with_scope([&](coroutine::scope& children) -> coroutine::task<> {
+        auto run_children = [&](coroutine::scope& children) -> coroutine::task<> {
             for (std::size_t i = 0; i < jobs.size(); ++i)
                 children.spawn(execute(s, project, operation, cacheable, fresh, jobs[i].first, jobs[i].second, snapshot, note, out.results[i], worldline,
                                        tree.version, actor));
             co_await children.join();
-        });
+        };
+        co_await coroutine::with_scope(std::move(run_children));
         out.ok = std::ranges::all_of(out.results, &config_result::ok);
         co_return out;
     }
@@ -2204,20 +2210,21 @@ export namespace tools {
         if (operation_id.empty())
             throw tool_error(nodes::code::invalid_record, "generation names an operation_id");
         std::string input = content::hash_of(rfl::json::write(parameters)).str();
+        auto apply_once = [&]() -> coroutine::task<mutation> {
+            auto observed = co_await main_tree(s, project, actor);
+            std::vector<change> changes;
+            for (const auto& file : out.preview.files) {
+                if (std::ranges::contains(observed.files, file.path, &nodes::file_view::path))
+                    throw tool_error(nodes::code::source_conflict, file.path + " already exists");
+                changes.push_back({.kind = "create", .path = file.path, .text = file.text});
+            }
+            auto r = co_await main_apply(s, project, actor, observed, std::move(changes), operation_id, "generate " + parameters.template_id,
+                                         rfl::json::write(record{input}));
+            co_return mutation{r.version, r.receipt, operation_id, r.replayed};
+        };
         out.receipt = co_await once<mutation>(
             s, project, actor, operation_id, input,
-            [&]() -> coroutine::task<mutation> {
-                auto observed = co_await main_tree(s, project, actor);
-                std::vector<change> changes;
-                for (const auto& file : out.preview.files) {
-                    if (std::ranges::contains(observed.files, file.path, &nodes::file_view::path))
-                        throw tool_error(nodes::code::source_conflict, file.path + " already exists");
-                    changes.push_back({.kind = "create", .path = file.path, .text = file.text});
-                }
-                auto r = co_await main_apply(s, project, actor, observed, std::move(changes), operation_id, "generate " + parameters.template_id,
-                                             rfl::json::write(record{input}));
-                co_return mutation{r.version, r.receipt, operation_id, r.replayed};
-            },
+            std::move(apply_once),
             [&](const auto& done) { return mutation{done.first.version, done.first.receipt, operation_id, true}; });
         co_return out;
     }

@@ -42,17 +42,20 @@ export int run_source(int argc, char** argv) {
         cores::signal_watch signals{context};
         execution::thread_pool disk{cfg.disk_threads};
         source_server::service files{context, cfg.storage, disk};
-        context.run([&](auto& io, std::size_t core) -> coroutine::task<> {
+        auto run_core = [&](auto& io, std::size_t core) -> coroutine::task<> {
             auto listener = native::listener{io, io::parse_endpoint(cfg.bind, cfg.port)};
             if (core == 0)
                 logging::info(std::format("source: internal file service on {}:{}, storage {}, {} cores", cfg.bind, cfg.port, cfg.storage, context.size()));
             std::cerr << "service-ready:source\n";
-            co_await coroutine::with_scope([&](coroutine::scope& children) -> coroutine::task<> {
-                for (;;)
-                    children.spawn(
-                        files.serve(io, co_await execution::then(net::async_accept(listener), [](auto socket, auto) { return std::move(socket); }), core));
-            });
-        });
+            auto run_children = [&](coroutine::scope& children) -> coroutine::task<> {
+                for (;;) {
+                    auto [connection, peer] = co_await net::async_accept(listener);
+                    children.spawn(files.serve(io, std::move(connection), core));
+                }
+            };
+            co_await coroutine::with_scope(std::move(run_children));
+        };
+        context.run(std::move(run_core));
     } catch (const std::exception& e) {
         logging::error(std::format("source: {}", e.what()));
         return 1;

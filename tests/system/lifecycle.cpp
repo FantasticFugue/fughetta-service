@@ -23,12 +23,13 @@ namespace {
 
             test::scratch tmp{"worker-exit"};
             std::atomic<unsigned> attempts = 0;
-            test::listener server{[&](native::scheduler&, native::socket peer) -> coroutine::task<> {
+            auto run_operation = [&](native::scheduler&, native::socket peer) -> coroutine::task<> {
                 transport::channel<native::socket> channel{peer};
                 auto frame = co_await channel.recv();
                 test::require(frame.kind == jobs::code<jobs::hello>, "first worker message was not hello");
                 ++attempts;
-            }};
+            };
+            test::listener server{std::move(run_operation)};
             config::worker config;
             config.gateway = std::format("127.0.0.1:{}", server.endpoint().port());
             config.work_root = (tmp.dir / "worker").string();

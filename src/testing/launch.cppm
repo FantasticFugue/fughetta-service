@@ -136,15 +136,18 @@ export namespace test {
             std::promise<net::ip::tcp::endpoint> promise;
             auto result = promise.get_future();
             thread_ = std::jthread([this, &promise, serve = std::move(serve)]() mutable {
-                context_.run([&](native::scheduler& scheduler, std::size_t) -> coroutine::task<> {
+                auto run_core = [&](native::scheduler& scheduler, std::size_t) -> coroutine::task<> {
                     auto acceptor = native::listener{scheduler, {net::ip::address_v4::loopback(), 0}};
                     promise.set_value({net::ip::address_v4{{127, 0, 0, 1}}, acceptor.local_endpoint().port()});
-                    co_await coroutine::with_scope([&](coroutine::scope& tasks) -> coroutine::task<> {
-                        for (;;)
-                            tasks.spawn(
-                                serve(scheduler, co_await execution::then(net::async_accept(acceptor), [](auto socket, auto) { return std::move(socket); })));
-                    });
-                });
+                    auto run_tasks = [&](coroutine::scope& tasks) -> coroutine::task<> {
+                        for (;;) {
+                            auto [connection, peer] = co_await net::async_accept(acceptor);
+                            tasks.spawn(serve(scheduler, std::move(connection)));
+                        }
+                    };
+                    co_await coroutine::with_scope(std::move(run_tasks));
+                };
+                context_.run(std::move(run_core));
             });
             endpoint_ = result.get();
         }

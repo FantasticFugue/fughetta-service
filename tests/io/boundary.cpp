@@ -224,16 +224,17 @@ namespace {
 
         "expect preserves void values and single errors"_test = [] {
             observation observed;
+            static constexpr auto run_operation = []() -> coroutine::task<> {
+                auto value = co_await coroutine::expect(execution::just());
+                static_assert(std::same_as<decltype(value), std::expected<void, std::error_code>>);
+                expect(value.has_value());
+                auto failure = co_await coroutine::expect(execution::just_error(std::make_error_code(std::errc::permission_denied)));
+                static_assert(std::same_as<decltype(failure), std::expected<void, std::error_code>>);
+                expect(!failure);
+                expect(failure.error() == std::errc::permission_denied);
+            };
             start_destroying(
-                []() -> coroutine::task<> {
-                    auto value = co_await coroutine::expect(execution::just());
-                    static_assert(std::same_as<decltype(value), std::expected<void, std::error_code>>);
-                    expect(value.has_value());
-                    auto failure = co_await coroutine::expect(execution::just_error(std::make_error_code(std::errc::permission_denied)));
-                    static_assert(std::same_as<decltype(failure), std::expected<void, std::error_code>>);
-                    expect(!failure);
-                    expect(failure.error() == std::errc::permission_denied);
-                }(),
+                run_operation(),
                 observed);
             expect(observed.result == channel::value);
         };
@@ -274,7 +275,8 @@ namespace {
                 expect(observed.cleaned == 1_i);
             }
             observation observed;
-            start_destroying([]() -> coroutine::task<> { co_return; }(), observed);
+            static constexpr auto run_operation = []() -> coroutine::task<> { co_return; };
+            start_destroying(run_operation(), observed);
             expect(observed.result == channel::value);
         };
 

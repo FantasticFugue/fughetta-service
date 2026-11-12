@@ -32,7 +32,7 @@ namespace {
         std::vector<input_file> files;
     };
     auto elapsed(clock_type::time_point start) -> double { return std::chrono::duration<double>(clock_type::now() - start).count(); }
-    auto operation(std::string name) -> std::string { return content::hash_of(name); }
+    auto operation(std::string name) -> std::string { return content::hash_of(name).str(); }
     auto call(nodes::local_node& node, nodes::node_request in) -> nodes::node_reply {
         if (in.owner.empty())
             in.owner = node.node_id();
@@ -66,8 +66,8 @@ namespace {
         out.resize(length);
         return out;
     }
-    auto intent(std::uint64_t i) -> std::string { return repeated(content::hash_of("intent:" + std::to_string(i)), 1024); }
-    auto result(std::uint64_t i) -> std::string { return repeated(content::hash_of("result:" + std::to_string(i)), 4096); }
+    auto intent(std::uint64_t i) -> std::string { return repeated(content::hash_of("intent:" + std::to_string(i)).str(), 1024); }
+    auto result(std::uint64_t i) -> std::string { return repeated(content::hash_of("result:" + std::to_string(i)).str(), 4096); }
     void summarize(measured& output, nodes::local_node& node, const std::string& worldline = "main", const std::vector<std::string>& heads = {}) {
         auto state = call(node, {.action = "inspect", .worldline = worldline, .source = heads});
         output.state_snapshot = state.state_snapshot;
@@ -193,7 +193,7 @@ namespace {
                                       .expected = head,
                                       .edits = {{.kind = "edit",
                                                  .path = std::format("scale/{:05}.txt", i % 100),
-                                                 .text = content::hash_of(std::to_string(i)).substr(0, 16),
+                                                 .text = content::hash_of(std::to_string(i)).str().substr(0, 16),
                                                  .count = 16}},
                                       .intent = intent(i),
                                       .result = result(i),
