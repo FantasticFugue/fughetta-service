@@ -17,7 +17,8 @@ namespace {
             const auto files = delivery::capture(tree, {{"package", "dist"}, {"empty", "empty"}}, storage);
             expect(files.size() == 3u);
             const auto found = std::ranges::find(files, "app", &builds::exported_file::path);
-            if (found == files.end()) throw std::runtime_error("exported app missing");
+            if (found == files.end())
+                throw std::runtime_error("exported app missing");
             expect(found->name == "package" && found->size == 14u);
             expect(found->digest == content::hash_of("first artifact"));
             test::spit(tree / "dist/app", "replacement");
@@ -40,17 +41,14 @@ namespace {
             delivery::accept(tmp.dir, {.digest = digest, .offset = 1, .total = 3, .bytes = {std::byte{'b'}, std::byte{'c'}}});
             expect(delivery::read(tmp.dir, {.digest = digest}).parts.at(0).bytes.size() == 3u);
             const auto wrong = content::hash_of("wrong");
-            expect(throws<std::invalid_argument>([&] {
-                delivery::accept(tmp.dir, {.digest = wrong, .total = 1, .bytes = {std::byte{'x'}}});
-            }));
+            expect(throws<std::invalid_argument>([&] { delivery::accept(tmp.dir, {.digest = wrong, .total = 1, .bytes = {std::byte{'x'}}}); }));
             expect(!std::filesystem::exists(tmp.dir / wrong.view()));
             expect(!std::filesystem::exists(tmp.dir / "partial" / wrong.view()));
         };
         "verification is separate from publication and active receivers survive collection"_test = [] {
             test::scratch tmp{"delivery-staging"};
             const auto digest = content::hash_of("abc");
-            jobs::source_part part{.digest = digest, .total = 3,
-                .bytes = {std::byte{'a'}, std::byte{'b'}, std::byte{'c'}}};
+            jobs::source_part part{.digest = digest, .total = 3, .bytes = {std::byte{'a'}, std::byte{'b'}, std::byte{'c'}}};
             expect(delivery::stage(tmp.dir, part));
             const auto pending = tmp.dir / "partial" / digest.view();
             std::filesystem::last_write_time(pending, std::filesystem::file_time_type::clock::now() - std::chrono::hours{48});
@@ -96,7 +94,8 @@ namespace {
             test::spit(tree / "other", "other artifact");
             std::error_code ec;
             std::filesystem::create_symlink("libfoo.so.1.2", tree / "lib/libfoo.so.1", ec);
-            if (ec) return;
+            if (ec)
+                return;
             std::filesystem::create_symlink("libfoo.so.1", tree / "lib/libfoo.so");
             std::vector<std::string> skipped;
             auto files = delivery::capture(tree, {{"library", "lib"}, {"other", "other"}}, storage, false, &skipped);
@@ -114,12 +113,13 @@ namespace {
             expect(throws<std::invalid_argument>([&] { delivery::capture(tree, {{"../bad", "good"}}, storage); }));
             std::error_code ec;
             std::filesystem::create_symlink(tmp.dir / "secret", tree / "link", ec);
-            if (!ec) expect(throws<std::invalid_argument>([&] { delivery::capture(tree, {{"bad", "link"}}, storage); }));
+            if (!ec)
+                expect(throws<std::invalid_argument>([&] { delivery::capture(tree, {{"bad", "link"}}, storage); }));
             for (const auto& item : std::filesystem::directory_iterator(storage))
                 expect(!item.path().filename().string().starts_with("pending-"));
         };
     };
-}
+} // namespace
 int main(int argc, const char** argv) {
     boost::ut::suite<"delivery">{cases};
     return boost::ut::cfg<>.run({.argc = argc, .argv = argv}) ? 1 : 0;

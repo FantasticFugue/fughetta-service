@@ -9,39 +9,53 @@ export namespace delivery {
     inline void collect(const std::filesystem::path& storage, std::chrono::seconds retention = constants::export_retention,
                         std::uint64_t budget = constants::export_cache_bytes, const std::set<std::string>& receiving = {}) {
         using clock = std::filesystem::file_time_type::clock;
-        struct object { std::filesystem::path path; std::filesystem::file_time_type used; std::uint64_t size; };
+        struct object {
+            std::filesystem::path path;
+            std::filesystem::file_time_type used;
+            std::uint64_t size;
+        };
         std::vector<object> objects;
         std::uint64_t total = 0;
         std::error_code ec;
         const auto now = clock::now();
         for (const auto& entry : std::filesystem::directory_iterator(storage, ec)) {
             const auto status = entry.symlink_status(ec);
-            if (ec || !std::filesystem::is_regular_file(status) || !content::is_hash(entry.path().filename().string())) continue;
+            if (ec || !std::filesystem::is_regular_file(status) || !content::is_hash(entry.path().filename().string()))
+                continue;
             const auto size = entry.file_size(ec);
-            if (ec) continue;
+            if (ec)
+                continue;
             const auto used = entry.last_write_time(ec);
-            if (ec) continue;
+            if (ec)
+                continue;
             total += size;
             objects.push_back({entry.path(), used, size});
         }
         std::ranges::sort(objects, {}, &object::used);
         for (const auto& item : objects) {
-            if (now - item.used < constants::export_transfer_grace) continue;
-            if (now - item.used < retention && total <= budget) continue;
-            if (std::filesystem::remove(item.path, ec)) total -= item.size;
+            if (now - item.used < constants::export_transfer_grace)
+                continue;
+            if (now - item.used < retention && total <= budget)
+                continue;
+            if (std::filesystem::remove(item.path, ec))
+                total -= item.size;
         }
         // Interrupted receivers leave only partial files; unfinished capture directories are private scratch.
         for (const auto& entry : std::filesystem::directory_iterator(storage / "partial", ec)) {
-            if (receiving.contains(entry.path().filename().string())) continue;
-            if (!std::filesystem::is_regular_file(entry.symlink_status(ec)) || ec) continue;
+            if (receiving.contains(entry.path().filename().string()))
+                continue;
+            if (!std::filesystem::is_regular_file(entry.symlink_status(ec)) || ec)
+                continue;
             const auto used = entry.last_write_time(ec);
-            if (!ec && now - used > std::chrono::hours{24}) std::filesystem::remove(entry.path(), ec);
+            if (!ec && now - used > std::chrono::hours{24})
+                std::filesystem::remove(entry.path(), ec);
         }
         for (const auto& entry : std::filesystem::directory_iterator(storage, ec)) {
-            if (!entry.path().filename().string().starts_with("pending-") ||
-                !std::filesystem::is_directory(entry.symlink_status(ec)) || ec) continue;
+            if (!entry.path().filename().string().starts_with("pending-") || !std::filesystem::is_directory(entry.symlink_status(ec)) || ec)
+                continue;
             const auto used = entry.last_write_time(ec);
-            if (!ec && now - used > std::chrono::hours{24}) std::filesystem::remove_all(entry.path(), ec);
+            if (!ec && now - used > std::chrono::hours{24})
+                std::filesystem::remove_all(entry.path(), ec);
         }
     }
 
@@ -86,19 +100,23 @@ export namespace delivery {
     }
 
     // Export storage is outside mutable build trees. Files are copied, never hard-linked to a build output.
-    inline auto capture(const std::filesystem::path& tree, const std::map<std::string, std::string>& requested,
-                        const std::filesystem::path& storage, bool allow_missing = false,
-                        std::vector<std::string>* skipped = nullptr) -> std::vector<builds::exported_file> {
+    inline auto capture(const std::filesystem::path& tree, const std::map<std::string, std::string>& requested, const std::filesystem::path& storage,
+                        bool allow_missing = false, std::vector<std::string>* skipped = nullptr) -> std::vector<builds::exported_file> {
         std::vector<builds::exported_file> result;
-        if (requested.empty()) return result;
+        if (requested.empty())
+            return result;
         std::filesystem::create_directories(storage);
         static std::atomic<std::uint64_t> next{0};
         std::filesystem::path temporary;
-        do { temporary = storage / ("pending-" + std::to_string(next.fetch_add(1))); }
-        while (!std::filesystem::create_directory(temporary));
+        do {
+            temporary = storage / ("pending-" + std::to_string(next.fetch_add(1)));
+        } while (!std::filesystem::create_directory(temporary));
         struct cleanup {
             std::filesystem::path path;
-            ~cleanup() { std::error_code ignored; std::filesystem::remove_all(path, ignored); }
+            ~cleanup() {
+                std::error_code ignored;
+                std::filesystem::remove_all(path, ignored);
+            }
         } guard{temporary};
         std::uint64_t total = 0;
         auto checked = [&](const std::filesystem::path& path) {
@@ -112,7 +130,8 @@ export namespace delivery {
                 status = std::filesystem::symlink_status(at, ec);
                 if (ec == std::errc::no_such_file_or_directory || ec == std::errc::not_a_directory)
                     return std::filesystem::file_status{std::filesystem::file_type::not_found};
-                if (ec) throw std::runtime_error("cannot inspect export: " + relative.generic_string());
+                if (ec)
+                    throw std::runtime_error("cannot inspect export: " + relative.generic_string());
                 if (std::filesystem::is_symlink(status))
                     throw std::invalid_argument("export path contains a symbolic link: " + relative.generic_string());
             }
@@ -126,7 +145,8 @@ export namespace delivery {
                 throw std::length_error("export file count exceeds the delivery limit");
             const auto staged = temporary / std::to_string(result.size());
             std::ofstream out{staged, std::ios::binary | std::ios::trunc};
-            if (!out) throw std::runtime_error("cannot store export: " + path.lexically_relative(tree).generic_string());
+            if (!out)
+                throw std::runtime_error("cannot store export: " + path.lexically_relative(tree).generic_string());
             content::sha256 hash;
             std::uint64_t size = 0;
             for (auto bytes : durability::read_plain(path, constants::export_bytes - total)) {
@@ -137,10 +157,12 @@ export namespace delivery {
                 size += count;
                 hash.update(bytes);
                 out.write(reinterpret_cast<const char*>(bytes.data()), count);
-                if (!out) throw std::runtime_error("cannot store export");
+                if (!out)
+                    throw std::runtime_error("cannot store export");
             }
             out.close();
-            if (!out) throw std::runtime_error("cannot finish export");
+            if (!out)
+                throw std::runtime_error("cannot finish export");
             auto digest = content::to_hex(hash.finish());
             const auto target = storage / digest.view();
             // Concurrent captures of identical bytes can share an already published object.
@@ -157,21 +179,25 @@ export namespace delivery {
             content::checked_path(path);
             const auto source = tree / path;
             const auto status = checked(source);
-            if (allow_missing && !std::filesystem::exists(status)) continue;
+            if (allow_missing && !std::filesystem::exists(status))
+                continue;
             if (std::filesystem::is_directory(status)) {
                 for (const auto& entry : std::filesystem::recursive_directory_iterator(source)) {
                     if (std::filesystem::is_symlink(entry.symlink_status())) {
                         if (skipped) {
-                            if (skipped->size() >= constants::export_files) throw std::length_error("too many skipped export paths");
+                            if (skipped->size() >= constants::export_files)
+                                throw std::length_error("too many skipped export paths");
                             skipped->push_back(entry.path().lexically_relative(tree).generic_string());
                         }
                         continue;
                     }
                     const auto state = checked(entry.path());
-                    if (std::filesystem::is_directory(state)) continue;
+                    if (std::filesystem::is_directory(state))
+                        continue;
                     copy(name, entry.path(), entry.path().lexically_relative(source).generic_string());
                 }
-            } else copy(name, source, source.filename().generic_string());
+            } else
+                copy(name, source, source.filename().generic_string());
         }
         std::ranges::sort(result, {}, [](const auto& file) { return std::pair{file.name, file.path}; });
         return result;
@@ -185,11 +211,13 @@ export namespace delivery {
             throw std::invalid_argument("export is not available");
         std::filesystem::last_write_time(path, std::filesystem::file_time_type::clock::now());
         const auto size = std::filesystem::file_size(path);
-        if (request.offset > size) throw std::invalid_argument("export offset is past its end");
+        if (request.offset > size)
+            throw std::invalid_argument("export offset is past its end");
         jobs::source_part part{.digest = request.digest, .offset = request.offset, .total = size};
         part.bytes.resize(std::min(request.length, size - request.offset));
         std::ifstream in{path, std::ios::binary};
-        if (!in || !in.seekg(request.offset)) throw std::runtime_error("cannot open exported content");
+        if (!in || !in.seekg(request.offset))
+            throw std::runtime_error("cannot open exported content");
         if (!part.bytes.empty() && !in.read(reinterpret_cast<char*>(part.bytes.data()), part.bytes.size()))
             throw std::runtime_error("cannot read exported content");
         return {{std::move(part)}};

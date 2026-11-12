@@ -50,57 +50,75 @@ export namespace builds {
             throw std::invalid_argument("invalid dependency identifier");
     }
     inline void validate(const dependency_recipe& recipe) {
-        if (!builds::absolute_path(recipe.executable) || !builds::absolute_path(recipe.root) ||
-            recipe.triplets.empty() || recipe.timeout_s == 0)
+        if (!builds::absolute_path(recipe.executable) || !builds::absolute_path(recipe.root) || recipe.triplets.empty() || recipe.timeout_s == 0)
             throw std::invalid_argument("dependency recipe requires absolute executable/root, allowed triplets and a positive timeout");
-        for (const auto& triplet : recipe.triplets) dependency_name(triplet);
+        for (const auto& triplet : recipe.triplets)
+            dependency_name(triplet);
         for (const auto& paths : {recipe.overlay_ports, recipe.overlay_triplets})
             for (const auto& path : paths)
-                if (!builds::absolute_path(path)) throw std::invalid_argument("publisher overlays must be absolute operator paths");
+                if (!builds::absolute_path(path))
+                    throw std::invalid_argument("publisher overlays must be absolute operator paths");
         validate_environment(recipe.env);
-        if (recipe.env.contains("VCPKG_FEATURE_FLAGS")) throw std::invalid_argument("dependency feature flags are managed");
+        if (recipe.env.contains("VCPKG_FEATURE_FLAGS"))
+            throw std::invalid_argument("dependency feature flags are managed");
     }
     inline void validate(const vcpkg_manifest& manifest) {
         std::size_t count = 0;
         auto references = [&](const auto& entries) {
             for (const auto& entry : entries) {
-                if (++count > constants::dependency_manifest_entries) throw std::invalid_argument("too many dependency selectors");
-                std::visit([&](const auto& value) {
-                    if constexpr (std::is_same_v<std::remove_cvref_t<decltype(value)>, std::string>) dependency_name(value);
-                    else {
-                        dependency_name(value.name);
-                        for (const auto& feature : value.features) dependency_name(feature);
-                        if (value.platform && (value.platform->size() > 256 || !std::ranges::all_of(*value.platform, [](unsigned char c) {
-                                return (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || std::string_view{"_ !&|()"}.contains(c);
-                            }))) throw std::invalid_argument("invalid dependency platform expression");
-                    }
-                }, entry);
+                if (++count > constants::dependency_manifest_entries)
+                    throw std::invalid_argument("too many dependency selectors");
+                std::visit(
+                    [&](const auto& value) {
+                        if constexpr (std::is_same_v<std::remove_cvref_t<decltype(value)>, std::string>)
+                            dependency_name(value);
+                        else {
+                            dependency_name(value.name);
+                            for (const auto& feature : value.features)
+                                dependency_name(feature);
+                            if (value.platform && (value.platform->size() > 256 || !std::ranges::all_of(*value.platform, [](unsigned char c) {
+                                                       return (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || std::string_view{"_ !&|()"}.contains(c);
+                                                   })))
+                                throw std::invalid_argument("invalid dependency platform expression");
+                        }
+                    },
+                    entry);
             }
         };
         references(manifest.dependencies);
-        for (const auto& [name, feature] : manifest.features) { dependency_name(name); references(feature.dependencies); }
-        for (const auto& feature : manifest.defaults.get()) dependency_name(feature);
-        for (const auto& value : manifest.overrides) dependency_name(value.name);
-        if (manifest.baseline.get() && (manifest.baseline.get()->size() != 40 ||
-                manifest.baseline.get()->find_first_not_of("0123456789abcdef") != std::string::npos))
+        for (const auto& [name, feature] : manifest.features) {
+            dependency_name(name);
+            references(feature.dependencies);
+        }
+        for (const auto& feature : manifest.defaults.get())
+            dependency_name(feature);
+        for (const auto& value : manifest.overrides)
+            dependency_name(value.name);
+        if (manifest.baseline.get() &&
+            (manifest.baseline.get()->size() != 40 || manifest.baseline.get()->find_first_not_of("0123456789abcdef") != std::string::npos))
             throw std::invalid_argument("invalid requested dependency baseline");
         if (rfl::json::write(manifest).size() > constants::dependency_manifest_bytes)
             throw std::invalid_argument("dependency manifest exceeds size limit");
     }
     inline auto dependency_manifest(std::string_view text) -> vcpkg_manifest {
-        if (text.size() > constants::dependency_manifest_bytes) throw std::invalid_argument("dependency manifest exceeds size limit");
+        if (text.size() > constants::dependency_manifest_bytes)
+            throw std::invalid_argument("dependency manifest exceeds size limit");
         auto raw = rfl::json::read<rfl::Generic>(text);
-        if (!raw) throw std::invalid_argument("invalid dependency manifest");
+        if (!raw)
+            throw std::invalid_argument("invalid dependency manifest");
         auto object = raw->to_object();
-        if (!object) throw std::invalid_argument("dependency manifest must be an object");
+        if (!object)
+            throw std::invalid_argument("dependency manifest must be an object");
         for (const auto& [name, value] : *object)
-            if (name == "vcpkg-configuration") throw std::invalid_argument("custom registries stay in the private cache");
+            if (name == "vcpkg-configuration")
+                throw std::invalid_argument("custom registries stay in the private cache");
         auto parsed = rfl::json::read<vcpkg_manifest, rfl::DefaultIfMissing>(text);
-        if (!parsed) throw std::invalid_argument("unsupported dependency manifest");
+        if (!parsed)
+            throw std::invalid_argument("unsupported dependency manifest");
         validate(*parsed);
         return *parsed;
     }
-}
+} // namespace builds
 
 namespace builds {
     // vcpkg in manifest mode: install reads the vcpkg.json of manifest_dir and lays the packages out under install_dir. Every
@@ -171,7 +189,7 @@ namespace builds {
                 if (argument.starts_with('@') || cache_option(argument))
                     throw std::invalid_argument("vcpkg binary caching is managed by the worker; response files are not allowed");
             auto tree = [](const std::string& p) { return "${tree}/" + p; };
-            step out{.name = "install", .cwd = c.manifest_dir};
+            step out{.name = "install", .cwd = c.manifest_dir, .preparation = true};
             out.argv = {tool(c.executable), "install", "--x-manifest-root=" + tree(c.manifest_dir), "--x-install-root=" + tree(c.install_dir)};
             if (!c.triplet.empty())
                 out.argv.push_back("--triplet=" + c.triplet);
@@ -214,9 +232,10 @@ namespace builds {
         static auto cache_option(std::string_view option) -> bool {
             std::string normalized{option};
             std::ranges::transform(normalized, normalized.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-            if (normalized.starts_with("--x-")) normalized.erase(2, 2);
-            return normalized.starts_with("--binarysource") || normalized.starts_with("--binarycaching") ||
-                normalized.starts_with("--no-binarycaching") || normalized.starts_with("--feature-flags") || normalized.starts_with("--editable");
+            if (normalized.starts_with("--x-"))
+                normalized.erase(2, 2);
+            return normalized.starts_with("--binarysource") || normalized.starts_with("--binarycaching") || normalized.starts_with("--no-binarycaching") ||
+                   normalized.starts_with("--feature-flags") || normalized.starts_with("--editable");
         }
         // A triplet or feature name: one word vcpkg looks up, not a path.
         static void word(const std::string& value, std::string_view what) {
@@ -226,7 +245,8 @@ namespace builds {
         }
         // The field that composes the option, empty when none does: extra states no setting twice.
         static auto field(std::string_view option) -> std::string_view {
-            if (cache_option(option)) return "binary cache";
+            if (cache_option(option))
+                return "binary cache";
             for (auto [composed_by, option_name] :
                  {std::pair{"manifest-root", "--x-manifest-root"}, std::pair{"install-root", "--x-install-root"}, std::pair{"triplet", "--triplet"},
                   std::pair{"host-triplet", "--host-triplet"}, std::pair{"overlay-ports", "--overlay-ports"},

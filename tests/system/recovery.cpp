@@ -68,7 +68,8 @@ namespace {
             test::require(saved.status == 200, saved.body);
             // Pin the observation before publishing; retry and receipt recovery use that same input.
             const auto observed = test::source_version(http_port, "app");
-            const auto changes = std::format(R"("observed":"{}","operation_id":"lost-ack","changes":[{{"kind":"create","path":"ambiguous.txt","text":"committed without ack"}}])", observed);
+            const auto changes = std::format(
+                R"("observed":"{}","operation_id":"lost-ack","changes":[{{"kind":"create","path":"ambiguous.txt","text":"committed without ack"}}])", observed);
             auto lost = test::worldline(http_port, "app", "apply", changes, true);
             expect(lost.contains("outcome_unknown")) << "a lost answer requires receipt recovery: " << lost;
             expect(mutations == 1 && dropped == 1);
@@ -90,8 +91,11 @@ namespace {
             auto replayed = test::worldline(http_port, "app", "apply", changes);
             expect(replayed.contains(R"("replayed":true)")) << replayed;
             expect(source->stop() == 0);
-            auto unavailable = test::worldline(http_port, "app", "apply",
-                std::format(R"("observed":"{}","operation_id":"unavailable","changes":[{{"kind":"create","path":"unavailable.txt","text":"x"}}])", published.version), true);
+            auto unavailable = test::worldline(
+                http_port, "app", "apply",
+                std::format(R"("observed":"{}","operation_id":"unavailable","changes":[{{"kind":"create","path":"unavailable.txt","text":"x"}}])",
+                            published.version),
+                true);
             expect(!unavailable.empty());
             expect(!std::filesystem::exists(tmp.dir / "state/app"));
             source = start_source();
@@ -103,8 +107,11 @@ namespace {
                 }
             });
             expect(read().contains(content::hash_of("committed without ack")));
-            test::worldline(http_port, "app", "apply", std::format(
-                R"("observed":"{}","operation_id":"edit","changes":[{{"kind":"edit","path":"ambiguous.txt","offset":0,"count":9,"text":"recovered"}}])", published.version));
+            test::worldline(
+                http_port, "app", "apply",
+                std::format(
+                    R"("observed":"{}","operation_id":"edit","changes":[{{"kind":"edit","path":"ambiguous.txt","offset":0,"count":9,"text":"recovered"}}])",
+                    published.version));
             expect(gateway->stop() == 0);
             gateway = start_gateway();
             expect(read().contains(content::hash_of("recovered without ack")));

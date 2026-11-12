@@ -111,9 +111,9 @@ namespace {
                 return test::worldline(http_port, std::move(project), std::move(action), std::move(fields), error);
             };
             auto create = [&](std::string project, std::string path, std::string text, std::string operation, std::string observed) {
-                return source_call(project, "apply", std::format(
-                    R"("observed":{},"operation_id":{},"changes":[{{"kind":"create","path":{},"text":{}}}])",
-                    rfl::json::write(observed), rfl::json::write(operation), rfl::json::write(path), rfl::json::write(text)));
+                return source_call(project, "apply",
+                                   std::format(R"("observed":{},"operation_id":{},"changes":[{{"kind":"create","path":{},"text":{}}}])",
+                                               rfl::json::write(observed), rfl::json::write(operation), rfl::json::write(path), rfl::json::write(text)));
             };
             create("app", "hello.txt", "durable source\n", "hello", test::source_version(http_port, "app"));
             create("lib", "independent.txt", "independent", "independent", test::source_version(http_port, "lib"));
@@ -125,9 +125,7 @@ namespace {
             {
                 const auto observed = test::source_version(http_port, "app");
                 writer_lock held{repository};
-                auto blocked = std::async(std::launch::async, [&] {
-                    return create("app", "blocked.txt", "committed later", "blocked-write", observed);
-                });
+                auto blocked = std::async(std::launch::async, [&] { return create("app", "blocked.txt", "committed later", "blocked-write", observed); });
                 issued("blocked.txt");
                 auto began = std::chrono::steady_clock::now();
                 auto other = source_call("lib", "read", R"("path":"independent.txt")");
@@ -203,10 +201,14 @@ namespace {
             expect(taken.status == 409 && taken.body.contains("source_conflict")) << taken.body;
             expect(!test::tool(http_port, "build", R"({"project":"app","worldline":"main"})", true).empty()) << "a build with no worker fails";
             auto observed = test::source_version(http_port, "app");
-            expect(source_call("app", "apply", std::format(
-                R"("observed":"{}","operation_id":"escape","changes":[{{"kind":"create","path":"../escape","text":"x"}}])", observed), true).contains("invalid_record"));
-            expect(source_call("app", "apply", std::format(
-                R"("observed":"{}","changes":[{{"kind":"create","path":"anonymous.txt","text":"x"}}])", observed), true).contains("invalid_record")) << "a change names its operation ID";
+            expect(source_call(
+                       "app", "apply",
+                       std::format(R"("observed":"{}","operation_id":"escape","changes":[{{"kind":"create","path":"../escape","text":"x"}}])", observed), true)
+                       .contains("invalid_record"));
+            expect(
+                source_call("app", "apply", std::format(R"("observed":"{}","changes":[{{"kind":"create","path":"anonymous.txt","text":"x"}}])", observed), true)
+                    .contains("invalid_record"))
+                << "a change names its operation ID";
             expect(source_call("missing", "read", R"("path":"x")", true).contains("not_found")) << "an unknown project is not opened";
             expect(!std::filesystem::exists(tmp.dir / "source/.nodes/missing"));
             expect(!std::filesystem::exists(tmp.dir / "source/escape"));

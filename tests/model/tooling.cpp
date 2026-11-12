@@ -14,7 +14,8 @@ namespace {
         cm.toolchain_file = ::test::absolute("/opt/vcpkg/scripts/buildsystems/vcpkg.cmake");
         cm.inputs = {{"packages", "directory"}};
         cm.variables = {{"VCPKG_INSTALLED_DIR", "${input:packages}"}, {"VCPKG_MANIFEST_INSTALL", "OFF"}};
-        c.builders["deps"] = builds::with<"vcpkg">{.options = {.root = ::test::absolute("/opt/vcpkg"), .install_dir = "build/installed", .triplet = "x64-linux"}};
+        c.builders["deps"] =
+            builds::with<"vcpkg">{.options = {.root = ::test::absolute("/opt/vcpkg"), .install_dir = "build/installed", .triplet = "x64-linux"}};
         c.tasks["dependencies"] = {.builder = "deps", .operation = "install"};
         c.tasks.at("configure").inputs = {{"packages", {"dependencies", "installed"}}};
         c.outputs = {{"database", {"configure", "compilation_database"}}};
@@ -22,11 +23,12 @@ namespace {
     }
     static constexpr auto cases = [] {
         "dependency manifests contain selectors but never registry configuration or commands"_test = [] {
-            auto manifest = builds::dependency_manifest(R"({"name":"tenant","dependencies":["fmt",{"name":"zlib","features":["core"],"default-features":false}],"features":{"tests":{"description":"tests","dependencies":["catch2"]}},"default-features":["tests"],"command":"untrusted","overrides":[{"name":"fmt","version":"10.0.0"}]})");
+            auto manifest = builds::dependency_manifest(
+                R"({"name":"tenant","dependencies":["fmt",{"name":"zlib","features":["core"],"default-features":false}],"features":{"tests":{"description":"tests","dependencies":["catch2"]}},"default-features":["tests"],"command":"untrusted","overrides":[{"name":"fmt","version":"10.0.0"}]})");
             const auto encoded = rfl::json::write(manifest);
             expect(encoded.contains("fmt") && encoded.contains("catch2") && !encoded.contains("untrusted") && !encoded.contains("tenant"));
             for (const auto* text : {R"({"vcpkg-configuration":{}})", R"({"dependencies":["../escape"]})",
-                    R"json({"dependencies":[{"name":"fmt","platform":"$(command)"}]})json", R"({"builtin-baseline":"not-a-hash"})"})
+                                     R"json({"dependencies":[{"name":"fmt","platform":"$(command)"}]})json", R"({"builtin-baseline":"not-a-hash"})"})
                 expect(throws<std::invalid_argument>([&] { builds::dependency_manifest(text); }));
         };
         "dependency filling is described only for supported provider inputs"_test = [] {
@@ -49,17 +51,23 @@ namespace {
             v.buildtrees_dir = "build/trees";
             auto plan = builds::prepare(c, {.operation = "build"});
             expect(plan.steps.size() == 3u);
-            auto install = builds::locate(plan.steps.front(), ::test::absolute("/work/project"), {{"vcpkg", ::test::absolute("/opt/tools/vcpkg")}}, 3, {}, ::test::absolute("/shared/dependencies"));
+            auto install = builds::locate(plan.steps.front(), ::test::absolute("/work/project"), {{"vcpkg", ::test::absolute("/opt/tools/vcpkg")}}, 3, {},
+                                          ::test::absolute("/shared/dependencies"));
             expect(install.env.at("VCPKG_BINARY_SOURCES") == ("clear;files," + ::test::absolute("/shared/dependencies/vcpkg") + ",readwrite"));
             expect(install.env.at("VCPKG_FEATURE_FLAGS") == "binarycaching");
-            auto consumer = builds::locate(plan.steps.front(), ::test::absolute("/work/project"), {}, 1, {}, "/private/dependencies", "/published/cache,stable");
-            expect(consumer.env.at("VCPKG_BINARY_SOURCES") == ("clear;files," + ::test::absolute("/published/cache`,stable/vcpkg") + ",read;files," + ::test::absolute("/private/dependencies/vcpkg") + ",readwrite"));
+            auto consumer =
+                builds::locate(plan.steps.front(), ::test::absolute("/work/project"), {}, 1, {}, "/private/dependencies", "/published/cache,stable");
+            expect(consumer.env.at("VCPKG_BINARY_SOURCES") == ("clear;files," + ::test::absolute("/published/cache`,stable/vcpkg") + ",read;files," +
+                                                               ::test::absolute("/private/dependencies/vcpkg") + ",readwrite"));
             for (const auto* writable : {"/published", "/published/sub/..", "/published/vcpkg/private"})
-                expect(throws<std::invalid_argument>([&] { builds::locate(plan.steps.front(), ::test::absolute("/work/project"), {}, 1, {}, writable, "/published"); }));
-            expect(throws<std::invalid_argument>([&] { builds::locate(plan.steps.front(), ::test::absolute("/work/project"), {}, 1, {}, "/published", "/published/vcpkg/nested"); }));
+                expect(throws<std::invalid_argument>(
+                    [&] { builds::locate(plan.steps.front(), ::test::absolute("/work/project"), {}, 1, {}, writable, "/published"); }));
+            expect(throws<std::invalid_argument>(
+                [&] { builds::locate(plan.steps.front(), ::test::absolute("/work/project"), {}, 1, {}, "/published", "/published/vcpkg/nested"); }));
             auto escaped = builds::locate(plan.steps.front(), ::test::absolute("/work/other"), {}, 1, {}, ::test::absolute("/shared/cache,semi;tick`"));
             expect(escaped.env.at("VCPKG_BINARY_SOURCES") == ("clear;files," + ::test::absolute("/shared/cache`,semi`;tick``/vcpkg") + ",readwrite"));
-            auto literal = builds::locate(plan.steps.front(), ::test::absolute("/work/other"), {}, 1, {}, ::test::absolute("/shared/${tree}/${jobs}/${tool:cc}"));
+            auto literal =
+                builds::locate(plan.steps.front(), ::test::absolute("/work/other"), {}, 1, {}, ::test::absolute("/shared/${tree}/${jobs}/${tool:cc}"));
             expect(literal.env.at("VCPKG_BINARY_SOURCES") == ("clear;files," + ::test::absolute("/shared/${tree}/${jobs}/${tool:cc}/vcpkg") + ",readwrite"));
             auto argument = plan.steps.front();
             argument.argv.push_back("${cache:vcpkg}");
@@ -77,8 +85,8 @@ namespace {
             v.extra = {"--triplet=other"};
             expect(throws<std::invalid_argument>([&] { builds::validate(c); }));
             v.extra.clear();
-            for (const auto* option : {"--binarysource=clear", "--binarysource=files,/other,readwrite", "--binarycaching",
-                    "--no-binarycaching", "--feature-flags=-binarycaching", "--editable"}) {
+            for (const auto* option : {"--binarysource=clear", "--binarysource=files,/other,readwrite", "--binarycaching", "--no-binarycaching",
+                                       "--feature-flags=-binarycaching", "--editable"}) {
                 v.extra = {option};
                 expect(throws<std::invalid_argument>([&] { builds::validate(c); }));
             }

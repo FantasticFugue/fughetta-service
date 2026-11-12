@@ -34,7 +34,8 @@ namespace cores {
 
 namespace daemon {
     void publish(phase value) {
-        if (current.exchange(value) == value) return;
+        if (current.exchange(value) == value)
+            return;
         std::string message = "STATUS=" + std::string{name(value)};
         if (value == phase::ready)
             message += "\nREADY=1";
@@ -45,7 +46,8 @@ namespace daemon {
     auto run(int argc, char** argv, int (*application)(int, char**), bool, std::string_view instance) -> int {
         identity = instance;
         auto result = application(argc, argv);
-        if (current.load() != phase::starting) publish(phase::stopped);
+        if (current.load() != phase::starting)
+            publish(phase::stopped);
         return result;
     }
-}
+} // namespace daemon

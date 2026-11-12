@@ -1,5 +1,6 @@
 export module mcp;
 import std;
+import constants;
 export import utility;
 import reflection;
 import coroutine;
@@ -74,6 +75,10 @@ export namespace mcp {
             return key{*t};
         return std::nullopt;
     }
+
+    struct call_context {
+        std::optional<double> client_sync_seconds;
+    };
 
     // Where a call's notifications go: the event stream its client reads, tagged with the progress token the client chose. One without a
     // stream drops them.
@@ -175,7 +180,7 @@ export namespace mcp {
     template <class T>
     concept toolset = requires(T& t, std::string_view name, rfl::Generic args, notifier& out, const worlds::actor& who) {
         { t.list() } -> std::convertible_to<const std::vector<tool>&>;
-        { t.call(name, std::move(args), out, who) } -> std::same_as<coroutine::task<tool_outcome>>;
+        { t.call(name, std::move(args), out, who, call_context{}) } -> std::same_as<coroutine::task<tool_outcome>>;
     };
 
     template <toolset Tools> class server {
@@ -207,8 +212,19 @@ export namespace mcp {
             if (!params)
                 co_return fail(*req.id, code::invalid_params, params.error().what());
             auto progress = out.tagged(progress_token(req));
+            call_context context;
+            if (params->_meta) {
+                if (auto meta = params->_meta->to_object()) {
+                    if (auto value = meta->get("fughetta/client_sync_seconds")) {
+                        auto seconds = rfl::from_generic<double>(*value);
+                        if (seconds && std::isfinite(*seconds) && *seconds >= 0 &&
+                            *seconds <= std::chrono::duration<double>(constants::client_sync_limit).count())
+                            context.client_sync_seconds = *seconds;
+                    }
+                }
+            }
             try {
-                auto outcome = co_await tools.call(params->name, params->arguments.value_or(rfl::Generic::Object{}), progress, who);
+                auto outcome = co_await tools.call(params->name, params->arguments.value_or(rfl::Generic::Object{}), progress, who, context);
                 co_return reply(*req.id, rfl::to_generic(tool_result{.content = {block{.text = std::move(outcome.text)}},
                                                                      .structuredContent = std::move(outcome.structured),
                                                                      .isError = outcome.error}));

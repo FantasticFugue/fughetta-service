@@ -17,7 +17,7 @@ namespace front {
                 return execution::just();
             }
         };
-    }
+    } // namespace
     auto config_hub::apply(util::function_ref<void(config::store&)> f) -> coroutine::task<> {
         auto held = co_await lock_.lock();
         config::store::snapshot snap;

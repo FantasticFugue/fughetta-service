@@ -137,9 +137,10 @@ namespace {
             auto plan = builds::prepare(c, {.operation = "prepare"});
             auto local = builds::locate(plan.steps[1], tmp.dir / "tree with spaces", {{"cc", ::test::absolute("/opt/toolchain/bin/cc")}}, 1);
             expect(local.argv[0] == "cmake") << "an unmapped tool is found on PATH";
-            expect(std::ranges::contains(local.argv, ("-DCMAKE_C_COMPILER=" + ::test::absolute("/opt/toolchain/bin/cc")))) << "a mapped tool is this machine's executable";
-            expect(std::ranges::contains(local.argv,
-                                         "-DGENERATED_HEADER=" + (std::filesystem::absolute(tmp.dir / "tree with spaces") / "build/generated.h").generic_string()));
+            expect(std::ranges::contains(local.argv, ("-DCMAKE_C_COMPILER=" + ::test::absolute("/opt/toolchain/bin/cc"))))
+                << "a mapped tool is this machine's executable";
+            expect(std::ranges::contains(local.argv, "-DGENERATED_HEADER=" +
+                                                         (std::filesystem::absolute(tmp.dir / "tree with spaces") / "build/generated.h").generic_string()));
             expect(local.env.at("NODE_ENV") == "source" && plan.env.at("ROOT_ENV") == "worker");
             auto db = tmp.dir / "build/commands.json";
             test::spit(db, R"([{"directory":"/workspace","file":"main.c","arguments":["cc","-c","main.c"]}])");
@@ -179,7 +180,8 @@ namespace {
             auto python = fixture::commands({"python", "-c", "pass"});
             plan = builds::prepare(python, {.operation = "build"});
             expect(plan.needs.tools == std::vector<std::string>{"python"} && plan.steps[0].argv[0] == "${tool:python}");
-            expect(builds::locate(plan.steps[0], ::test::absolute("/tree"), {{"python", ::test::absolute("/opt/py/bin/python3")}}, 1).argv[0] == ::test::absolute("/opt/py/bin/python3"));
+            expect(builds::locate(plan.steps[0], ::test::absolute("/tree"), {{"python", ::test::absolute("/opt/py/bin/python3")}}, 1).argv[0] ==
+                   ::test::absolute("/opt/py/bin/python3"));
             expect(throws<std::invalid_argument>([] { builds::validate(fixture::commands({::test::absolute("/usr/bin/python3")})); }));
         };
 
@@ -208,7 +210,8 @@ namespace {
             expect(std::ranges::contains(configure, "--preset"));
             expect(std::ranges::contains(configure, ("-DCMAKE_TOOLCHAIN_FILE=" + ::test::absolute("/opt/vcpkg/scripts/buildsystems/vcpkg.cmake"))));
             expect(!std::ranges::contains(configure, "-G"));
-            auto local = builds::locate(p.steps.back(), ::test::absolute("/work/project"), {{"ctest", ::test::absolute("/opt/cmake/bin/ctest")}}, 2, ::test::absolute("/work/reports"));
+            auto local = builds::locate(p.steps.back(), ::test::absolute("/work/project"), {{"ctest", ::test::absolute("/opt/cmake/bin/ctest")}}, 2,
+                                        ::test::absolute("/work/reports"));
             auto after = [&](std::string_view flag) {
                 auto at = std::ranges::find(local.argv, flag);
                 return at == local.argv.end() || ++at == local.argv.end() ? std::string{} : *at;
@@ -217,7 +220,8 @@ namespace {
             expect(after("--test-dir") == ::test::absolute("/work/project/build/cmake") && after("-R") == "^gateway");
             expect(after("-L") == "fast" && after("-LE") == "network" && after("-j") == "3");
             expect(after("--timeout") == "30" && after("-C") == "Release");
-            expect(after("--output-junit") == ::test::absolute("/work/reports/ctest.xml") && local.reports == std::vector<builds::report>{{"junit", "ctest.xml"}});
+            expect(after("--output-junit") == ::test::absolute("/work/reports/ctest.xml") &&
+                   local.reports == std::vector<builds::report>{{"junit", "ctest.xml"}});
             expect(std::ranges::contains(local.argv, "--no-tests=error"));
             expect(local.env.at("CTEST_PARALLEL_LEVEL") == "2");
         };

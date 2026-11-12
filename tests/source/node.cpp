@@ -193,12 +193,15 @@ namespace {
             auto check = [&](const index& left, const index& right, const rows& a, const rows& b) {
                 std::vector<entry> expected, actual;
                 std::set<std::string> keys;
-                for (const auto& [key, _] : a) keys.insert(key);
-                for (const auto& [key, _] : b) keys.insert(key);
+                for (const auto& [key, _] : a)
+                    keys.insert(key);
+                for (const auto& [key, _] : b)
+                    keys.insert(key);
                 for (const auto& key : keys) {
                     auto x = a.contains(key) ? std::optional{a.at(key)} : std::nullopt;
                     auto y = b.contains(key) ? std::optional{b.at(key)} : std::nullopt;
-                    if (x != y) expected.emplace_back(key, x, y);
+                    if (x != y)
+                        expected.emplace_back(key, x, y);
                 }
                 auto before = cold(left), after = cold(right);
                 before.difference(after, [&](const auto& key, const auto* x, const auto* y) {
@@ -421,23 +424,27 @@ namespace {
                                          .expected = seed.frontier,
                                          .edits = {{.kind = "directory_move", .path = "d", .target = "x"}, {.kind = "move", .path = "a", .target = "x/e"}}});
             expect(inward.code == "source_conflict") << inward.reason;
-            auto parent = attempt(node, {.action = "apply", .operation = op("parent"), .expected = seed.frontier,
-                .edits = {{.kind = "create", .path = "z/child", .text = "child"}, {.kind = "create", .path = "z", .text = "parent"}}});
+            auto parent = attempt(node, {.action = "apply",
+                                         .operation = op("parent"),
+                                         .expected = seed.frontier,
+                                         .edits = {{.kind = "create", .path = "z/child", .text = "child"}, {.kind = "create", .path = "z", .text = "parent"}}});
             expect(parent.code == "source_conflict") << parent.reason;
             auto swapped = good(node, {.action = "apply",
                                        .operation = op("swapped"),
                                        .expected = seed.frontier,
-                                       .edits = {{.kind = "remove", .path = "b"}, {.kind = "move", .path = "a", .target = "b"},
-                                                 {.kind = "create", .path = "z-one", .text = "sibling"}, {.kind = "create", .path = "z/two", .text = "child"}}});
+                                       .edits = {{.kind = "remove", .path = "b"},
+                                                 {.kind = "move", .path = "a", .target = "b"},
+                                                 {.kind = "create", .path = "z-one", .text = "sibling"},
+                                                 {.kind = "create", .path = "z/two", .text = "child"}}});
             expect(text(good(node, {.action = "inspect"}), "b") == "A") << "a path the batch empties takes another file";
             expect(inspect(node).frontier == swapped.frontier);
         };
         "source lock actions are removed"_test = [] {
             test::scratch tmp{"no-locks"};
             nodes::local_node node{tmp.dir / "a"};
-            good(node, {.action="initialize"});
+            good(node, {.action = "initialize"});
             for (const auto action : {"lock", "unlock", "locks"})
-                expect(attempt(node,{.action=action}).code == "invalid_record");
+                expect(attempt(node, {.action = action}).code == "invalid_record");
         };
         "size limits hold for the state a publication leaves, reversals included"_test = [] {
             test::scratch tmp{"limits"};
@@ -636,46 +643,78 @@ namespace {
             for (unsigned i = 0; i < 9; ++i)
                 seed.push_back({.kind = "create", .path = "spare/" + std::to_string(i), .text = "spare"});
             auto base = good(node, {.action = "apply", .operation = op("scope-seed"), .edits = std::move(seed)});
-            auto references = good(node, {.action = "scope_register", .revision = base.version,
-                .analyzed_scopes = {{.id = "first", .range = {.place = semantic::place{"x", 1, 3}}},
-                                    {.id = "second", .range = {.place = semantic::place{"x", 6, 8}}}}});
+            auto references = good(node, {.action = "scope_register",
+                                          .revision = base.version,
+                                          .analyzed_scopes = {{.id = "first", .range = {.place = semantic::place{"x", 1, 3}}},
+                                                              {.id = "second", .range = {.place = semantic::place{"x", 6, 8}}}}});
             auto refs = std::vector<std::string>{*references.scopes[0].reference, *references.scopes[1].reference};
             auto occupied = good(node, {.action = "scope_acquire", .lease_owner = "run-b", .operation = op("occupied"), .scope_refs = {refs[1]}});
-            expect(attempt(node, {.action = "scope_acquire", .lease_owner = "run-a", .operation = op("conflicting-set"), .scope_refs = refs}).code == "scope_conflict");
+            expect(attempt(node, {.action = "scope_acquire", .lease_owner = "run-a", .operation = op("conflicting-set"), .scope_refs = refs}).code ==
+                   "scope_conflict");
             auto unchanged = good(node, {.action = "scope_list"});
             expect(unchanged.leases.size() == 1u && unchanged.leases[0].owner == "run-b");
             good(node, {.action = "scope_release", .lease_owner = "run-b", .lease_token = occupied.leases[0].token});
             auto leased = good(node, {.action = "scope_acquire", .lease_owner = "run-a", .operation = op("both-scopes"), .scope_refs = refs});
             auto first = leased.leases[0].token, second = leased.leases[1].token;
-            good(node, {.action = "apply", .lease_owner = "run-a", .leases = {first, second}, .operation = op("unrelated"),
-                .expected = base.frontier, .edits = {{.kind = "edit", .path = "spare/0", .text = "!", .offset = 1}}});
-            auto refused = attempt(node, {.action = "apply", .lease_owner = "run-b", .operation = op("intruder"),
-                .expected = base.frontier, .edits = {{.kind = "edit", .path = "x", .text = "!", .offset = 1, .count = 1}}});
+            good(node, {.action = "apply",
+                        .lease_owner = "run-a",
+                        .leases = {first, second},
+                        .operation = op("unrelated"),
+                        .expected = base.frontier,
+                        .edits = {{.kind = "edit", .path = "spare/0", .text = "!", .offset = 1}}});
+            auto refused = attempt(node, {.action = "apply",
+                                          .lease_owner = "run-b",
+                                          .operation = op("intruder"),
+                                          .expected = base.frontier,
+                                          .edits = {{.kind = "edit", .path = "x", .text = "!", .offset = 1, .count = 1}}});
             expect(refused.code == "scope_conflict");
-            auto edited = good(node, {.action = "apply", .lease_owner = "run-a", .leases = {first, second}, .operation = op("edit-first"),
-                .expected = base.frontier, .edits = {{.kind = "edit", .path = "x", .text = "B", .offset = 1, .count = 1}}});
-            good(node, {.action = "apply", .lease_owner = "run-a", .leases = {first, second}, .operation = op("edit-second"),
-                .expected = edited.frontier, .edits = {{.kind = "edit", .path = "x", .text = "G", .offset = 6, .count = 1}}});
+            auto edited = good(node, {.action = "apply",
+                                      .lease_owner = "run-a",
+                                      .leases = {first, second},
+                                      .operation = op("edit-first"),
+                                      .expected = base.frontier,
+                                      .edits = {{.kind = "edit", .path = "x", .text = "B", .offset = 1, .count = 1}}});
+            good(node, {.action = "apply",
+                        .lease_owner = "run-a",
+                        .leases = {first, second},
+                        .operation = op("edit-second"),
+                        .expected = edited.frontier,
+                        .edits = {{.kind = "edit", .path = "x", .text = "G", .offset = 6, .count = 1}}});
             expect(text(good(node, {.action = "read", .target = "x"}), "x") == "aBcdefGhij");
             good(node, {.action = "scope_release", .lease_owner = "run-a", .lease_token = first});
-            expect(attempt(node, {.action = "apply", .lease_owner = "run-a", .leases = {first}, .operation = op("unrelated-expired"),
-                .expected = edited.frontier, .edits = {{.kind = "edit", .path = "spare/0", .text = "!", .offset = 1}}}).code == "scope_expired");
-            expect(attempt(node, {.action = "scope_acquire", .lease_owner = "run-a", .operation = op("both-scopes"), .scope_refs = refs}).code == "scope_expired");
+            expect(attempt(node, {.action = "apply",
+                                  .lease_owner = "run-a",
+                                  .leases = {first},
+                                  .operation = op("unrelated-expired"),
+                                  .expected = edited.frontier,
+                                  .edits = {{.kind = "edit", .path = "spare/0", .text = "!", .offset = 1}}})
+                       .code == "scope_expired");
+            expect(attempt(node, {.action = "scope_acquire", .lease_owner = "run-a", .operation = op("both-scopes"), .scope_refs = refs}).code ==
+                   "scope_expired");
             expect(good(node, {.action = "scope_list"}).leases.size() == 1u);
         };
         "lease grouping protects directory ancestors and move destinations"_test = [] {
             test::scratch tmp{"scope-paths"};
             nodes::local_node node{tmp.dir / "a"};
             good(node, {.action = "initialize"});
-            auto state = good(node, {.action = "apply", .operation = op("path-seed"),
-                .edits = {{.kind = "create", .path = "dir/x", .text = "text"}}});
-            auto held = good(node, {.action = "scope_acquire", .lease_owner = "owner", .operation = op("path-lease"),
-                .revision = state.version, .scope_files = {"dir/x"}, .scope_entries = {"target"}});
+            auto state = good(node, {.action = "apply", .operation = op("path-seed"), .edits = {{.kind = "create", .path = "dir/x", .text = "text"}}});
+            auto held = good(node, {.action = "scope_acquire",
+                                    .lease_owner = "owner",
+                                    .operation = op("path-lease"),
+                                    .revision = state.version,
+                                    .scope_files = {"dir/x"},
+                                    .scope_entries = {"target"}});
             auto apply = [&](std::string id, nodes::edit edit, bool owns = false) {
                 std::vector<std::string> tokens;
-                if (owns) for (const auto& lease : held.leases) tokens.push_back(lease.token);
-                return attempt(node, {.action = "apply", .lease_owner = owns ? "owner" : "other", .leases = std::move(tokens),
-                    .operation = op(id), .expected = state.frontier, .edits = {std::move(edit)}});
+                if (owns)
+                    for (const auto& lease : held.leases)
+                        tokens.push_back(lease.token);
+                return attempt(node, {.action = "apply",
+                                      .lease_owner = owns ? "owner" : "other",
+                                      .leases = std::move(tokens),
+                                      .operation = op(id),
+                                      .expected = state.frontier,
+                                      .edits = {std::move(edit)}});
             };
             auto sibling = apply("sibling", {.kind = "create", .path = "target-other/x", .text = "free"});
             expect(sibling.code == "ok");
@@ -696,20 +735,34 @@ namespace {
             good(node, {.action = "initialize"});
             auto base = change(node, "task-seed", {}, {.kind = "create", .path = "x", .text = "text"});
             good(node, {.action = "task_create", .operation = op("task-create"), .task_id = "task", .execution_owner = "owner"});
-            auto started = good(node, {.action = "task_start", .operation = op("task-start"), .task_id = "task",
-                .execution_identity = "identity", .execution_owner = "owner"});
+            auto started = good(
+                node, {.action = "task_start", .operation = op("task-start"), .task_id = "task", .execution_identity = "identity", .execution_owner = "owner"});
             const auto run = *started.execution;
-            auto lease = good(node, {.action = "scope_acquire", .revision = base.version, .lease_owner = run.run,
-                .operation = op("task-lease"), .run_id = run.run, .execution_token = run.token, .scope_files = {"x"}});
-            nodes::node_request delayed{.action = "apply", .lease_owner = run.run, .leases = {lease.leases[0].token},
-                .operation = op("delayed"), .expected = base.frontier,
-                .edits = {{.kind = "write", .path = "x", .text = "late"}}, .run_id = run.run, .execution_token = run.token};
+            auto lease = good(node, {.action = "scope_acquire",
+                                     .revision = base.version,
+                                     .lease_owner = run.run,
+                                     .operation = op("task-lease"),
+                                     .run_id = run.run,
+                                     .execution_token = run.token,
+                                     .scope_files = {"x"}});
+            nodes::node_request delayed{.action = "apply",
+                                        .lease_owner = run.run,
+                                        .leases = {lease.leases[0].token},
+                                        .operation = op("delayed"),
+                                        .expected = base.frontier,
+                                        .edits = {{.kind = "write", .path = "x", .text = "late"}},
+                                        .run_id = run.run,
+                                        .execution_token = run.token};
             good(node, {.action = "task_stop", .task_id = "task", .run_id = run.run, .execution_owner = "owner"});
             expect(attempt(node, delayed).code == "execution_expired");
             expect(good(node, {.action = "scope_list"}).leases.empty());
             expect(text(good(node, {.action = "read", .target = "x"}), "x") == "text");
-            auto failed = attempt(node, {.action = "fork", .worldline = "unbound", .operation = op("fork-bound-task"), .source = base.frontier,
-                .task_id = "task", .execution_owner = "owner"});
+            auto failed = attempt(node, {.action = "fork",
+                                         .worldline = "unbound",
+                                         .operation = op("fork-bound-task"),
+                                         .source = base.frontier,
+                                         .task_id = "task",
+                                         .execution_owner = "owner"});
             expect(failed.code == "identity_conflict");
             expect(!good(node, {.action = "worldlines"}).worldlines.contains("unbound"));
         };
@@ -1104,13 +1157,21 @@ namespace {
             peers p;
             auto seed = p.seed();
             auto fork = good(p.a, {.action = "fork", .worldline = "experiment", .operation = op("promotion-fork"), .source = seed.frontier});
-            auto edited = good(p.a, {.action = "apply", .worldline = "experiment", .operation = op("promotion-edit"), .expected = fork.frontier,
-                .edits = {{.kind = "write", .path = "x", .text = "experiment"}, {.kind = "binary_create", .path = "asset", .text = "00ff", .executable = true}}});
+            auto edited = good(p.a, {.action = "apply",
+                                     .worldline = "experiment",
+                                     .operation = op("promotion-edit"),
+                                     .expected = fork.frontier,
+                                     .edits = {{.kind = "write", .path = "x", .text = "experiment"},
+                                               {.kind = "binary_create", .path = "asset", .text = "00ff", .executable = true}}});
             auto independent = change(p.a, "promotion-independent", seed.frontier, {.kind = "create", .path = "local", .text = "retained"});
             auto diff = good(p.a, {.action = "diff", .worldline = "main", .expected = edited.frontier, .target = "experiment"});
             expect(diff.changes.size() == 3u);
-            nodes::node_request request{.action = "promote", .operation = op("promotion-accept"), .expected = independent.frontier,
-                .source = edited.frontier, .target = "experiment", .intent = "Adopt the experiment"};
+            nodes::node_request request{.action = "promote",
+                                        .operation = op("promotion-accept"),
+                                        .expected = independent.frontier,
+                                        .source = edited.frontier,
+                                        .target = "experiment",
+                                        .intent = "Adopt the experiment"};
             auto promoted = good(p.a, request);
             auto current = inspect(p.a);
             expect(text(current, "x") == "experiment");
@@ -1129,9 +1190,14 @@ namespace {
             expect(source.version == edited.version);
             auto remaining = good(p.a, {.action = "diff", .worldline = "main", .expected = edited.frontier, .target = "experiment"});
             expect(remaining.changes.size() == 1u && remaining.changes.front().after->path == "local");
-            auto divergent = good(p.a, {.action = "apply", .worldline = "experiment", .operation = op("promotion-diverge"), .expected = edited.frontier,
-                .edits = {{.kind = "write", .path = "x", .text = "different"}}});
-            request.operation = op("promotion-conflict"); request.expected = promoted.frontier; request.source = divergent.frontier;
+            auto divergent = good(p.a, {.action = "apply",
+                                        .worldline = "experiment",
+                                        .operation = op("promotion-diverge"),
+                                        .expected = edited.frontier,
+                                        .edits = {{.kind = "write", .path = "x", .text = "different"}}});
+            request.operation = op("promotion-conflict");
+            request.expected = promoted.frontier;
+            request.source = divergent.frontier;
             expect(attempt(p.a, request).code == nodes::code::source_conflict);
             expect(inspect(p.a).version == promoted.version);
         };

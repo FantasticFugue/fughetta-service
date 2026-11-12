@@ -95,7 +95,7 @@ namespace builds {
         return {{"configure", std::move(configure)}, {"build", std::move(build)}, {"test", std::move(test)}};
     }
     auto adapter<"cmake">::expand(const options& c, std::string_view operation, const parameters& p) -> std::vector<step> {
-        step out{.name = std::string{operation}};
+        step out{.name = std::string{operation}, .preparation = operation == "configure"};
         if (operation == "configure") {
             out.cwd = c.source_dir;
             out.argv = {tool(c.executable), "-S", path(c.source_dir), "-B", path(c.build_dir), "--no-warn-unused-cli"};

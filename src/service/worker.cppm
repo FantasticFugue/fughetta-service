@@ -36,18 +36,19 @@ namespace worker {
         node(config::worker cfg, cores::context<native::scheduler>& rt)
             : cfg_(std::move(cfg)), name_(cfg_.name.empty() ? host::name() : cfg_.name), compute_(cfg_.compute_threads),
               builds_(rt,
-                      replica::options{.root = cfg_.worker_id ? std::filesystem::path{cfg_.work_root} / *cfg_.workspace_id / *cfg_.worker_id
-                                                              : std::filesystem::path{cfg_.work_root},
-                                       .worker = name_,
-                                       .limits = {.max_cache_bytes = cfg_.max_cache_bytes, .tree_ttl = std::chrono::hours{24 * cfg_.tree_ttl_days}},
-                                       .env = cfg_.env,
-                                       .inherit_env = cfg_.inherit_env,
-                                       .tools = cfg_.tools,
-                                       .parallel = cfg_.parallel,
-                                       .dependency_cache = cfg_.dependency_cache ? std::optional{std::filesystem::path{*cfg_.dependency_cache}} : std::nullopt,
-                                       .dependency_upstream = cfg_.dependency_upstream ? std::optional{std::filesystem::path{*cfg_.dependency_upstream}} : std::nullopt,
-                                       .dependency_publish = cfg_.dependency_publish ? std::optional{std::filesystem::path{*cfg_.dependency_publish}} : std::nullopt,
-                                       .dependency_recipe = cfg_.dependency_recipe},
+                      replica::options{
+                          .root = cfg_.worker_id ? std::filesystem::path{cfg_.work_root} / *cfg_.workspace_id / *cfg_.worker_id
+                                                 : std::filesystem::path{cfg_.work_root},
+                          .worker = name_,
+                          .limits = {.max_cache_bytes = cfg_.max_cache_bytes, .tree_ttl = std::chrono::hours{24 * cfg_.tree_ttl_days}},
+                          .env = cfg_.env,
+                          .inherit_env = cfg_.inherit_env,
+                          .tools = cfg_.tools,
+                          .parallel = cfg_.parallel,
+                          .dependency_cache = cfg_.dependency_cache ? std::optional{std::filesystem::path{*cfg_.dependency_cache}} : std::nullopt,
+                          .dependency_upstream = cfg_.dependency_upstream ? std::optional{std::filesystem::path{*cfg_.dependency_upstream}} : std::nullopt,
+                          .dependency_publish = cfg_.dependency_publish ? std::optional{std::filesystem::path{*cfg_.dependency_publish}} : std::nullopt,
+                          .dependency_recipe = cfg_.dependency_recipe},
                       compute_) {}
 
         auto run(native::scheduler& io, std::size_t core) -> coroutine::task<> { co_await builds_.run(core, connected(io, core)); }
@@ -109,7 +110,8 @@ namespace worker {
             transport::dispatcher<S> serve;
             builds_.install(serve, core);
             auto handle_hash_file = [this, &io](jobs::hash_file job, auto&) -> coroutine::task<jobs::digest> {
-                if (cfg_.dependency_publish) throw std::invalid_argument("dependency publishers only accept dependency.fill");
+                if (cfg_.dependency_publish)
+                    throw std::invalid_argument("dependency publishers only accept dependency.fill");
                 auto out = co_await offload(io, [this, job = std::move(job)] { return hash(job); });
                 if (!out)
                     throw std::runtime_error(out.error());

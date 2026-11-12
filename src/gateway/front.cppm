@@ -109,7 +109,8 @@ export namespace front {
 
     // Clients choose JSON-RPC IDs and repeat them, so a cancellation names a request of the same caller and endpoint.
     inline auto request_key(const worlds::actor& who, bool configuration, const mcp::key& id) -> std::string {
-        return std::format("{}\n{}\n{}\n{}\n{}", worlds::identity_key(who), who.client.value_or(""), who.run, configuration ? "config" : "business", mcp::key_text(id));
+        return std::format("{}\n{}\n{}\n{}\n{}", worlds::identity_key(who), who.client.value_or(""), who.run, configuration ? "config" : "business",
+                           mcp::key_text(id));
     }
 
     class in_flight {
@@ -240,6 +241,7 @@ export namespace front {
         tools::standard::bound execution_;
         settings::bound<dispatch> settings_;
         std::vector<mcp::tool> tools_;
+
     public:
         workspace_tools(context ctx, tools::services& services) : execution_(services), settings_(dispatch{ctx}) {
             tools_ = execution_.list();
@@ -247,13 +249,14 @@ export namespace front {
             tools_.insert(tools_.end(), configuration.begin(), configuration.end());
         }
         auto list() const -> const std::vector<mcp::tool>& { return tools_; }
-        auto call(std::string_view name, rfl::Generic args, mcp::notifier& note, const worlds::actor& who)
+        auto call(std::string_view name, rfl::Generic args, mcp::notifier& note, const worlds::actor& who, mcp::call_context call = {})
             -> coroutine::task<mcp::tool_outcome> {
             if (std::ranges::any_of(settings_.list(), [name](const auto& tool) { return tool.name == name; })) {
-                if (!who.run.empty()) co_return mcp::tool_outcome{.text = "execution credentials cannot access project settings", .error = true};
-                co_return co_await settings_.call(name, std::move(args), note, who);
+                if (!who.run.empty())
+                    co_return mcp::tool_outcome{.text = "execution credentials cannot access project settings", .error = true};
+                co_return co_await settings_.call(name, std::move(args), note, who, call);
             }
-            co_return co_await execution_.call(name, std::move(args), note, who);
+            co_return co_await execution_.call(name, std::move(args), note, who, call);
         }
     };
 
@@ -306,16 +309,20 @@ export namespace front {
                     if (!(method == "OPTIONS" && origin) && t.path != "/healthz") {
                         auto authorization = web::header(in.head, "authorization").value_or("");
                         const bool execution = authorization.size() > 14 && authorization.substr(7).starts_with("fugrun.") &&
-                            std::ranges::equal(authorization.substr(0, 7), std::string_view{"bearer "}, {},
-                                [](char c) { return static_cast<char>(std::tolower(static_cast<unsigned char>(c))); });
+                                               std::ranges::equal(authorization.substr(0, 7), std::string_view{"bearer "}, {},
+                                                                  [](char c) { return static_cast<char>(std::tolower(static_cast<unsigned char>(c))); });
                         if (execution) {
-                            if (t.path != "/mcp") refused = error(403, "execution credentials are restricted to the task MCP endpoint");
+                            if (t.path != "/mcp")
+                                refused = error(403, "execution credentials are restricted to the task MCP endpoint");
                             else {
                                 try {
                                     who = co_await tools::execution_actor(*ctx_.services, std::string{authorization.substr(7)});
-                                } catch (const std::exception& e) { refused = error(401, e.what()); }
+                                } catch (const std::exception& e) {
+                                    refused = error(401, e.what());
+                                }
                             }
-                        } else refused = authenticate(doc->server.auth, in.head, who);
+                        } else
+                            refused = authenticate(doc->server.auth, in.head, who);
                         if (who)
                             c.who = &*who;
                     }
@@ -393,8 +400,8 @@ export namespace front {
             } catch (const std::exception& e) {
                 // A peer that aborts mid-request reaches here too; the log line is how a
                 // silent drop gets distinguished from a gateway fault.
-                logging::error(std::format("gateway: connection closed after unhandled exception{}: {}", serving.empty() ? "" : " while serving " + serving,
-                                           e.what()));
+                logging::error(
+                    std::format("gateway: connection closed after unhandled exception{}: {}", serving.empty() ? "" : " while serving " + serving, e.what()));
             }
             peer.close();
         }
@@ -481,7 +488,8 @@ export namespace front {
                 head.fields.push_back({"vary", "origin"});
             }
             auto run_children = [&](coroutine::scope& children) -> coroutine::task<> {
-                static constexpr auto run_child_2 = [](Conn& conn, auto token, http::response head, web::event_stream& events, coroutine::stop_source& disconnected) -> coroutine::task<> {
+                static constexpr auto run_child_2 = [](Conn& conn, auto token, http::response head, web::event_stream& events,
+                                                       coroutine::stop_source& disconnected) -> coroutine::task<> {
                     try {
                         co_await http::coroutine::respond(conn, std::move(token), std::move(head), events);
                     } catch (...) {
@@ -489,20 +497,19 @@ export namespace front {
                         throw;
                     }
                 };
-                children.spawn(
-                    run_child_2(conn, std::move(in.token), std::move(head), events, disconnected));
-                static constexpr auto run_child = [](native::scheduler io, web::event_stream& events, coroutine::stop_token token, std::chrono::milliseconds interval) -> coroutine::task<> {
-                    static constexpr auto run_operation = [](native::scheduler io, web::event_stream& events, std::chrono::milliseconds interval) -> coroutine::task<> {
+                children.spawn(run_child_2(conn, std::move(in.token), std::move(head), events, disconnected));
+                static constexpr auto run_child = [](native::scheduler io, web::event_stream& events, coroutine::stop_token token,
+                                                     std::chrono::milliseconds interval) -> coroutine::task<> {
+                    static constexpr auto run_operation = [](native::scheduler io, web::event_stream& events,
+                                                             std::chrono::milliseconds interval) -> coroutine::task<> {
                         for (;;) {
                             co_await execution::schedule_after(io, interval);
                             events.push(": keepalive\n\n");
                         }
                     };
-                    co_await coroutine::under(token,
-                                              run_operation(io, events, interval));
+                    co_await coroutine::under(token, run_operation(io, events, interval));
                 };
-                children.spawn(
-                    run_child(ctx_.rt.get_scheduler(ctx_.core), events, heartbeat_stop.get_token(), heartbeat_));
+                children.spawn(run_child(ctx_.rt.get_scheduler(ctx_.core), events, heartbeat_stop.get_token(), heartbeat_));
                 struct stop_heartbeat {
                     coroutine::stop_source& source;
                     ~stop_heartbeat() { source.request_stop(); }

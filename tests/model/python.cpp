@@ -54,19 +54,22 @@ namespace {
         "uv gives each command only the flags it accepts"_test = [] {
             auto c = project();
             auto sync = step_of(builds::prepare(c, {.operation = "sync"}), "sync");
+            expect(sync.preparation);
             expect(sync.argv.front() == "${tool:uv}" && sync.argv[1] == "sync" && has(sync, "--locked"));
             expect(has_pair(sync, "--group", "dev") && has_pair(sync, "--extra", "cli"));
             expect(sync.env.at("UV_PROJECT_ENVIRONMENT") == "${tree}/build/venv" && sync.env.at("UV_CACHE_DIR") == "${tree}/build/cache");
             auto lock = step_of(builds::prepare(c, {.operation = "lock"}), "lock");
             expect(lock.argv[1] == "lock" && has(lock, "--locked") && !has(lock, "--group") && !has(lock, "--extra"));
             auto build = step_of(builds::prepare(c, {.operation = "build"}), "build");
+            expect(!build.preparation);
             expect(has_pair(build, "--out-dir", "${tree}/build/dist") && !has(build, "--locked") && !has(build, "--group") && !has(build, "--extra"));
             auto run = step_of(builds::prepare(c, {.operation = "run", .parameters = {.args = {"--port", "0"}}}), "run");
             expect(run.argv[1] == "run" && has(run, "--no-sync") && !has(run, "--locked") && !has(run, "--group") && !has(run, "--"));
             expect((run.argv.size() >= 5u) >> fatal);
             expect(std::vector<std::string>(run.argv.end() - 5, run.argv.end()) == std::vector<std::string>{"python", "-m", "svc", "--port", "0"});
             auto local = builds::locate(sync, ::test::absolute("/work/project"), {{"uv", ::test::absolute("/opt/uv/bin/uv")}}, 2);
-            expect(local.argv.front() == ::test::absolute("/opt/uv/bin/uv") && local.env.at("UV_PROJECT_ENVIRONMENT") == ::test::absolute("/work/project/build/venv"));
+            expect(local.argv.front() == ::test::absolute("/opt/uv/bin/uv") &&
+                   local.env.at("UV_PROJECT_ENVIRONMENT") == ::test::absolute("/work/project/build/venv"));
             auto offline = project();
             options<"uv">(offline, "uv").offline = true;
             expect(has(step_of(builds::prepare(offline, {.operation = "sync"}), "sync"), "--no-build"));
@@ -138,7 +141,8 @@ namespace {
                    R"({"settings":{"configuration":{"rules":{"unresolved-import":"warn"}},"diagnosticMode":"workspace"}})");
             expect(plan.server.env.at("VIRTUAL_ENV") == "${tree}/build/venv") << "ty finds the uv environment by its variable";
             auto local = language::locate(plan.server, ::test::absolute("/work/project"), {{"ty", ::test::absolute("/opt/ty/bin/ty")}}, 1);
-            expect(local.argv == std::vector<std::string>{::test::absolute("/opt/ty/bin/ty"), "server"} && local.env.at("VIRTUAL_ENV") == ::test::absolute("/work/project/build/venv"));
+            expect(local.argv == std::vector<std::string>{::test::absolute("/opt/ty/bin/ty"), "server"} &&
+                   local.env.at("VIRTUAL_ENV") == ::test::absolute("/work/project/build/venv"));
             expect(language::providers::document("ty", "src/app.py") == std::optional<std::string_view>{"python"});
 
             language::config<"ruff"> ruff;
@@ -206,7 +210,8 @@ E       assert 3 == 4</failure><error message="failed on teardown with &quot;Run
             c.tasks["run"].reports = {{"junit", "pytest.xml"}};
             auto run = step_of(builds::prepare(c, {.operation = "run"}), "run");
             expect(run.reports == std::vector<builds::report>{{"junit", "pytest.xml"}});
-            expect(has(builds::locate(run, ::test::absolute("/work/project"), {}, 1, ::test::absolute("/work/reports")), ("--junit-xml=" + ::test::absolute("/work/reports/pytest.xml"))));
+            expect(has(builds::locate(run, ::test::absolute("/work/project"), {}, 1, ::test::absolute("/work/reports")),
+                       ("--junit-xml=" + ::test::absolute("/work/reports/pytest.xml"))));
             expect(step_of(builds::prepare(c, {.operation = "sync"}), "sync").reports.empty());
             options<"uv">(c, "uv").run_command = {"pytest", "${tree}/tests"};
             expect(throws<std::invalid_argument>([&] { builds::validate(c); })) << "${reports} is the one reference a program takes";

@@ -56,13 +56,15 @@ namespace {
         struct output {
             std::string said;
         };
-        static auto run(tools::services&, input in, mcp::notifier&, const worlds::actor&) -> coroutine::task<output> { co_return output{in.text}; }
+        static auto run(tools::services&, mcp::call_context, input in, mcp::notifier&, const worlds::actor&) -> coroutine::task<output> {
+            co_return output{in.text};
+        }
     };
 
     struct shout : tools::tool<"shout", "Say it back, louder."> {
         using input = echo::input;
         using output = echo::output;
-        static auto run(tools::services&, input in, mcp::notifier&, const worlds::actor&) -> coroutine::task<output> {
+        static auto run(tools::services&, mcp::call_context, input in, mcp::notifier&, const worlds::actor&) -> coroutine::task<output> {
             std::ranges::transform(in.text, in.text.begin(), [](unsigned char c) { return std::toupper(c); });
             co_return output{in.text};
         }
@@ -75,12 +77,13 @@ namespace {
         struct output {
             int count = 0;
             bool failed_ = false;
+            std::optional<double> client_sync_seconds;
             auto failed() const -> bool { return failed_; }
         };
-        static auto run(tools::services&, input in, mcp::notifier& note, const worlds::actor&) -> coroutine::task<output> {
+        static auto run(tools::services& s, mcp::call_context context, input in, mcp::notifier& note, const worlds::actor&) -> coroutine::task<output> {
             for (std::int64_t i = 1; i <= 2; ++i)
                 note({.method = "notifications/progress", .params = mcp::object({{"progress", i}, {"total", std::int64_t{2}}})});
-            co_return output{2, in.fail.value_or(false)};
+            co_return output{2, in.fail.value_or(false), context.client_sync_seconds};
         }
     };
 
@@ -134,18 +137,29 @@ namespace {
             mcp::notifier keep{stream};
             const worlds::actor someone{.issuer = "token", .user = "tester", .caller = "test-suite", .role = "owner"};
 
-            auto plain = request(R"({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"tick","arguments":{}}})");
+            auto plain = request(
+                R"({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"tick","arguments":{},"_meta":{"fughetta/client_sync_seconds":0.25}}})");
             auto r = *cores::run(context, server.handle(plain, keep, someone));
             expect(notifications(stream).empty()) << "no token, no progress";
             expect(!r->error.has_value());
+            auto result = rfl::from_generic<mcp::tool_result>(*r->result).value();
+            expect(rfl::from_generic<tick::output>(*result.structuredContent)->client_sync_seconds == 0.25);
 
             auto asked = request(R"({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"tick","arguments":{},"_meta":{"progressToken":"t-7"}}})");
-            cores::run(context, server.handle(asked, keep, someone));
+            auto next = *cores::run(context, server.handle(asked, keep, someone));
+            auto next_result = rfl::from_generic<mcp::tool_result>(*next->result).value();
+            expect(!rfl::from_generic<tick::output>(*next_result.structuredContent)->client_sync_seconds.has_value());
             auto sent = notifications(stream);
             expect((sent.size() == 2u) >> fatal);
             auto params = sent[1].params.to_object().value();
             expect(params.get("progressToken").value().to_string().value() == "t-7");
             expect(params.get("progress").value().to_int().value() == 2);
+
+            auto excessive = request(
+                R"({"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"tick","arguments":{},"_meta":{"fughetta/client_sync_seconds":86401}}})");
+            auto ignored = *cores::run(context, server.handle(excessive, keep, someone));
+            auto ignored_result = rfl::from_generic<mcp::tool_result>(*ignored->result).value();
+            expect(!rfl::from_generic<tick::output>(*ignored_result.structuredContent)->client_sync_seconds.has_value());
 
             auto hello = request(R"({"jsonrpc":"2.0","id":3,"method":"initialize","params":{"protocolVersion":"2025-03-26"}})");
             auto init = *cores::run(context, server.handle(hello, keep, someone));

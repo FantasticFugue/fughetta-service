@@ -56,7 +56,7 @@ namespace {
         return o.project_dir == "." ? "node_modules" : o.project_dir + "/node_modules";
     }
     auto install(const builds::adapter<"bun">::options& o) -> builds::step {
-        builds::step out{.name = "install", .cwd = o.project_dir};
+        builds::step out{.name = "install", .cwd = o.project_dir, .preparation = true};
         out.argv = {builds::tool(o.executable), "install", "--no-progress", "--frozen-lockfile"};
         if (o.offline)
             out.argv.push_back("--offline");

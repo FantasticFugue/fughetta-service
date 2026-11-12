@@ -160,7 +160,8 @@ int main(int argc, char** argv) {
                                            .platform = {.os = "linux", .arch = "x86_64"},
                                            .max_inflight = 4,
                                            .protocol = jobs::protocol_version,
-                                           .tools = host::detect_tools(test::toolset()), .toolchain_id = std::string(64, 'a')});
+                                           .tools = host::detect_tools(test::toolset()),
+                                           .toolchain_id = std::string(64, 'a')});
             try {
                 auto run_requests = [&](coroutine::scope& requests) -> coroutine::task<> {
                     static constexpr auto run_child = [](ctx& io, auto& channel) -> coroutine::task<> {
@@ -187,10 +188,13 @@ int main(int argc, char** argv) {
             tools::backlog queue{rt, s};
             s.queue = &queue;
             mcp::notifier note{progress};
+            const mcp::call_context call_context{.client_sync_seconds = 0.25};
             const worlds::actor tester{.issuer = "token", .user = "tester", .caller = "test-suite", .role = "owner"};
             auto build = [&](bool fresh = false) -> coroutine::task<tools::config_result> {
-                auto out =
-                    co_await tools::build::run(s, {.project = "app", .configurations = std::nullopt, .targets = std::nullopt, .worldline = std::string{"main"}, .fresh = fresh}, note, tester);
+                auto out = co_await tools::build::run(
+                    s, call_context,
+                    {.project = "app", .configurations = std::nullopt, .targets = std::nullopt, .worldline = std::string{"main"}, .fresh = fresh}, note,
+                    tester);
                 co_return out.results.at(0);
             };
 
@@ -201,21 +205,24 @@ int main(int argc, char** argv) {
                     co_await execution::schedule_after(io, 1ms);
 
                 for (auto project : {"app", "cm", "commands", "slow"})
-                co_await fixture::write_file(s, {.project = "app", .path = "src/msg.txt", .content = "hello v1\n", .operation_id = "write-15"}, note, tester);
+                    co_await fixture::write_file(s, {.project = "app", .path = "src/msg.txt", .content = "hello v1\n", .operation_id = "write-15"}, note,
+                                                 tester);
                 out.builds.push_back(co_await build());
                 co_await fixture::edit_text(
                     s,
                     {.project = "app", .path = "src/msg.txt", .old_string = "v1", .new_string = "v2", .replace_all = std::nullopt, .operation_id = "edit-16"},
                     note, tester);
-                co_await fixture::write_file(s, {.project = "app", .path = "big.bin", .content = std::string(9u << 20, 'z'), .operation_id = "write-17"},
-                                             note, tester);
+                co_await fixture::write_file(s, {.project = "app", .path = "big.bin", .content = std::string(9u << 20, 'z'), .operation_id = "write-17"}, note,
+                                             tester);
                 out.builds.push_back(co_await build());
                 out.cached = co_await build();
                 out.builds.push_back(co_await build(true));
                 out.builds.push_back(co_await build(true));
                 out.quota = (co_await build(true)).error;
                 try {
-                    co_await tools::build::run(s, {.project = "nope", .configurations = std::nullopt, .targets = std::nullopt, .worldline = std::string{"main"}}, note, tester);
+                    co_await tools::build::run(s, call_context,
+                                               {.project = "nope", .configurations = std::nullopt, .targets = std::nullopt, .worldline = std::string{"main"}},
+                                               note, tester);
                 } catch (const config::not_found& e) {
                     out.unknown_project = e.what();
                 }
@@ -231,7 +238,9 @@ int main(int argc, char** argv) {
                 co_await fixture::write_file(s, {.project = "cm", .path = "hello.c", .content = std::string{hello_c}, .operation_id = "write-19"}, note,
                                              tester);
                 auto started = std::chrono::steady_clock::now();
-                out.both = co_await tools::build::run(s, {.project = "cm", .configurations = std::nullopt, .targets = std::nullopt, .worldline = std::string{"main"}}, note, tester);
+                out.both = co_await tools::build::run(
+                    s, call_context, {.project = "cm", .configurations = std::nullopt, .targets = std::nullopt, .worldline = std::string{"main"}}, note,
+                    tester);
                 out.both_seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
                 co_await fixture::edit_text(s,
                                             {.project = "cm",
@@ -241,7 +250,9 @@ int main(int argc, char** argv) {
                                              .replace_all = std::nullopt,
                                              .operation_id = "edit-20"},
                                             note, tester);
-                out.broken = co_await tools::build::run(s, {.project = "cm", .configurations = std::nullopt, .targets = std::nullopt, .worldline = std::string{"main"}}, note, tester);
+                out.broken = co_await tools::build::run(
+                    s, call_context, {.project = "cm", .configurations = std::nullopt, .targets = std::nullopt, .worldline = std::string{"main"}}, note,
+                    tester);
                 co_await fixture::edit_text(s,
                                             {.project = "cm",
                                              .path = "hello.c",
@@ -250,13 +261,20 @@ int main(int argc, char** argv) {
                                              .replace_all = std::nullopt,
                                              .operation_id = "edit-21"},
                                             note, tester);
-                out.tested = co_await tools::test::run(s, {.project = "cm", .configurations = std::nullopt, .filter = std::nullopt, .labels = std::nullopt, .worldline = std::string{"main"}},
-                                                       note, tester);
-                out.filtered = co_await tools::test::run(
-                    s,
-                    {.project = "cm", .configurations = std::vector<std::string>{"Debug-alternate"}, .filter = std::string{"greets"}, .labels = std::nullopt, .worldline = std::string{"main"}},
-                    note, tester);
-                out.ran = co_await tools::launch::run(s, {.project = "cm", .configuration = "hello", .configurations = std::nullopt, .worldline = std::string{"main"}}, note, tester);
+                out.tested = co_await tools::test::run(
+                    s, call_context,
+                    {.project = "cm", .configurations = std::nullopt, .filter = std::nullopt, .labels = std::nullopt, .worldline = std::string{"main"}}, note,
+                    tester);
+                out.filtered = co_await tools::test::run(s, call_context,
+                                                         {.project = "cm",
+                                                          .configurations = std::vector<std::string>{"Debug-alternate"},
+                                                          .filter = std::string{"greets"},
+                                                          .labels = std::nullopt,
+                                                          .worldline = std::string{"main"}},
+                                                         note, tester);
+                out.ran = co_await tools::launch::run(
+                    s, call_context, {.project = "cm", .configuration = "hello", .configurations = std::nullopt, .worldline = std::string{"main"}}, note,
+                    tester);
 
                 if (check_commands) {
                     co_await fixture::write_file(
@@ -266,16 +284,31 @@ int main(int argc, char** argv) {
                          .content = "all:\n\t@echo built > built\ntest:\n\t@test -f prepared && test -f built\n\t@echo tests passed\nfail:\n\t@exit 1\n",
                          .operation_id = "write-22"},
                         note, tester);
-                    out.command_tested = co_await tools::test::run(
-                        s, {.project = "commands", .configurations = std::nullopt, .filter = std::nullopt, .labels = std::nullopt, .worldline = std::string{"main"}}, note, tester);
-                    out.command_failed = co_await tools::test::run(
-                        s, {.project = "commands", .configurations = std::vector<std::string>{"bad"}, .filter = std::nullopt, .labels = std::nullopt, .worldline = std::string{"main"}}, note,
-                        tester);
-                    out.command_ran =
-                        co_await tools::launch::run(s, {.project = "commands", .configuration = "app", .configurations = std::nullopt, .worldline = std::string{"main"}}, note, tester);
+                    out.command_tested = co_await tools::test::run(s, call_context,
+                                                                   {.project = "commands",
+                                                                    .configurations = std::nullopt,
+                                                                    .filter = std::nullopt,
+                                                                    .labels = std::nullopt,
+                                                                    .worldline = std::string{"main"}},
+                                                                   note, tester);
+                    out.command_failed = co_await tools::test::run(s, call_context,
+                                                                   {.project = "commands",
+                                                                    .configurations = std::vector<std::string>{"bad"},
+                                                                    .filter = std::nullopt,
+                                                                    .labels = std::nullopt,
+                                                                    .worldline = std::string{"main"}},
+                                                                   note, tester);
+                    out.command_ran = co_await tools::launch::run(
+                        s, call_context, {.project = "commands", .configuration = "app", .configurations = std::nullopt, .worldline = std::string{"main"}},
+                        note, tester);
                     try {
-                        co_await tools::test::run(
-                            s, {.project = "commands", .configurations = std::nullopt, .filter = std::string{"unit"}, .labels = std::nullopt, .worldline = std::string{"main"}}, note, tester);
+                        co_await tools::test::run(s, call_context,
+                                                  {.project = "commands",
+                                                   .configurations = std::nullopt,
+                                                   .filter = std::string{"unit"},
+                                                   .labels = std::nullopt,
+                                                   .worldline = std::string{"main"}},
+                                                  note, tester);
                     } catch (const std::invalid_argument&) {
                         out.command_options_rejected = true;
                     }
@@ -283,7 +316,10 @@ int main(int argc, char** argv) {
 
                 co_await fixture::write_file(s, {.project = "slow", .path = "x", .content = "x", .operation_id = "write-23"}, note, tester);
                 auto stopped = co_await coroutine::deadline(
-                    io, 800ms, tools::build::run(s, {.project = "slow", .configurations = std::nullopt, .targets = std::nullopt, .worldline = std::string{"main"}}, note, tester));
+                    io, 800ms,
+                    tools::build::run(s, call_context,
+                                      {.project = "slow", .configurations = std::nullopt, .targets = std::nullopt, .worldline = std::string{"main"}}, note,
+                                      tester));
                 out.slow_stopped = !stopped;
                 co_await execution::schedule_after(io, std::chrono::milliseconds{3500});
                 out.slow_finished_anyway = std::filesystem::exists(tree_of(tmp.dir / "work", "slow") / "out/late");
@@ -333,7 +369,7 @@ int main(int argc, char** argv) {
                     co_await execution::schedule_after(io, 1ms);
                 for (const auto& [path, text] : sources)
                     co_await fixture::write_file(services, {.project = "app", .path = path, .content = text, .operation_id = "write " + path}, note, actor);
-                auto result = co_await tools::build::run(services, {.project = "app", .worldline = std::string{"main"}}, note, actor);
+                auto result = co_await tools::build::run(services, {}, {.project = "app", .worldline = std::string{"main"}}, note, actor);
                 expect(result.ok >> fatal) << config::write(result);
                 std::vector<std::string> names;
                 for (const auto& step : result.results.at(0).steps)
@@ -460,24 +496,23 @@ int main(int argc, char** argv) {
         bool repin = false;
 
         test::scratch tmp{"deps"};
-        config::slots config{
-            2, [] {
-                config::document value;
-                builds::config<"vcpkg"> options;
-                options.install_dir = "vcpkg_installed";
-                options.triplet = "x64-linux";
-                options.host_triplet = "x64-linux";
-                builds::configuration build;
-                build.builders["vcpkg"] = builds::with<"vcpkg">{.options = std::move(options)};
-                build.tasks["deps"] = {.builder = "vcpkg", .operation = "install"};
-                build.operations["build"] = {.tasks = {"deps"}};
-                auto& project = value.projects["deps"];
-                project.build_configurations["shared"] = std::move(build);
-                project.default_configurations = {"shared"};
-                project.env["PRIVATE_TOKEN"] = "consumer-secret";
-                config::validate(value);
-                return std::make_shared<const config::document>(std::move(value));
-            }()};
+        config::slots config{2, [] {
+                                 config::document value;
+                                 builds::config<"vcpkg"> options;
+                                 options.install_dir = "vcpkg_installed";
+                                 options.triplet = "x64-linux";
+                                 options.host_triplet = "x64-linux";
+                                 builds::configuration build;
+                                 build.builders["vcpkg"] = builds::with<"vcpkg">{.options = std::move(options)};
+                                 build.tasks["deps"] = {.builder = "vcpkg", .operation = "install"};
+                                 build.operations["build"] = {.tasks = {"deps"}};
+                                 auto& project = value.projects["deps"];
+                                 project.build_configurations["shared"] = std::move(build);
+                                 project.default_configurations = {"shared"};
+                                 project.env["PRIVATE_TOKEN"] = "consumer-secret";
+                                 config::validate(value);
+                                 return std::make_shared<const config::document>(std::move(value));
+                             }()};
         cores::io_context<native::context> rt{2};
         routing::router router{rt};
         execution::thread_pool pool{2};
@@ -525,32 +560,28 @@ int main(int argc, char** argv) {
                 }
                 if (with_manifest)
                     co_await fixture::write_file(
-                        services,
-                        {.project = "deps", .path = "vcpkg.json", .content = std::string{vcpkg_manifest_v1}, .operation_id = "deps-manifest-v1"},
+                        services, {.project = "deps", .path = "vcpkg.json", .content = std::string{vcpkg_manifest_v1}, .operation_id = "deps-manifest-v1"},
                         note, actor);
                 else
                     co_await fixture::write_file(
-                        services, {.project = "deps", .path = "readme.txt", .content = "no dependency manifest\n", .operation_id = "deps-readme"},
-                        note, actor);
+                        services, {.project = "deps", .path = "readme.txt", .content = "no dependency manifest\n", .operation_id = "deps-readme"}, note, actor);
                 if (with_configuration)
                     co_await fixture::write_file(
-                        services, {.project = "deps", .path = "vcpkg-configuration.json", .content = "{}\n", .operation_id = "deps-registries"},
-                        note, actor);
-                out.first = co_await tools::build::run(services, {.project = "deps", .configurations = std::nullopt, .targets = std::nullopt, .worldline = std::string{"main"}},
-                                                       note, actor);
+                        services, {.project = "deps", .path = "vcpkg-configuration.json", .content = "{}\n", .operation_id = "deps-registries"}, note, actor);
+                out.first = co_await tools::build::run(
+                    services, {}, {.project = "deps", .configurations = std::nullopt, .targets = std::nullopt, .worldline = std::string{"main"}}, note, actor);
                 if (repin) {
                     co_await fixture::write_file(
-                        services,
-                        {.project = "deps", .path = "vcpkg.json", .content = std::string{vcpkg_manifest_v2}, .operation_id = "deps-manifest-v2"},
+                        services, {.project = "deps", .path = "vcpkg.json", .content = std::string{vcpkg_manifest_v2}, .operation_id = "deps-manifest-v2"},
                         note, actor);
-                    out.pinned = co_await tools::build::run(
-                        services,
-                        {.project = "deps",
-                         .configurations = std::nullopt,
-                         .targets = std::nullopt,
-                         .worldline = std::string{"main"}, .version = std::optional<std::string>{out.first.revision},
-                         .fresh = true},
-                        note, actor);
+                    out.pinned = co_await tools::build::run(services, {},
+                                                            {.project = "deps",
+                                                             .configurations = std::nullopt,
+                                                             .targets = std::nullopt,
+                                                             .worldline = std::string{"main"},
+                                                             .version = std::optional<std::string>{out.first.revision},
+                                                             .fresh = true},
+                                                            note, actor);
                 }
             };
             co_await coroutine::with_scope(std::move(run_tasks));
@@ -667,8 +698,7 @@ int main(int argc, char** argv) {
             h.with_configuration = true;
             h.run();
             expect(h.out.first.ok) << config::write(h.out.first);
-            expect(h.out.first.results.at(0).dependency_cache == "skipped: custom registries")
-                << h.out.first.results.at(0).dependency_cache;
+            expect(h.out.first.results.at(0).dependency_cache == "skipped: custom registries") << h.out.first.results.at(0).dependency_cache;
             expect(h.captured.fills.empty());
             expect(h.captured.builds.size() == 1u) << "the private build still runs";
             expect(h.captured.leaked.empty());
@@ -679,8 +709,7 @@ int main(int argc, char** argv) {
             h.publisher_same_toolchain = false;
             h.run();
             expect(h.out.first.ok) << config::write(h.out.first);
-            expect(h.out.first.results.at(0).dependency_cache == "unavailable: no matching dependency publisher")
-                << h.out.first.results.at(0).dependency_cache;
+            expect(h.out.first.results.at(0).dependency_cache == "unavailable: no matching dependency publisher") << h.out.first.results.at(0).dependency_cache;
             expect(h.captured.fills.empty()) << "neither the wrong-toolchain publisher nor the plain consumer was asked";
             expect(h.captured.builds.size() == 1u) << "an unavailable publisher does not block the private build";
         };
@@ -702,8 +731,7 @@ int main(int argc, char** argv) {
             h.with_manifest = false;
             h.run();
             expect(h.out.first.ok) << config::write(h.out.first);
-            expect(h.out.first.results.at(0).dependency_cache == "deps: skipped: manifest absent or too large")
-                << h.out.first.results.at(0).dependency_cache;
+            expect(h.out.first.results.at(0).dependency_cache == "deps: skipped: manifest absent or too large") << h.out.first.results.at(0).dependency_cache;
             expect(h.captured.fills.empty());
             expect(h.captured.builds.size() == 1u);
         };
@@ -783,6 +811,8 @@ int main(int argc, char** argv) {
             expect(!both.snapshot.empty() && both.results[0].snapshot == both.snapshot && both.results[1].snapshot == both.snapshot)
                 << "one call, one snapshot";
             for (const auto& result : both.results) {
+                expect(result.timings.client_sync_seconds == 0.25);
+                expect(result.timings.preparation_seconds.value_or(-1) > 0 && result.timings.execution_seconds.value_or(-1) > 0);
                 expect(result.timings.sync_seconds.value_or(-1) >= 0 && result.timings.queue_seconds.value_or(-1) >= 0);
                 expect(result.timings.worker_seconds.value_or(-1) > 0 && result.timings.dependency_seconds.value_or(-1) >= 0);
             }

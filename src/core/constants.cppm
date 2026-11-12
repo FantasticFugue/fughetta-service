@@ -16,6 +16,7 @@ export namespace constants {
     // A stream whose reader falls behind is closed at this size instead of buffering without bound.
     inline constexpr std::size_t event_stream_buffer_bytes = 65536;
     inline constexpr std::size_t source_handler_limit = 64;
+    inline constexpr auto client_sync_limit = std::chrono::hours{24};
     inline constexpr auto mcp_heartbeat = std::chrono::seconds{15};
     inline constexpr auto workspace_event_heartbeat = std::chrono::seconds{15};
     inline constexpr auto workspace_event_lifetime = std::chrono::minutes{5};

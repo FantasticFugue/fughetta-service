@@ -487,7 +487,8 @@ export namespace config {
             throw std::invalid_argument("Worker dependency_publish already supplies the upstream cache");
         if (w.dependency_publish.has_value() != w.dependency_recipe.has_value())
             throw std::invalid_argument("Worker dependency_publish and dependency_recipe must be configured together");
-        if (w.dependency_recipe) builds::validate(*w.dependency_recipe);
+        if (w.dependency_recipe)
+            builds::validate(*w.dependency_recipe);
         if (w.compute_threads == 0 || w.parallel == 0)
             throw std::invalid_argument("worker thread and parallel budgets must be positive");
         if (w.max_inflight == 0)

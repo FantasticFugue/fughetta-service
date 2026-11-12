@@ -58,8 +58,7 @@ namespace {
     auto linux_platform() -> jobs::platform { return {.os = "linux", .arch = "x86_64"}; }
 
     auto fake_worker(socket& s, std::string name, std::vector<std::string> tools = {"cmake"}, std::uint32_t max_inflight = 4, std::string auth = "",
-                     bool publisher = false)
-        -> coroutine::task<> {
+                     bool publisher = false) -> coroutine::task<> {
         transport::channel<socket> chan{s};
         co_await chan.post(jobs::hello{.name = name,
                                        .auth = auth,
@@ -207,8 +206,7 @@ namespace {
                     children.spawn(fake_worker(socket, "persistent"));
                     while (!fleet.holds({}))
                         co_await execution::schedule_after(io, 1ms);
-                    for (int i = 0; i < 600; ++i)
-                        {
+                    for (int i = 0; i < 600; ++i) {
                         static constexpr auto run_operation = [](auto&) -> coroutine::task<> { co_return; };
                         co_await fleet.with({.tree_key = std::format("app/tree-{}", i)}, run_operation);
                     }
@@ -312,8 +310,11 @@ namespace {
                     expect(!fleet.busy({}));
                     expect(fleet.diagnose({}) == "no live general build worker is available");
                     bool refused = false;
-                    try { co_await h.who({}); }
-                    catch (const routing::no_worker& error) { refused = !error.busy; }
+                    try {
+                        co_await h.who({});
+                    } catch (const routing::no_worker& error) {
+                        refused = !error.busy;
+                    }
                     expect(refused);
                     expect(co_await h.who({.needs = {.dependency_publisher = true}}) == "publisher:who");
                 };

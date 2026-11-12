@@ -6,9 +6,12 @@ import host;
 
 export namespace toolchain {
     inline auto required_tools() -> std::vector<std::string> {
-        return {"cmake", "ctest", "bazel", "ninja", "make",  "cc",     "c++",     "gcc", "g++",  "clang", "clang++", "cl",  "link",
-                "ld",    "lld",   "mold",  "vcpkg", "python", "python3", "uv",  "ruff", "ty",    "clice",   "tsc", "typescript-language-server",
-                "node",  "npm",   "bun",   "git"};
+        return {"cmake",   "ctest", "bazel",  "ninja",   "make",
+                "cc",      "c++",   "gcc",    "g++",     "clang",
+                "clang++", "cl",    "link",   "ld",      "lld",
+                "mold",    "vcpkg", "python", "python3", "uv",
+                "ruff",    "ty",    "clice",  "tsc",     "typescript-language-server",
+                "node",    "npm",   "bun",    "git"};
     }
 
     struct identity {

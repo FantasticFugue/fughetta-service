@@ -20,7 +20,6 @@ namespace {
         };
 
         "worker exits when its gateway connection closes"_test = [] {
-
             test::scratch tmp{"worker-exit"};
             std::atomic<unsigned> attempts = 0;
             auto run_operation = [&](native::scheduler&, native::socket peer) -> coroutine::task<> {

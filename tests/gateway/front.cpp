@@ -96,7 +96,8 @@ namespace {
         std::string selected{args};
         if (tool == "worldline" || tool == "language" || tool == "scope" || tool == "build" || tool == "test" || tool == "run") {
             auto object = rfl::json::read<rfl::Generic>(selected)->to_object().value();
-            if (!object.get("worldline")) object["worldline"] = "main";
+            if (!object.get("worldline"))
+                object["worldline"] = "main";
             selected = rfl::json::write(object);
         }
         return std::format(R"({{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{{"name":"{}","arguments":{}{}}}}})", tool, selected,
@@ -129,22 +130,27 @@ namespace {
                 auto handle_build_request = [&](jobs::build_request request, auto&) -> coroutine::task<jobs::build_report> {
                     ++builds;
                     expect(request.exports.at("binary") == "out/app");
-                    if (remove_project) expect((co_await h.ask(io, DELETE, "/api/v1/projects/app")).status == 200);
-                    co_return jobs::build_report{.steps = {{.name = "compile", .exit_code = 0, .output = "log", .truncated = true,
-                            .log = builds::exported_file{"step-0.log", "0.log", log_digest, log.size(), false}}},
-                        .exports = {{"binary", "app", digest, data.size(), true}}};
+                    if (remove_project)
+                        expect((co_await h.ask(io, DELETE, "/api/v1/projects/app")).status == 200);
+                    co_return jobs::build_report{.steps = {{.name = "compile",
+                                                            .exit_code = 0,
+                                                            .output = "log",
+                                                            .truncated = true,
+                                                            .log = builds::exported_file{"step-0.log", "0.log", log_digest, log.size(), false}}},
+                                                 .exports = {{"binary", "app", digest, data.size(), true}}};
                 };
                 dispatch.on<jobs::build_request>(std::move(handle_build_request));
                 auto handle_export_read = [&](jobs::export_read request, auto&) -> coroutine::task<jobs::source_bytes> {
                     ++downloads;
-                    if (fail_download) throw std::runtime_error("artifact transport unavailable");
+                    if (fail_download)
+                        throw std::runtime_error("artifact transport unavailable");
                     const auto& value = request.digest == log_digest ? log : data;
                     auto part = std::as_bytes(std::span{value}).subspan(request.offset, request.length);
                     co_return jobs::source_bytes{{{request.digest, request.offset, value.size(), {part.begin(), part.end()}}}};
                 };
                 dispatch.on<jobs::export_read>(std::move(handle_export_read));
-                co_await channel.post(jobs::hello{.name = "export-builder", .protocol = jobs::protocol_version,
-                    .tools = {"true"}, .toolchain_id = "export-toolchain"});
+                co_await channel.post(
+                    jobs::hello{.name = "export-builder", .protocol = jobs::protocol_version, .tools = {"true"}, .toolchain_id = "export-toolchain"});
                 auto run_children = [&](coroutine::scope& children) -> coroutine::task<> {
                     static constexpr auto run_child_2 = [](harness& h, native::listener& listener, coroutine::scope& children) -> coroutine::task<> {
                         for (;;) {
@@ -155,11 +161,13 @@ namespace {
                     children.spawn(run_child_2(h, listener, children));
                     children.spawn(h.router.workers(0).admit(io, std::move(peer)));
                     static constexpr auto run_child = [](auto& channel, auto& dispatch, coroutine::scope& children) -> coroutine::task<> {
-                        for (;;) children.spawn(dispatch.handle(channel, co_await channel.recv()));
+                        for (;;)
+                            children.spawn(dispatch.handle(channel, co_await channel.recv()));
                     };
                     children.spawn(run_child(channel, dispatch, children));
                     children.spawn(h.queue.serve(io));
-                    while (h.router.workers(0).describe(0).empty()) co_await execution::schedule_after(io, 1ms);
+                    while (h.router.workers(0).describe(0).empty())
+                        co_await execution::schedule_after(io, 1ms);
                     config::settings project;
                     project.build_configurations["native"] = fixture::commands({"true"});
                     project.build_configurations["native"].operations["build"].exports = {{"binary", "out/app"}};
@@ -193,7 +201,8 @@ namespace {
                     expect(builds == 2 && downloads == previous_downloads) << "fresh execution reuses stored artifact and log bytes";
                     std::filesystem::remove(h.tmp.dir / "storage/.exports/blobs" / digest.view());
                     const auto failed = co_await h.mcp(io, call("build", R"({"project":"app","fresh":true})"));
-                    expect(failed.status == 200 && failed.body.contains("artifact transport unavailable") && failed.body.contains(R"("exit_code":0)")) << failed.body;
+                    expect(failed.status == 200 && failed.body.contains("artifact transport unavailable") && failed.body.contains(R"("exit_code":0)"))
+                        << failed.body;
                     expect(!failed.body.contains("outcome_unknown")) << "execution results survive delivery failures";
                     expect(builds == 3);
                     fail_download = false;
@@ -202,7 +211,9 @@ namespace {
                     std::filesystem::remove(h.tmp.dir / "storage/.exports/blobs" / digest.view());
                     const auto stale = co_await h.mcp(io, call("build", R"({"project":"app"})"));
                     struct execution_reply {
-                        struct payload { tools::results structuredContent; };
+                        struct payload {
+                            tools::results structuredContent;
+                        };
                         payload result;
                     };
                     const auto stale_result = rfl::json::read<execution_reply>(stale.body).value();
@@ -217,7 +228,6 @@ namespace {
                     expect(!completed.exports.at(0).delivery_error.empty());
                     expect(completed.steps.at(0).log && !completed.steps.at(0).log->delivery_error.empty());
                     expect((co_await h.ask(io, GET, path)).status != 200);
-
                 };
                 co_await coroutine::with_scope(std::move(run_children));
             };
@@ -316,7 +326,8 @@ namespace {
                 auto worker_socket = co_await io::connect(io, worker_listener.local_endpoint());
                 auto [worker_peer, endpoint] = co_await net::async_accept(worker_listener);
                 transport::channel<socket> worker_channel{worker_socket};
-                co_await worker_channel.post(jobs::hello{.name = "queued-builder", .protocol = jobs::protocol_version, .tools = {"true"}, .toolchain_id = "test-toolchain"});
+                co_await worker_channel.post(
+                    jobs::hello{.name = "queued-builder", .protocol = jobs::protocol_version, .tools = {"true"}, .toolchain_id = "test-toolchain"});
                 auto run_children = [&](coroutine::scope& children) -> coroutine::task<> {
                     static constexpr auto run_child = [](harness& h, native::listener& listener, coroutine::scope& children) -> coroutine::task<> {
                         for (;;) {
@@ -334,8 +345,9 @@ namespace {
                     project.build_configurations["test"] = fixture::commands({"true"});
                     project.default_configurations = {"test"};
                     co_await h.save(io, "/api/v1/projects/app", config::write(project));
-                    co_await h.ask(io, http::method::POST, "/api/v1/projects/app/worldline",
-                                   R"({"project":"app","worldline":"main","action":"apply","observed":"","operation_id":"seed","changes":[{"kind":"create","path":"a.txt","text":"a"}]})");
+                    co_await h.ask(
+                        io, http::method::POST, "/api/v1/projects/app/worldline",
+                        R"({"project":"app","worldline":"main","action":"apply","observed":"","operation_id":"seed","changes":[{"kind":"create","path":"a.txt","text":"a"}]})");
                     auto run_operation = [&io](tools::services&, jobs::progress_log&, std::string) -> coroutine::task<std::optional<tools::backlog::outcome>> {
                         co_await execution::schedule_after(io, 30s);
                         co_return tools::config_result{.ok = true};
@@ -712,7 +724,7 @@ namespace {
                 for (auto action : {"plan", "prepare", "receipt", "scopes"}) {
                     bool rejected = false;
                     try {
-                        co_await tools::language_query::run(h.services, {.project = "app", .configuration = "Cpp", .action = action}, note, actor);
+                        co_await tools::language_query::run(h.services, {}, {.project = "app", .configuration = "Cpp", .action = action}, note, actor);
                     } catch (const tools::tool_error&) {
                         rejected = true;
                     }
@@ -873,50 +885,230 @@ namespace {
         "the MCP endpoint, over HTTP"_test = [] {
             harness h;
             std::vector<answer> a;
-            auto run_core = [&](ctx& io, std::size_t) -> coroutine::task<> {
-                static constexpr auto run_operation = [](harness& h, ctx& io, std::vector<answer>& a) -> coroutine::task<> {
-                    auto l = native::listener{io, {net::ip::address_v4::loopback(), 0}};
-                    h.port = l.local_endpoint().port();
-                    auto run_children = [&](coroutine::scope& children) -> coroutine::task<> {
-                        static constexpr auto run_child = [](harness& h, native::listener& l, coroutine::scope& children) -> coroutine::task<> {
-                            for (;;) {
-                                auto [connection, peer] = co_await net::async_accept(l);
-                                children.spawn(h.server.serve(std::move(connection)));
-                            }
-                        };
-                        children.spawn(run_child(h, l, children));
-                        co_await h.save(io, "/api/v1/config/limits", R"({"max_file_bytes": 100})");
-                        co_await h.save(io, "/api/v1/projects/app", "{}");
-                        a.push_back(co_await h.mcp(io, R"({"jsonrpc":"2.0","id":1,"method":"tools/list"})"));
-                        for (const auto name : {"read", "write", "edit", "remove", "move", "list", "glob", "search", "generate", "jobs"}) {
-                            auto refused = co_await h.mcp(io, call(name, R"({"project":"app"})"));
-                            expect(refused.body.contains("unknown tool")) << refused.body;
-                        }
-                        a.push_back(co_await h.ask(io, GET, "/mcp"));
-                        a.push_back(co_await h.mcp(io, "{not json"));
-                        a.push_back(co_await h.mcp(io, R"({"jsonrpc":"2.0","id":1,"method":"ping"})", {{"mcp-protocol-version", "1999-01-01"}}));
-                        a.push_back(co_await h.mcp(io, R"({"jsonrpc":"2.0","id":1,"method":"ping"})", {{"origin", "http://evil.example"}}));
-                        a.push_back(co_await h.mcp(io, R"({"jsonrpc":"2.0","id":1,"method":"ping"})", {{"origin", "http://ok.example"}}));
-                        a.push_back(co_await h.mcp(io, std::string(5000, ' ')));
-                        a.push_back(co_await h.mcp(io, call("configurations", R"({"project":"app"})", R"({"progressToken":"p1"})"),
-                                                   {{"accept", "application/json, text/event-stream"}}));
-                        const auto endpoint = "/api/v1/projects/app/worldline";
-                        const auto inspected = co_await h.ask(io, http::method::POST, endpoint, R"({"project":"app","worldline":"main","action":"inspect"})");
-                        const auto initial = rfl::json::read<tools::worldline::output>(inspected.body).value().version.value();
-                        const auto apply = std::format(R"({{"project":"app","worldline":"main","action":"apply","observed":"{}","operation_id":"op-a","changes":[{{"kind":"create","path":"a.txt","text":"hi\n"}}]}})", initial);
-                        a.push_back(co_await h.ask(io, http::method::POST, endpoint, apply));
-                        a.push_back(co_await h.ask(io, http::method::POST, endpoint, R"({"project":"app","worldline":"main","action":"receipt","operation_id":"op-a"})"));
-                        a.push_back(co_await h.ask(io, http::method::POST, endpoint, apply));
-                        a.push_back(co_await h.ask(io, http::method::POST, endpoint, R"({"project":"app","worldline":"main","action":"fork","name":"wl","operation_id":"op-fork"})"));
-                        a.push_back(co_await h.ask(io, http::method::POST, endpoint, R"({"project":"app","action":"history","worldline":"wl"})"));
-                        a.push_back(co_await h.ask(io, http::method::POST, endpoint, R"({"project":"app","worldline":"main","action":"read","path":"a.txt"})"));
-                        a.push_back(co_await h.ask(io, GET, "/api/v1/usage"));
-                        a.push_back(co_await h.ask(io, GET, "/metrics"));
-                    };
-                    co_await coroutine::with_scope(std::move(run_children));
-                };
-                return run_operation(h, io, a);
-            };
+            auto run_core = [&](ctx& io, std::size_t) -> coroutine::
+                                                          task<> {
+                                                              static constexpr auto run_operation =
+                                                                  [](harness& h, ctx& io, std::vector<answer>& a) -> coroutine::
+                                                                                                                      task<> {
+                                                                                                                          auto l = native::listener{
+                                                                                                                              io,
+                                                                                                                              {net::ip::address_v4::loopback(),
+                                                                                                                               0}};
+                                                                                                                          h.port = l.local_endpoint().port();
+                                                                                                                          auto run_children = [&](coroutine::scope& children) -> coroutine::
+                                                                                                                                                                                  task<> {
+                                                                                                                                                                                      static constexpr auto
+                                                                                                                                                                                          run_child =
+                                                                                                                                                                                              [](harness&
+                                                                                                                                                                                                     h,
+                                                                                                                                                                                                 native::listener&
+                                                                                                                                                                                                     l,
+                                                                                                                                                                                                 coroutine::
+                                                                                                                                                                                                     scope&
+                                                                                                                                                                                                         children) -> coroutine::
+                                                                                                                                                                                                                       task<> {
+                                                                                                                                                                                                                           for (
+                                                                                                                                                                                                                               ;
+                                                                                                                                                                                                                               ;) {
+                                                                                                                                                                                                                               auto [connection,
+                                                                                                                                                                                                                                     peer] =
+                                                                                                                                                                                                                                   co_await net::
+                                                                                                                                                                                                                                       async_accept(
+                                                                                                                                                                                                                                           l);
+                                                                                                                                                                                                                               children
+                                                                                                                                                                                                                                   .spawn(
+                                                                                                                                                                                                                                       h.server
+                                                                                                                                                                                                                                           .serve(std::move(
+                                                                                                                                                                                                                                               connection)));
+                                                                                                                                                                                                                           }
+                                                                                                                                                                                                                       };
+                                                                                                                                                                                      children
+                                                                                                                                                                                          .spawn(run_child(
+                                                                                                                                                                                              h,
+                                                                                                                                                                                              l,
+                                                                                                                                                                                              children));
+                                                                                                                                                                                      co_await h
+                                                                                                                                                                                          .save(
+                                                                                                                                                                                              io,
+                                                                                                                                                                                              "/api/v1/config/limits",
+                                                                                                                                                                                              R"({"max_file_bytes": 100})");
+                                                                                                                                                                                      co_await h
+                                                                                                                                                                                          .save(
+                                                                                                                                                                                              io,
+                                                                                                                                                                                              "/api/v1/projects/app",
+                                                                                                                                                                                              "{}");
+                                                                                                                                                                                      a.push_back(
+                                                                                                                                                                                          co_await h
+                                                                                                                                                                                              .mcp(
+                                                                                                                                                                                                  io,
+                                                                                                                                                                                                  R"({"jsonrpc":"2.0","id":1,"method":"tools/list"})"));
+                                                                                                                                                                                      for (
+                                                                                                                                                                                          const auto
+                                                                                                                                                                                              name :
+                                                                                                                                                                                          {"read",
+                                                                                                                                                                                           "write",
+                                                                                                                                                                                           "edit",
+                                                                                                                                                                                           "remove",
+                                                                                                                                                                                           "move",
+                                                                                                                                                                                           "list",
+                                                                                                                                                                                           "glob",
+                                                                                                                                                                                           "search",
+                                                                                                                                                                                           "generate",
+                                                                                                                                                                                           "jobs"}) {
+                                                                                                                                                                                          auto refused =
+                                                                                                                                                                                              co_await h
+                                                                                                                                                                                                  .mcp(
+                                                                                                                                                                                                      io,
+                                                                                                                                                                                                      call(
+                                                                                                                                                                                                          name,
+                                                                                                                                                                                                          R"({"project":"app"})"));
+                                                                                                                                                                                          expect(
+                                                                                                                                                                                              refused
+                                                                                                                                                                                                  .body
+                                                                                                                                                                                                  .contains(
+                                                                                                                                                                                                      "unknown tool"))
+                                                                                                                                                                                              << refused
+                                                                                                                                                                                                     .body;
+                                                                                                                                                                                      }
+                                                                                                                                                                                      a.push_back(
+                                                                                                                                                                                          co_await h
+                                                                                                                                                                                              .ask(
+                                                                                                                                                                                                  io,
+                                                                                                                                                                                                  GET,
+                                                                                                                                                                                                  "/mcp"));
+                                                                                                                                                                                      a.push_back(
+                                                                                                                                                                                          co_await h
+                                                                                                                                                                                              .mcp(
+                                                                                                                                                                                                  io,
+                                                                                                                                                                                                  "{not json"));
+                                                                                                                                                                                      a.push_back(
+                                                                                                                                                                                          co_await h
+                                                                                                                                                                                              .mcp(
+                                                                                                                                                                                                  io,
+                                                                                                                                                                                                  R"({"jsonrpc":"2.0","id":1,"method":"ping"})",
+                                                                                                                                                                                                  {{"mcp-protocol-version",
+                                                                                                                                                                                                    "1999-01-01"}}));
+                                                                                                                                                                                      a.push_back(
+                                                                                                                                                                                          co_await h
+                                                                                                                                                                                              .mcp(
+                                                                                                                                                                                                  io,
+                                                                                                                                                                                                  R"({"jsonrpc":"2.0","id":1,"method":"ping"})",
+                                                                                                                                                                                                  {{"origin",
+                                                                                                                                                                                                    "http://evil.example"}}));
+                                                                                                                                                                                      a.push_back(
+                                                                                                                                                                                          co_await h
+                                                                                                                                                                                              .mcp(
+                                                                                                                                                                                                  io,
+                                                                                                                                                                                                  R"({"jsonrpc":"2.0","id":1,"method":"ping"})",
+                                                                                                                                                                                                  {{"origin",
+                                                                                                                                                                                                    "http://ok.example"}}));
+                                                                                                                                                                                      a.push_back(
+                                                                                                                                                                                          co_await h
+                                                                                                                                                                                              .mcp(
+                                                                                                                                                                                                  io,
+                                                                                                                                                                                                  std::string(
+                                                                                                                                                                                                      5000,
+                                                                                                                                                                                                      ' ')));
+                                                                                                                                                                                      a.push_back(
+                                                                                                                                                                                          co_await h
+                                                                                                                                                                                              .mcp(
+                                                                                                                                                                                                  io,
+                                                                                                                                                                                                  call(
+                                                                                                                                                                                                      "configurations",
+                                                                                                                                                                                                      R"({"project":"app"})",
+                                                                                                                                                                                                      R"({"progressToken":"p1"})"),
+                                                                                                                                                                                                  {{"accept",
+                                                                                                                                                                                                    "application/json, text/event-stream"}}));
+                                                                                                                                                                                      const auto
+                                                                                                                                                                                          endpoint =
+                                                                                                                                                                                              "/api/v1/projects/app/worldline";
+                                                                                                                                                                                      const auto inspected =
+                                                                                                                                                                                          co_await h
+                                                                                                                                                                                              .ask(
+                                                                                                                                                                                                  io,
+                                                                                                                                                                                                  http::method::
+                                                                                                                                                                                                      POST,
+                                                                                                                                                                                                  endpoint,
+                                                                                                                                                                                                  R"({"project":"app","worldline":"main","action":"inspect"})");
+                                                                                                                                                                                      const auto initial =
+                                                                                                                                                                                          rfl::json::read<
+                                                                                                                                                                                              tools::worldline::
+                                                                                                                                                                                                  output>(
+                                                                                                                                                                                              inspected
+                                                                                                                                                                                                  .body)
+                                                                                                                                                                                              .value()
+                                                                                                                                                                                              .version
+                                                                                                                                                                                              .value();
+                                                                                                                                                                                      const auto apply =
+                                                                                                                                                                                          std::format(
+                                                                                                                                                                                              R"({{"project":"app","worldline":"main","action":"apply","observed":"{}","operation_id":"op-a","changes":[{{"kind":"create","path":"a.txt","text":"hi\n"}}]}})",
+                                                                                                                                                                                              initial);
+                                                                                                                                                                                      a.push_back(
+                                                                                                                                                                                          co_await h
+                                                                                                                                                                                              .ask(
+                                                                                                                                                                                                  io,
+                                                                                                                                                                                                  http::method::
+                                                                                                                                                                                                      POST,
+                                                                                                                                                                                                  endpoint,
+                                                                                                                                                                                                  apply));
+                                                                                                                                                                                      a.push_back(
+                                                                                                                                                                                          co_await h
+                                                                                                                                                                                              .ask(
+                                                                                                                                                                                                  io,
+                                                                                                                                                                                                  http::method::
+                                                                                                                                                                                                      POST,
+                                                                                                                                                                                                  endpoint,
+                                                                                                                                                                                                  R"({"project":"app","worldline":"main","action":"receipt","operation_id":"op-a"})"));
+                                                                                                                                                                                      a.push_back(
+                                                                                                                                                                                          co_await h
+                                                                                                                                                                                              .ask(
+                                                                                                                                                                                                  io,
+                                                                                                                                                                                                  http::method::
+                                                                                                                                                                                                      POST,
+                                                                                                                                                                                                  endpoint,
+                                                                                                                                                                                                  apply));
+                                                                                                                                                                                      a.push_back(
+                                                                                                                                                                                          co_await h
+                                                                                                                                                                                              .ask(
+                                                                                                                                                                                                  io,
+                                                                                                                                                                                                  http::method::
+                                                                                                                                                                                                      POST,
+                                                                                                                                                                                                  endpoint,
+                                                                                                                                                                                                  R"({"project":"app","worldline":"main","action":"fork","name":"wl","operation_id":"op-fork"})"));
+                                                                                                                                                                                      a.push_back(
+                                                                                                                                                                                          co_await h
+                                                                                                                                                                                              .ask(
+                                                                                                                                                                                                  io,
+                                                                                                                                                                                                  http::method::
+                                                                                                                                                                                                      POST,
+                                                                                                                                                                                                  endpoint,
+                                                                                                                                                                                                  R"({"project":"app","action":"history","worldline":"wl"})"));
+                                                                                                                                                                                      a.push_back(
+                                                                                                                                                                                          co_await h
+                                                                                                                                                                                              .ask(
+                                                                                                                                                                                                  io,
+                                                                                                                                                                                                  http::method::
+                                                                                                                                                                                                      POST,
+                                                                                                                                                                                                  endpoint,
+                                                                                                                                                                                                  R"({"project":"app","worldline":"main","action":"read","path":"a.txt"})"));
+                                                                                                                                                                                      a.push_back(
+                                                                                                                                                                                          co_await h
+                                                                                                                                                                                              .ask(
+                                                                                                                                                                                                  io,
+                                                                                                                                                                                                  GET,
+                                                                                                                                                                                                  "/api/v1/usage"));
+                                                                                                                                                                                      a.push_back(
+                                                                                                                                                                                          co_await h
+                                                                                                                                                                                              .ask(
+                                                                                                                                                                                                  io,
+                                                                                                                                                                                                  GET,
+                                                                                                                                                                                                  "/metrics"));
+                                                                                                                                                                                  };
+                                                                                                                          co_await coroutine::with_scope(
+                                                                                                                              std::move(run_children));
+                                                                                                                      };
+                                                              return run_operation(h, io, a);
+                                                          };
             h.rt.run(std::move(run_core));
             expect((a.size() == 16u) >> fatal);
             for (const auto name : {"configurations", "build", "test", "run", "language"})
@@ -933,7 +1125,8 @@ namespace {
             expect(a[5].status == 200 && a[5].allow_origin == "http://ok.example");
             expect(a[6].status == 413);
             expect(a[7].content_type == "text/event-stream" && a[7].body.starts_with("event: message\ndata: {"));
-            for (std::size_t i = 8; i < a.size(); ++i) expect(a[i].status == 200) << a[i].body;
+            for (std::size_t i = 8; i < a.size(); ++i)
+                expect(a[i].status == 200) << a[i].body;
             expect(a[8].body.contains(R"("replayed":false)"));
             expect(a[9].body.contains(content::hash_of("hi\n")));
             expect(a[10].body.contains(R"("replayed":true)"));

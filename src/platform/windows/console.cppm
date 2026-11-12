@@ -33,7 +33,8 @@ namespace cores {
                 if (!::SetConsoleCtrlHandler(console_handler, TRUE))
                     winapi::fail("SetConsoleCtrlHandler");
                 notification = event.value;
-                if (service_stop) ::SetEvent(notification);
+                if (service_stop)
+                    ::SetEvent(notification);
             }
             try {
                 watcher = std::jthread{[this, owner, stop](std::stop_token token) {
@@ -99,7 +100,8 @@ namespace daemon {
         }
         void WINAPI start(DWORD, LPWSTR*) {
             handle = ::RegisterServiceCtrlHandlerW(service_name.c_str(), control);
-            if (!handle) return;
+            if (!handle)
+                return;
             report(SERVICE_START_PENDING);
             std::jthread progress{[](std::stop_token token) {
                 while (!token.stop_requested()) {
@@ -118,21 +120,29 @@ namespace daemon {
             current.store(phase::stopped);
             report(SERVICE_STOPPED, result ? ERROR_PROCESS_ABORTED : NO_ERROR);
         }
-    }
+    } // namespace
     void publish(phase value) {
-        if (current.exchange(value) == value) return;
+        if (current.exchange(value) == value)
+            return;
         std::lock_guard lock{status_mutex};
-        if (!handle || status.dwCurrentState == SERVICE_STOP_PENDING) return;
-        if (value == phase::ready) report_locked(SERVICE_RUNNING);
-        if (value == phase::stopping) report_locked(SERVICE_STOP_PENDING);
+        if (!handle || status.dwCurrentState == SERVICE_STOP_PENDING)
+            return;
+        if (value == phase::ready)
+            report_locked(SERVICE_RUNNING);
+        if (value == phase::stopping)
+            report_locked(SERVICE_STOP_PENDING);
     }
     auto run(int argc, char** argv, int (*application)(int, char**), bool service, std::string_view instance) -> int {
         identity = instance;
         service_name.assign(instance.begin(), instance.end());
-        if (!service) return application(argc, argv);
-        saved_argc = argc; saved_argv = argv; entry = application;
+        if (!service)
+            return application(argc, argv);
+        saved_argc = argc;
+        saved_argv = argv;
+        entry = application;
         SERVICE_TABLE_ENTRYW table[]{{service_name.data(), start}, {nullptr, nullptr}};
-        if (!::StartServiceCtrlDispatcherW(table)) return 1;
+        if (!::StartServiceCtrlDispatcherW(table))
+            return 1;
         return result;
     }
-}
+} // namespace daemon

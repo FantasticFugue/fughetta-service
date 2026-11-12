@@ -24,8 +24,7 @@ namespace tools {
             std::shared_ptr<runner> run;
             auto operator()() -> coroutine::task<std::shared_ptr<ticket>> { co_return owner->enqueue(value, run); }
         };
-        co_return co_await cores::call(rt_.get_scheduler(here), rt_.get_scheduler(0),
-                                       submit_work{this, std::move(e), std::move(shared)});
+        co_return co_await cores::call(rt_.get_scheduler(here), rt_.get_scheduler(0), submit_work{this, std::move(e), std::move(shared)});
     }
 
     auto backlog::list(std::size_t here) -> coroutine::task<std::vector<view>> {
@@ -60,8 +59,7 @@ namespace tools {
             worlds::actor who;
             auto operator()() -> coroutine::task<std::string> { co_return owner->withdraw(id, who); }
         };
-        co_return co_await cores::call(rt_.get_scheduler(here), rt_.get_scheduler(0),
-                                       cancel_work{this, id, std::move(who)});
+        co_return co_await cores::call(rt_.get_scheduler(here), rt_.get_scheduler(0), cancel_work{this, id, std::move(who)});
     }
 
     auto backlog::serve(native::scheduler& io) -> coroutine::task<> {
@@ -75,8 +73,8 @@ namespace tools {
         // The same asker's older request for the same project, configuration and operation has not started: this one replaces it.
         for (auto it = jobs_.begin(); it != jobs_.end();) {
             auto j = *it++;
-            if (e.operation == "build" && j->what.operation == "build" && e.cacheable && j->what.cacheable && !j->what.fresh && !j->running && j->what.key != e.key &&
-                j->what.project == e.project && j->what.configuration == e.configuration && j->what.operation == e.operation &&
+            if (e.operation == "build" && j->what.operation == "build" && e.cacheable && j->what.cacheable && !j->what.fresh && !j->running &&
+                j->what.key != e.key && j->what.project == e.project && j->what.configuration == e.configuration && j->what.operation == e.operation &&
                 j->what.worldline == e.worldline && std::ranges::all_of(j->tickets, [&](auto& t) { return t->actor_ == e.actor; }))
                 finish(j, refused(j->what, "replaced by a newer request for the same configuration"), "replaced");
         }
@@ -86,9 +84,16 @@ namespace tools {
                 cache_.splice(cache_.begin(), cache_, hit);
                 held->reuse_ = "cache";
                 held->result_ = hit->second;
-                std::visit([](auto& result) {
-                    result.timings = {.sync_seconds = 0, .queue_seconds = 0, .dependency_seconds = 0, .worker_seconds = 0};
-                }, held->result_);
+                std::visit(
+                    [](auto& result) {
+                        result.timings = {.sync_seconds = 0,
+                                          .queue_seconds = 0,
+                                          .dependency_seconds = 0,
+                                          .worker_seconds = 0,
+                                          .preparation_seconds = 0,
+                                          .execution_seconds = 0};
+                    },
+                    held->result_);
                 held->done_.store(true, std::memory_order_release);
                 return held;
             }
@@ -239,10 +244,11 @@ namespace tools {
                               : analyzed->status == "prepared" && analyzed->analysis == "analyzed" && !analyzed->worker.empty() && analyzed->outline &&
                                     analyzed->outline->complete && analyzed->outline->cacheable;
         if (built)
-            reusable = reusable && built->export_error.empty() && std::ranges::all_of(built->exports, [](const auto& file) { return file.delivery_error.empty(); }) &&
-                std::ranges::all_of(built->steps, [](const auto& step) {
-                    return step.log_error.empty() && step.cache_error.empty() && (!step.log || step.log->delivery_error.empty());
-                });
+            reusable = reusable && built->export_error.empty() &&
+                       std::ranges::all_of(built->exports, [](const auto& file) { return file.delivery_error.empty(); }) &&
+                       std::ranges::all_of(built->steps, [](const auto& step) {
+                           return step.log_error.empty() && step.cache_error.empty() && (!step.log || step.log->delivery_error.empty());
+                       });
         if (state == "done" && j->what.cacheable && reusable) {
             std::erase_if(cache_, [&](auto& c) { return c.first == j->what.key; });
             cache_.emplace_front(j->what.key, r);
@@ -262,9 +268,8 @@ namespace tools {
         for (auto& t : j->tickets) {
             t->result_ = r;
             const auto end = j->started_at == std::chrono::steady_clock::time_point{} ? std::chrono::steady_clock::now() : j->started_at;
-            std::visit([&](auto& result) {
-                result.timings.queue_seconds = std::max(0.0, std::chrono::duration<double>(end - t->submitted_).count());
-            }, t->result_);
+            std::visit([&](auto& result) { result.timings.queue_seconds = std::max(0.0, std::chrono::duration<double>(end - t->submitted_).count()); },
+                       t->result_);
             t->done_.store(true, std::memory_order_release);
         }
         jobs_.remove(j);
@@ -295,7 +300,8 @@ namespace tools {
             throw config::not_found(std::format("no queued or running job {}", id));
         auto j = *found;
         auto asker = worlds::execution_key(who);
-        if ((!who.run.empty() || worlds::rank(who.role) < worlds::rank("owner")) && !std::ranges::all_of(j->tickets, [&](auto& t) { return t->actor_ == asker; }))
+        if ((!who.run.empty() || worlds::rank(who.role) < worlds::rank("owner")) &&
+            !std::ranges::all_of(j->tickets, [&](auto& t) { return t->actor_ == asker; }))
             throw tool_error(nodes::code::permission_denied, "another caller waits for this job too; only an owner cancels it");
         if (j->running) {
             j->stop.request_stop();

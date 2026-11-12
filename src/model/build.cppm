@@ -17,7 +17,7 @@ export import ruff;
 
 export namespace builds {
     struct timings {
-        std::optional<double> sync_seconds, queue_seconds, dependency_seconds, worker_seconds;
+        std::optional<double> client_sync_seconds, sync_seconds, queue_seconds, dependency_seconds, worker_seconds, preparation_seconds, execution_seconds;
     };
 
     // One builder of a configuration: a build system by name and that system's options.

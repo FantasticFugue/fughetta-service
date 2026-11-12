@@ -38,7 +38,8 @@ int main(int argc, char** argv) {
         std::string_view option{argv[1]};
         if (option == "--service") {
             service = true;
-            --argc; ++argv;
+            --argc;
+            ++argv;
         } else if ((option == "--instance" || option == "--log-dir") && argc > 2) {
             std::string_view value{argv[2]};
             if (option == "--instance") {
@@ -56,10 +57,15 @@ int main(int argc, char** argv) {
                     return 1;
                 }
             }
-            argc -= 2; argv += 2;
-        } else break;
+            argc -= 2;
+            argv += 2;
+        } else
+            break;
     }
-    if (output.is_open()) { std::cout.rdbuf(output.rdbuf()); std::cerr.rdbuf(errors.rdbuf()); }
+    if (output.is_open()) {
+        std::cout.rdbuf(output.rdbuf());
+        std::cerr.rdbuf(errors.rdbuf());
+    }
     int result = 1;
     try {
         result = daemon::run(argc, argv, application, service, identity);

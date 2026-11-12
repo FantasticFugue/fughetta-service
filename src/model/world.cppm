@@ -24,7 +24,8 @@ export namespace worlds {
     // Work queues and execution audit records distinguish concurrent runs of one caller.
     inline auto execution_key(const actor& who) -> std::string {
         auto key = identity_key(who);
-        if (!who.run.empty()) key += "\nrun:" + who.run;
+        if (!who.run.empty())
+            key += "\nrun:" + who.run;
         return key;
     }
 

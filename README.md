@@ -570,15 +570,15 @@ they stay in the step's output for the agent to read. A new tool joins with its
 own adapter module, and a new protocol only when no existing one fits.
 
 Execution results and the member endpoint `GET /api/v1/calls?project=NAME&limit=50`
-include `timings` in seconds: `sync_seconds` measures source transfer from the
+include `timings` in seconds. `client_sync_seconds` is the client-reported local checkout scan, upload and writeback duration, supplied as `fughetta/client_sync_seconds` in MCP call `_meta`. It excludes waiting for the local push lock and is shared across configurations of one call. The service accepts finite values from zero through 24 hours and ignores values outside that range. It is descriptive data, separate from service-measured durations. `sync_seconds` measures source transfer from the
 service to the Worker, `queue_seconds` the caller's wait for a job to start,
 `dependency_seconds` dependency preparation (including its own scheduling), and
-`worker_seconds` execution on the Worker, including checkout and analysis.
+`worker_seconds` total work on the Worker, including checkout and analysis. Within that total, `preparation_seconds` measures provider-marked setup steps (vcpkg install, uv lock/sync, Bun install and CMake configure), including dependency cache lock waits; `execution_seconds` measures other command steps and language/artifact analysis. Step measurements include command setup and report processing. Checkout and exported-file capture are outside these two sub-stages.
 Dependency time is measured before the main job enters its queue. Missing stages
 are absent; a cache hit reports zero work for that call. Shared callers receive
 the shared execution's sync and Worker times, and their own queue wait. The call's
 `reuse` identifies executed, shared and cached results. These stages do not
-include local CLI scanning/upload or result delivery and do not sum to the full
+include result delivery and do not sum to the full
 request duration. Call records retain the same bounded recent history as builds.
 
 Agents configure projects with the `project`, `schema`, and `save_project` tools of

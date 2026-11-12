@@ -340,7 +340,8 @@ namespace builds {
                 const std::filesystem::path& dependency_cache, const std::filesystem::path& dependency_upstream) -> step {
         auto root = std::filesystem::absolute(tree);
         auto bind = [&](std::string& text) {
-            if (text.contains("${cache:")) throw std::invalid_argument("cache placeholders are reserved for managed binary sources");
+            if (text.contains("${cache:"))
+                throw std::invalid_argument("cache placeholders are reserved for managed binary sources");
             replace_all(text, "${tree}", root.generic_string());
             replace_all(text, "${jobs}", std::to_string(jobs));
             if (!reports.empty())
@@ -359,7 +360,8 @@ namespace builds {
             bind(arg);
         for (auto& [name, v] : value.env) {
             if (name == "VCPKG_BINARY_SOURCES" && v == "clear;files,${cache:vcpkg},readwrite") {
-                if (dependency_cache.empty()) throw std::invalid_argument("vcpkg dependency cache is not configured");
+                if (dependency_cache.empty())
+                    throw std::invalid_argument("vcpkg dependency cache is not configured");
                 if (!dependency_upstream.empty()) {
                     const auto writable = std::filesystem::weakly_canonical(std::filesystem::absolute(dependency_cache / "vcpkg"));
                     const auto upstream = std::filesystem::weakly_canonical(std::filesystem::absolute(dependency_upstream / "vcpkg"));
@@ -370,15 +372,18 @@ namespace builds {
                 auto source = [](const std::filesystem::path& cache) {
                     std::string escaped;
                     for (char c : std::filesystem::absolute(cache / "vcpkg").generic_string()) {
-                        if (c == '`' || c == ',' || c == ';') escaped += '`';
+                        if (c == '`' || c == ',' || c == ';')
+                            escaped += '`';
                         escaped += c;
                     }
                     return ";files," + escaped;
                 };
                 v = "clear";
-                if (!dependency_upstream.empty()) v += source(dependency_upstream) + ",read";
+                if (!dependency_upstream.empty())
+                    v += source(dependency_upstream) + ",read";
                 v += source(dependency_cache) + ",readwrite";
-            } else bind(v);
+            } else
+                bind(v);
         }
         relative(value.cwd, true);
         value.cwd = (value.cwd.empty() ? root : root / value.cwd).string();

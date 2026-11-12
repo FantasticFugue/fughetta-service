@@ -8,13 +8,12 @@ import protocol;
 
 export namespace test {
     inline auto shell() -> std::string {
-        if (const auto* value = std::getenv("TEST_SHELL")) return value;
+        if (const auto* value = std::getenv("TEST_SHELL"))
+            return value;
         return "/bin/sh";
     }
 
-    inline auto absolute(std::string_view value) -> std::string {
-        return std::filesystem::absolute(std::filesystem::path{value}).generic_string();
-    }
+    inline auto absolute(std::string_view value) -> std::string { return std::filesystem::absolute(std::filesystem::path{value}).generic_string(); }
 
     // Keep sender constraint instantiation inside a module for clients compiled outside module units.
     struct http_stream {

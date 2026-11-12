@@ -138,8 +138,9 @@ namespace {
             auto json = rfl::json::write(plan.server.initialization);
             expect(json.contains(R"("hostInfo":"fughetta")") && json.contains(R"("maxTsServerMemory":4096)"));
             expect(json.contains(R"("includeInlayParameterNameHints":"all")") && json.contains(R"("checkJs":true)"));
-            auto local = language::locate(plan.server, ::test::absolute("/work/project"),
-                                          {{"typescript-language-server", ::test::absolute("/opt/ts/language-server")}, {"tsserver", ::test::absolute("/opt/ts/tsserver")}}, 1);
+            auto local = language::locate(
+                plan.server, ::test::absolute("/work/project"),
+                {{"typescript-language-server", ::test::absolute("/opt/ts/language-server")}, {"tsserver", ::test::absolute("/opt/ts/tsserver")}}, 1);
             expect(local.argv.front() == ::test::absolute("/opt/ts/language-server") && local.argv.back() == ::test::absolute("/opt/ts/tsserver"));
             expect(language::providers::document("typescript", "src/app.tsx") == std::optional<std::string_view>{"typescriptreact"});
             expect(language::providers::document("typescript", "src/worker.mts") == std::optional<std::string_view>{"typescript"});
