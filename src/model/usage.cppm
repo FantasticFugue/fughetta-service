@@ -104,9 +104,25 @@ export namespace usage {
         explicit ledger(std::filesystem::path dir, std::uint32_t keep_days = 32) : dir_(std::move(dir)), keep_days_(keep_days) {
             std::filesystem::create_directories(dir_);
             replay();
+            writer_ = std::make_unique<durability::append_file>(log_path());
         }
 
         std::function<void()> changed;
+
+        // The caller owns serialization; one durable append covers the queued event callbacks.
+        template <class F> void batch(F f) {
+            batching_ = true;
+            try {
+                f();
+                flush();
+                batching_ = false;
+                if (changed)
+                    changed();
+            } catch (...) {
+                batching_ = false;
+                throw;
+            }
+        }
 
         // Admits a build within the rate and time quotas; how many run at once is the backlog's to keep.
         auto admit_build(const std::string& project, const config::effective_limits& limits) -> std::uint64_t {
@@ -118,7 +134,7 @@ export namespace usage {
                 throw quota_exceeded(std::format("{:.0f} build seconds used this month (limit {})", s, limits.build_seconds_per_month));
             auto ticket = next_ticket_++;
             running_.emplace(ticket, project);
-            if (changed)
+            if (changed && !batching_)
                 changed();
             return ticket;
         }
@@ -134,7 +150,7 @@ export namespace usage {
                 e.at = now();
             append(event{.seq = next_seq_++, .build = e}, e.at);
             apply(e);
-            if (changed)
+            if (changed && !batching_)
                 changed();
         }
 
@@ -143,7 +159,7 @@ export namespace usage {
                 e.at = now();
             append(event{.seq = next_seq_++, .tool = e}, e.at);
             apply(e);
-            if (changed)
+            if (changed && !batching_)
                 changed();
         }
 
@@ -152,7 +168,7 @@ export namespace usage {
                 e.at = now();
             append(event{.seq = next_seq_++, .call = e}, e.at);
             apply(e);
-            if (changed)
+            if (changed && !batching_)
                 changed();
         }
 
@@ -221,13 +237,24 @@ export namespace usage {
             auto first = std::ranges::upper_bound(index_, after, {}, &mark::seq);
             if (first == index_.end() || !limit)
                 return out;
-            std::ifstream in{log_path(), std::ios::binary};
-            in.seekg(static_cast<std::streamoff>(first->offset));
-            std::string line;
-            while (out.events.size() < limit && std::getline(in, line)) {
-                auto e = rfl::json::read<event, rfl::DefaultIfMissing>(line);
-                if (!e || (!e->build && !e->tool && !e->call))
+            std::ifstream in;
+            std::uint64_t opened = std::numeric_limits<std::uint64_t>::max();
+            for (auto it = first; it != index_.end() && out.events.size() < limit; ++it) {
+                if (it->at < cutoff())
                     continue;
+                if (opened != it->segment) {
+                    in.close();
+                    in.clear();
+                    in.open(log_path(it->segment), std::ios::binary);
+                    opened = it->segment;
+                }
+                in.seekg(static_cast<std::streamoff>(it->offset));
+                std::string line;
+                if (!std::getline(in, line))
+                    throw std::runtime_error("cannot read usage event");
+                auto e = rfl::json::read<event, rfl::DefaultIfMissing>(line);
+                if (!e)
+                    throw std::runtime_error("unreadable usage event");
                 out.next = e->seq;
                 out.events.push_back(std::move(*e));
             }
@@ -239,18 +266,45 @@ export namespace usage {
         struct mark {
             std::uint64_t seq = 0, offset = 0;
             std::int64_t at = 0;
+            std::uint64_t segment = 0;
         };
 
-        auto log_path() const -> std::filesystem::path { return dir_ / "events.jsonl"; }
+        auto log_path(std::uint64_t segment = 0) const -> std::filesystem::path {
+            return dir_ / (segment ? std::format("events-{:020}.jsonl", segment) : "events.jsonl");
+        }
         auto cutoff() const -> std::int64_t { return now() - static_cast<std::int64_t>(keep_days_) * 86400; }
-
+        void flush() {
+            if (pending_.empty())
+                return;
+            writer_->append(pending_);
+            pending_.clear();
+        }
         void append(const event& e, std::int64_t at) {
-            auto line = rfl::json::write(e) + '\n';
-            durability::durable_append(log_path(), line);
-            index_.push_back({e.seq, size_, at});
-            size_ += line.size();
-            if (now() - compacted_at_ >= 86400)
+            if (size_ && (size_ >= 16 * 1024 * 1024 || day_of(now()) != active_day_)) {
+                flush();
+                writer_.reset();
+                auto segment = e.seq - 1;
+                durability::durable_rename(log_path(), log_path(segment));
+                for (auto& m : index_)
+                    if (!m.segment)
+                        m.segment = segment;
+                segments_[segment] = active_latest_;
+                // Keep the sequence even if every archived event expires.
+                auto marker = rfl::json::write(event{.seq = segment}) + '\n';
+                durability::durable_write(log_path(), marker);
+                size_ = marker.size();
+                active_latest_ = 0;
+                active_day_ = day_of(now());
+                writer_ = std::make_unique<durability::append_file>(log_path());
                 compact();
+            }
+            auto line = rfl::json::write(e) + '\n';
+            pending_ += line;
+            if (!batching_)
+                flush();
+            index_.push_back({e.seq, size_, at, 0});
+            size_ += line.size();
+            active_latest_ = std::max(active_latest_, at);
         }
 
         void prune() {
@@ -259,84 +313,98 @@ export namespace usage {
                 index_.pop_front();
         }
 
-        // Drops what is past keeping from the log once a day: the kept events are its tail, written again from where the first starts.
-        // A log with nothing kept holds a line with only the last number, so numbering goes on.
         void compact() {
             prune();
-            std::string tail;
-            if (index_.empty()) {
-                if (next_seq_ > 1)
-                    tail = rfl::json::write(event{.seq = next_seq_ - 1}) + '\n';
-            } else {
-                auto base = index_.front().offset;
-                std::ifstream in{log_path(), std::ios::binary};
-                in.seekg(static_cast<std::streamoff>(base));
-                tail.assign(std::istreambuf_iterator<char>{in}, {});
-                for (auto& m : index_)
-                    m.offset -= base;
+            std::erase_if(index_, [&](const mark& m) { return m.at < cutoff(); });
+            for (auto it = segments_.begin(); it != segments_.end();) {
+                if (it->second >= cutoff()) {
+                    ++it;
+                    continue;
+                }
+                durability::durable_remove(log_path(it->first));
+                it = segments_.erase(it);
             }
-            durability::durable_write(log_path(), tail, false, ".tmp");
-            size_ = tail.size();
-            compacted_at_ = now();
         }
 
         void replay() {
-            auto cutoff = this->cutoff();
-            std::string text;
-            {
-                std::ifstream in{log_path(), std::ios::binary};
-                if (!in && std::filesystem::exists(log_path()))
-                    throw std::runtime_error(std::format("cannot read {}", log_path().string()));
-                text.assign(std::istreambuf_iterator<char>{in}, {});
-            }
-            std::vector<event> kept;
-            std::size_t bad = 0, torn = 0;
-            for (std::size_t pos = 0; pos < text.size();) {
-                auto end = text.find('\n', pos);
-                bool complete = end != std::string::npos;
-                std::string_view line{text.data() + pos, (complete ? end : text.size()) - pos};
-                pos = complete ? end + 1 : text.size();
-                if (line.empty())
+            std::vector<std::uint64_t> segments;
+            for (auto& entry : std::filesystem::directory_iterator(dir_)) {
+                auto name = entry.path().filename().string();
+                if (!name.starts_with("events-") || !name.ends_with(".jsonl"))
                     continue;
-                auto e = rfl::json::read<event, rfl::DefaultIfMissing>(line);
-                if (!e) {
-                    (complete ? bad : torn) += 1;
+                auto number = std::string_view{name}.substr(7, name.size() - 13);
+                std::uint64_t seq = 0;
+                auto [end, error] = std::from_chars(number.data(), number.data() + number.size(), seq);
+                if (error == std::errc{} && end == number.data() + number.size() && seq)
+                    segments.push_back(seq);
+            }
+            std::ranges::sort(segments);
+            segments.push_back(0);
+            for (auto segment : segments) {
+                auto path = log_path(segment);
+                std::ifstream in{path, std::ios::binary};
+                if (!in) {
+                    if (std::filesystem::exists(path))
+                        throw std::runtime_error(std::format("cannot read {}", path.string()));
                     continue;
                 }
-                next_seq_ = std::max(next_seq_, e->seq + 1);
-                auto at = e->build ? e->build->at : e->tool ? e->tool->at : e->call ? e->call->at : 0;
-                if (at < cutoff)
-                    continue;
-                if (e->build)
-                    apply(*e->build);
-                if (e->tool)
-                    apply(*e->tool);
-                if (e->call)
-                    apply(*e->call);
-                kept.push_back(std::move(*e));
+                std::string repaired, original, line;
+                std::uint64_t offset = 0;
+                std::int64_t latest = 0;
+                std::size_t bad = 0, torn = 0;
+                while (std::getline(in, line)) {
+                    bool complete = !in.eof();
+                    original += line;
+                    if (complete)
+                        original += '\n';
+                    auto e = rfl::json::read<event, rfl::DefaultIfMissing>(line);
+                    if (!complete || !e) {
+                        (complete ? bad : torn)++;
+                        continue;
+                    }
+                    next_seq_ = std::max(next_seq_, e->seq + 1);
+                    auto at = e->build ? e->build->at : e->tool ? e->tool->at : e->call ? e->call->at : 0;
+                    latest = std::max(latest, at);
+                    if (at >= cutoff()) {
+                        if (e->build)
+                            apply(*e->build);
+                        if (e->tool)
+                            apply(*e->tool);
+                        if (e->call)
+                            apply(*e->call);
+                        index_.push_back({e->seq, offset, at, segment});
+                    }
+                    repaired += line + '\n';
+                    offset = repaired.size();
+                }
+                if (in.bad())
+                    throw std::runtime_error(std::format("cannot read {}", path.string()));
+                in.close();
+                if (bad || torn) {
+                    if (bad) {
+                        auto evidence = path;
+                        evidence += std::format(".corrupt-{}", now());
+                        durability::durable_write(evidence, original);
+                        recovery_ = std::format("{} unreadable lines in {}; original saved to {}", bad, path.string(), evidence.string());
+                    } else
+                        recovery_ = std::format("dropped a torn last line in {}", path.string());
+                    durability::durable_write(path, repaired);
+                }
+                if (segment)
+                    segments_[segment] = latest;
+                else {
+                    size_ = offset;
+                    active_latest_ = latest;
+                }
             }
-            if (bad) {
-                auto evidence = log_path();
-                evidence += std::format(".corrupt-{}", now());
-                durability::durable_write(evidence, text);
-                recovery_ =
-                    std::format("{} unreadable line{} in {}; the log as found is kept in {}", bad, bad == 1 ? "" : "s", log_path().string(), evidence.string());
-            } else if (torn) {
-                recovery_ = std::format("dropped a torn last line in {} (a crash while it was written)", log_path().string());
+            active_day_ = active_latest_ ? day_of(active_latest_) : day_of(now());
+            // Write the sequence before removing expired archives after a restart.
+            if (!size_ && next_seq_ > 1) {
+                auto marker = rfl::json::write(event{.seq = next_seq_ - 1}) + '\n';
+                durability::durable_write(log_path(), marker);
+                size_ = marker.size();
             }
-            // When the last number is not among the kept events, a line with only that number keeps the numbering going.
-            if (next_seq_ > 1 && (kept.empty() || kept.back().seq != next_seq_ - 1))
-                kept.push_back(event{.seq = next_seq_ - 1});
-            std::string out;
-            for (auto& e : kept) {
-                auto at = e.build ? e.build->at : e.tool ? e.tool->at : e.call ? e.call->at : 0;
-                if (e.build || e.tool || e.call)
-                    index_.push_back({e.seq, out.size(), at});
-                out += rfl::json::write(e) + '\n';
-            }
-            durability::durable_write(log_path(), out, false, ".tmp");
-            size_ = out.size();
-            compacted_at_ = now();
+            compact();
         }
 
         auto day_for(std::int64_t at, const std::string& project) -> day& {
@@ -383,7 +451,8 @@ export namespace usage {
 
         void apply(const call_event& e) {
             calls_.push_back(e);
-            if (calls_.size() > max_builds_kept) calls_.pop_front();
+            if (calls_.size() > max_builds_kept)
+                calls_.pop_front();
         }
 
         static constexpr std::size_t max_builds_kept = 10000;
@@ -400,6 +469,10 @@ export namespace usage {
         std::uint64_t next_seq_ = 1;
         std::deque<mark> index_;
         std::uint64_t size_ = 0;
-        std::int64_t compacted_at_ = 0;
+        std::int64_t active_day_ = 0, active_latest_ = 0;
+        std::map<std::uint64_t, std::int64_t> segments_;
+        std::unique_ptr<durability::append_file> writer_;
+        std::string pending_;
+        bool batching_ = false;
     };
 } // namespace usage

@@ -12,7 +12,7 @@ namespace source {
                 throw std::runtime_error("source connect timed out");
             auto sock = std::move(*connected);
             transport::channel<native::socket> chan{sock};
-            co_return co_await coroutine::with_scope([&](coroutine::scope& children) -> coroutine::task<jobs::reply_t<Req>> {
+            auto run_children = [&](coroutine::scope& children) -> coroutine::task<jobs::reply_t<Req>> {
                 children.spawn(chan.pump([](const transport::frame&) {}));
                 co_await chan.post(jobs::hello{.name = "gateway", .auth = jobs::source_token(), .protocol = jobs::protocol_version});
                 issued = true;
@@ -22,7 +22,8 @@ namespace source {
                 if (!*result)
                     transport::raise_call_error(std::move(result->error()));
                 co_return std::move(**result);
-            });
+            };
+            co_return co_await coroutine::with_scope(std::move(run_children));
         }
 
         template <jobs::request Req> auto invoke(net::ip::tcp::endpoint endpoint, Req request, coroutine::stop_token stop) -> jobs::reply_t<Req> {

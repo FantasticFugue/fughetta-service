@@ -107,26 +107,29 @@ namespace {
     }
 
     auto scoped(ctx& io, bool* hit) -> coroutine::task<int> {
-        co_await coroutine::with_scope([&io, hit](coroutine::scope& children) -> coroutine::task<> {
+        auto run_children = [&io, hit](coroutine::scope& children) -> coroutine::task<> {
             children.spawn(forever(io, hit));
             co_await execution::schedule_after(io, 1ms);
-        });
+        };
+        co_await coroutine::with_scope(std::move(run_children));
         co_return 3;
     }
 
     auto joining_scope(ctx& io, bool* hit) -> coroutine::task<> {
-        co_await coroutine::with_scope([&](coroutine::scope& children) -> coroutine::task<> {
+        auto run_children = [&](coroutine::scope& children) -> coroutine::task<> {
             children.spawn(forever(io, hit));
             co_await children.join();
-        });
+        };
+        co_await coroutine::with_scope(std::move(run_children));
     }
 
     auto failing_scope_body(ctx& io, bool* hit) -> coroutine::task<> {
-        co_await coroutine::with_scope([&](coroutine::scope& children) -> coroutine::task<> {
+        auto run_children = [&](coroutine::scope& children) -> coroutine::task<> {
             children.spawn(forever(io, hit));
             throw std::runtime_error("scope body failed");
             co_return;
-        });
+        };
+        co_await coroutine::with_scope(std::move(run_children));
     }
 
     auto failing_child() -> coroutine::task<> {
@@ -135,10 +138,11 @@ namespace {
     }
 
     auto scope_failure(ctx& io) -> coroutine::task<> {
-        co_await coroutine::with_scope([&io](coroutine::scope& children) -> coroutine::task<> {
+        auto run_children = [&io](coroutine::scope& children) -> coroutine::task<> {
             children.spawn(failing_child());
             co_await execution::schedule_after(io, 1ms);
-        });
+        };
+        co_await coroutine::with_scope(std::move(run_children));
     }
 
     auto echo_once(native::listener& l) -> coroutine::task<> {
@@ -160,10 +164,11 @@ namespace {
     auto loopback(ctx& io) -> coroutine::task<std::string> {
         auto l = native::listener{io, {net::ip::address_v4::loopback(), 0}};
         std::string out;
-        co_await coroutine::with_scope([&](coroutine::scope& children) -> coroutine::task<> {
+        auto run_children = [&](coroutine::scope& children) -> coroutine::task<> {
             children.spawn(echo_once(l));
             out = co_await ask(io, l.local_endpoint().port());
-        });
+        };
+        co_await coroutine::with_scope(std::move(run_children));
         co_return out;
     }
 
@@ -189,11 +194,12 @@ namespace {
     auto contend(ctx& io) -> coroutine::task<std::vector<int>> {
         coroutine::mutex m;
         std::vector<int> log;
-        co_await coroutine::with_scope([&](coroutine::scope& children) -> coroutine::task<> {
+        auto run_children = [&](coroutine::scope& children) -> coroutine::task<> {
             for (int i = 0; i < 3; ++i)
                 children.spawn(ordered(m, log, io, i));
             co_await children.join();
-        });
+        };
+        co_await coroutine::with_scope(std::move(run_children));
         co_return log;
     }
 
@@ -403,10 +409,12 @@ namespace {
             cores::io_context<native::context> rt{2};
             cross out;
             std::atomic<bool> unwound = false;
-            rt.run([&](ctx& io, std::size_t core) -> coroutine::task<> {
-                if (core != 0)
-                    return [](ctx&) -> coroutine::task<> { co_return; }(io);
-                return [](cores::context<ctx>& rt, ctx& io, cross& out, std::atomic<bool>& unwound) -> coroutine::task<> {
+            auto run_core = [&](ctx& io, std::size_t core) -> coroutine::task<> {
+                if (core != 0) {
+                    static constexpr auto run_operation = [](ctx&) -> coroutine::task<> { co_return; };
+                    return run_operation(io);
+                }
+                static constexpr auto run_operation = [](cores::context<ctx>& rt, ctx& io, cross& out, std::atomic<bool>& unwound) -> coroutine::task<> {
                     auto& there = rt.get_scheduler(1);
                     out.caller = std::this_thread::get_id();
                     out.callee = co_await cores::call(io, there, [] { return thread_id(); });
@@ -420,8 +428,10 @@ namespace {
                     auto r = co_await coroutine::stop_point(
                         execution::when_all(cores::call(io, there, [&there, &unwound] { return remote_timer(there, &unwound); }), execution::just_stopped()));
                     out.stopped = !r;
-                }(rt, io, out, unwound);
-            });
+                };
+                return run_operation(rt, io, out, unwound);
+            };
+            rt.run(std::move(run_core));
             expect(out.callee != out.caller);
             expect(out.resumed == out.caller);
             expect(out.value == 42);
@@ -468,15 +478,17 @@ namespace {
                 std::this_thread::sleep_for(50ms);
                 rt.stop();
             });
-            rt.run([&](ctx& io, std::size_t) -> coroutine::task<> {
-                return [](ctx& io, std::atomic<int>& unwound) -> coroutine::task<> {
+            auto run_core = [&](ctx& io, std::size_t) -> coroutine::task<> {
+                static constexpr auto run_operation = [](ctx& io, std::atomic<int>& unwound) -> coroutine::task<> {
                     struct count {
                         std::atomic<int>& n;
                         ~count() { ++n; }
                     } c{unwound};
                     co_await execution::schedule_after(io, 1h);
-                }(io, unwound);
-            });
+                };
+                return run_operation(io, unwound);
+            };
+            rt.run(std::move(run_core));
             expect(unwound.load() == 2);
         };
     };

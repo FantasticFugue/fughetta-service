@@ -647,9 +647,10 @@ export namespace transport {
         template <jobs::request Req, class F>
             requires std::same_as<std::invoke_result_t<F&, Req, exchange&>, coroutine::task<jobs::reply_t<Req>>>
         void on(F handler) {
-            handlers_[jobs::code<Req>] = [handler = std::move(handler)](channel<S>& chan, frame f) mutable -> coroutine::task<> {
+            auto dispatch = [handler = std::move(handler)](channel<S>& chan, frame f) mutable -> coroutine::task<> {
                 return serve<Req>(handler, chan, std::move(f));
             };
+            handlers_[jobs::code<Req>] = std::move(dispatch);
         }
 
         auto handles(std::uint32_t kind) const -> bool { return handlers_.contains(kind); }

@@ -98,6 +98,25 @@ namespace durability {
         sync_dir(target.parent_path());
     }
 
+    struct append_file::state {
+        std::filesystem::path path;
+        fd file;
+        bool fresh;
+        explicit state(const std::filesystem::path& path) : path(path), file(-1), fresh(!std::filesystem::exists(path)) {
+            file = open(path, O_WRONLY | O_CREAT | O_APPEND);
+        }
+    };
+    append_file::append_file(const std::filesystem::path& path) : state_(std::make_unique<state>(path)) {}
+    append_file::~append_file() = default;
+    void append_file::append(std::string_view records) {
+        write_all(state_->file, std::as_bytes(std::span{records}), state_->path);
+        sync(state_->file, state_->path);
+        if (state_->fresh) {
+            sync_dir(state_->path.parent_path());
+            state_->fresh = false;
+        }
+    }
+
     void durable_append(const std::filesystem::path& log, std::string_view record) {
         bool fresh = !std::filesystem::exists(log);
         auto f = open(log, O_WRONLY | O_CREAT | O_APPEND);

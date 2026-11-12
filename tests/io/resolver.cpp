@@ -19,7 +19,7 @@ namespace {
                 ++received;
             }
         };
-        co_await coroutine::with_scope([&](coroutine::scope& children) -> coroutine::task<> {
+        auto run_children = [&](coroutine::scope& children) -> coroutine::task<> {
             children.spawn(drain());
             auto started = std::chrono::steady_clock::now();
             auto answer = co_await coroutine::deadline(
@@ -27,7 +27,8 @@ namespace {
             expect(!answer);
             expect(received > 0u);
             expect(std::chrono::steady_clock::now() - started < 500ms);
-        });
+        };
+        co_await coroutine::with_scope(std::move(run_children));
         auto localhost = co_await resolver::resolve(io, "localhost", 8443);
         expect(localhost.port() == 8443u);
         expect(localhost.address().to_v4().to_bytes() == std::array<std::uint8_t, 4>{127, 0, 0, 1});

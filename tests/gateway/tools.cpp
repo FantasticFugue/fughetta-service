@@ -25,7 +25,7 @@ namespace {
     using namespace std::chrono_literals;
     using ctx = native::scheduler;
     auto worker_loop(ctx& io, std::uint16_t port, replica::service& worker) -> coroutine::task<> {
-        co_await worker.run(0, [&]() -> coroutine::task<> {
+        auto run_operation = [&]() -> coroutine::task<> {
         auto sock = co_await io::connect(io, {net::ip::address_v4{{127, 0, 0, 1}}, port});
         transport::channel<native::socket> chan{sock};
         transport::dispatcher<native::socket> dispatch;
@@ -35,17 +35,20 @@ namespace {
                                        .max_inflight = 4,
                                        .protocol = jobs::protocol_version,
                                        .tools = host::detect_tools(test::toolset()), .toolchain_id = std::string(64, 'a')});
-        co_await coroutine::with_scope([&](coroutine::scope& handlers) -> coroutine::task<> {
-            handlers.spawn([](ctx& io, auto& channel) -> coroutine::task<> {
+        auto run_handlers = [&](coroutine::scope& handlers) -> coroutine::task<> {
+            static constexpr auto run_child = [](ctx& io, auto& channel) -> coroutine::task<> {
                 for (;;) {
                     co_await execution::schedule_after(io, 2s);
                     co_await channel.post(jobs::heartbeat{});
                 }
-            }(io, chan));
+            };
+            handlers.spawn(run_child(io, chan));
             for (;;)
                 handlers.spawn(dispatch.handle(chan, co_await chan.recv()));
-        });
-        }());
+        };
+        co_await coroutine::with_scope(std::move(run_handlers));
+        };
+        co_await worker.run(0, run_operation());
     }
     static constexpr auto cases = [] {
         "source range replies preserve Unicode positions and byte-limited output"_test = [] {
@@ -110,7 +113,7 @@ namespace {
             source_server::service source{rt, tmp.dir / "source", source_disk};
             routing::router router{rt};
             replica::service worker{rt, replica::options{.root = tmp.dir / "replica", .worker = "source-test-worker", .tools = test::toolset()}, worker_disk};
-            rt.run([&](ctx& io, std::size_t) -> coroutine::task<> {
+            auto run_core = [&](ctx& io, std::size_t) -> coroutine::task<> {
                 auto sources = native::listener{io, {net::ip::address_v4::loopback(), 0}};
                 auto workers = native::listener{io, {net::ip::address_v4::loopback(), 0}};
                 storage::registry registry{rt, tmp.dir / "state", config, gateway_disk,
@@ -120,16 +123,18 @@ namespace {
                 services.queue = &queue;
                 mcp::notifier note;
                 const worlds::actor tester{.issuer = "token", .user = "tester", .caller = "test-suite", .role = "owner"};
-                co_await coroutine::with_scope([&](coroutine::scope& children) -> coroutine::task<> {
-                    children.spawn([](auto& io, auto& listener, auto& source, auto& scope) -> coroutine::task<> {
-                        for (;;)
-                            scope.spawn(source.serve(
-                                io, co_await execution::then(net::async_accept(listener), [](auto socket, auto) { return std::move(socket); }), 0));
-                    }(io, sources, source, children));
+                auto run_children_2 = [&](coroutine::scope& children) -> coroutine::task<> {
+                    static constexpr auto run_child_2 = [](auto& io, auto& listener, auto& source, auto& scope) -> coroutine::task<> {
+                        for (;;) {
+                            auto [connection, peer] = co_await net::async_accept(listener);
+                            scope.spawn(source.serve(io, std::move(connection), 0));
+                        }
+                    };
+                    children.spawn(run_child_2(io, sources, source, children));
                     children.spawn(worker_loop(io, workers.local_endpoint().port(), worker));
                     children.spawn(queue.serve(io));
-                    children.spawn(
-                        router.workers(0).admit(io, co_await execution::then(net::async_accept(workers), [](auto socket, auto) { return std::move(socket); })));
+                    auto [worker_connection, worker_peer] = co_await net::async_accept(workers);
+                    children.spawn(router.workers(0).admit(io, std::move(worker_connection)));
                     while (!router.workers(0).holds({}))
                         co_await execution::schedule_after(io, 1ms);
                     auto line = [&](tools::worldline::input in) -> coroutine::task<tools::worldline::output> {
@@ -200,15 +205,17 @@ namespace {
                                                 note, tester);
                     auto moved = co_await fixture::read_file(services, {.project = "app", .path = "src/moved.txt"}, note, tester);
                     expect(moved.content == "goodbye source\n");
-                    auto escaped = co_await refused([&]() -> coroutine::task<> {
+                    auto run_operation_24 = [&]() -> coroutine::task<> {
                         co_await fixture::write_file(services, {.project = "app", .path = "../escaped", .content = "x", .operation_id = "write-6"}, note,
                                                      tester);
-                    });
+                    };
+                    auto escaped = co_await refused(std::move(run_operation_24));
                     expect(escaped == "invalid_record") << escaped;
-                    auto oversized = co_await refused([&]() -> coroutine::task<> {
+                    auto run_operation_23 = [&]() -> coroutine::task<> {
                         co_await fixture::write_file(
                             services, {.project = "app", .path = "too-big", .content = std::string(16777217, 'x'), .operation_id = "write-7"}, note, tester);
-                    });
+                    };
+                    auto oversized = co_await refused(std::move(run_operation_23));
                     expect(oversized == "resource_limit") << oversized;
                     co_await fixture::write_file(
                         services, {.project = "app", .path = "big.bin", .content = std::string(9u << 20, 'z'), .operation_id = "write-8"}, note, tester);
@@ -247,9 +254,10 @@ namespace {
                                                  note, tester);
                     auto reforked = co_await line({.action = "fork", .name = std::string{"agent-c"}, .operation_id = std::string{"fork-c"}});
                     expect(*reforked.replayed && reforked.version == forked.version) << "a fork retried after its source moved answers from its receipt";
-                    auto renamed = co_await refused([&]() -> coroutine::task<> {
+                    auto run_operation_22 = [&]() -> coroutine::task<> {
                         co_await line({.action = "fork", .name = std::string{"agent-d"}, .operation_id = std::string{"fork-c"}});
-                    });
+                    };
+                    auto renamed = co_await refused(std::move(run_operation_22));
                     expect(renamed == "identity_conflict") << renamed;
                     co_await fixture::remove_file(services, {.project = "app", .path = "src/later.txt", .operation_id = "remove-12"}, note,
                                                   tester); // Two identical requests
@@ -260,9 +268,10 @@ namespace {
                     fixture::write_input twice{.project = "app", .path = "src/twice.txt", .content = "once\n", .operation_id = "twice"};
                     std::vector<tools::mutation> answers;
                     std::vector<std::string> failures;
-                    co_await coroutine::with_scope([&](coroutine::scope& both) -> coroutine::task<> {
+                    auto run_both = [&](coroutine::scope& both) -> coroutine::task<> {
                         for (int i = 0; i < 2; ++i)
-                            both.spawn([](auto& services, auto in, auto& note, auto& tester, auto& answers, auto& failures) -> coroutine::task<> {
+                            {
+                            static constexpr auto run_child = [](auto& services, auto in, auto& note, auto& tester, auto& answers, auto& failures) -> coroutine::task<> {
                                 try {
                                     answers.push_back(co_await fixture::write_file(services, std::move(in), note, tester));
                                 } catch (const tools::tool_error& e) {
@@ -270,9 +279,12 @@ namespace {
                                 } catch (const std::exception& e) {
                                     failures.push_back(e.what());
                                 }
-                            }(services, twice, note, tester, answers, failures));
+                            };
+                            both.spawn(run_child(services, twice, note, tester, answers, failures));
+                        }
                         co_await both.join();
-                    });
+                    };
+                    co_await coroutine::with_scope(std::move(run_both));
                     expect(failures.empty()) << (failures.empty() ? std::string{} : failures.front());
                     expect((answers.size() == 2u) >> fatal);
                     expect(std::ranges::count(answers, true, &tools::mutation::replayed) == 1);
@@ -305,7 +317,8 @@ namespace {
                                      .changes = std::vector<tools::change>{
                                          {.kind = "edit", .path = "full.txt", .offset = std::uint64_t{0}, .count = count, .text = std::move(text)}}});
                     };
-                    auto grown = co_await refused([&]() -> coroutine::task<> { co_await resize("grow", 0, "x"); });
+                    auto run_operation_21 = [&]() -> coroutine::task<> { co_await resize("grow", 0, "x"); };
+                    auto grown = co_await refused(std::move(run_operation_21));
                     expect(grown == "resource_limit") << "an edit cannot grow a file past the file limit: " << grown;
                     co_await resize("same-size", 1, "y"); // A package whose file
                     // is past the project's
@@ -320,10 +333,11 @@ namespace {
                         std::format(
                             R"({{"format":1,"project":"tiny","worldline":"main","version":"v","exported_at":0,"files":[{{"path":"big.txt","digest":"{}","kind":"text","size":100,"executable":false}}]}})",
                             content::hash_of(big)));
-                    auto too_big = co_await refused([&]() -> coroutine::task<> {
+                    auto run_operation_20 = [&]() -> coroutine::task<> {
                         co_await tiny(
                             {.action = "restore", .name = std::string{"big"}, .operation_id = std::string{"restore-big"}, .package = std::string{"big"}});
-                    });
+                    };
+                    auto too_big = co_await refused(std::move(run_operation_20));
                     expect(too_big == "resource_limit") << too_big;
                     auto tiny_lines = co_await tiny({.action = "list"});
                     expect(!std::ranges::contains(*tiny_lines.worldlines, std::string{"big"}, &tools::worldline::line_entry::name))
@@ -343,10 +357,11 @@ namespace {
                     std::filesystem::remove_all(tiny_packages / "empty");
                     auto blank_again = co_await tiny(restore_empty);
                     expect(*blank_again.replayed && blank_again.version == blank.version) << "a replay does not read the package again";
-                    auto other_package = co_await refused([&]() -> coroutine::task<> {
+                    auto run_operation_19 = [&]() -> coroutine::task<> {
                         co_await tiny(
                             {.action = "restore", .name = std::string{"blank"}, .operation_id = std::string{"restore-empty"}, .package = std::string{"big"}});
-                    });
+                    };
+                    auto other_package = co_await refused(std::move(run_operation_19));
                     expect(other_package == "identity_conflict") << "an operation ID answers only for its own restore: " << other_package;
                     co_await fixture::remove_file(services, {.project = "tiny", .path = "full.txt", .operation_id = "drop"}, note, tester);
                     co_await fixture::write_file(services, {.project = "tiny", .path = "other.txt", .content = std::string(64, 'o'), .operation_id = "other"},
@@ -355,9 +370,10 @@ namespace {
                     auto drop = std::ranges::find(*past_tiny.entries, std::string{"drop"}, &tools::worldline::history_entry::operation_id);
                     expect((drop != past_tiny.entries->end()) >> fatal);
                     auto now_tiny = co_await tiny({.action = "inspect"});
-                    auto restored = co_await refused([&]() -> coroutine::task<> {
+                    auto run_operation_18 = [&]() -> coroutine::task<> {
                         co_await tiny({.action = "reverse", .observed = now_tiny.version, .operation_id = std::string{"undrop"}, .target = drop->id});
-                    });
+                    };
+                    auto restored = co_await refused(std::move(run_operation_18));
                     expect(restored == "resource_limit") << "a reversal cannot bring a project past its limit: " << restored;
                     std::filesystem::remove_all(tiny_packages / "big"); // A workspace whose
                     // repositories reach its
@@ -365,9 +381,10 @@ namespace {
                     // more history, but its
                     // locks still work.
                     with_limits({.max_workspace_bytes = 1});
-                    auto stored_full = co_await refused([&]() -> coroutine::task<> {
+                    auto run_operation_17 = [&]() -> coroutine::task<> {
                         co_await fixture::write_file(services, {.project = "full", .path = "a.txt", .content = "a", .operation_id = "full"}, note, tester);
-                    });
+                    };
+                    auto stored_full = co_await refused(std::move(run_operation_17));
                     expect(stored_full == "resource_limit") << stored_full; // A write that reaches
                     // the limit commits; its
                     // replay still answers,
@@ -385,13 +402,15 @@ namespace {
                     // write-ahead logs hold
                     // at the moment.
                     with_limits({.max_workspace_bytes = 1});
-                    auto beyond = co_await refused([&]() -> coroutine::task<> {
+                    auto run_operation_16 = [&]() -> coroutine::task<> {
                         co_await fixture::write_file(services, {.project = "full", .path = "b.txt", .content = "b", .operation_id = "beyond"}, note, tester);
-                    });
+                    };
+                    auto beyond = co_await refused(std::move(run_operation_16));
                     expect(beyond == "resource_limit") << beyond;
-                    auto exported_full = co_await refused([&]() -> coroutine::task<> {
+                    auto run_operation_15 = [&]() -> coroutine::task<> {
                         co_await tools::worldline::run(services, {.project = "full", .action = "export", .package = std::string{"copy"}, .worldline = std::string{"main"}}, note, tester);
-                    });
+                    };
+                    auto exported_full = co_await refused(std::move(run_operation_15));
                     expect(exported_full == "resource_limit") << "an export counts toward the workspace's storage: " << exported_full;
                     if (std::filesystem::exists(tmp.dir / "source/.packages"))
                         for (auto& entry : std::filesystem::directory_iterator(tmp.dir / "source/.packages"))
@@ -525,15 +544,16 @@ while True:
                         with_query.projects.at("app").build_configurations["Query"] = query_build;
                         config.set(0, std::make_shared<const config::document>(std::move(with_query)));
                         tools::language_query::output diagnostic, symbols;
-                        co_await coroutine::with_scope([&](coroutine::scope& calls) -> coroutine::task<> {
-                            auto query = [&](std::string action, tools::language_query::output& out) -> coroutine::task<> {
-                                out =
-                                    co_await tools::language_query::run(services, {.project = "app", .worldline = std::string{"main"}, .configuration = "Query", .action = action}, note, tester);
-                            };
+                        auto query = [&](std::string action, tools::language_query::output& out) -> coroutine::task<> {
+                            out =
+                                co_await tools::language_query::run(services, {.project = "app", .worldline = std::string{"main"}, .configuration = "Query", .action = action}, note, tester);
+                        };
+                        auto run_calls = [&](coroutine::scope& calls) -> coroutine::task<> {
                             calls.spawn(query("diagnostics", diagnostic));
                             calls.spawn(query("symbols", symbols));
                             co_await calls.join();
-                        });
+                        };
+                        co_await coroutine::with_scope(std::move(run_calls));
                         expect(diagnostic.analyzed && !diagnostic.stale);
                         expect(diagnostic.diagnostics && diagnostic.diagnostics->size() == 1u);
                         if (diagnostic.diagnostics && !diagnostic.diagnostics->empty())
@@ -613,11 +633,12 @@ while True:
                         "build", rfl::json::read<rfl::Generic>(R"({"project":"app","fresh":"not-a-boolean"})").value(),
                         note, tester);
                     expect(malformed.error && malformed.text.contains(R"("code":"invalid_record")")) << malformed.text;
-                    auto anonymous = co_await refused([&]() -> coroutine::task<> {
+                    auto run_operation_14 = [&]() -> coroutine::task<> {
                         co_await tools::generate_globally(services, "app",
                                                           templates::expand(templates::arguments{.template_id = "cpp-class", .name = "Anonymous"}), tester,
                                                           "");
-                    });
+                    };
+                    auto anonymous = co_await refused(std::move(run_operation_14));
                     expect(anonymous == "invalid_record") << "a generation names its operation ID";
                     auto changed_a = co_await line({.action = "apply",
                                                     .worldline = std::string{"agent-a"},
@@ -653,9 +674,10 @@ while True:
                     expect(warm_a.ok && warm_a.results.at(0).bytes_sent == 0u);
                     auto main_read = co_await fixture::read_file(services, {.project = "app", .path = "src/message.txt"}, note, tester);
                     expect(main_read.content == "goodbye source\n");
-                    auto analysis = co_await refused([&]() -> coroutine::task<> {
+                    auto run_operation_13 = [&]() -> coroutine::task<> {
                         co_await tools::language_query::run(services, {.project = "app", .worldline = "agent-a", .action = "diagnostics"}, note, tester);
-                    });
+                    };
+                    auto analysis = co_await refused(std::move(run_operation_13));
                     expect(analysis == "invalid_record") << "a project without an analysis configuration has nothing to query";
                     auto project_a =
                         co_await line({.action = "apply",
@@ -719,9 +741,10 @@ while True:
                     expect(described.contained_in && std::ranges::contains(*described.contained_in, std::string{"agent-a"}) &&
                            !std::ranges::contains(*described.contained_in, std::string{"agent-b"}))
                         << "a contribution names the worldlines that contain it";
-                    auto unknown = co_await refused([&]() -> coroutine::task<> {
+                    auto run_operation_12 = [&]() -> coroutine::task<> {
                         co_await line({.action = "contribution", .worldline = std::string{"agent-a"}, .target = std::string(64, 'f')});
-                    });
+                    };
+                    auto unknown = co_await refused(std::move(run_operation_12));
                     expect(unknown == "missing_objects") << unknown;
                     co_await fixture::write_file(services,
                                                  {.project = "app",
@@ -747,9 +770,10 @@ while True:
                     auto exported = co_await line(
                         {.action = "export", .worldline = std::string{"agent-a"}, .version = changed_a.version, .package = std::string{"greeting"}});
                     expect(exported.version == changed_a.version && exported.files && !exported.files->empty());
-                    auto again = co_await refused([&]() -> coroutine::task<> {
+                    auto run_operation_11 = [&]() -> coroutine::task<> {
                         co_await line({.action = "export", .worldline = std::string{"agent-a"}, .package = std::string{"greeting"}});
-                    });
+                    };
+                    auto again = co_await refused(std::move(run_operation_11));
                     expect(again == "source_conflict") << "an export does not replace a package unless asked: " << again;
                     tools::worldline::input restoring{.action = "restore",
                                                       .name = std::string{"restored"},
@@ -774,19 +798,21 @@ while True:
                     expect(*after_replace.replayed && after_replace.version == unpacked.version && after_replace.configuration == unpacked.configuration);
                     auto blob = tmp.dir / "source/.packages/greeting/blobs" / replaced.files->front().digest;
                     test::spit(blob, "tampered");
-                    auto damaged = co_await refused([&]() -> coroutine::task<> {
+                    auto run_operation_10 = [&]() -> coroutine::task<> {
                         co_await line({.action = "restore",
                                        .name = std::string{"damaged"},
                                        .operation_id = std::string{"restore-damaged"},
                                        .package = std::string{"greeting"}});
-                    });
+                    };
+                    auto damaged = co_await refused(std::move(run_operation_10));
                     expect(damaged == "missing_objects") << "a damaged package restores nothing: " << damaged;
-                    auto elsewhere = co_await refused([&]() -> coroutine::task<> {
+                    auto run_operation_9 = [&]() -> coroutine::task<> {
                         co_await line({.action = "restore",
                                        .name = std::string{"elsewhere"},
                                        .operation_id = std::string{"restore-greeting"},
                                        .package = std::string{"greeting"}});
-                    });
+                    };
+                    auto elsewhere = co_await refused(std::move(run_operation_9));
                     expect(elsewhere == "identity_conflict")
                         << "an operation ID answers only for the worldline it restored: " << elsewhere; // A replacement a crash
                     // cut short between its
@@ -831,24 +857,26 @@ while True:
                     std::filesystem::rename(acme_packages / "corrupt", acme_packages / ".retired-00000000000000c4");
                     test::spit(acme_packages / ".corrupt.replacing", "{not json");
                     std::filesystem::create_directories(acme_packages / ".staging-00000000000000c4");
-                    auto untrusted = co_await refused([&]() -> coroutine::task<> {
+                    auto run_operation_8 = [&]() -> coroutine::task<> {
                         co_await line({.action = "restore",
                                        .name = std::string{"corrupt"},
                                        .operation_id = std::string{"restore-corrupt"},
                                        .package = std::string{"corrupt"}});
-                    });
+                    };
+                    auto untrusted = co_await refused(std::move(run_operation_8));
                     expect(untrusted == "storage_failure") << untrusted;
                     expect(std::filesystem::exists(acme_packages / ".retired-00000000000000c4") &&
                            std::filesystem::exists(acme_packages / ".staging-00000000000000c4") &&
                            std::filesystem::exists(acme_packages / ".corrupt.replacing"))
                         << "an unreadable journal keeps everything it might name";
                     test::spit(acme_packages / ".corrupt.replacing", R"({"retired":"../../escape","staging":".staging-00000000000000c4"})");
-                    auto escaping = co_await refused([&]() -> coroutine::task<> {
+                    auto run_operation_7 = [&]() -> coroutine::task<> {
                         co_await line({.action = "restore",
                                        .name = std::string{"corrupt"},
                                        .operation_id = std::string{"restore-escape"},
                                        .package = std::string{"corrupt"}});
-                    });
+                    };
+                    auto escaping = co_await refused(std::move(run_operation_7));
                     expect(escaping == "storage_failure") << "a journal naming anything but its scratch is not followed: " << escaping;
                     test::spit(acme_packages / ".corrupt.replacing", R"({"retired":".retired-00000000000000c4","staging":".staging-00000000000000c4"})");
                     auto mended = co_await line({.action = "restore",
@@ -908,12 +936,13 @@ while True:
                         std::filesystem::rename(acme_packages / "held", acme_packages / ".retired-00000000000000c8");
                         std::filesystem::create_directory_symlink(acme_packages / "greeting", acme_packages / "held");
                         test::spit(acme_packages / ".held.replacing", R"({"retired":".retired-00000000000000c8","staging":".staging-00000000000000c8"})");
-                        auto held = co_await refused([&]() -> coroutine::task<> {
+                        auto run_operation = [&]() -> coroutine::task<> {
                             co_await line({.action = "restore",
                                            .name = std::string{"held"},
                                            .operation_id = std::string{"restore-held"},
                                            .package = std::string{"held"}});
-                        });
+                        };
+                        auto held = co_await refused(std::move(run_operation));
                         expect(held == "storage_failure") << held;
                         expect(std::filesystem::exists(acme_packages / ".retired-00000000000000c8/manifest.json") &&
                                std::filesystem::exists(acme_packages / ".held.replacing"));
@@ -939,10 +968,11 @@ while True:
                     // journal are kept.
                     std::filesystem::create_directories(acme_packages / ".staging-00000000000000ca/blobs");
                     test::spit(acme_packages / ".lost.replacing", R"({"retired":".retired-00000000000000ca","staging":".staging-00000000000000ca"})");
-                    auto lost = co_await refused([&]() -> coroutine::task<> {
+                    auto run_operation_6 = [&]() -> coroutine::task<> {
                         co_await line(
                             {.action = "restore", .name = std::string{"lost"}, .operation_id = std::string{"restore-lost"}, .package = std::string{"lost"}});
-                    });
+                    };
+                    auto lost = co_await refused(std::move(run_operation_6));
                     expect(lost == "storage_failure") << lost;
                     expect(std::filesystem::exists(acme_packages / ".staging-00000000000000ca") && std::filesystem::exists(acme_packages / ".lost.replacing"));
                     std::filesystem::remove_all(acme_packages / ".staging-00000000000000ca");
@@ -954,10 +984,11 @@ while True:
                     for (auto bad : {R"({"retired":".retired-00000000000000c6\u0000x","staging":".staging-00000000000000c6"})",
                                      R"({"retired":".retired-00000000000000c6","staging":".staging-1.replacing"})"}) {
                         test::spit(acme_packages / ".odd.replacing", bad);
-                        auto odd = co_await refused([&]() -> coroutine::task<> {
+                        auto run_operation = [&]() -> coroutine::task<> {
                             co_await line(
                                 {.action = "restore", .name = std::string{"odd"}, .operation_id = std::string{"restore-odd"}, .package = std::string{"odd"}});
-                        });
+                        };
+                        auto odd = co_await refused(std::move(run_operation));
                         expect(odd == "storage_failure") << bad << ": " << odd;
                     }
                     std::filesystem::remove(acme_packages / ".odd.replacing"); // A journal that is not
@@ -969,10 +1000,11 @@ while True:
                         expect(std::filesystem::create_directory(acme_packages / ".fifo.replacing"));
                     else
                         expect(std::system(std::format("mkfifo '{}'", (acme_packages / ".fifo.replacing").string()).c_str()) == 0);
-                    auto piped = co_await refused([&]() -> coroutine::task<> {
+                    auto run_operation_5 = [&]() -> coroutine::task<> {
                         co_await line(
                             {.action = "restore", .name = std::string{"fifo"}, .operation_id = std::string{"restore-fifo"}, .package = std::string{"fifo"}});
-                    });
+                    };
+                    auto piped = co_await refused(std::move(run_operation_5));
                     expect(piped == "storage_failure") << piped;
                     std::filesystem::remove(acme_packages / ".fifo.replacing"); // One digest declared
                     // with two sizes would
@@ -988,26 +1020,28 @@ while True:
                         copy.size = 0;
                         doubled.files.push_back(copy);
                         test::spit(manifest_path, rfl::json::write(doubled));
-                        auto sized = co_await refused([&]() -> coroutine::task<> {
+                        auto run_operation = [&]() -> coroutine::task<> {
                             co_await line({.action = "restore",
                                            .name = std::string{"doubled"},
                                            .operation_id = std::string{"restore-doubled"},
                                            .package = std::string{"greeting"}});
-                        });
+                        };
+                        auto sized = co_await refused(std::move(run_operation));
                         expect(sized == "invalid_record") << sized;
                         test::spit(manifest_path, text);
                     }
                     for (auto& entry : *past.entries)
                         expect(entry.actor == "token:tester") << "history names the signed-in user";
-                    auto stale = co_await refused([&]() -> coroutine::task<> {
+                    auto run_operation_4 = [&]() -> coroutine::task<> {
                         co_await line({.action = "apply",
                                        .worldline = std::string{"agent-b"},
                                        .observed = changed_a.version,
                                        .operation_id = std::string{"cross"},
                                        .changes = std::vector<tools::change>{{.kind = "remove", .path = "src/message.txt"}}});
-                    });
+                    };
+                    auto stale = co_await refused(std::move(run_operation_4));
                     expect(stale == "worldline_boundary") << stale;
-                    auto changed_input = co_await refused([&]() -> coroutine::task<> {
+                    auto run_operation_3 = [&]() -> coroutine::task<> {
                         co_await line({.action = "apply",
                                        .worldline = std::string{"agent-a"},
                                        .observed = wa.version,
@@ -1017,14 +1051,16 @@ while True:
                                                                               .path = "src/message.txt",
                                                                               .text = std::string{"another greeting"
                                                                                                   "\n"}}}});
-                    });
+                    };
+                    auto changed_input = co_await refused(std::move(run_operation_3));
                     expect(changed_input == "identity_conflict") << "an operation ID keeps its first committed input: " << changed_input;
                     co_await fixture::write_file(services, {.project = "app", .path = "src/other.txt", .content = "other\n", .operation_id = "other"}, note,
                                                  tester);
-                    auto onto = co_await refused([&]() -> coroutine::task<> {
+                    auto run_operation_2 = [&]() -> coroutine::task<> {
                         co_await fixture::move_file(services, {.project = "app", .from = "src/other.txt", .to = "src/message.txt", .operation_id = "onto"},
                                                     note, tester);
-                    });
+                    };
+                    auto onto = co_await refused(std::move(run_operation_2));
                     expect(onto == "source_conflict") << "a move never replaces a file: " << onto;
                     co_await fixture::remove_file(services, {.project = "app", .path = "src/other.txt", .operation_id = "other-gone"}, note,
                                                   tester); // Reusing an operation ID with another input remains invalid.
@@ -1032,7 +1068,7 @@ while True:
                     auto member_write = co_await fixture::write_file(services,
                         {.project="app",.path="src/rival.txt",.content="first\n",.operation_id="rival"},note,rival);
                     expect(!member_write.replayed) << "members publish without scope locks";
-                    auto other_input = co_await refused([&]() -> coroutine::task<> {
+                    auto run_operation = [&]() -> coroutine::task<> {
                         co_await fixture::write_file(services,
                                                      {.project = "app",
                                                       .path = "src/rival.txt",
@@ -1040,7 +1076,8 @@ while True:
                                                                  "\n",
                                                       .operation_id = "rival"},
                                                      note, rival);
-                    });
+                    };
+                    auto other_input = co_await refused(std::move(run_operation));
                     expect(other_input == "identity_conflict") << other_input;
                     auto second = co_await fixture::write_file(services,
                                                                {.project = "app",
@@ -1053,7 +1090,7 @@ while True:
                     co_await fixture::remove_file(services, {.project = "app", .path = "src/rival.txt", .operation_id = "rival-gone"}, note, rival);
                     auto peer = co_await io::connect(io, {net::ip::address_v4{{127, 0, 0, 1}}, sources.local_endpoint().port()});
                     transport::channel<native::socket> raw{peer};
-                    co_await coroutine::with_scope([&](coroutine::scope& children) -> coroutine::task<> {
+                    auto run_children = [&](coroutine::scope& children) -> coroutine::task<> {
                         children.spawn(raw.pump([](const transport::frame&) {}));
                         co_await raw.post(jobs::hello{.name = "peer", .auth = jobs::source_token(), .protocol = jobs::protocol_version});
                         auto anonymous = co_await raw.call(jobs::node_call{.project = "app", .request = {.action = "tree"}});
@@ -1063,27 +1100,32 @@ while True:
                         expect(failure && failure->code == "permission_denied") << "no actor, no commit";
                         auto* refusal = denied ? nullptr : std::get_if<jobs::failure>(&denied.error());
                         expect(refusal && refusal->code == "permission_denied") << "no role, no commit";
-                    });
+                    };
+                    co_await coroutine::with_scope(std::move(run_children));
                     auto stalled = native::listener{io, {net::ip::address_v4::loopback(), 0}};
                     storage::registry blocked{rt, tmp.dir / "cancel-state", config, gateway_disk,
                                               net::ip::tcp::endpoint{net::ip::address_v4{{127, 0, 0, 1}}, stalled.local_endpoint().port()}};
                     unsigned requests = 0;
-                    co_await coroutine::with_scope([&](coroutine::scope& pending) -> coroutine::task<> {
-                        pending.spawn([](auto& listener, unsigned& requests) -> coroutine::task<> {
-                            auto peer = co_await execution::then(net::async_accept(listener), [](auto socket, auto) { return std::move(socket); });
+                    auto run_pending = [&](coroutine::scope& pending) -> coroutine::task<> {
+                        static constexpr auto run_child = [](auto& listener, unsigned& requests) -> coroutine::task<> {
+                            auto [peer, endpoint] = co_await net::async_accept(listener);
                             transport::channel<native::socket> chan{peer};
                             co_await chan.recv();
                             co_await chan.recv();
                             ++requests;
                             co_await chan.recv();
-                        }(stalled, requests));
+                        };
+                        pending.spawn(run_child(stalled, requests));
                         auto begin = std::chrono::steady_clock::now();
                         auto result = co_await coroutine::deadline(io, 100ms, blocked.node(0, "app", {.action = "tree"}, tester, true));
                         expect(!result && requests == 1u);
                         expect(std::chrono::steady_clock::now() - begin < 2s);
-                    });
-                });
-            });
+                    };
+                    co_await coroutine::with_scope(std::move(run_pending));
+                };
+                co_await coroutine::with_scope(std::move(run_children_2));
+            };
+            rt.run(std::move(run_core));
         };
     };
 } // namespace

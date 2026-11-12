@@ -304,15 +304,19 @@ namespace {
             execution::thread_pool pool{1};
             front::config_hub hub{rt, config::store{config::document{}, tmp.dir / "gateway.json"}, pool};
             std::vector<bool> seen;
-            rt.run([&](scheduler&, std::size_t core) -> coroutine::task<> {
-                if (core != 0)
-                    return [](auto&) -> coroutine::task<> { co_return; }(core);
-                return [](front::config_hub& hub, std::vector<bool>& seen, std::size_t cores) -> coroutine::task<> {
+            auto run_core = [&](scheduler&, std::size_t core) -> coroutine::task<> {
+                if (core != 0) {
+                    static constexpr auto run_operation = [](auto&) -> coroutine::task<> { co_return; };
+                    return run_operation(core);
+                }
+                static constexpr auto run_operation = [](front::config_hub& hub, std::vector<bool>& seen, std::size_t cores) -> coroutine::task<> {
                     co_await hub.edit(0, [](config::store& s) { s.put_project("app", {}, 0); });
                     for (std::size_t c = 0; c < cores; ++c)
                         seen.push_back(hub.current(c)->projects.contains("app"));
-                }(hub, seen, rt.size());
-            });
+                };
+                return run_operation(hub, seen, rt.size());
+            };
+            rt.run(std::move(run_core));
             expect(seen == std::vector<bool>{true, true, true});
             expect(config::load(tmp.dir / "gateway.json").projects.contains("app")) << "and is on the disk";
         };
@@ -375,6 +379,35 @@ namespace {
             usage::ledger again{old.dir};
             again.record({.project = "app", .tool = "read"});
             expect(again.events(0, 10).events.at(0).seq == 3u) << "a log pruned to nothing still remembers the last number";
+        };
+
+        "ledger batches survive segment rotation, retention and restart"_test = [] {
+            test::scratch tmp{"usage-segments"};
+            auto at = usage::now();
+            test::spit(tmp.dir / "events-00000000000000000001.jsonl",
+                std::format(R"({{"seq":1,"tool":{{"at":{},"project":"app","tool":"read"}}}})" "\n", at - 100 * 86400));
+            test::spit(tmp.dir / "events.jsonl",
+                std::format(R"({{"seq":2,"tool":{{"at":{},"project":"app","tool":"read"}}}})" "\n", at - 86400));
+            {
+                usage::ledger log{tmp.dir};
+                int notified = 0;
+                log.changed = [&] { ++notified; };
+                log.batch([&] {
+                    log.record({.project = "app", .tool = "edit"});
+                    log.record({.project = "app", .tool = "list"});
+                });
+                expect(notified == 1);
+                expect(!std::filesystem::exists(tmp.dir / "events-00000000000000000001.jsonl"));
+                expect(std::filesystem::exists(tmp.dir / "events-00000000000000000002.jsonl"));
+                auto page = log.events(0, 2);
+                expect(page.events.size() == 2u && page.next == 3u && page.oldest == 2u);
+                expect(log.events(page.next, 2).next == 4u);
+            }
+            usage::ledger restored{tmp.dir};
+            auto page = restored.events(0, 10);
+            expect(page.events.size() == 3u && page.next == 4u && page.oldest == 2u);
+            restored.record({.project = "app", .tool = "read"});
+            expect(restored.events(4, 1).next == 5u);
         };
 
         "ledger notifications follow visible committed state"_test = [] {

@@ -256,6 +256,24 @@ namespace durability {
     auto read_private(const std::filesystem::path& path, std::uint64_t limit) -> util::generator<std::span<const std::byte>> {
         return read_checked(path, limit, true);
     }
+    struct append_file::state {
+        std::filesystem::path path;
+        bool fresh;
+        winapi::handle file;
+        explicit state(const std::filesystem::path& path)
+            : path(path), fresh(!std::filesystem::exists(path)), file(open(path, FILE_APPEND_DATA, OPEN_ALWAYS)) {}
+    };
+    append_file::append_file(const std::filesystem::path& path) : state_(std::make_unique<state>(path)) {}
+    append_file::~append_file() = default;
+    void append_file::append(std::string_view records) {
+        write(state_->file.value, std::as_bytes(std::span{records}));
+        flush(state_->file.value);
+        if (state_->fresh) {
+            sync_dir(state_->path.parent_path());
+            state_->fresh = false;
+        }
+    }
+
     void durable_append(const std::filesystem::path& path, std::string_view record) {
         bool fresh = !std::filesystem::exists(path);
         auto file = open(path, FILE_APPEND_DATA, OPEN_ALWAYS);

@@ -32,7 +32,7 @@ namespace {
         auto s = co_await io::connect(io, {net::ip::address_v4{{127, 0, 0, 1}}, l.local_endpoint().port()});
         auto peer = co_await execution::then(net::async_accept(l), [](auto socket, auto) { return std::move(socket); });
         transport::channel<socket> chan{s};
-        co_await coroutine::with_scope([&](coroutine::scope& children) -> coroutine::task<> {
+        auto run_children = [&](coroutine::scope& children) -> coroutine::task<> {
             children.spawn(answer(peer, reply, fail));
             children.spawn(chan.pump([](const transport::frame&) {}));
             if (reply) {
@@ -48,13 +48,15 @@ namespace {
                     out = d->hex;
                 }
             } else {
-                children.spawn([](transport::channel<socket>& chan) -> coroutine::task<> {
+                static constexpr auto run_child = [](transport::channel<socket>& chan) -> coroutine::task<> {
                     co_await chan.call(jobs::hash_file{.path = "local/b.txt"});
                     expect(false) << "an unanswered call returned";
-                }(chan));
+                };
+                children.spawn(run_child(chan));
                 co_await execution::schedule_after(io, 5ms);
             }
-        });
+        };
+        co_await coroutine::with_scope(std::move(run_children));
         co_return out;
     }
 
@@ -78,11 +80,12 @@ namespace {
         auto next = encode_frame(jobs::code<jobs::cancel>, 42, cancel);
         bytes.insert(bytes.end(), next.begin(), next.end());
         transport::channel<socket> channel{reader};
-        co_await coroutine::with_scope([&](coroutine::scope& children) -> coroutine::task<> {
-            children.spawn([](socket& writer, std::vector<std::byte>& bytes, std::size_t chunk) -> coroutine::task<> {
+        auto run_children = [&](coroutine::scope& children) -> coroutine::task<> {
+            static constexpr auto run_child = [](socket& writer, std::vector<std::byte>& bytes, std::size_t chunk) -> coroutine::task<> {
                 for (std::size_t offset = 0; offset < bytes.size(); offset += chunk)
                     co_await io::async_write(writer, std::span{bytes}.subspan(offset, std::min(chunk, bytes.size() - offset)));
-            }(writer, bytes, chunk));
+            };
+            children.spawn(run_child(writer, bytes, chunk));
             auto first = co_await channel.recv();
             expect(first.kind == jobs::code<jobs::progress> && first.corr == 0xfedcba9876543210ULL);
             auto value = transport::decode<jobs::progress>(first);
@@ -90,7 +93,8 @@ namespace {
             auto second = co_await channel.recv();
             expect(second.kind == jobs::code<jobs::cancel> && second.corr == 42_u);
             expect(std::ranges::equal(second.payload, cancel));
-        });
+        };
+        co_await coroutine::with_scope(std::move(run_children));
     }
 
     auto frame_limit(ctx& io, bool oversized) -> coroutine::task<> {
@@ -103,8 +107,9 @@ namespace {
         if (!oversized)
             bytes.resize(transport::header_size + length, std::byte{0x5a});
         transport::channel<socket> channel{reader};
-        co_await coroutine::with_scope([&](coroutine::scope& children) -> coroutine::task<> {
-            children.spawn([](socket& writer, std::vector<std::byte>& bytes) -> coroutine::task<> { co_await io::async_write(writer, bytes); }(writer, bytes));
+        auto run_children = [&](coroutine::scope& children) -> coroutine::task<> {
+            static constexpr auto run_child = [](socket& writer, std::vector<std::byte>& bytes) -> coroutine::task<> { co_await io::async_write(writer, bytes); };
+            children.spawn(run_child(writer, bytes));
             bool rejected = false;
             try {
                 auto frame = co_await channel.recv();
@@ -117,7 +122,8 @@ namespace {
                 expect(std::string_view{error.what()} == "frame too large");
             }
             expect(rejected == oversized);
-        });
+        };
+        co_await coroutine::with_scope(std::move(run_children));
     }
 
     static constexpr auto edge_suite = [] {

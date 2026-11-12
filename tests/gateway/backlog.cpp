@@ -40,8 +40,8 @@ namespace {
 
         // A job runs on core zero, as the backlog's own jobs do, whichever core asked for it.
         auto job(ctx&, std::string name, std::chrono::milliseconds takes = 30ms) -> tools::backlog::runner {
-            return [this, name, takes](tools::services&, jobs::progress_log& progress,
-                                       std::string tree) -> coroutine::task<std::optional<tools::backlog::outcome>> {
+            auto run_job = [this, name, takes](tools::services&, jobs::progress_log& progress,
+                                             std::string tree) -> coroutine::task<std::optional<tools::backlog::outcome>> {
                 ran.push_back(name);
                 trees.push_back(std::move(tree));
                 most = std::max(most, ++running);
@@ -50,6 +50,7 @@ namespace {
                 --running;
                 co_return tools::config_result{.configuration = name, .worker = "w", .ok = true};
             };
+            return run_job;
         }
 
         static auto entry(std::string key, std::string actor, std::string configuration = "Debug") -> tools::backlog::entry {
@@ -84,8 +85,8 @@ namespace {
         // The queue serves on core zero; `body` runs on the last core, and the run ends when it does.
         template <class Body> void run(Body body) {
             std::atomic<bool> over{false};
-            rt.run([&](ctx& io, std::size_t core) -> coroutine::task<> {
-                co_await coroutine::with_scope([&](coroutine::scope& children) -> coroutine::task<> {
+            auto run_core = [&](ctx& io, std::size_t core) -> coroutine::task<> {
+                auto run_children = [&](coroutine::scope& children) -> coroutine::task<> {
                     if (core == 0)
                         children.spawn(queue.serve(io));
                     if (core + 1 == rt.size()) {
@@ -94,8 +95,10 @@ namespace {
                     }
                     while (!over)
                         co_await execution::schedule_after(io, 5ms);
-                });
-            });
+                };
+                co_await coroutine::with_scope(std::move(run_children));
+            };
+            rt.run(std::move(run_core));
         }
     };
 
@@ -105,7 +108,7 @@ namespace {
             const worlds::actor x{.issuer = "token", .user = "x", .caller = "x", .role = "member"};
             auto ex = worlds::identity_key(x);
             std::vector<std::string> stages;
-            h.run([&](ctx& io) -> coroutine::task<> {
+            auto exercise = [&](ctx& io) -> coroutine::task<> {
                 auto first = co_await h.queue.submit(1, harness::entry("first", ex, "A"), h.job(io, "first", 100ms));
                 auto second = co_await h.queue.submit(1, harness::entry("second", ex, "B"), h.job(io, "second"));
                 auto listed = co_await h.queue.list(1);
@@ -121,7 +124,8 @@ namespace {
                 for (auto& p : first->progress(seen))
                     stages.push_back(p.stage);
                 expect(harness::built(first).ok);
-            });
+            };
+            h.run(std::move(exercise));
             expect(stages == std::vector<std::string>{"first"}) << "progress reported on core zero reaches the caller once";
             expect(h.ran == std::vector<std::string>{"first"});
         };
@@ -134,7 +138,7 @@ namespace {
                 e.files = std::move(files);
                 return e;
             };
-            h.run([&](ctx& io) -> coroutine::task<> {
+            auto exercise = [&](ctx& io) -> coroutine::task<> {
                 auto a = co_await h.queue.submit(0, job("a", {"f1", "f2"}), h.job(io, "a"));
                 auto b = co_await h.queue.submit(0, job("b", {"g1", "g2"}), h.job(io, "b"));
                 expect(co_await harness::done(io, a) && co_await harness::done(io, b));
@@ -142,7 +146,8 @@ namespace {
                 expect(co_await harness::done(io, c));
                 auto d = co_await h.queue.submit(0, job("d", {"g1"}), h.job(io, "d"));
                 expect(co_await harness::done(io, d));
-            });
+            };
+            h.run(std::move(exercise));
             expect((h.trees.size() == 4u) >> fatal);
             expect(h.trees[0] != h.trees[1]) << "jobs running at once take different trees";
             expect(h.trees[2] == h.trees[0]) << "c builds on where a left off";
@@ -158,39 +163,42 @@ namespace {
                 return e;
             };
             std::string prepared;
-            h.run([&](ctx& io) -> coroutine::task<> {
+            auto exercise = [&](ctx& io) -> coroutine::task<> {
                 auto a = co_await h.queue.submit(0, entry("a", {"old-a"}), h.job(io, "a"));
                 auto b = co_await h.queue.submit(0, entry("b", {"old-b"}), h.job(io, "b"));
                 expect(co_await harness::done(io, a) && co_await harness::done(io, b));
+                auto run_operation = [&prepared](tools::services&, jobs::progress_log&, std::string tree) -> coroutine::task<std::optional<tools::backlog::outcome>> {
+                    prepared = tree;
+                    co_return language::result{.status = "prepared", .worker = "w"};
+                };
                 auto p = co_await h.queue.submit(
                     0, entry("prepare", {"old-b", "new"}),
-                    [&prepared](tools::services&, jobs::progress_log&, std::string tree) -> coroutine::task<std::optional<tools::backlog::outcome>> {
-                        prepared = tree;
-                        co_return language::result{.status = "prepared", .worker = "w"};
-                    });
+                    std::move(run_operation));
                 expect(co_await harness::done(io, p));
                 auto c = co_await h.queue.submit(0, entry("c", {"new"}), h.job(io, "c"));
                 expect(co_await harness::done(io, c));
-            });
+            };
+            h.run(std::move(exercise));
             expect(prepared == h.trees[1] && h.trees.back() == prepared);
         };
 
         "jobs past the limit wait their turn instead of failing"_test = [] {
             harness h{1};
-            h.run([&](ctx& io) -> coroutine::task<> {
+            auto exercise = [&](ctx& io) -> coroutine::task<> {
                 auto a = co_await h.queue.submit(0, harness::entry("a", "x", "A"), h.job(io, "a"));
                 auto b = co_await h.queue.submit(0, harness::entry("b", "y", "B"), h.job(io, "b"));
                 expect(b->ahead() == 0u && !b->done()) << "b waits while a runs";
                 expect(co_await harness::done(io, a) && co_await harness::done(io, b));
                 expect(harness::built(b).ok && harness::built(b).configuration == "b");
-            });
+            };
+            h.run(std::move(exercise));
             expect(h.most == 1u) << "one at a time";
             expect(h.ran == std::vector<std::string>{"a", "b"});
         };
 
         "equal jobs run once, and a finished build answers again unless asked fresh"_test = [] {
             harness h{4};
-            h.run([&](ctx& io) -> coroutine::task<> {
+            auto exercise = [&](ctx& io) -> coroutine::task<> {
                 auto first = co_await h.queue.submit(0, harness::entry("same", "x"), h.job(io, "first"));
                 auto second = co_await h.queue.submit(0, harness::entry("same", "y"), h.job(io, "second"));
                 expect(first->job() == second->job()) << "the second asker joins the first job";
@@ -206,13 +214,14 @@ namespace {
                 fresh.fresh = true;
                 auto again = co_await h.queue.submit(0, fresh, h.job(io, "fresh"));
                 expect(co_await harness::done(io, again) && harness::built(again).configuration == "fresh");
-            });
+            };
+            h.run(std::move(exercise));
             expect(h.ran == std::vector<std::string>{"first", "fresh"});
         };
 
         "equal fills from different callers run once, and a finished fill is not cached"_test = [] {
             harness h{4};
-            h.run([&](ctx& io) -> coroutine::task<> {
+            auto exercise = [&](ctx& io) -> coroutine::task<> {
                 auto x = co_await h.queue.submit(0, harness::fill("same", "x"), h.job(io, "fill"));
                 auto y = co_await h.queue.submit(0, harness::fill("same", "y"), h.job(io, "fill"));
                 expect(x->job() == y->job()) << "the second caller joins the in-flight fill of the same key";
@@ -223,28 +232,31 @@ namespace {
                 expect(co_await harness::done(io, later));
                 expect(later->reuse() == "executed" && harness::built(later).configuration == "again")
                     << "once the archive may have pruned it, the same selector and toolchain fill again";
-            });
+            };
+            h.run(std::move(exercise));
             expect(h.ran == std::vector<std::string>{"fill", "again"}) << "shared in flight, never from a result cache";
         };
 
         "one slot serves both consumer flows once their shared fill is done"_test = [] {
             harness h{1};
             // Two gateway flows, each like fill_dependencies: submit and await the fill first, the consumer job only after.
-            h.run([&](ctx& io) -> coroutine::task<> {
-                co_await coroutine::with_scope([&](coroutine::scope& children) -> coroutine::task<> {
-                    std::size_t completed = 0;
-                    auto flow = [&](std::string name) -> coroutine::task<> {
-                        auto fill = co_await h.queue.submit(0, harness::fill("shared", name), h.job(io, "fill"));
-                        expect(co_await harness::done(io, fill) && harness::built(fill).ok);
-                        auto consumer = co_await h.queue.submit(0, harness::entry(name, name), h.job(io, name));
-                        expect(co_await harness::done(io, consumer) && harness::built(consumer).ok);
-                        ++completed;
-                    };
+            auto exercise = [&](ctx& io) -> coroutine::task<> {
+                std::size_t completed = 0;
+                auto flow = [&](std::string name) -> coroutine::task<> {
+                    auto fill = co_await h.queue.submit(0, harness::fill("shared", name), h.job(io, "fill"));
+                    expect(co_await harness::done(io, fill) && harness::built(fill).ok);
+                    auto consumer = co_await h.queue.submit(0, harness::entry(name, name), h.job(io, name));
+                    expect(co_await harness::done(io, consumer) && harness::built(consumer).ok);
+                    ++completed;
+                };
+                auto run_children = [&](coroutine::scope& children) -> coroutine::task<> {
                     for (auto name : {"one", "two"}) children.spawn(flow(name));
                     for (int n = 0; n < 400 && completed != 2; ++n) co_await execution::schedule_after(io, 5ms);
                     expect(completed == 2u);
-                });
-            });
+                };
+                co_await coroutine::with_scope(std::move(run_children));
+            };
+            h.run(std::move(exercise));
             expect((h.ran.size() == 3u) >> fatal);
             expect(h.ran.front() == "fill") << "no consumer held the only slot while its fill was still waiting";
             expect(std::ranges::count(h.ran, "one") == 1 && std::ranges::count(h.ran, "two") == 1) << "both flows completed";
@@ -253,7 +265,7 @@ namespace {
 
         "a shared fill outlives one caller leaving, and is dropped when its last waiter leaves"_test = [] {
             harness h{1};
-            h.run([&](ctx& io) -> coroutine::task<> {
+            auto exercise = [&](ctx& io) -> coroutine::task<> {
                 auto first = co_await h.queue.submit(0, harness::fill("keep", "x"), h.job(io, "fill", 100ms));
                 auto second = co_await h.queue.submit(0, harness::fill("keep", "y"), h.job(io, "fill"));
                 expect(first->job() == second->job());
@@ -269,14 +281,15 @@ namespace {
                 auto listed = co_await h.queue.list(0);
                 expect(std::ranges::any_of(listed, [](auto& v) { return v.state == "cancelled" && v.operation == "dependencies"; }))
                     << "the fill its last waiter left is cancelled";
-            });
+            };
+            h.run(std::move(exercise));
             expect(h.ran == std::vector<std::string>{"fill", "blocker"}) << "the fill nobody waited for never ran";
         };
 
         "the last fill waiter cancels an executing dependency job"_test = [] {
             harness h{1};
             bool started = false, exited = false, completed = false;
-            h.run([&](ctx& io) -> coroutine::task<> {
+            auto exercise = [&](ctx& io) -> coroutine::task<> {
                 auto work = [&](tools::services&, jobs::progress_log&, std::string) -> coroutine::task<std::optional<tools::backlog::outcome>> {
                     started = true;
                     struct finish { bool& value; ~finish() { value = true; } } finished{exited};
@@ -294,43 +307,48 @@ namespace {
                 expect(exited && !completed);
                 auto next = co_await h.queue.submit(0, harness::entry("barrier", "three"), h.job(io, "barrier"));
                 expect(co_await harness::done(io, next));
-            });
+            };
+            h.run(std::move(exercise));
             expect(exited && !completed);
         };
 
         "dependency publication failures are not cached as completed builds"_test = [] {
             harness h{1};
-            h.run([&](ctx& io) -> coroutine::task<> {
+            auto exercise = [&](ctx& io) -> coroutine::task<> {
+                static constexpr auto run_operation = [](tools::services&, jobs::progress_log&, std::string) -> coroutine::task<std::optional<tools::backlog::outcome>> {
+                    tools::config_result result{.configuration = "first", .worker = "w", .ok = true};
+                    result.steps.push_back({.name = "install", .exit_code = 0, .cache_error = "publication failed"});
+                    co_return result;
+                };
                 auto first = co_await h.queue.submit(0, harness::entry("publication", "x"),
-                    [](tools::services&, jobs::progress_log&, std::string) -> coroutine::task<std::optional<tools::backlog::outcome>> {
-                        tools::config_result result{.configuration = "first", .worker = "w", .ok = true};
-                        result.steps.push_back({.name = "install", .exit_code = 0, .cache_error = "publication failed"});
-                        co_return result;
-                    });
+                    run_operation);
                 expect(co_await harness::done(io, first));
                 expect(harness::built(first).ok && harness::built(first).steps.front().cache_error == "publication failed");
                 auto retry = co_await h.queue.submit(0, harness::entry("publication", "x"), h.job(io, "retry"));
                 expect(co_await harness::done(io, retry));
                 expect(harness::built(retry).configuration == "retry" && retry->reuse() == "executed");
-            });
+            };
+            h.run(std::move(exercise));
         };
         "export capture failures are not cached as completed builds"_test = [] {
             harness h{1};
-            h.run([&](ctx& io) -> coroutine::task<> {
+            auto exercise = [&](ctx& io) -> coroutine::task<> {
+                static constexpr auto run_operation = [](tools::services&, jobs::progress_log&, std::string) -> coroutine::task<std::optional<tools::backlog::outcome>> {
+                    co_return tools::config_result{.configuration = "first", .worker = "w", .ok = true, .export_error = "disk full"};
+                };
                 auto first = co_await h.queue.submit(0, harness::entry("export", "x"),
-                    [](tools::services&, jobs::progress_log&, std::string) -> coroutine::task<std::optional<tools::backlog::outcome>> {
-                        co_return tools::config_result{.configuration = "first", .worker = "w", .ok = true, .export_error = "disk full"};
-                    });
+                    run_operation);
                 expect(co_await harness::done(io, first));
                 expect(harness::built(first).ok && harness::built(first).export_error == "disk full");
                 auto retry = co_await h.queue.submit(0, harness::entry("export", "x"), h.job(io, "retry"));
                 expect(co_await harness::done(io, retry));
                 expect(harness::built(retry).configuration == "retry" && retry->reuse() == "executed");
-            });
+            };
+            h.run(std::move(exercise));
         };
         "a fresh build does not join an in-flight equal build"_test = [] {
             harness h{1};
-            h.run([&](ctx& io) -> coroutine::task<> {
+            auto exercise = [&](ctx& io) -> coroutine::task<> {
                 auto regular = co_await h.queue.submit(0, harness::entry("same", "x"), h.job(io, "regular"));
                 auto entry = harness::entry("same", "y");
                 entry.fresh = true;
@@ -338,13 +356,14 @@ namespace {
                 expect(regular->job() != fresh->job());
                 expect(co_await harness::done(io, regular) && co_await harness::done(io, fresh));
                 expect(harness::built(fresh).configuration == "fresh");
-            });
+            };
+            h.run(std::move(exercise));
             expect(h.ran == std::vector<std::string>{"regular", "fresh"});
         };
 
         "a queued fresh build survives a newer build from the same caller"_test = [] {
             harness h{1};
-            h.run([&](ctx& io) -> coroutine::task<> {
+            auto exercise = [&](ctx& io) -> coroutine::task<> {
                 auto busy = co_await h.queue.submit(0, harness::entry("busy", "other", "Other"), h.job(io, "busy", 80ms));
                 auto entry = harness::entry("fresh", "x");
                 entry.fresh = true;
@@ -353,29 +372,32 @@ namespace {
                 expect(!fresh->done());
                 expect(co_await harness::done(io, busy) && co_await harness::done(io, fresh) && co_await harness::done(io, newer));
                 expect(harness::built(fresh).ok && harness::built(newer).ok);
-            });
+            };
+            h.run(std::move(exercise));
             expect(h.ran == std::vector<std::string>{"busy", "fresh", "newer"});
         };
 
         "a job no worker can take now waits for one"_test = [] {
             harness h{4};
             int tries = 0;
-            h.run([&](ctx& io) -> coroutine::task<> {
+            auto exercise = [&](ctx& io) -> coroutine::task<> {
+                auto run_operation = [&tries](tools::services&, jobs::progress_log&, std::string) -> coroutine::task<std::optional<tools::backlog::outcome>> {
+                    if (++tries == 1)
+                        co_return std::nullopt;
+                    co_return tools::config_result{.configuration = "busy", .worker = "w", .ok = true};
+                };
                 auto held = co_await h.queue.submit(
                     0, harness::entry("busy", "x"),
-                    [&tries](tools::services&, jobs::progress_log&, std::string) -> coroutine::task<std::optional<tools::backlog::outcome>> {
-                        if (++tries == 1)
-                            co_return std::nullopt;
-                        co_return tools::config_result{.configuration = "busy", .worker = "w", .ok = true};
-                    });
+                    std::move(run_operation));
                 expect(co_await harness::done(io, held) && harness::built(held).ok);
-            });
+            };
+            h.run(std::move(exercise));
             expect(tries == 2);
         };
 
         "askers take turns, and a newer request replaces the same asker's queued one"_test = [] {
             harness h{1};
-            h.run([&](ctx& io) -> coroutine::task<> {
+            auto exercise = [&](ctx& io) -> coroutine::task<> {
                 auto x1 = co_await h.queue.submit(0, harness::entry("x1", "x", "one"), h.job(io, "x1"));
                 auto x2 = co_await h.queue.submit(0, harness::entry("x2", "x", "two"), h.job(io, "x2"));
                 auto x3 = co_await h.queue.submit(0, harness::entry("x3", "x", "three"), h.job(io, "x3"));
@@ -384,13 +406,14 @@ namespace {
                 expect(x3->done() && harness::built(x3).error.contains("replaced")) << harness::built(x3).error;
                 for (auto& t : {x1, x2, y1, x3b})
                     expect(co_await harness::done(io, t));
-            });
+            };
+            h.run(std::move(exercise));
             expect(h.ran == std::vector<std::string>{"x1", "y1", "x2", "x3b"}) << "x asked first, then y gets a turn";
         };
 
         "queued requests from different worldlines do not replace each other"_test = [] {
             harness h{1};
-            h.run([&](ctx& io) -> coroutine::task<> {
+            auto exercise = [&](ctx& io) -> coroutine::task<> {
                 auto blocker = co_await h.queue.submit(0, harness::entry("block", "other"), h.job(io, "block", 100ms));
                 auto first = harness::entry("first", "same");
                 first.worldline = "main";
@@ -400,13 +423,14 @@ namespace {
                 auto b = co_await h.queue.submit(0, second, h.job(io, "second"));
                 for (auto& ticket : {blocker, a, b})
                     expect(co_await harness::done(io, ticket) && harness::built(ticket).ok);
-            });
+            };
+            h.run(std::move(exercise));
             expect(h.ran == std::vector<std::string>{"block", "first", "second"});
         };
 
         "concurrent task runs sharing a caller and worldline keep both queued builds"_test = [] {
             harness h{1};
-            h.run([&](ctx& io) -> coroutine::task<> {
+            auto exercise = [&](ctx& io) -> coroutine::task<> {
                 auto blocker = co_await h.queue.submit(0, harness::entry("block", "other"), h.job(io, "block", 100ms));
                 worlds::actor caller{.issuer = "token", .user = "same", .caller = "agent", .role = "member", .run = "first"};
                 auto first = harness::entry("first", worlds::execution_key(caller));
@@ -416,7 +440,8 @@ namespace {
                 auto a = co_await h.queue.submit(0, first, h.job(io, "first"));
                 auto b = co_await h.queue.submit(0, second, h.job(io, "second"));
                 for (auto& ticket : {blocker, a, b}) expect(co_await harness::done(io, ticket) && harness::built(ticket).ok);
-            });
+            };
+            h.run(std::move(exercise));
             expect((h.ran.size() == 3u) >> fatal);
             expect(h.ran.front() == "block");
             std::ranges::sort(h.ran);
@@ -426,7 +451,7 @@ namespace {
         "queued effect and language calls from the same actor all execute"_test = [] {
             for (const auto& operation : {"run", "test", "prepare", "dependencies"}) {
                 harness h{1};
-                h.run([&](ctx& io) -> coroutine::task<> {
+                auto exercise = [&](ctx& io) -> coroutine::task<> {
                     auto blocker = co_await h.queue.submit(0, harness::entry("block", "other"), h.job(io, "block", 100ms));
                     auto first = harness::entry("run/1", "same");
                     first.cacheable = std::string_view{operation} == "prepare";
@@ -437,7 +462,8 @@ namespace {
                     auto b = co_await h.queue.submit(0, second, h.job(io, "second"));
                     for (auto& ticket : {blocker, a, b})
                         expect(co_await harness::done(io, ticket) && harness::built(ticket).ok);
-                });
+                };
+                h.run(std::move(exercise));
                 expect(h.ran == std::vector<std::string>{"block", "first", "second"});
             }
         };
@@ -445,7 +471,7 @@ namespace {
         "pushed diagnostics are not cached even after a matching version arrives"_test = [] {
             harness h{1};
             int runs = 0;
-            h.run([&](ctx& io) -> coroutine::task<> {
+            auto exercise = [&](ctx& io) -> coroutine::task<> {
                 auto what = harness::entry("push", "same");
                 what.operation = "prepare";
                 auto work = [&runs](tools::services&, jobs::progress_log&, std::string) -> coroutine::task<std::optional<tools::backlog::outcome>> {
@@ -461,7 +487,8 @@ namespace {
                 auto second = co_await h.queue.submit(0, what, work);
                 expect(co_await harness::done(io, second));
                 expect(second->reuse() == "executed");
-            });
+            };
+            h.run(std::move(exercise));
             expect(runs == 2);
         };
 
@@ -471,7 +498,7 @@ namespace {
             const worlds::actor y{.issuer = "token", .user = "y", .caller = "y", .role = "member"};
             const worlds::actor owner{.issuer = "token", .user = "o", .caller = "o", .role = "owner"};
             auto ex = worlds::identity_key(x), why = worlds::identity_key(y);
-            h.run([&](ctx& io) -> coroutine::task<> {
+            auto exercise = [&](ctx& io) -> coroutine::task<> {
                 auto running = co_await h.queue.submit(0, harness::entry("long", ex), h.job(io, "long", 200ms));
                 auto left = co_await h.queue.submit(0, harness::entry("left", ex, "Release"), h.job(io, "left"));
                 left->leave();
@@ -491,7 +518,8 @@ namespace {
                 expect(co_await harness::done(io, running));
                 auto listed = co_await h.queue.list(0);
                 expect(std::ranges::any_of(listed, [](auto& v) { return v.state == "cancelled" && v.configuration == "Release"; })) << "the left job";
-            });
+            };
+            h.run(std::move(exercise));
             expect(h.ran == std::vector<std::string>{"long"}) << "no queued job that was left or cancelled ran";
         };
     };

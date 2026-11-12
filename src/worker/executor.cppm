@@ -81,37 +81,41 @@ export namespace replica {
         }
 
         template <io::stream S> void install(transport::dispatcher<S>& d, std::size_t core) {
-            d.template on<jobs::export_read>([this, core](jobs::export_read request, auto&) -> coroutine::task<jobs::source_bytes> {
+            auto handle_export_read = [this, core](jobs::export_read request, auto&) -> coroutine::task<jobs::source_bytes> {
                 require_consumer();
                 co_return co_await io::blocking(rt_.get_scheduler(core), pool_, [this, root = options_.root, request] {
                     std::shared_lock guard{exports_lock_};
                     return delivery::read(root / "exports", request);
                 });
-            });
+            };
+            d.template on<jobs::export_read>(std::move(handle_export_read));
             d.template on<jobs::sync_offer>(
                 [this, core](jobs::sync_offer o, auto&) {
                     require_consumer();
                     return at_home(core, [o = std::move(o)](store& s) { return s.offer(o); });
                 });
-            d.template on<jobs::source_bytes>([this, core](jobs::source_bytes p, auto&) -> coroutine::task<jobs::authority_ack> {
+            auto handle_source_bytes = [this, core](jobs::source_bytes p, auto&) -> coroutine::task<jobs::authority_ack> {
                 require_consumer();
                 if (core == home_)
                     co_return co_await push(std::move(p));
                 co_return co_await cores::call(rt_.get_scheduler(core), rt_.get_scheduler(home_), [this, p = std::move(p)] { return push(p); });
-            });
-            d.template on<jobs::build_request>([this, core](jobs::build_request r, auto& ex) -> coroutine::task<jobs::build_report> {
+            };
+            d.template on<jobs::source_bytes>(std::move(handle_source_bytes));
+            auto handle_build_request = [this, core](jobs::build_request r, auto& ex) -> coroutine::task<jobs::build_report> {
                 require_consumer();
                 co_await ex.progress({.stage = "checkout"});
                 if (core == home_)
                     co_return co_await build(std::move(r));
                 co_return co_await cores::call(rt_.get_scheduler(core), rt_.get_scheduler(home_), [this, r = std::move(r)] { return build(r); });
-            });
-            d.template on<jobs::dependency_fill>([this, core](jobs::dependency_fill request, auto& ex) -> coroutine::task<jobs::build_report> {
+            };
+            d.template on<jobs::build_request>(std::move(handle_build_request));
+            auto handle_dependency_fill = [this, core](jobs::dependency_fill request, auto& ex) -> coroutine::task<jobs::build_report> {
                 co_await ex.progress({.stage = "dependencies"});
                 if (core == home_) co_return co_await fill(std::move(request));
                 co_return co_await cores::call(rt_.get_scheduler(core), rt_.get_scheduler(home_),
                     [this, request = std::move(request)] { return fill(request); });
-            });
+            };
+            d.template on<jobs::dependency_fill>(std::move(handle_dependency_fill));
         }
 
     private:

@@ -52,7 +52,7 @@ namespace gateway {
             if (core == 0)
                 logging::info(std::format("gateway: source and language API on http://{}:{}/, source {}, metadata {}, {} cores", server_.http_bind,
                                           server_.http_port, server_.source, server_.storage, rt_.size()));
-            co_await coroutine::with_scope([&](coroutine::scope& children) -> coroutine::task<> {
+            auto run_children = [&](coroutine::scope& children) -> coroutine::task<> {
                 if (core == 0 && !executable_.empty()) {
                     co_await processes.start(io, children, executable_, doc_);
                     daemon::publish(daemon::phase::initialized);
@@ -68,7 +68,8 @@ namespace gateway {
                         children.spawn(watch_runtime(io));
                 }
                 co_await accept_http(http, here, children);
-            });
+            };
+            co_await coroutine::with_scope(std::move(run_children));
         }
 
         auto reconfiguring() const -> bool { return reconfigure_; }
@@ -131,16 +132,19 @@ namespace gateway {
         };
 
         auto accept_http(listener& l, per_core& here, coroutine::scope& children) -> coroutine::task<> {
-            for (;;)
-                children.spawn(here.http.serve(co_await execution::then(net::async_accept(l), [](auto socket, auto) { return std::move(socket); })));
+            for (;;) {
+                auto [connection, peer] = co_await net::async_accept(l);
+                children.spawn(here.http.serve(std::move(connection)));
+            }
         }
 
         auto accept_workers(listener& l, std::size_t core, coroutine::scope& children, bool remote = false) -> coroutine::task<> {
-            for (;;)
-                children.spawn(router_.workers(core).admit(rt_.get_scheduler(core),
-                                                           co_await execution::then(net::async_accept(l), [](auto socket, auto) { return std::move(socket); }),
-                                                           remote ? &identities_ : nullptr, remote ? &io_pool_ : nullptr,
+            for (;;) {
+                auto [connection, peer] = co_await net::async_accept(l);
+                children.spawn(router_.workers(core).admit(rt_.get_scheduler(core), std::move(connection), remote ? &identities_ : nullptr,
+                                                           remote ? &io_pool_ : nullptr,
                                                            [this, core] { return hub_.current(core)->server.remote_worker_enrollment; }));
+            }
         }
 
         std::atomic<bool>* interrupted_;

@@ -22,6 +22,16 @@ export namespace durability {
     // never waited on. Throws `unreadable` when it is anything else, or changes size while read.
     auto read_plain(const std::filesystem::path& path, std::uint64_t limit) -> util::generator<std::span<const std::byte>>;
     auto read_private(const std::filesystem::path& path, std::uint64_t limit) -> util::generator<std::span<const std::byte>>;
+    class append_file {
+    public:
+        explicit append_file(const std::filesystem::path& path);
+        ~append_file();
+        void append(std::string_view records);
+
+    private:
+        struct state;
+        std::unique_ptr<state> state_;
+    };
     void durable_append(const std::filesystem::path& log, std::string_view record);
     void durable_remove(const std::filesystem::path& path);
     void durable_rename(const std::filesystem::path& from, const std::filesystem::path& to);

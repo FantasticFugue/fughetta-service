@@ -40,23 +40,24 @@ namespace {
             rt, {.root = tmp.dir / "cache", .worker = "worker-test", .env = {{"VALUE", "worker"}}, .inherit_env = false,
                  .dependency_cache = dependency_cache, .dependency_upstream = dependency_upstream, .dependency_publish = dependency_publish,
                  .dependency_recipe = recipe}, disk, 1};
-        rt.run([&](ctx& io, std::size_t core) -> coroutine::task<> {
+        auto run_core = [&](ctx& io, std::size_t core) -> coroutine::task<> {
             if (core != 0)
                 co_return;
-            co_await service.run(0, [&]() -> coroutine::task<> {
+            auto run_operation = [&]() -> coroutine::task<> {
                 auto listener = native::listener{io, {net::ip::address_v4::loopback(), 0}};
-                co_await coroutine::with_scope([&](coroutine::scope& tasks) -> coroutine::task<> {
-                    tasks.spawn([](ctx& io, auto& listener, auto& service, coroutine::scope& tasks) -> coroutine::task<> {
-                        auto socket = co_await execution::then(net::async_accept(listener), [](auto socket, auto) { return std::move(socket); });
+                auto run_tasks = [&](coroutine::scope& tasks) -> coroutine::task<> {
+                    static constexpr auto run_child = [](ctx& io, auto& listener, auto& service, coroutine::scope& tasks) -> coroutine::task<> {
+                        auto [socket, endpoint] = co_await net::async_accept(listener);
                         transport::channel<native::socket> channel{socket};
                         transport::dispatcher<native::socket> dispatch;
                         service.install(dispatch, 0);
                         for (;;)
                             tasks.spawn(dispatch.handle(channel, co_await channel.recv()));
-                    }(io, listener, service, tasks));
+                    };
+                    tasks.spawn(run_child(io, listener, service, tasks));
                     auto socket = co_await io::connect(io, {net::ip::address_v4{{127, 0, 0, 1}}, listener.local_endpoint().port()});
                     transport::channel<native::socket> channel{socket};
-                    co_await coroutine::with_scope([&](coroutine::scope& pump) -> coroutine::task<> {
+                    auto run_pump = [&](coroutine::scope& pump) -> coroutine::task<> {
                         pump.spawn(channel.pump([](const transport::frame&) {}));
                         if constexpr (std::invocable<F&, decltype(channel)&, decltype(tmp.dir)&, replica::service&, ctx&>)
                             co_await work(channel, tmp.dir, service, io);
@@ -64,10 +65,14 @@ namespace {
                             co_await work(channel, tmp.dir, service);
                         else
                             co_await work(channel, tmp.dir);
-                    });
-                });
-            }());
-        });
+                    };
+                    co_await coroutine::with_scope(std::move(run_pump));
+                };
+                co_await coroutine::with_scope(std::move(run_tasks));
+            };
+            co_await service.run(0, run_operation());
+        };
+        rt.run(std::move(run_core));
     }
 
     auto recipe_script(const std::filesystem::path& root, std::string_view body) -> builds::dependency_recipe {
@@ -120,7 +125,7 @@ set(VCPKG_ENV_PASSTHROUGH_UNTRACKED PROBE_LEDGER)
                 std::atomic<int> ready{0};
                 auto worker = [&](int index) {
                     std::string library;
-                    exercise([&](auto& channel, auto&, replica::service&, ctx& io) -> coroutine::task<> {
+                    auto run_operation = [&](auto& channel, auto&, replica::service&, ctx& io) -> coroutine::task<> {
                         const std::string manifest = R"({"name":"cache-consumer","version-string":"1","dependencies":["fug-cache-probe"]})";
                         ++ready;
                         const auto deadline = std::chrono::steady_clock::now() + 10s;
@@ -135,7 +140,8 @@ set(VCPKG_ENV_PASSTHROUGH_UNTRACKED PROBE_LEDGER)
                         if (!result->ok() || !result->steps.front().cache_error.empty())
                             throw std::runtime_error(result->steps.front().output + result->steps.front().cache_error);
                         library = test::slurp(std::filesystem::path{result->tree} / "installed/fug-cache-probe/lib/libprobe.a");
-                    }, shared.dir / ("private-" + std::to_string(index)), {}, shared.dir / "published",
+                    };
+                    exercise(std::move(run_operation), shared.dir / ("private-" + std::to_string(index)), {}, shared.dir / "published",
                         builds::dependency_recipe{.executable = executable, .root = std::filesystem::path{executable}.parent_path().string(),
                             .triplets = {"x64-linux", "fug-cache-probe"}, .overlay_ports = {(shared.dir / "ports").string()},
                             .overlay_triplets = {(shared.dir / "triplets").string()},
@@ -195,7 +201,7 @@ set(VCPKG_ENV_PASSTHROUGH_UNTRACKED PROBE_LEDGER)
             test::spit(cache / relative, "staged archive");
             auto recipe = recipe_script(tmp.dir, "printf done; exit 7");
             recipe.env["EXPECTED"] = "clear;files," + (published / "vcpkg").generic_string() + ",read;files," + (cache / "vcpkg").generic_string() + ",readwrite";
-            exercise([&](auto& channel, auto&) -> coroutine::task<> {
+            auto run_operation = [&](auto& channel, auto&) -> coroutine::task<> {
                 expect(!(co_await channel.call(jobs::sync_offer{"app", {}})).has_value());
                 expect(!(co_await channel.call(jobs::source_bytes{{blob("tenant bytes")}})).has_value());
                 expect(!(co_await channel.call(jobs::build_request{.project = "app"})).has_value());
@@ -220,12 +226,13 @@ set(VCPKG_ENV_PASSTHROUGH_UNTRACKED PROBE_LEDGER)
                 expect(partial->ok() && partial->steps.front().output == "done");
                 expect(partial->steps.front().cache_error.contains("not a vcpkg ABI"));
                 durability::dir_lock unlocked{published / "vcpkg", "publisher released"};
-            }, cache, {}, published, recipe);
+            };
+            exercise(std::move(run_operation), cache, {}, published, recipe);
         };
         "worker binds a read-only upstream and never locks it"_test = [] {
             test::scratch shared{"dependency-upstream"};
             auto upstream = shared.dir / "published", cache = shared.dir / "private";
-            exercise([&](auto& channel, auto&) -> coroutine::task<> {
+            auto run_operation = [&](auto& channel, auto&) -> coroutine::task<> {
                 content::manifest tree;
                 co_await channel.call(jobs::sync_offer{"app", tree});
                 auto result = co_await channel.call(jobs::build_request{.project = "app", .snapshot = tree.id(),
@@ -236,11 +243,12 @@ set(VCPKG_ENV_PASSTHROUGH_UNTRACKED PROBE_LEDGER)
                 expect(result->steps.front().output == "clear;files," + (upstream / "vcpkg").generic_string() + ",read;files," + (cache / "vcpkg").generic_string() + ",readwrite");
                 expect(!std::filesystem::exists(upstream));
                 expect(std::filesystem::is_directory(cache / "vcpkg"));
-            }, cache, upstream);
+            };
+            exercise(std::move(run_operation), cache, upstream);
         };
         "publisher defaults never import the older general cache"_test = [] {
             test::scratch shared{"publisher-default"};
-            exercise([&](auto& channel, auto& root) -> coroutine::task<> {
+            auto run_operation = [&](auto& channel, auto& root) -> coroutine::task<> {
                 const std::string abi(64, 'c');
                 const auto relative = std::filesystem::path{"vcpkg/cc"} / (abi + ".zip");
                 test::spit(root / "cache/dependencies" / relative, "old untrusted archive");
@@ -251,13 +259,14 @@ set(VCPKG_ENV_PASSTHROUGH_UNTRACKED PROBE_LEDGER)
                     (root / "cache/publisher/dependencies/vcpkg").generic_string() + ",readwrite");
                 expect(!std::filesystem::exists(shared.dir / relative));
                 expect(test::slurp(root / "cache/dependencies" / relative) == "old untrusted archive");
-            }, {}, {}, shared.dir, recipe_script(shared.dir, "printf '%s' \"$VCPKG_BINARY_SOURCES\""));
+            };
+            exercise(std::move(run_operation), {}, {}, shared.dir, recipe_script(shared.dir, "printf '%s' \"$VCPKG_BINARY_SOURCES\""));
         };
         "overlapping worker caches fail before creating a lock or running a command"_test = [] {
             test::scratch shared{"dependency-overlap"};
             const auto cache = shared.dir / "cache";
             for (bool publishing : {false, true}) {
-            exercise([&](auto& channel, auto& root) -> coroutine::task<> {
+            auto run_operation = [&](auto& channel, auto& root) -> coroutine::task<> {
                 content::manifest tree;
                 if (!publishing) co_await channel.call(jobs::sync_offer{"app", tree});
                 auto result = publishing ? co_await channel.call(jobs::dependency_fill{}) : co_await channel.call(jobs::build_request{.project = "app", .snapshot = tree.id(),
@@ -269,14 +278,15 @@ set(VCPKG_ENV_PASSTHROUGH_UNTRACKED PROBE_LEDGER)
                 expect(failure->message.contains("must not overlap"));
                 expect(!std::filesystem::exists(cache));
                 expect(!std::filesystem::exists(root / "cache/trees/app/default/installed"));
-            }, cache, publishing ? std::nullopt : std::optional{cache}, publishing ? std::optional{cache} : std::nullopt,
+            };
+            exercise(std::move(run_operation), cache, publishing ? std::nullopt : std::optional{cache}, publishing ? std::optional{cache} : std::nullopt,
                 publishing ? std::optional{recipe_script(shared.dir, "touch installed")} : std::nullopt);
             }
         };
         "dependency cache lock waiting respects the build deadline and releases for retry"_test = [] {
             test::scratch shared{"dependency-lock"};
             auto held = std::make_unique<durability::dir_lock>(shared.dir / "vcpkg", "test cache");
-            exercise([&](auto& channel, auto& root) -> coroutine::task<> {
+            auto run_operation = [&](auto& channel, auto& root) -> coroutine::task<> {
                 content::manifest tree;
                 co_await channel.call(jobs::sync_offer{"app", tree});
                 jobs::build_request request{.project = "app", .snapshot = tree.id(),
@@ -294,40 +304,45 @@ set(VCPKG_ENV_PASSTHROUGH_UNTRACKED PROBE_LEDGER)
                 expect(retried.has_value() >> fatal);
                 expect(retried->ok() && retried->steps.at(0).output == "installed");
                 durability::dir_lock available{shared.dir / "vcpkg", "released cache"};
-            }, shared.dir);
+            };
+            exercise(std::move(run_operation), shared.dir);
         };
         "a waiting cache install acquires the released lock and cancellation prevents execution"_test = [] {
             test::scratch shared{"dependency-wait"};
             auto held = std::make_unique<durability::dir_lock>(shared.dir / "vcpkg", "test cache");
-            exercise([&](auto& channel, auto& root, replica::service&, ctx& io) -> coroutine::task<> {
+            auto run_operation = [&](auto& channel, auto& root, replica::service&, ctx& io) -> coroutine::task<> {
                 content::manifest tree;
                 co_await channel.call(jobs::sync_offer{"app", tree});
                 jobs::build_request request{.project = "app", .snapshot = tree.id(),
                     .steps = {{.name = "install", .argv = {test::shell(), "-c", "printf ready > installed; printf installed"},
                         .env = {{"VCPKG_BINARY_SOURCES", "clear;files,${cache:vcpkg},readwrite"}}}}, .timeout_s = 5};
                 const auto installed = root / "cache/trees/app/default/installed";
-                co_await coroutine::with_scope([&](coroutine::scope& timers) -> coroutine::task<> {
-                    timers.spawn([](ctx& io, auto& held, const auto& installed) -> coroutine::task<> {
+                auto run_timers_2 = [&](coroutine::scope& timers) -> coroutine::task<> {
+                    static constexpr auto run_child = [](ctx& io, auto& held, const auto& installed) -> coroutine::task<> {
                         co_await execution::schedule_after(io, 150ms);
                         expect(!std::filesystem::exists(installed));
                         held.reset();
-                    }(io, held, installed));
+                    };
+                    timers.spawn(run_child(io, held, installed));
                     auto result = co_await channel.call(request);
                     expect(result.has_value() >> fatal);
                     expect(result->ok() && result->steps.front().output == "installed");
-                });
+                };
+                co_await coroutine::with_scope(std::move(run_timers_2));
                 expect(std::filesystem::exists(installed));
                 std::filesystem::remove(installed);
                 held = std::make_unique<durability::dir_lock>(shared.dir / "vcpkg", "test cache");
                 coroutine::stop_source stop;
-                co_await coroutine::with_scope([&](coroutine::scope& timers) -> coroutine::task<> {
-                    timers.spawn([](ctx& io, coroutine::stop_source& stop) -> coroutine::task<> {
+                auto run_timers = [&](coroutine::scope& timers) -> coroutine::task<> {
+                    static constexpr auto run_child = [](ctx& io, coroutine::stop_source& stop) -> coroutine::task<> {
                         co_await execution::schedule_after(io, 150ms);
                         stop.request_stop();
-                    }(io, stop));
+                    };
+                    timers.spawn(run_child(io, stop));
                     auto result = co_await coroutine::under(stop.get_token(), channel.call(request));
                     expect(!result);
-                });
+                };
+                co_await coroutine::with_scope(std::move(run_timers));
                 held.reset();
                 request.steps = {{.name = "barrier", .argv = {test::shell(), "-c", "test ! -e installed && printf stopped"}}};
                 auto barrier = co_await channel.call(request);
@@ -335,12 +350,13 @@ set(VCPKG_ENV_PASSTHROUGH_UNTRACKED PROBE_LEDGER)
                 expect(barrier->ok() && barrier->steps.front().output == "stopped");
                 expect(!std::filesystem::exists(installed));
                 durability::dir_lock available{shared.dir / "vcpkg", "released cache"};
-            }, shared.dir);
+            };
+            exercise(std::move(run_operation), shared.dir);
         };
         "workers bind the shared dependency cache outside fresh checkout trees"_test = [] {
             test::scratch shared{"dependency-cache"};
             for (int worker = 0; worker < 2; ++worker) {
-                exercise([&](auto& channel, auto&) -> coroutine::task<> {
+                auto run_operation = [&](auto& channel, auto&) -> coroutine::task<> {
                     content::manifest tree;
                     const auto project = "project-" + std::to_string(worker);
                     co_await channel.call(jobs::sync_offer{project, tree});
@@ -352,11 +368,12 @@ set(VCPKG_ENV_PASSTHROUGH_UNTRACKED PROBE_LEDGER)
                     expect(result.has_value() >> fatal);
                     expect(result->ok() && result->steps.front().output == "compiled");
                     expect(test::slurp(shared.dir / "vcpkg/package") == "compiled");
-                }, shared.dir);
+                };
+                exercise(std::move(run_operation), shared.dir);
             }
         };
         "worker preserves full step logs when inline output is truncated and a build fails"_test = [] {
-            exercise([](auto& channel, auto&) -> coroutine::task<> {
+            static constexpr auto run_operation = [](auto& channel, auto&) -> coroutine::task<> {
                 content::manifest tree;
                 expect((co_await channel.call(jobs::sync_offer{"app", tree})).has_value());
                 auto report = co_await channel.call(jobs::build_request{.project = "app", .snapshot = tree.id(),
@@ -374,22 +391,24 @@ set(VCPKG_ENV_PASSTHROUGH_UNTRACKED PROBE_LEDGER)
                     const auto& part = bytes->parts.at(0);
                     expect(std::string(reinterpret_cast<const char*>(part.bytes.data()), part.bytes.size()) == expected[index]);
                 }
-            });
+            };
+            exercise(run_operation);
         };
         "log capture limits and storage failure preserve process results"_test = [] {
             test::scratch tmp{"runner-logs"};
             cores::io_context<native::context> rt{1};
-            rt.run([&](ctx& io, std::size_t) -> coroutine::task<> {
+            auto run_core = [&](ctx& io, std::size_t) -> coroutine::task<> {
                 auto capped = co_await ::runner::run_step(io, {.argv = {test::shell(), "-c", "printf abcdef; exit 7"}, .cwd = tmp.dir}, 5s, 4, "capped", tmp.dir / "capped.log", 3);
                 expect(capped.exit_code == 7 && capped.truncated && capped.log_truncated) << capped.exit_code << capped.output << capped.log_error;
                 expect(test::slurp(tmp.dir / "capped.log") == "abc");
                 auto failed = co_await ::runner::run_step(io, {.argv = {test::shell(), "-c", "printf kept; exit 7"}, .cwd = tmp.dir}, 5s, 100, "failed", tmp.dir / "missing/log");
                 expect(failed.exit_code == 7 && failed.output == "kept" && !failed.log_error.empty()) << failed.exit_code << failed.output << failed.log_error;
-            });
+            };
+            rt.run(std::move(run_core));
         };
 
         "worker exports remain readable after the hot tree changes"_test = [] {
-            exercise([](auto& channel, auto& root) -> coroutine::task<> {
+            static constexpr auto run_operation = [](auto& channel, auto& root) -> coroutine::task<> {
                 content::manifest manifest{{entry("output.bin", "stable output")}};
                 auto plan = co_await channel.call(jobs::sync_offer{"app", manifest});
                 co_await channel.call(jobs::source_bytes{{blob("stable output")}});
@@ -402,10 +421,11 @@ set(VCPKG_ENV_PASSTHROUGH_UNTRACKED PROBE_LEDGER)
                 expect(bytes->parts.size() == 1u);
                 auto& part = bytes->parts.at(0);
                 expect(std::string(reinterpret_cast<const char*>(part.bytes.data()), part.bytes.size()) == "stable output");
-            });
+            };
+            exercise(run_operation);
         };
         "export failures preserve execution status and failed runs still export files"_test = [] {
-            exercise([](auto& channel, auto&) -> coroutine::task<> {
+            static constexpr auto run_operation = [](auto& channel, auto&) -> coroutine::task<> {
                 content::manifest tree;
                 co_await channel.call(jobs::sync_offer{"app", tree});
                 jobs::build_request request{.project = "app", .snapshot = tree.id(),
@@ -421,7 +441,8 @@ set(VCPKG_ENV_PASSTHROUGH_UNTRACKED PROBE_LEDGER)
                 expect(missing.has_value() >> fatal);
                 expect(missing->ok() && missing->steps.size() == 1u && missing->steps.front().output == "completed");
                 expect(!missing->export_error.empty() && missing->exports.empty());
-            });
+            };
+            exercise(run_operation);
         };
         "a checkout writes what changed and keeps build outputs"_test = [] {
             test::scratch tmp{"replica"};
@@ -607,7 +628,7 @@ set(VCPKG_ENV_PASSTHROUGH_UNTRACKED PROBE_LEDGER)
             expect(test::slurp(cache.checkout("app", offered.snapshot) / "a") == "retained");
         };
         "service dispatch syncs bytes, executes steps and stops at failure"_test = [] {
-            exercise([](auto& channel, const auto&) -> coroutine::task<> {
+            static constexpr auto run_operation = [](auto& channel, const auto&) -> coroutine::task<> {
                 content::manifest tree{{entry("input.txt", "hello")}};
                 auto offer = co_await channel.call(jobs::sync_offer{"app", tree});
                 expect(offer.has_value() >> fatal);
@@ -645,11 +666,12 @@ set(VCPKG_ENV_PASSTHROUGH_UNTRACKED PROBE_LEDGER)
                 request.steps[0].argv = {test::shell(), "-c", "echo start; sleep 30"};
                 auto timeout = co_await channel.call(request);
                 expect(timeout.has_value() && timeout->steps[0].timed_out && !timeout->ok());
-            });
+            };
+            exercise(run_operation);
         };
 
         "a hot directory keeps its language process across source changes and builds"_test = [] {
-            exercise([](auto& channel, const auto& root, replica::service& service) -> coroutine::task<> {
+            static constexpr auto run_operation = [](auto& channel, const auto& root, replica::service& service) -> coroutine::task<> {
                 auto script = root / "language.py";
                 test::spit(script, R"python(
 import json, os, sys
@@ -728,11 +750,12 @@ while True:
                 expect((restarted && restarted->outline) >> fatal);
                 expect(restarted->outline->diagnostics.front().message == "x = 2");
                 expect(test::slurp(root / "starts") == "start\nstart\nstart\n") << "a clean build retires the directory's language process";
-            });
+            };
+            exercise(run_operation);
         };
 
         "language analysis shares the preparation execution deadline"_test = [] {
-            exercise([](auto& channel, const auto&) -> coroutine::task<> {
+            static constexpr auto run_operation = [](auto& channel, const auto&) -> coroutine::task<> {
                 content::manifest tree{{entry("a.cpp", "int a;")}};
                 auto offered = co_await channel.call(jobs::sync_offer{"app", tree});
                 expect(offered.has_value() >> fatal);
@@ -748,18 +771,20 @@ while True:
                 expect(report.has_value() >> fatal);
                 expect(!report->ok() && report->steps.back().name == "analysis" && report->steps.back().timed_out);
                 expect(std::chrono::steady_clock::now() - started < 3s) << "the survey receives only the remaining execution time";
-            });
+            };
+            exercise(run_operation);
         };
 
         "service rejects a damaged push without caching its contents"_test = [] {
-            exercise([](auto& channel, const auto&) -> coroutine::task<> {
+            static constexpr auto run_operation = [](auto& channel, const auto&) -> coroutine::task<> {
                 auto corrupt = blob("bad");
                 corrupt.digest = content::hash_of("yes");
                 auto pushed = co_await channel.call(jobs::source_bytes{{corrupt}});
                 expect(!pushed.has_value());
                 auto offered = co_await channel.call(jobs::sync_offer{"app", {{entry("a", "yes")}}});
                 expect(offered.has_value() && offered->missing.size() == 1u);
-            });
+            };
+            exercise(run_operation);
         };
     };
 } // namespace

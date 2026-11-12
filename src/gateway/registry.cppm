@@ -169,7 +169,11 @@ export namespace storage {
         // Runs `f` on the ledger later, without waiting for it.
         template <class F> void post(std::size_t here, F f) {
             auto start = [this, f = std::move(f)] mutable {
-                rt_.spawn(0, serial([f = std::move(f)](usage::ledger& ledger, const config::document&) mutable { f(ledger); }));
+                pending_.emplace_back(std::move(f));
+                if (!draining_) {
+                    draining_ = true;
+                    rt_.spawn(0, drain());
+                }
             };
             if (here == 0)
                 start();
@@ -214,10 +218,21 @@ export namespace storage {
             std::unreachable();
         }
 
+        auto drain() -> coroutine::task<> {
+            struct reset {
+                bool& value;
+                ~reset() { value = false; }
+            } done{draining_};
+            do {
+                co_await serial([](usage::ledger&, const config::document&) {});
+            } while (!pending_.empty());
+        }
+
         template <class F> auto serial(F f) -> coroutine::task<std::invoke_result_t<F&, usage::ledger&, const config::document&>> {
             auto held = co_await ledger_lock_.lock();
             auto doc = config_.current(0);
-            co_return co_await io::blocking(rt_.get_scheduler(0), pool_, [this, f = std::move(f), doc]() mutable {
+            auto pending = std::exchange(pending_, {});
+            co_return co_await io::blocking(rt_.get_scheduler(0), pool_, [this, f = std::move(f), doc, pending = std::move(pending)]() mutable {
                 if (!ledger_) {
                     ledger_ = std::make_unique<usage::ledger>(storage_ / constants::source_ledger_directory);
                     ledger_->changed = [this] {
@@ -229,6 +244,11 @@ export namespace storage {
                 }
                 // A refusal leaves the ledger as it was; any other failure reopens it from its log, so running builds stay counted.
                 try {
+                    if (!pending.empty())
+                        ledger_->batch([&] {
+                            for (auto& record : pending)
+                                record(*ledger_);
+                        });
                     return f(*ledger_, *doc);
                 } catch (const usage::quota_exceeded&) {
                     throw;
@@ -248,6 +268,8 @@ export namespace storage {
         execution::thread_pool& pool_;
         net::ip::tcp::endpoint source_;
         coroutine::mutex ledger_lock_;
+        std::vector<std::function<void(usage::ledger&)>> pending_;
+        bool draining_ = false;
         std::unique_ptr<usage::ledger> ledger_;
         std::mutex exports_mutex_;
         std::map<std::string, std::weak_ptr<std::mutex>> export_receivers_;

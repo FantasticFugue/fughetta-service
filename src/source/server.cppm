@@ -39,7 +39,7 @@ export namespace source_server {
                     co_await chan.fail(0, "gateway/source protocol mismatch");
                     co_return;
                 }
-                co_await coroutine::with_scope([&](coroutine::scope& handlers) -> coroutine::task<> {
+                auto run_handlers = [&](coroutine::scope& handlers) -> coroutine::task<> {
                     // A well-behaved gateway sends one call per connection; the cap keeps a looping or compromised peer from growing handlers and payload memory without bound.
                     std::atomic<std::size_t> inflight{0};
                     for (;;) {
@@ -56,7 +56,8 @@ export namespace source_server {
                         inflight.fetch_add(1, std::memory_order_relaxed);
                         handlers.spawn(tracked(dispatch, chan, std::move(frame), inflight));
                     }
-                });
+                };
+                co_await coroutine::with_scope(std::move(run_handlers));
             } catch (const std::exception&) {
             }
         }

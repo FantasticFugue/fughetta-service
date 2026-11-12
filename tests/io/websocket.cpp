@@ -22,14 +22,14 @@ namespace {
         static_assert(io::stream<decltype(client)>);
         transport::channel outgoing{client};
         transport::channel incoming{server};
-        co_await coroutine::with_scope([&](coroutine::scope& children) -> coroutine::task<> {
-            auto answer = [&]() -> coroutine::task<> {
-                auto frame = co_await incoming.recv();
-                auto request = transport::decode<jobs::hash_file>(frame);
-                expect(request.path.value().size() == 200000u);
-                co_await incoming.post(jobs::progress{.stage = "received"}, frame.corr);
-                co_await incoming.reply(frame.corr, jobs::digest{.hex = "done"});
-            };
+        auto answer = [&]() -> coroutine::task<> {
+            auto frame = co_await incoming.recv();
+            auto request = transport::decode<jobs::hash_file>(frame);
+            expect(request.path.value().size() == 200000u);
+            co_await incoming.post(jobs::progress{.stage = "received"}, frame.corr);
+            co_await incoming.reply(frame.corr, jobs::digest{.hex = "done"});
+        };
+        auto run_children = [&](coroutine::scope& children) -> coroutine::task<> {
             children.spawn(answer());
             jobs::progress_log progress;
             children.spawn(outgoing.pump([](const transport::frame&) {}));
@@ -38,7 +38,8 @@ namespace {
             expect(result->hex == "done");
             std::size_t seen = 0;
             expect(progress.since(seen).size() == 1u);
-        });
+        };
+        co_await coroutine::with_scope(std::move(run_children));
     }
 
     auto control(native::scheduler& io) -> coroutine::task<> {

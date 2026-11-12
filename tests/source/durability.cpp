@@ -29,10 +29,11 @@ namespace {
             test::scratch tmp{"missing"};
             native::context context;
             auto task = [&]() -> coroutine::task<> {
-                co_await coroutine::with_scope([&](coroutine::scope&) -> coroutine::task<> {
+                auto run_children = [&](coroutine::scope&) -> coroutine::task<> {
                     std::filesystem::recursive_directory_iterator absent{tmp.dir / "absent"};
                     co_return;
-                });
+                };
+                co_await coroutine::with_scope(std::move(run_children));
             };
             expect(throws<std::filesystem::filesystem_error>([&] { cores::run(context, task()); }));
         };

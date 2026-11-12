@@ -129,20 +129,21 @@ namespace {
 
     auto connected_pair(native::context& context) -> std::pair<native::socket, native::socket> {
         auto io = context.get_scheduler();
-        auto l = io::listen(io, io::endpoint{});
+        auto l = native::listener{io, {net::ip::address_v4::loopback(), 0}};
         auto pair = [](native::scheduler& io, native::listener& l) -> coroutine::task<std::pair<native::socket, native::socket>> {
-            auto c = co_await io::connect(io, {{127, 0, 0, 1}, l.port()});
-            auto s = co_await io::async_accept(l);
+            auto c = co_await io::connect(io, {net::ip::address_v4{{127, 0, 0, 1}}, l.local_endpoint().port()});
+            auto s = co_await execution::then(net::async_accept(l), [](auto socket, auto) { return std::move(socket); });
             co_return std::pair{std::move(s), std::move(c)};
         };
         return *cores::run(context, pair(io, l));
     }
 
     auto both(native::context&, coroutine::task<> a, coroutine::task<> b) -> coroutine::task<> {
-        co_await coroutine::with_scope([&](coroutine::scope& children) -> coroutine::task<> {
+        auto run_children = [&](coroutine::scope& children) -> coroutine::task<> {
             children.spawn(std::move(a));
             co_await std::move(b);
-        });
+        };
+        co_await coroutine::with_scope(std::move(run_children));
     }
 
     struct stopping {
