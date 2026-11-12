@@ -68,6 +68,10 @@ namespace nodes {
                     "CREATE TABLE IF NOT EXISTS metadata(name TEXT PRIMARY KEY, data BLOB NOT NULL);"
                     "CREATE TABLE IF NOT EXISTS roots(name TEXT PRIMARY KEY, data BLOB NOT NULL);"
                     "CREATE TABLE IF NOT EXISTS revisions(id TEXT PRIMARY KEY, data BLOB NOT NULL);"
+                    "CREATE TABLE IF NOT EXISTS reference_events(id INTEGER PRIMARY KEY AUTOINCREMENT,line TEXT NOT NULL,name TEXT NOT NULL,data BLOB NOT "
+                    "NULL);"
+                    "CREATE INDEX IF NOT EXISTS reference_events_line ON reference_events(line,id);"
+                    "CREATE TABLE IF NOT EXISTS named_refs(line TEXT NOT NULL,name TEXT NOT NULL,event INTEGER NOT NULL,PRIMARY KEY(line,name));"
                     "DROP TABLE IF EXISTS semantics;"
                     "DROP TABLE IF EXISTS locks;"
                     "CREATE TABLE IF NOT EXISTS dmail(id INTEGER PRIMARY KEY AUTOINCREMENT, at INTEGER NOT NULL, sender TEXT NOT NULL, "
@@ -3251,6 +3255,23 @@ namespace nodes {
             return {blocked.begin(), blocked.end()};
         }
         auto receipt(const std::string& id, bool replayed) -> node_reply {
+            if (id.starts_with("reference:")) {
+                statement row{*db, "SELECT data FROM reference_events WHERE id=?1"};
+                row.text(1, id.substr(10));
+                if (!row.next())
+                    fail(nodes::code::outcome_unknown, "reference receipt not found");
+                auto record = rfl::json::read<reference_record>(row.data(0));
+                if (!record)
+                    fail(nodes::code::storage_failure, "reference receipt is unreadable");
+                auto out = identity();
+                out.worldline = record->worldline;
+                out.version = out.base_version = record->version;
+                out.operation = record->operation_id;
+                out.receipt = id;
+                out.replayed = replayed;
+                out.references.push_back(*record);
+                return out;
+            }
             if (!is_validated(id))
                 fail(nodes::code::outcome_unknown, "original receipt has not been verified");
             auto& r = get(id, "receipt");
@@ -3425,9 +3446,9 @@ namespace nodes {
             auto record = execution_record(in.execution_token);
             if (record.at("line").text() != in.worldline || record.at("run").text() != in.run_id)
                 fail(nodes::code::permission_denied, "execution belongs to another worldline or run");
-            static const std::set<std::string> reads{"tree",    "head",    "stat",    "read",         "inspect",    "compare",
-                                                     "history", "receipt", "content", "contribution", "scope_list", "scope_register"};
-            static const std::set<std::string> writes{"apply", "scope_acquire", "scope_renew", "scope_release"};
+            static const std::set<std::string> reads{"tree",    "head",    "stat",         "read",       "inspect",        "compare",    "history",
+                                                     "receipt", "content", "contribution", "scope_list", "scope_register", "references", "reference_history"};
+            static const std::set<std::string> writes{"apply", "scope_acquire", "scope_renew", "scope_release", "reference"};
             if (!reads.contains(in.action) && !(record.at("writable").boolean() && writes.contains(in.action)))
                 fail(nodes::code::permission_denied, "operation is outside the execution grant");
         }
@@ -4151,9 +4172,10 @@ namespace nodes {
             checked_name(in.worldline);
             if (!content::is_hash(in.operation))
                 fail(nodes::code::invalid_record, "operation ID must be 32-byte lowercase hex");
-            if (in.mail || in.after || !in.genesis_nonce.empty() || !in.authors.empty() || !in.nodes.empty() || !in.policies.empty() || !in.settled.empty() ||
-                !in.want.empty() || !in.parts.empty() || !in.configuration.empty() || !in.environment.empty() || in.force || !in.revision.empty() ||
-                !in.snapshot.empty() || in.protected_worldlines != std::vector<std::string>{"main"} || in.max_bytes != 1024 * 1024 || in.limit != 100)
+            if (in.reference || in.mail || in.after || !in.genesis_nonce.empty() || !in.authors.empty() || !in.nodes.empty() || !in.policies.empty() ||
+                !in.settled.empty() || !in.want.empty() || !in.parts.empty() || !in.configuration.empty() || !in.environment.empty() || in.force ||
+                !in.revision.empty() || !in.snapshot.empty() || in.protected_worldlines != std::vector<std::string>{"main"} || in.max_bytes != 1024 * 1024 ||
+                in.limit != 100)
                 fail(nodes::code::invalid_record, "source publication contains fields for another operation");
             if (in.activation && in.action != "resolve")
                 fail(nodes::code::invalid_record, "activation choices belong to conflict resolution");
@@ -4356,6 +4378,121 @@ namespace nodes {
             interrupt_at("after_commit");
             return out;
         }
+        auto resolve_revision(const std::string& line, const std::string& selection) -> std::string {
+            if (selection.empty())
+                return selection;
+            statement row{*db, "SELECT e.data FROM named_refs r JOIN reference_events e ON e.id=r.event WHERE r.line=?1 AND r.name=?2"};
+            row.text(1, line);
+            row.text(2, selection.starts_with('@') ? selection.substr(1) : selection);
+            if (row.next()) {
+                auto record = rfl::json::read<reference_record>(row.data(0));
+                if (!record)
+                    fail(nodes::code::storage_failure, "reference is unreadable");
+                return record->version;
+            }
+            if (selection.starts_with('@'))
+                fail(nodes::code::invalid_record, "named reference not found in this worldline");
+            return selection;
+        }
+        auto reference_call(const node_request& in) -> node_reply {
+            auto out = identity();
+            out.worldline = in.worldline;
+            (void)root_line(in.worldline);
+            if (in.action != "reference") {
+                if (!in.limit || in.limit > 1000)
+                    fail(nodes::code::resource_limit, "reference page must contain 1 through 1000 records");
+                statement rows{
+                    *db, in.action == "references"
+                             ? "SELECT e.data FROM named_refs r JOIN reference_events e ON e.id=r.event WHERE r.line=?1 AND e.id>?2 ORDER BY e.id LIMIT ?3"
+                             : "SELECT data FROM reference_events WHERE line=?1 AND id>?2 ORDER BY id LIMIT ?3"};
+                rows.text(1, in.worldline);
+                rows.number(2, in.after);
+                rows.number(3, in.limit + 1);
+                while (rows.next()) {
+                    if (out.references.size() == in.limit) {
+                        out.truncated = true;
+                        break;
+                    }
+                    auto record = rfl::json::read<reference_record>(rows.data(0));
+                    if (!record)
+                        fail(nodes::code::storage_failure, "reference is unreadable");
+                    out.references.push_back(*record);
+                }
+                return out;
+            }
+            if (!in.reference || in.actor.empty() || !content::is_hash(in.operation) || in.owner != node.id() || in.revision.empty())
+                fail(nodes::code::invalid_record, "reference requires actor, operation, owner and selected version");
+            const auto& requested = *in.reference;
+            checked_name(requested.name);
+            if (content::is_hash(requested.name) || (requested.kind != "tag" && requested.kind != "channel"))
+                fail(nodes::code::invalid_record, "reference needs a readable name and tag or channel kind");
+            if (requested.attestations.size() > 100 || in.intent.size() > 65536)
+                fail(nodes::code::resource_limit, "reference metadata is too large");
+            for (const auto& item : requested.attestations)
+                if ((item.kind != "build" && item.kind != "test" && item.kind != "review") || item.conclusion.empty() || item.conclusion.size() > 16384 ||
+                    item.receipt.size() > 1024)
+                    fail(nodes::code::invalid_record, "attestation needs build, test or review kind and a conclusion");
+            // Bind the caller's selection before resolving a moving channel so replay returns the original target.
+            auto digest = digest_of(rfl::json::write(std::tuple{in.action, in.worldline, in.revision, in.actor, in.intent, requested}));
+            transaction tx{*db};
+            refresh_external();
+            if (auto previous = retry(in, digest))
+                return *previous;
+            ensure_kernel();
+            auto heads = selected_heads(in);
+            auto state = source.projection(heads);
+            if (!state->conflicts.empty())
+                fail(nodes::code::source_conflict, "resolve source conflicts before naming a version");
+            auto permissions = get(policy(in.worldline));
+            if (protected_target(permissions, in.worldline) && (!allowed(permissions, "authors", author.id()) || !allowed(permissions, "nodes", node.id())))
+                fail(nodes::code::policy_denied, "reference author or node is outside project policy");
+            std::string previous;
+            statement current{*db, "SELECT e.data FROM named_refs r JOIN reference_events e ON e.id=r.event WHERE r.line=?1 AND r.name=?2"};
+            current.text(1, in.worldline);
+            current.text(2, requested.name);
+            if (current.next()) {
+                auto record = rfl::json::read<reference_record>(current.data(0));
+                if (!record)
+                    fail(nodes::code::storage_failure, "reference is unreadable");
+                if (record->kind != requested.kind)
+                    fail(nodes::code::source_conflict, "reference kind cannot change from " + record->kind + " to " + requested.kind);
+                if (record->kind == "tag")
+                    fail(nodes::code::source_conflict, "immutable tag already exists");
+                previous = record->receipt;
+            }
+            if (previous != requested.expected)
+                fail("stale_reference", "reference moved; read its current receipt before updating");
+            reference_record record{.name = requested.name,
+                                    .kind = requested.kind,
+                                    .worldline = in.worldline,
+                                    .version = version(heads),
+                                    .actor = in.actor,
+                                    .intent = in.intent,
+                                    .operation_id = in.caller_operation.empty() ? in.operation : in.caller_operation,
+                                    .previous = previous};
+            record.created_at =
+                static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count());
+            record.attestations = requested.attestations;
+            statement append{*db, "INSERT INTO reference_events(line,name,data) VALUES(?1,?2,'')"};
+            append.text(1, in.worldline);
+            append.text(2, requested.name);
+            append.next();
+            record.sequence = static_cast<std::uint64_t>(sqlite3_last_insert_rowid(db->handle));
+            record.receipt = "reference:" + std::to_string(record.sequence);
+            statement save{*db, "UPDATE reference_events SET data=?1 WHERE id=?2"};
+            save.text(1, rfl::json::write(record));
+            save.number(2, record.sequence);
+            save.next();
+            statement point{*db, "INSERT INTO named_refs(line,name,event) VALUES(?1,?2,?3) ON CONFLICT(line,name) DO UPDATE SET event=excluded.event"};
+            point.text(1, in.worldline);
+            point.text(2, record.name);
+            point.number(3, record.sequence);
+            point.next();
+            binding(in.operation, digest, record.receipt);
+            check_execution(in);
+            tx.commit();
+            return receipt(record.receipt, false);
+        }
         // Reads select a stored revision within the requested worldline.
         auto selected_heads(const node_request& in) -> std::vector<std::string> {
             auto found = roots.find(in.worldline);
@@ -4365,7 +4502,7 @@ namespace nodes {
             std::vector<std::string> heads = found == roots.end() ? std::vector<std::string>{} : found->second;
             if (!in.revision.empty()) {
                 statement revision{*db, "SELECT data FROM revisions WHERE id=?1"};
-                revision.text(1, in.revision);
+                revision.text(1, resolve_revision(in.worldline, in.revision));
                 if (!revision.next())
                     fail(nodes::code::invalid_record, "revision not found");
                 heads = string_list(codec::decode(revision.data(0)).at("frontier"));
@@ -5142,9 +5279,9 @@ namespace nodes {
             ~cache_boundary() { state.trim_kernel(); }
         } cache{s};
         try {
-            static const std::set<std::string> reads{"identity",   "offer",   "usage",        "rejected",  "send",      "inspect", "tree",
-                                                     "head",       "stat",    "read",         "compare",   "diff",      "history", "receipt",
-                                                     "worldlines", "content", "contribution", "mail_list", "scope_list"};
+            static const std::set<std::string> reads{"identity",   "offer",   "usage",        "rejected",  "send",       "inspect",    "tree",
+                                                     "head",       "stat",    "read",         "compare",   "diff",       "history",    "receipt",
+                                                     "worldlines", "content", "contribution", "mail_list", "scope_list", "references", "reference_history"};
             if (s.read_only && !reads.contains(in.action))
                 fail(nodes::code::policy_denied, "source reader does not accept mutations");
             std::optional<read_snapshot> snapshot;
@@ -5240,6 +5377,8 @@ namespace nodes {
             }
             if (in.action == "mail_send" || in.action == "mail_list")
                 return s.mail(in);
+            if (in.action == "reference" || in.action == "references" || in.action == "reference_history")
+                return s.reference_call(in);
             if (in.action == "worldlines")
                 return s.worldline_list();
             if (in.action == "content")
@@ -5275,12 +5414,12 @@ namespace nodes {
                     heads = string_list(checkpoint.at("frontier"));
                 } else if (!in.revision.empty()) {
                     statement revision{*s.db, "SELECT data FROM revisions WHERE id=?1"};
-                    revision.text(1, in.revision);
+                    revision.text(1, s.resolve_revision(in.worldline, in.revision));
                     if (!revision.next())
                         fail(nodes::code::invalid_record, "revision not found");
                     heads = string_list(codec::decode(revision.data(0)).at("frontier"));
                 }
-                if (!in.revision.empty() && s.version(heads) != in.revision)
+                if (!in.revision.empty() && s.version(heads) != s.resolve_revision(in.worldline, in.revision))
                     fail(nodes::code::invalid_record, "revision does not identify the selected frontier");
                 if (!in.source.empty() || !in.revision.empty() || !in.snapshot.empty()) {
                     s.ensure_kernel();

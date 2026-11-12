@@ -190,6 +190,16 @@ namespace {
                     expect(fresh.ok && fresh.results.at(0).bytes_sent == 0u) << "a fresh build runs again, on the worker that has the files";
                     auto pinned =
                         co_await tools::build::run(services, {}, {.project = "app", .worldline = std::string{"main"}, .version = first.revision}, note, tester);
+                    auto checkpoint = co_await tools::worldline::run(services, {},
+                                                                     {.project = "app",
+                                                                      .action = "reference",
+                                                                      .worldline = std::string{"main"},
+                                                                      .version = pinned.revision,
+                                                                      .operation_id = std::string{"reviewed-source"},
+                                                                      .intent = std::string{"Reviewed source"},
+                                                                      .reference = nodes::reference_input{.name = "reviewed"}},
+                                                                     note, tester);
+                    expect(checkpoint.references->front().version == pinned.revision);
                     co_await fixture::edit_text(
                         services, {.project = "app", .path = "src/message.txt", .old_string = "hello", .new_string = "goodbye", .operation_id = "edit-4"}, note,
                         tester);
@@ -197,8 +207,8 @@ namespace {
                     expect(changed.ok && changed.results.at(0).steps.at(0).output == "goodbye "
                                                                                      "source\n");
                     expect(changed.results.at(0).bytes_sent == 15u);
-                    auto older = co_await tools::build::run(services, {}, {.project = "app", .worldline = std::string{"main"}, .version = pinned.revision},
-                                                            note, tester);
+                    auto older = co_await tools::build::run(
+                        services, {}, {.project = "app", .worldline = std::string{"main"}, .version = std::string{"@reviewed"}}, note, tester);
                     expect(older.ok && older.results.at(0).steps.at(0).output == "hello source\n") << "a named version builds exactly that version";
                     auto hits = co_await fixture::search_files(services, {.project = "app", .query = "source"}, note, tester);
                     expect(hits.matches.size() == 1u && hits.matches.at(0).path == "src/message.txt");

@@ -510,12 +510,12 @@ export namespace tools {
                             "use Unicode scalar offsets. Repeat an operation_id with identical input to recover its recorded result."> {
         struct input {
             rfl::Description<"Project; supplied by the execution context when absent", std::optional<std::string>> project;
-            rfl::Description<"list, inspect, read, compare, diff, promote, fork, apply, receipt, history, contribution, reverse, redo, export or restore",
+            rfl::Description<"list, inspect, read, compare, diff, promote, fork, apply, receipt, history, contribution, reference, references, "
+                             "reference_history, reverse, redo, export or restore",
                              std::string>
                 action;
             rfl::Description<"Worldline name; task binding when absent; explicit selection required without a task", std::optional<std::string>> worldline;
-            rfl::Description<"inspect/read/fork/export: selected version; diff/promote: source version (required for promote)", std::optional<std::string>>
-                version;
+            rfl::Description<"Selected version or @tag/channel; diff/promote: source version (required for promote)", std::optional<std::string>> version;
             rfl::Description<"apply/reverse/redo/compare: observed version; diff/promote: target version (required for promote)", std::optional<std::string>>
                 observed;
             rfl::Description<"read: first Unicode scalar to return in a text file", std::optional<std::uint64_t>> offset;
@@ -534,6 +534,10 @@ export namespace tools {
             rfl::Description<"reverse/redo/contribution: the history entry to undo, restore or describe", std::optional<std::string>> target;
             rfl::Description<"history: page size", std::optional<std::uint64_t>> limit;
             rfl::Description<"history: the last entry of the previous page", std::optional<std::string>> cursor;
+            rfl::Description<"reference: name, tag/channel kind, expected prior receipt and build/test/review attestations",
+                             std::optional<nodes::reference_input>>
+                reference;
+            rfl::Description<"references/reference_history: last sequence of the previous page", std::optional<std::uint64_t>> after;
         };
         struct line_entry {
             std::string name, version;
@@ -563,6 +567,7 @@ export namespace tools {
             std::optional<std::vector<lines::entry>> files;
             std::optional<std::vector<std::string>> conflicts;
             std::optional<std::vector<history_entry>> entries;
+            std::optional<std::vector<nodes::reference_record>> references;
             std::optional<std::vector<file_change>> changes;
             // contribution: the worldlines whose current version contains the entry.
             std::optional<std::vector<std::string>> contained_in;
@@ -684,6 +689,29 @@ export namespace tools {
                 out.version = tree.version;
                 out.files = lines::manifest(tree);
                 out.conflicts = tree.conflicts;
+            } else if (action == "reference" || action == "references" || action == "reference_history") {
+                if (action == "reference" && (!in.reference.value() || !in.version.value() || !in.operation_id.value()))
+                    throw tool_error(nodes::code::invalid_record, "reference requires reference, version and operation_id");
+                nodes::node_request request{.action = action,
+                                            .reference = in.reference.value(),
+                                            .worldline = line,
+                                            .revision = in.version.value().value_or(""),
+                                            .intent = in.intent.value().value_or("")};
+                request.after = in.after.value().value_or(0);
+                request.limit = std::min<std::uint64_t>(in.limit.value().value_or(100), config::resolve(*s.snapshot(), project).limits.list_max_entries);
+                if (action == "reference") {
+                    request.operation = lines::operation_of(*in.operation_id.value());
+                    request.caller_operation = *in.operation_id.value();
+                }
+                auto r = co_await node_call(s, project, std::move(request), actor, action != "reference");
+                out.references = r.references;
+                out.truncated = r.truncated;
+                if (action == "reference") {
+                    out.version = r.version;
+                    out.receipt = r.receipt;
+                    out.operation_id = in.operation_id.value();
+                    out.replayed = r.replayed;
+                }
             } else if (action == "read") {
                 if (!in.path.value())
                     throw tool_error(nodes::code::invalid_record, "read names a path");
@@ -815,14 +843,24 @@ export namespace tools {
                                              .operation = lines::operation_of(in.operation_id.value().value_or("")),
                                              .caller_operation = std::string{in.operation_id.value().value_or("")}},
                                             actor, true);
-                out = co_await delta(s, project, r.worldline, r.base_version, r.version, actor);
+                if (!r.references.empty()) {
+                    out.worldline = r.worldline;
+                    out.version = r.version;
+                    out.references = r.references;
+                } else
+                    out = co_await delta(s, project, r.worldline, r.base_version, r.version, actor);
                 out.receipt = r.receipt;
                 out.operation_id = in.operation_id.value();
                 out.replayed = true;
                 out.written_version = r.written_version;
             } else if (action == "history") {
                 auto limit = std::min<std::uint64_t>(in.limit.value().value_or(100), config::resolve(*s.snapshot(), project).limits.list_max_entries);
-                auto r = co_await node_call(s, project, {.action = "history", .worldline = line, .target = in.cursor.value().value_or(""), .limit = limit},
+                auto r = co_await node_call(s, project,
+                                            {.action = "history",
+                                             .worldline = line,
+                                             .revision = in.version.value().value_or(""),
+                                             .target = in.cursor.value().value_or(""),
+                                             .limit = limit},
                                             actor, true);
                 std::vector<history_entry> entries;
                 for (auto& h : r.history)

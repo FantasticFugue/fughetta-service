@@ -40,9 +40,24 @@ export namespace nodes {
         std::string task, run, worldline, token, identity;
         bool active = true;
     };
+    struct attestation {
+        std::string kind, receipt, conclusion;
+    };
+    struct reference_input {
+        std::string name, kind = "tag";
+        // Empty creates a name; updates name the last reference receipt.
+        std::string expected;
+        std::vector<attestation> attestations;
+    };
+    struct reference_record {
+        std::string name, kind, worldline, version, actor, intent, operation_id, receipt, previous;
+        std::uint64_t sequence = 0, created_at = 0;
+        std::vector<attestation> attestations;
+    };
     struct node_request {
         std::string action;
         std::optional<mail_input> mail;
+        std::optional<reference_input> reference;
         std::uint64_t after = 0;
         std::string worldline = "main";
         std::string revision, snapshot;
@@ -117,6 +132,7 @@ export namespace nodes {
         std::vector<file_view> files;
         std::vector<source_difference> changes;
         std::vector<history_entry> history;
+        std::vector<reference_record> references;
         std::map<std::string, std::vector<std::string>> worldlines;
         std::vector<line_view> lines;
         std::vector<scope_lease> leases;
