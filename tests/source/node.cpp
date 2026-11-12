@@ -84,6 +84,67 @@ namespace {
     auto inspect(nodes::local_node& node) -> nodes::node_reply { return good(node, {.action = "inspect"}); }
 
     const auto cases = [] {
+        "named checkpoints and channels preserve source selection and operation recovery"_test = [] {
+            test::scratch tmp{"named-checkpoints"};
+            std::string first, second, reference_receipt;
+            {
+                nodes::local_node node{tmp.dir};
+                good(node, {.action = "initialize"});
+                auto a = good(
+                    node,
+                    {.action = "apply", .operation = op("release-source"), .edits = {{.kind = "create", .path = "app", .text = "one", .executable = true}}});
+                first = a.version;
+                nodes::node_request tag{.action = "reference",
+                                        .reference = nodes::reference_input{.name = "v1.0.0", .attestations = {{"review", "", "Approved"}}},
+                                        .revision = first,
+                                        .operation = op("release-tag"),
+                                        .owner = node.node_id(),
+                                        .actor = "alice",
+                                        .intent = "First release"};
+                auto named = good(node, tag);
+                reference_receipt = named.receipt;
+                auto b = good(
+                    node,
+                    {.action = "apply", .operation = op("next-source"), .expected = a.frontier, .edits = {{.kind = "write", .path = "app", .text = "two"}}});
+                second = b.version;
+                expect(good(node, tag).replayed);
+                expect(text(good(node, {.action = "read", .revision = "@v1.0.0", .target = "app"}), "app") == "one");
+                expect(good(node, {.action = "history", .revision = "v1.0.0"}).history.size() == 1_u);
+                tag.operation = op("overwrite-tag");
+                tag.revision = second;
+                expect(attempt(node, tag).code == nodes::code::source_conflict);
+                nodes::node_request channel{.action = "reference",
+                                            .reference = nodes::reference_input{.name = "stable", .kind = "channel"},
+                                            .revision = first,
+                                            .operation = op("stable-start"),
+                                            .owner = node.node_id(),
+                                            .actor = "alice"};
+                auto start = good(node, channel);
+                channel.reference->expected = start.receipt;
+                channel.revision = second;
+                channel.operation = op("stable-move");
+                auto moved = good(node, channel);
+                expect(moved.references.front().previous == start.receipt);
+                expect(good(node, channel).replayed);
+                channel.operation = op("stale-move");
+                expect(attempt(node, channel).code == "stale_reference");
+                expect(good(node, {.action = "head", .revision = "@stable"}).version == second);
+                auto replay = good(node, {.action = "receipt", .operation = op("release-tag")});
+                expect(replay.version == first && replay.receipt == reference_receipt);
+                expect(good(node, {.action = "head"}).version == second);
+                auto refs = good(node, {.action = "reference_history", .limit = 2});
+                expect(refs.references.size() == 2_u && refs.truncated);
+                expect(good(node, {.action = "reference_history", .after = refs.references.back().sequence}).references.size() == 1_u);
+                auto fork = good(node, {.action = "fork", .worldline = "release-fix", .operation = op("release-fork"), .source = a.frontier});
+                expect(text(good(node, {.action = "read", .worldline = "release-fix", .revision = fork.version, .target = "app"}), "app") == "one");
+                expect(attempt(node, {.action = "head", .worldline = "release-fix", .revision = "@stable"}).code == nodes::code::invalid_record);
+            }
+            nodes::local_node reopened{tmp.dir};
+            expect(good(reopened, {.action = "references"}).references.size() == 2_u);
+            expect(good(reopened, {.action = "head", .revision = "@v1.0.0"}).version == first);
+            expect(good(reopened, {.action = "head", .revision = "@stable"}).version == second);
+            expect(good(reopened, {.action = "receipt", .operation = op("release-tag")}).receipt == reference_receipt);
+        };
         "DCN1 rejects ambiguous encodings and preserves typed values"_test = [] {
             value input =
                 value::map{{"array", value::array{value{}, true, false, std::uint64_t{42}, nodes::bytes{std::string{"a\0b", 3}}}}, {"text", "hello 世界"}};

@@ -268,8 +268,8 @@ export namespace source_server {
             co_return co_await io::blocking(rt_.get_scheduler(core), pool_, [this, root, request = std::move(request)]() mutable {
                 authorize(request.actor);
                 // A workspace at its storage limit accepts reversals but no additional source history.
-                static const std::set<std::string, std::less<>> growing{"mail_send", "apply",   "promote", "fork",    "integrate",
-                                                                        "admit",     "resolve", "redo",    "receive", "restore"};
+                static const std::set<std::string, std::less<>> growing{"reference", "mail_send", "apply", "promote", "fork",   "integrate",
+                                                                        "admit",     "resolve",   "redo",  "receive", "restore"};
                 auto stores = growing.contains(request.request.action) ? request.request.workspace_limit : 0;
                 return repositories_.with(
                     root,

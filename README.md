@@ -732,6 +732,32 @@ The Console exposes component-specific editors. Local executable versions,
 behavioral acceptance, and remaining deployment limits are recorded once in the
 [toolchain acceptance record](../console/DEPLOYMENT.md#c-and-python-toolchains--october-27-2026).
 
+### Named source checkpoints
+
+`worldline` action `reference` records a name in one worldline. Supply `version`
+(an opaque version, a name, or `@name`), `operation_id`, optional `intent`, and
+`reference: {name, kind, expected, attestations}`. `kind` is `tag` or `channel`;
+`expected` is empty when creating a name and is the previous reference receipt
+when moving a channel. Tags cannot be replaced, and names cannot change kind.
+A stale channel update returns `stale_reference`.
+
+Each attestation has `kind` (`build`, `test`, or `review`), `receipt` (empty when
+there is no linked receipt), and a nonempty `conclusion`. These are statements by
+the authenticated caller; recording one does not execute a build or test.
+The result includes `references`, with actor, intent, selected version, creation
+time, operation ID, current/previous receipt and a monotonic sequence. Pointer
+updates and their operation bindings commit together without changing source
+history. Replaying identical input or requesting `receipt` with the original
+operation ID recovers the original selection even after a channel moves.
+
+`references` lists the current names; `reference_history` lists their append-only
+change records. Both page by numeric `after` sequence and `limit`, with
+`truncated` indicating more results. Names are scoped to the selected worldline.
+`inspect`, `read`, `compare`, `fork`, and `history`, plus build/test/run version
+inputs, accept `@name` or a bare name. Execution resolves a channel once before
+scheduling its fixed source input. The existing replication `checkpoint` action
+continues to describe internal source snapshots.
+
 ## Concurrency budget
 
 The configuration owns the execution thread count and subprocess parallelism:
