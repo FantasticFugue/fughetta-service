@@ -6,7 +6,6 @@
 # the dependency direction is checked at this granularity.
 function(add_layer TARGET)
   add_library(${TARGET} STATIC)
-  target_link_libraries(${TARGET} PUBLIC xclang::std)
 endfunction()
 
 # Interface units, named without the extension, under src/<directory>/.
@@ -65,26 +64,14 @@ add_modules(worker worker executor dependencies)
 
 ## Platform provider
 #
-# Each platform adds the units the platform layer needs. A platform without a
-# provider fails here.
+# The units, definitions, link options and libraries the platform layer adds,
+# from the description the root build includes.
 
-if(WIN32)
-  add_modules(platform platform/windows winapi)
-  add_implementation(platform platform/windows create machine console group flush)
-  # Only the Windows provider includes <windows.h>.
-  target_compile_definitions(platform PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX _WIN32_WINNT=0x0A00 NTDDI_VERSION=0x0A00000C)
-  # The main thread's stack, for every executable that links the platform.
-  target_link_options(platform INTERFACE "LINKER:/STACK:8388608")
-  target_link_libraries(platform PRIVATE advapi32)
-elseif(CMAKE_SYSTEM_NAME MATCHES "Linux|Darwin")
-  string(TOLOWER "${CMAKE_SYSTEM_NAME}" system)
-  add_modules(platform platform/posix descriptor posix)
-  add_implementation(platform platform/posix uname sigwait create flush)
-  add_implementation(platform platform/${system} posix affinity)
-else()
-  message(FATAL_ERROR "No platform provider for ${CMAKE_SYSTEM_NAME}")
-endif()
-message(STATUS "Platform: ${CMAKE_SYSTEM_NAME}")
+add_modules(platform platform ${PLATFORM_MODULES})
+add_implementation(platform platform ${PLATFORM_IMPLEMENTATION})
+target_compile_definitions(platform PRIVATE ${PLATFORM_DEFINITIONS})
+target_link_options(platform INTERFACE ${PLATFORM_LINK_OPTIONS})
+target_link_libraries(platform PRIVATE ${PLATFORM_LIBRARIES})
 
 ## How they depend
 #

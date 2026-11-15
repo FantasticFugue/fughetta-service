@@ -424,7 +424,7 @@ export namespace transport {
 
     template <class T> auto decode(const frame& f) -> T { return codec<T>::decode(f.payload); }
 
-    struct remote_error : std::runtime_error, util::retained_error<remote_error> {
+    struct remote_error : std::runtime_error {
         remote_error(std::string message, std::string_view code) : std::runtime_error(std::move(message)), code(code) {}
         std::string code;
     };
@@ -438,13 +438,13 @@ export namespace transport {
                 if constexpr (std::same_as<std::remove_cvref_t<E>, jobs::failure>)
                     throw remote_error(std::move(e.message), std::move(e.code));
                 else
-                    util::rethrow_exception(e);
+                    std::rethrow_exception(e);
             },
             std::move(error));
         std::unreachable();
     }
 
-    struct coded_error : std::runtime_error, util::retained_error<coded_error> {
+    struct coded_error : std::runtime_error {
         coded_error(std::string_view code, std::string message) : std::runtime_error(std::move(message)), code(code) {}
         std::string code;
     };
@@ -532,11 +532,11 @@ export namespace transport {
                     }
                 }
             } catch (...) {
-                why = util::current_exception();
+                why = std::current_exception();
             }
             if (!why && !stopped)
-                why = util::make_exception_ptr(io::closed{});
-            ended_ = why ? why : util::make_exception_ptr(io::closed{});
+                why = std::make_exception_ptr(io::closed{});
+            ended_ = why ? why : std::make_exception_ptr(io::closed{});
             std::vector<pending*> waiting;
             for (auto& [corr, slot] : pending_)
                 waiting.push_back(slot);

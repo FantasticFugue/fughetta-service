@@ -26,7 +26,7 @@ jobs:
             os: ubuntu-24.04
           - name: windows-x64
             os: windows-2025
-            configure: -DXCLANG_SANITIZER=
+            configure: -DCLANG_SANITIZER=
     steps:
       - uses: actions/checkout@v7
 
@@ -46,8 +46,9 @@ jobs:
           key: ${{ steps.toolchain.outputs.installed-key }}
 
       - name: Build
-        # xclang occasionally segfaults on a unit that compiles on the next
-        # attempt; ninja retries only what failed, and ten failures fail the step.
+        # The compiler occasionally segfaults on a unit that compiles on
+        # the next attempt; ninja retries only what failed, and ten failures
+        # fail the step.
         run: |
           for attempt in $(seq 10); do
             cmake --build --preset debug --parallel 2 && exit 0

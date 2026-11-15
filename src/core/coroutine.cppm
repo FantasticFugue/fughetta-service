@@ -45,7 +45,7 @@ export namespace coroutine {
 
             auto get_env() const noexcept -> env;
             auto initial_suspend() noexcept -> std::suspend_always { return {}; }
-            void unhandled_exception() noexcept { error_ = util::current_exception(); }
+            void unhandled_exception() noexcept { error_ = std::current_exception(); }
 
             auto unhandled_stopped() noexcept -> std::coroutine_handle<> { return on_stopped_(stopped_ctx_); }
 
@@ -161,7 +161,7 @@ export namespace coroutine {
                     try {
                         self->result_.template emplace<1>(std::forward<Vs>(vs)...);
                     } catch (...) {
-                        self->boundary_error_ = util::current_exception();
+                        self->boundary_error_ = std::current_exception();
                     }
                     self->resume();
                 }
@@ -169,7 +169,7 @@ export namespace coroutine {
                     try {
                         self->result_.template emplace<2>(std::in_place_type<std::decay_t<E>>, std::forward<E>(e));
                     } catch (...) {
-                        self->boundary_error_ = util::current_exception();
+                        self->boundary_error_ = std::current_exception();
                     }
                     self->resume();
                 }
@@ -232,7 +232,7 @@ export namespace coroutine {
                     try {
                         ::new (static_cast<void*>(storage_)) op_t(execution::connect(std::move(sender_), receiver{&state_, {state_.promise_->stop_}}));
                     } catch (...) {
-                        state_.boundary_error_ = util::current_exception();
+                        state_.boundary_error_ = std::current_exception();
                         return self;
                     }
                     live_ = true;
@@ -247,7 +247,7 @@ export namespace coroutine {
 
             auto await_resume() {
                 if (state_.boundary_error_)
-                    util::rethrow_exception(state_.boundary_error_);
+                    std::rethrow_exception(state_.boundary_error_);
                 if constexpr (M == mode::stop_point) {
                     using out = std::conditional_t<std::is_void_v<value_type>, bool, std::optional<value_type>>;
                     if (state_.result_.index() == 3)
@@ -294,7 +294,7 @@ export namespace coroutine {
                     std::visit(
                         []<class E>(E& e) {
                             if constexpr (std::same_as<E, std::exception_ptr>)
-                                util::rethrow_exception(e);
+                                std::rethrow_exception(e);
                             else if constexpr (std::same_as<E, std::error_code>)
                                 throw std::system_error(e);
                             else
@@ -352,14 +352,14 @@ export namespace coroutine {
                     if (stopped_)
                         return out{};
                     if (p.error_)
-                        util::rethrow_exception(p.error_);
+                        std::rethrow_exception(p.error_);
                     if constexpr (std::is_void_v<T>)
                         return true;
                     else
                         return out{std::move(*p.value_)};
                 } else {
                     if (p.error_)
-                        util::rethrow_exception(p.error_);
+                        std::rethrow_exception(p.error_);
                     if constexpr (!std::is_void_v<T>)
                         return std::move(*p.value_);
                 }
@@ -486,7 +486,7 @@ export namespace coroutine {
                         throw std::logic_error("cannot start an empty coroutine task");
                     h_.promise().stop_ = bridge_.attach(execution::get_stop_token(execution::get_env(rcvr_)));
                 } catch (...) {
-                    auto failure = util::current_exception();
+                    auto failure = std::current_exception();
                     bridge_.detach();
                     auto receiver = std::move(rcvr_);
                     execution::set_error(std::move(receiver), std::move(failure));
@@ -518,7 +518,7 @@ export namespace coroutine {
                         auto value = std::move(*p.value_);
                         execution::set_value(std::move(receiver), std::move(value));
                     } catch (...) {
-                        execution::set_error(std::move(receiver), util::current_exception());
+                        execution::set_error(std::move(receiver), std::current_exception());
                     }
                 }
                 return std::noop_coroutine();
@@ -564,7 +564,7 @@ export namespace coroutine {
         auto join() -> task<> {
             co_await under(stop_token{}, join_unstoppable());
             if (auto e = std::exchange(failure_, {}))
-                util::rethrow_exception(e);
+                std::rethrow_exception(e);
         }
 
     private:
@@ -594,17 +594,17 @@ export namespace coroutine {
         try {
             outcome = co_await stop_point(body(children));
         } catch (...) {
-            failure = util::current_exception();
+            failure = std::current_exception();
         }
         children.request_stop();
         try {
             co_await children.join();
         } catch (...) {
             if (!failure)
-                failure = util::current_exception();
+                failure = std::current_exception();
         }
         if (failure)
-            util::rethrow_exception(failure);
+            std::rethrow_exception(failure);
         if (!outcome || parent.stop_requested())
             co_await coroutine::stop;
         if constexpr (!std::is_void_v<T>)
@@ -710,7 +710,7 @@ export namespace coroutine {
                         race.out.emplace(std::move(*result));
                 }
             } catch (...) {
-                race.fail(util::current_exception());
+                race.fail(std::current_exception());
             }
             race.source.request_stop();
         }
@@ -724,7 +724,7 @@ export namespace coroutine {
                 if (result)
                     race.first.compare_exchange_strong(pending, winner::timer);
             } catch (...) {
-                race.fail(util::current_exception());
+                race.fail(std::current_exception());
             }
             race.source.request_stop();
         }
@@ -751,12 +751,12 @@ export namespace coroutine {
             children.spawn(detail::deadline_branch(race.source.get_token(), detail::deadline_work(std::move(work), race)));
             children.spawn(detail::deadline_branch(race.source.get_token(), detail::deadline_timer(io, limit, race)));
         } catch (...) {
-            race.fail(util::current_exception());
+            race.fail(std::current_exception());
             race.source.request_stop();
         }
         co_await under(stop_token{}, children.join());
         if (race.failure)
-            util::rethrow_exception(race.failure);
+            std::rethrow_exception(race.failure);
         if (race.first.load(std::memory_order_acquire) == winner::pending)
             co_await coroutine::stop;
         co_return std::move(race.out);

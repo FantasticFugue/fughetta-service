@@ -54,8 +54,9 @@ jobs:
           key: ${{ steps.toolchain.outputs.installed-key }}
 
       - name: Build
-        # xclang occasionally segfaults on a unit that compiles on the next
-        # attempt; ninja retries only what failed, and ten failures fail the step.
+        # The compiler occasionally segfaults on a unit that compiles on
+        # the next attempt; ninja retries only what failed, and ten failures
+        # fail the step.
         run: |
           for attempt in $(seq 10); do
             cmake --build --preset release --target fughetta-service --parallel 2 && exit 0
@@ -68,7 +69,7 @@ jobs:
           cmake --install build/release --prefix dist-root
           binary="$(ls dist-root/bin/fughetta-service*)"
           if [ "$RUNNER_OS" != Windows ]; then
-            "$XCLANG_ROOT/bin/llvm-strip" "$binary"
+            "$CLANG_ROOT/bin/llvm-strip" "$binary"
           fi
           if [ "$RUNNER_OS" = macOS ]; then
             codesign --force --sign - "$binary"

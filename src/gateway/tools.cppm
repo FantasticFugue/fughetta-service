@@ -74,7 +74,7 @@ export namespace tools {
     }
 
     // A refusal from the node engine, kept with its code so MCP callers get { code, message }.
-    struct tool_error : std::runtime_error, util::retained_error<tool_error> {
+    struct tool_error : std::runtime_error {
         tool_error(std::string_view code, std::string message) : std::runtime_error(std::move(message)), code(code) {}
         std::string code;
     };
@@ -491,7 +491,7 @@ export namespace tools {
         try {
             co_return co_await fresh();
         } catch (const tool_error&) {
-            failed = util::current_exception();
+            failed = std::current_exception();
         }
         // When even the receipt cannot be read, the caller hears the first answer, which may be outcome_unknown.
         std::optional<std::pair<nodes::node_reply, record>> done;
@@ -501,7 +501,7 @@ export namespace tools {
         }
         if (done)
             co_return replay(*done);
-        util::rethrow_exception(failed);
+        std::rethrow_exception(failed);
     }
 
     struct worldline

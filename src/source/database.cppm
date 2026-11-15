@@ -2308,7 +2308,7 @@ namespace nodes {
             auto merge = [&] {
                 for (auto& row : batch) {
                     if (row.failure)
-                        util::rethrow_exception(row.failure);
+                        std::rethrow_exception(row.failure);
                     auto [stored, inserted] = objects.emplace(std::move(row.id), std::move(row.object));
                     if (inserted) {
                         object_order.push_back(stored->first);

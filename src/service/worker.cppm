@@ -15,7 +15,7 @@ import toolchain;
 
 namespace worker {
     // The Core refused this identity; retrying cannot succeed.
-    struct refused : std::runtime_error, util::retained_error<refused> {
+    struct refused : std::runtime_error {
         explicit refused(std::string_view code)
             : std::runtime_error(code == "worker_revoked" ? "Worker identity was revoked" : "Worker credentials or endpoint were refused") {}
     };

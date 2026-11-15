@@ -66,7 +66,7 @@ export namespace routing {
     };
 
     // No worker takes a dispatch now. `busy` when one could but is at its dispatch limit, so the dispatch may wait for it.
-    struct no_worker : std::runtime_error, util::retained_error<no_worker> {
+    struct no_worker : std::runtime_error {
         explicit no_worker(std::string why, bool busy = false) : std::runtime_error(std::move(why)), busy(busy) {}
         bool busy;
     };

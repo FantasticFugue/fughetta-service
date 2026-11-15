@@ -451,7 +451,7 @@ export namespace io {
                             auto result = std::move(*owner->socket);
                             execution::set_value(std::move(owner->receiver), std::move(result));
                         } catch (...) {
-                            execution::set_error(std::move(owner->receiver), util::current_exception());
+                            execution::set_error(std::move(owner->receiver), std::current_exception());
                         }
                     }
                     template <class E> void set_error(E&& error) noexcept { execution::set_error(std::move(owner->receiver), std::forward<E>(error)); }
@@ -473,7 +473,7 @@ export namespace io {
                         };
                         inner.emplace(connecting{this});
                     } catch (...) {
-                        execution::set_error(std::move(receiver), util::current_exception());
+                        execution::set_error(std::move(receiver), std::current_exception());
                         return;
                     }
                     execution::start(*inner);
@@ -567,7 +567,7 @@ export namespace io {
                 else if constexpr (std::same_as<E, std::exception_ptr>)
                     error.template emplace<2>(std::move(e));
                 else
-                    error.template emplace<2>(util::make_exception_ptr(std::move(e)));
+                    error.template emplace<2>(std::make_exception_ptr(std::move(e)));
             }
             void run() noexcept {
                 try {
@@ -577,7 +577,7 @@ export namespace io {
                     } else
                         value.emplace(work());
                 } catch (...) {
-                    fail(util::current_exception());
+                    fail(std::current_exception());
                 }
                 execution::start(back);
             }
@@ -635,17 +635,17 @@ export namespace cores {
                 if constexpr (std::same_as<std::decay_t<E>, std::exception_ptr>)
                     return std::forward<E>(e);
                 else if constexpr (std::same_as<std::decay_t<E>, std::error_code>)
-                    return util::make_exception_ptr(std::system_error(e));
+                    return std::make_exception_ptr(std::system_error(e));
                 else
-                    return util::make_exception_ptr(std::forward<E>(e));
+                    return std::make_exception_ptr(std::forward<E>(e));
             } catch (...) {
-                return util::current_exception();
+                return std::current_exception();
             }
         }
 
         inline void report(std::exception_ptr error, std::string_view where) noexcept {
             try {
-                util::rethrow_exception(error);
+                std::rethrow_exception(error);
             } catch (const std::exception& e) {
                 logging::error(std::format("{}: {}", where, e.what()));
             } catch (...) {
@@ -691,7 +691,7 @@ export namespace cores {
                     try {
                         action();
                     } catch (...) {
-                        control_error{}(util::current_exception());
+                        control_error{}(std::current_exception());
                     }
                     execution::set_value(std::move(out));
                 }
@@ -759,7 +759,7 @@ export namespace cores {
                 try {
                     state->value.emplace(std::forward<Values>(values)...);
                 } catch (...) {
-                    state->error = util::current_exception();
+                    state->error = std::current_exception();
                 }
                 state->context->stop();
             }
@@ -784,7 +784,7 @@ export namespace cores {
         execution::start(operation);
         context.run();
         if (state.error)
-            util::rethrow_exception(state.error);
+            std::rethrow_exception(state.error);
         if constexpr (std::is_void_v<value>)
             return state.value.has_value();
         else
@@ -809,7 +809,7 @@ export namespace cores {
                     try {
                         self->result_.template emplace<1>(std::in_place_type<std::tuple<std::decay_t<Values>...>>, std::forward<Values>(value)...);
                     } catch (...) {
-                        self->result_.template emplace<2>(util::current_exception());
+                        self->result_.template emplace<2>(std::current_exception());
                     }
                     self->inner_done();
                 }
@@ -867,7 +867,7 @@ export namespace cores {
                     };
                     inner_.emplace(connecting{this});
                 } catch (...) {
-                    result_.template emplace<2>(util::current_exception());
+                    result_.template emplace<2>(std::current_exception());
                     inner_done();
                     return;
                 }
@@ -1020,7 +1020,7 @@ export namespace cores {
         void release_join() noexcept { join_.reset(); }
         void rethrow_failure() {
             if (failure_)
-                util::rethrow_exception(failure_);
+                std::rethrow_exception(failure_);
         }
         void unpublish(std::size_t core) {
             std::lock_guard lock(lifecycle_);
@@ -1132,7 +1132,7 @@ export namespace cores {
             auto remember = [&] {
                 std::lock_guard lock(errors);
                 if (!startup_error)
-                    startup_error = util::current_exception();
+                    startup_error = std::current_exception();
             };
             {
                 std::vector<std::jthread> threads;
@@ -1183,7 +1183,7 @@ export namespace cores {
                 }
             }
             if (startup_error)
-                util::rethrow_exception(startup_error);
+                std::rethrow_exception(startup_error);
             this->rethrow_failure();
         }
 

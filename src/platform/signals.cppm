@@ -16,16 +16,16 @@ export namespace cores {
 } // namespace cores
 
 // The platform host owns the service-manager handshake; the application owns scheduling.
-export namespace daemon {
+export namespace lifecycle {
     auto run(int argc, char** argv, int (*application)(int, char**), bool service, std::string_view identity) -> int;
     enum class phase { starting, initialized, ready, draining, stopping, stopped };
     inline std::atomic<phase> current{phase::starting};
     inline std::string identity;
     auto name(phase value) -> std::string_view;
     void publish(phase value);
-} // namespace daemon
+} // namespace lifecycle
 
-namespace daemon {
+namespace lifecycle {
     auto name(phase value) -> std::string_view {
         switch (value) {
         case phase::starting:
@@ -43,4 +43,4 @@ namespace daemon {
         }
         return "starting";
     }
-} // namespace daemon
+} // namespace lifecycle

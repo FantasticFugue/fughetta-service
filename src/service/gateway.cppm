@@ -56,7 +56,7 @@ namespace gateway {
             auto run_children = [&](coroutine::scope& children) -> coroutine::task<> {
                 if (core == 0 && !executable_.empty()) {
                     co_await processes.start(io, children, executable_, doc_);
-                    daemon::publish(daemon::phase::initialized);
+                    lifecycle::publish(lifecycle::phase::initialized);
                     children.spawn(supervise(io, processes));
                 }
                 children.spawn(router_.workers(core).watch(io));
@@ -81,7 +81,7 @@ namespace gateway {
             try {
                 co_await processes.supervise(io);
             } catch (...) {
-                daemon::publish(daemon::phase::stopping);
+                lifecycle::publish(lifecycle::phase::stopping);
                 rt_.stop();
                 throw;
             }
@@ -92,11 +92,11 @@ namespace gateway {
             for (;;) {
                 if (interrupted_ && interrupted_->load()) {
                     control_.drain();
-                    daemon::publish(daemon::phase::draining);
+                    lifecycle::publish(lifecycle::phase::draining);
                     if (!deadline)
                         deadline = std::chrono::steady_clock::now() + std::chrono::seconds{5};
                     if ((control_.idle() && queue_->idle()) || std::chrono::steady_clock::now() >= *deadline) {
-                        daemon::publish(daemon::phase::stopping);
+                        lifecycle::publish(lifecycle::phase::stopping);
                         rt_.stop();
                         co_return;
                     }
@@ -106,7 +106,7 @@ namespace gateway {
                 auto current = hub_.current(0);
                 if (current->runtime != doc_.runtime) {
                     control_.drain();
-                    daemon::publish(daemon::phase::draining);
+                    lifecycle::publish(lifecycle::phase::draining);
                     if (control_.idle() && queue_->idle()) {
                         reconfigure_ = true;
                         rt_.stop();
@@ -116,7 +116,7 @@ namespace gateway {
                     auto workers = router_.workers(0).describe(0);
                     if (std::ranges::count_if(workers, [](const auto& w) { return w.online; }) == doc_.runtime.workers) {
                         control_.ready(current->revisions.runtime);
-                        daemon::publish(daemon::phase::ready);
+                        lifecycle::publish(lifecycle::phase::ready);
                     }
                 }
                 co_await execution::schedule_after(io, std::chrono::milliseconds{50});
@@ -193,7 +193,7 @@ export int run_gateway(int argc, char** argv, bool managed) {
         environment::load(file.parent_path() / ".env");
         std::atomic<bool> interrupted{false};
         for (;;) {
-            daemon::publish(daemon::phase::starting);
+            lifecycle::publish(lifecycle::phase::starting);
             config::document doc;
             if (argc > 1 || std::filesystem::exists(file))
                 doc = config::load(file);
@@ -208,7 +208,7 @@ export int run_gateway(int argc, char** argv, bool managed) {
                 bool managed;
                 void stop() noexcept {
                     interrupted.store(true);
-                    if (!managed || daemon::current.load() == daemon::phase::starting || daemon::current.load() == daemon::phase::initialized)
+                    if (!managed || lifecycle::current.load() == lifecycle::phase::starting || lifecycle::current.load() == lifecycle::phase::initialized)
                         context.stop();
                 }
             } stop{context, interrupted, managed};
@@ -219,10 +219,10 @@ export int run_gateway(int argc, char** argv, bool managed) {
                 break;
         }
     } catch (const std::exception& e) {
-        daemon::publish(daemon::phase::stopping);
+        lifecycle::publish(lifecycle::phase::stopping);
         logging::error(std::format("gateway: {}", e.what()));
         return 1;
     }
-    daemon::publish(daemon::phase::stopping);
+    lifecycle::publish(lifecycle::phase::stopping);
     return 0;
 }

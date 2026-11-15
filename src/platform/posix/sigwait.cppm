@@ -32,7 +32,7 @@ namespace cores {
     signal_watch::~signal_watch() = default;
 } // namespace cores
 
-namespace daemon {
+namespace lifecycle {
     void publish(phase value) {
         if (current.exchange(value) == value)
             return;
@@ -50,4 +50,4 @@ namespace daemon {
             publish(phase::stopped);
         return result;
     }
-} // namespace daemon
+} // namespace lifecycle

@@ -44,7 +44,7 @@ export namespace replica {
             try {
                 stopped = !(co_await coroutine::under(token, std::move(work)));
             } catch (...) {
-                failed = util::current_exception();
+                failed = std::current_exception();
             }
             auto finish = [this]() -> coroutine::task<> {
                 std::exception_ptr failed;
@@ -54,11 +54,11 @@ export namespace replica {
                         co_await retire(key);
                     } catch (...) {
                         if (!failed)
-                            failed = util::current_exception();
+                            failed = std::current_exception();
                     }
                 }
                 if (failed)
-                    util::rethrow_exception(failed);
+                    std::rethrow_exception(failed);
             };
             auto cleanup = [&]() -> coroutine::task<> {
                 if (core == home_)
@@ -68,7 +68,7 @@ export namespace replica {
             };
             co_await coroutine::under(coroutine::stop_token{}, cleanup());
             if (failed)
-                util::rethrow_exception(failed);
+                std::rethrow_exception(failed);
             if (stopped)
                 co_await coroutine::stop;
         }
@@ -193,11 +193,11 @@ export namespace replica {
             try {
                 co_await old->server->abort();
             } catch (...) {
-                failed = util::current_exception();
+                failed = std::current_exception();
             }
             old->server.reset();
             if (failed)
-                util::rethrow_exception(failed);
+                std::rethrow_exception(failed);
         }
 
         auto collect_sessions(bool pressure = false) -> coroutine::task<> {
@@ -325,12 +325,12 @@ export namespace replica {
                             {.name = "analysis", .timed_out = true, .output = "execution deadline exceeded during artifact or language analysis"});
                 }
             } catch (...) {
-                failed = util::current_exception();
+                failed = std::current_exception();
             }
             if (r.survey && (failed || !report || !report->ok()))
                 co_await coroutine::under(coroutine::stop_token{}, retire(key));
             if (failed)
-                util::rethrow_exception(failed);
+                std::rethrow_exception(failed);
             if (!report)
                 co_await coroutine::stop;
             if (!r.exports.empty()) {
