@@ -785,8 +785,8 @@ namespace front {
             static auto handle(context& c, params, const web::target&, std::string_view) -> coroutine::task<web::reply> {
                 auto workers = co_await all_workers(c);
                 // Observed for this request, so a restart or the gap between two syncs cannot report a stale answer.
-                health out{.lifecycle = std::string{daemon::name(daemon::current.load())},
-                           .instance = daemon::identity,
+                health out{.lifecycle = std::string{lifecycle::name(lifecycle::current.load())},
+                           .instance = lifecycle::identity,
                            .source = co_await probe_source(c),
                            .workers = workers.size(),
                            .protocol = jobs::protocol_version};

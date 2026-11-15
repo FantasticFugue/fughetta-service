@@ -31,7 +31,7 @@ the component library `@fantasticfugue/components` (`../components`):
 
 ## Dependencies and build
 
-Requires CMake 4.0+, Ninja, vcpkg, and the xclang toolchain.
+Requires CMake 4.5+, Ninja, vcpkg, and clang 23 or later with libc++.
 The service defaults to `uring` on Linux (kernel 6.1 or later), `iocp` on Windows, and `kqueue` on
 macOS. Select another mechanism with `-DHTTPANT_IO_BACKEND=NAME` when configuring the service.
 The manifest installs liburing on Linux.
@@ -41,13 +41,19 @@ build's compiler; set
 `FETCHCONTENT_SOURCE_DIR_HTTPANT` to build a local checkout instead. The
 remaining dependencies come from the builtin vcpkg registry at the
 microsoft/vcpkg baseline in `vcpkg-configuration.json`; the vcpkg checkout must
-contain that commit. The toolchain writes the dependency triplet for the target
-into the build directory, so dependencies build with the same xclang.
-`cmake/toolchain.cmake` reads two environment variables: `XCLANG_ROOT` names
-the xclang tree and `VCPKG_ROOT` the vcpkg checkout. `XCLANG_TARGET` selects the
-target, the host's by default. `CMakePresets.json` places each build in
-`build/<preset>`; machine paths belong in a Git-ignored `CMakeUserPresets.json`
-that inherits its presets.
+contain that commit. The toolchain writes the dependency triplet for the host
+into the build directory, so dependencies build with the same clang and flags.
+`cmake/toolchain.cmake` reads two environment variables: `CLANG_ROOT` names a
+clang tree to compile with and `VCPKG_ROOT` the vcpkg checkout. Without
+`CLANG_ROOT` the platform's clang is used, and a `CMAKE_CXX_COMPILER` given to
+CMake wins over both; either way CMake 4.5's `import std` support synthesizes
+the std module from libc++'s manifest. vcpkg's downloads stay in the build
+directory unless `VCPKG_DOWNLOADS` names a shared one. Each target system has a
+description in `cmake/platform/<system>.cmake` (platform units, I/O backend,
+service-manager template) and its own tests in `tests/platform/<system>.cmake`;
+porting to a new system starts with those two files. `CMakePresets.json`
+places each build in `build/<preset>`; machine paths belong in a Git-ignored
+`CMakeUserPresets.json` that inherits its presets.
 Build products and dependency working directories belong under `build/`.
 
 From this directory:
@@ -66,10 +72,9 @@ python3 tests/run.py --test-dir build/debug -- -R '^front$' --output-on-failure
 
 The test entry runs CTest as the current user; no cgroup delegation or sudo is required.
 
-The debug preset builds with `-g0` and address and undefined-behavior
-sanitizers. Frame pointers keep sanitizer stacks symbolized by function name;
-no file/line, type, or local-variable debug information is emitted.
-`XCLANG_SANITIZER` selects the sanitizers, with their matching runtimes.
+The debug preset builds with address and undefined-behavior sanitizers.
+`CLANG_SANITIZER` selects the sanitizers, with their matching runtimes, and
+adds frame pointers so sanitizer stacks stay symbolized by function name.
 `release` disables tests and sanitizers and enables benchmarks and
 interprocedural optimization.
 

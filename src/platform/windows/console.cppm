@@ -63,7 +63,7 @@ namespace cores {
     signal_watch::~signal_watch() = default;
 } // namespace cores
 
-namespace daemon {
+namespace lifecycle {
     namespace {
         SERVICE_STATUS_HANDLE handle = nullptr;
         SERVICE_STATUS status{SERVICE_WIN32_OWN_PROCESS};
@@ -145,4 +145,4 @@ namespace daemon {
             return 1;
         return result;
     }
-} // namespace daemon
+} // namespace lifecycle

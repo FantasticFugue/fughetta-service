@@ -19,7 +19,7 @@ export namespace nodes {
         inline constexpr std::string_view identity_conflict = "identity_conflict";
     } // namespace code
 
-    struct error : std::runtime_error, util::retained_error<error> {
+    struct error : std::runtime_error {
         std::string code;
         std::vector<std::string> missing;
         std::vector<std::string> conflicts;

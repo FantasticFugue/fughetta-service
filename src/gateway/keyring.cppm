@@ -9,7 +9,7 @@ import world;
 
 // Who sends a request to this core: the holder of a bearer token, or the caller a front on the private network names.
 export namespace keyring {
-    struct unauthorized : std::runtime_error, util::retained_error<unauthorized> {
+    struct unauthorized : std::runtime_error {
         using std::runtime_error::runtime_error;
     };
 

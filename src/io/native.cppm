@@ -93,7 +93,7 @@ export namespace native {
                     try {
                         watch.emplace(execution::get_stop_token(execution::get_env(receiver)), on_stop{this});
                     } catch (...) {
-                        execution::set_error(std::move(receiver), util::current_exception());
+                        execution::set_error(std::move(receiver), std::current_exception());
                         return;
                     }
                     s->child.begin_wait(*this);

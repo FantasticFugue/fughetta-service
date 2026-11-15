@@ -1,21 +1,8 @@
 export module utility;
 
 import std;
-export import httpant.exception;
 
 export namespace util {
-    using http::exceptions::current_exception;
-    using http::exceptions::make_exception_ptr;
-    using std::rethrow_exception;
-
-    // Retains an error's concrete type across a module boundary. httpant's
-    // exception module captures through exception_capture; the capture runs in
-    // this module unit, so clang records the copy constructor in the throw
-    // metadata on the Microsoft ABI (see httpant.exception).
-    template <class Error> struct retained_error : http::exceptions::exception_capture {
-        auto capture() const noexcept -> std::exception_ptr override { return http::exceptions::capture(static_cast<const Error&>(*this)); }
-    };
-
     // A move-only, type-erased callable with a small buffer, for the places the
     // scheduler and the service layers hand a callback to somebody and forget
     // the concrete type (a post to a worker, a notification sink, a gate

@@ -2,37 +2,49 @@
 # add_subdirectory(tests) when FUGHETTA_BUILD_TESTS is on; every target here is built
 # only for that.
 #
-# A suite is `add_suite(<name> <source under tests/> <targets it links>)`; it
-# produces `<name>-test`, registered with the same name, and links the testing
-# layer, which brings every layer up to gateway. Sources that need a
-# script driver are registered directly with add_test.
+# A suite is `add_suite(<name> <source under tests/> [SERVICE] [TIMEOUT <s>]
+# [ENVIRONMENT <var=value>...] <targets it links>)`; it produces `<name>-test`,
+# registered with the same name, and links the testing layer, which brings
+# every layer up to gateway. SERVICE suites start the built fughetta-service.
+# Sources that need a script driver are registered directly with add_test.
+#
+# tests/platform/<system>.cmake adds the platform's own tests. TEST_ENVIRONMENT
+# collects what every test sees.
 
 # The scripted drivers look for their helpers beside the services, so test
 # binaries keep the flat layout the root build has.
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}")
 
 find_package(ut CONFIG REQUIRED)
+find_package(Python3 COMPONENTS Interpreter REQUIRED)
+set(TEST_ENVIRONMENT
+  "SOURCE_TOKEN=source-test-secret"
+  "TMPDIR=${CMAKE_BINARY_DIR}" "TEMP=${CMAKE_BINARY_DIR}" "TMP=${CMAKE_BINARY_DIR}"
+  "TEST_PYTHON=${Python3_EXECUTABLE}")
 
 add_layer(testing)
 add_modules(testing testing support fixture launch)
 # boost.ut's global module fragment differs per platform; the header itself is
 # included in the module purview, as its module mode expects.
-if(WIN32)
-  set(UT_PLATFORM windows)
-else()
-  set(UT_PLATFORM posix)
-endif()
-add_modules(testing testing/${UT_PLATFORM} ut)
-set_source_files_properties("${FUGHETTA_SOURCE}/testing/${UT_PLATFORM}/ut.cppm" PROPERTIES
+add_modules(testing testing/${PLATFORM_FAMILY} ut)
+set_source_files_properties("${FUGHETTA_SOURCE}/testing/${PLATFORM_FAMILY}/ut.cppm" PROPERTIES
   COMPILE_DEFINITIONS BOOST_UT_CXX_MODULES=1 COMPILE_OPTIONS -Wno-include-angled-in-module-purview)
 add_implementation(testing testing service)
 target_link_libraries(testing PUBLIC gateway Boost::ut PRIVATE source)
 
 function(add_suite NAME SOURCE)
+  cmake_parse_arguments(PARSE_ARGV 2 SUITE "SERVICE" "TIMEOUT" "ENVIRONMENT")
+  if(NOT SUITE_TIMEOUT)
+    set(SUITE_TIMEOUT 120)
+  endif()
   add_executable(${NAME}-test "${CMAKE_CURRENT_SOURCE_DIR}/${SOURCE}")
-  target_link_libraries(${NAME}-test PRIVATE testing ${ARGN})
+  target_link_libraries(${NAME}-test PRIVATE testing ${SUITE_UNPARSED_ARGUMENTS})
+  if(SUITE_SERVICE)
+    target_compile_definitions(${NAME}-test PRIVATE SERVICE_EXECUTABLE="$<TARGET_FILE:fughetta-service>")
+    add_dependencies(${NAME}-test fughetta-service)
+  endif()
   add_test(NAME ${NAME} COMMAND ${NAME}-test)
-  set_tests_properties(${NAME} PROPERTIES TIMEOUT 120)
+  set_tests_properties(${NAME} PROPERTIES TIMEOUT ${SUITE_TIMEOUT} ENVIRONMENT "${SUITE_ENVIRONMENT}")
 endfunction()
 
 ## Suites
@@ -65,8 +77,7 @@ add_suite(backlog gateway/backlog.cpp)
 add_suite(dispatch gateway/dispatch.cpp worker)
 add_suite(front gateway/front.cpp)
 add_suite(generation gateway/generation.cpp)
-add_suite(host platform/host.cpp)
-set_property(TEST host APPEND PROPERTY ENVIRONMENT "HOST_TEST_VALUE=left=right")
+add_suite(host platform/host.cpp ENVIRONMENT "HOST_TEST_VALUE=left=right")
 add_suite(settings gateway/settings.cpp)
 add_suite(meta gateway/meta.cpp)
 add_suite(node source/node.cpp source unofficial::sqlite3::sqlite3)
@@ -74,46 +85,23 @@ add_suite(mail source/mail.cpp source unofficial::sqlite3::sqlite3)
 add_suite(optimistic source/optimistic.cpp source unofficial::sqlite3::sqlite3)
 add_suite(storage source/storage.cpp source)
 add_suite(executor worker/executor.cpp worker)
-add_suite(lsp source/lsp.cpp)
+# The language-server suites drive clice when it is found.
 find_program(CLICE_TOOL clice)
 if(CLICE_TOOL)
-  set_property(TEST lsp APPEND PROPERTY ENVIRONMENT "TEST_CLICE=${CLICE_TOOL}")
+  set(CLICE_ENVIRONMENT "TEST_CLICE=${CLICE_TOOL}")
 endif()
+add_suite(lsp source/lsp.cpp ENVIRONMENT ${CLICE_ENVIRONMENT})
 add_suite(server source/server.cpp source)
 
-add_suite(analysis system/analysis.cpp)
+add_suite(analysis system/analysis.cpp SERVICE ENVIRONMENT ${CLICE_ENVIRONMENT})
 
-# xclang 23.1.2 segfaults in UBSan + line-tables IR generation for this TU
-# (stdexec __tuple.hpp). Only debug info is dropped; sanitizers stay active.
-if(XCLANG_SANITIZER MATCHES "undefined" AND CMAKE_CXX_COMPILER_ID MATCHES "Clang")
-  set_source_files_properties(system/analysis.cpp PROPERTIES COMPILE_OPTIONS "-g0")
-endif()
-if(CLICE_TOOL)
-  set_property(TEST analysis APPEND PROPERTY ENVIRONMENT "TEST_CLICE=${CLICE_TOOL}")
-endif()
-add_suite(workflow system/workflow.cpp)
-add_suite(lifecycle system/lifecycle.cpp)
-add_suite(startup system/startup.cpp)
-add_suite(recovery system/recovery.cpp)
-add_suite(projects system/projects.cpp unofficial::sqlite3::sqlite3)
-foreach(SUITE IN ITEMS analysis workflow lifecycle startup recovery projects)
-  target_compile_definitions(${SUITE}-test PRIVATE
-    SERVICE_EXECUTABLE="$<TARGET_FILE:fughetta-service>"
-    PROJECT_DIRECTORY="${PROJECT_SOURCE_DIR}")
-  add_dependencies(${SUITE}-test fughetta-service)
-endforeach()
+add_suite(workflow system/workflow.cpp SERVICE)
+add_suite(lifecycle system/lifecycle.cpp SERVICE)
+add_suite(startup system/startup.cpp SERVICE)
+add_suite(recovery system/recovery.cpp SERVICE)
+add_suite(projects system/projects.cpp SERVICE unofficial::sqlite3::sqlite3)
 
-if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
-  add_suite(spawn platform/spawn.cpp)
-  add_suite(runner model/runner.cpp)
-  add_suite(fsync platform/fsync.cpp)
-endif()
-if(CMAKE_SYSTEM_NAME MATCHES "^(Linux|Darwin)$")
-  add_executable(sigwait-test platform/sigwait.cpp)
-  target_link_libraries(sigwait-test PRIVATE platform)
-  add_test(NAME sigwait COMMAND sigwait-test)
-  set_tests_properties(sigwait PROPERTIES TIMEOUT 10)
-endif()
+include("${CMAKE_CURRENT_SOURCE_DIR}/platform/${CMAKE_SYSTEM_NAME}.cmake")
 
 ## Compile failures
 #
@@ -133,13 +121,7 @@ add_compile_failure(naming "an MCP tool name is")
 #
 # Python drivers that exercise the real binaries through the services.
 
-find_package(Python3 COMPONENTS Interpreter REQUIRED)
-
-if(WIN32)
-  add_executable(shell source/shell.cpp source/windows/binary.cpp)
-else()
-  add_executable(shell source/shell.cpp source/posix/binary.cpp)
-endif()
+add_executable(shell source/shell.cpp source/${PLATFORM_FAMILY}/binary.cpp)
 target_link_libraries(shell PRIVATE source)
 
 foreach(SCENARIO IN ITEMS atomicity recovery transfer)
@@ -147,33 +129,14 @@ foreach(SCENARIO IN ITEMS atomicity recovery transfer)
   set_tests_properties(scenario.${SCENARIO} PROPERTIES TIMEOUT 180)
 endforeach()
 
-
-if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
-  add_test(NAME managed-budget COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/system/processes.py"
-    "$<TARGET_FILE:fughetta-service>" "${CMAKE_BINARY_DIR}")
-  set_tests_properties(managed-budget PROPERTIES TIMEOUT 90)
-endif()
-
 ## Shared environment
 #
 # Every test runs inside the build directory with the same token, so a service
 # started by one driver is reachable by the next.
 
 get_property(PROJECT_TESTS DIRECTORY PROPERTY TESTS)
-set_property(TEST ${PROJECT_TESTS} APPEND PROPERTY ENVIRONMENT
-  "SOURCE_TOKEN=source-test-secret"
-  "TMPDIR=${CMAKE_BINARY_DIR}" "TEMP=${CMAKE_BINARY_DIR}" "TMP=${CMAKE_BINARY_DIR}"
-  "TEST_PYTHON=${Python3_EXECUTABLE}")
+set_property(TEST ${PROJECT_TESTS} APPEND PROPERTY ENVIRONMENT ${TEST_ENVIRONMENT})
 
 find_program(DISPATCH_CC NAMES cc clang gcc REQUIRED)
 set_property(TEST dispatch tools APPEND PROPERTY ENVIRONMENT "TEST_CC=${DISPATCH_CC}")
 target_compile_definitions(dispatch-test PRIVATE TEST_EXECUTABLE_SUFFIX="${CMAKE_EXECUTABLE_SUFFIX}")
-
-if(WIN32)
-  find_program(TEST_SHELL NAMES sh PATHS "$ENV{ProgramFiles}/Git/bin" REQUIRED)
-  add_executable(command-helper platform/command.cpp)
-  target_link_libraries(command-helper PRIVATE xclang::std)
-  target_compile_definitions(command-helper PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
-  set_property(TEST ${PROJECT_TESTS} APPEND PROPERTY ENVIRONMENT "TEST_SHELL=${TEST_SHELL}"
-    "TEST_COMMAND_HELPER=$<TARGET_FILE:command-helper>")
-endif()

@@ -15,7 +15,7 @@ export namespace durability {
                        std::string_view temp_suffix = constants::temporary_suffix);
     void durable_private_write(const std::filesystem::path& target, std::string_view text);
     // Why a file could not be read: not a regular file within the limit, not owner-only where required, unreadable, or resized while read.
-    struct unreadable : std::runtime_error, util::retained_error<unreadable> {
+    struct unreadable : std::runtime_error {
         using std::runtime_error::runtime_error;
     };
     // Yields `path` in pieces if it is a regular file, not a link, of at most `limit` bytes, checked on the opened file itself; a FIFO is
@@ -37,7 +37,7 @@ export namespace durability {
     void durable_rename(const std::filesystem::path& from, const std::filesystem::path& to);
     void durable_directories(const std::filesystem::path& dir);
 
-    struct lock_busy : std::runtime_error, util::retained_error<lock_busy> {
+    struct lock_busy : std::runtime_error {
         using std::runtime_error::runtime_error;
     };
 

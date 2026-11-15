@@ -2,7 +2,7 @@
     "version": 10,
     "cmakeMinimumRequired": {
         "major": 4,
-        "minor": 0,
+        "minor": 5,
         "patch": 0
     },
     "configurePresets": [
@@ -18,8 +18,9 @@
             "inherits": "base",
             "cacheVariables": {
                 "CMAKE_BUILD_TYPE": "Debug",
-                "CMAKE_CXX_FLAGS": "-fno-omit-frame-pointer",
-                "XCLANG_SANITIZER": "address,undefined"
+                "CMAKE_CXX_FLAGS_DEBUG": "",
+                "CMAKE_MSVC_DEBUG_INFORMATION_FORMAT": "",
+                "CLANG_SANITIZER": "address,undefined"
             }
         },
         {

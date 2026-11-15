@@ -102,7 +102,7 @@ namespace lsp::detail {
             if (cancelled)
                 return std::nullopt;
             if (error)
-                util::rethrow_exception(error);
+                std::rethrow_exception(error);
             return std::move(value);
         }
         void wake() {
@@ -345,7 +345,7 @@ namespace lsp::detail {
 // never an empty answer. Spans name only a place, a path and Unicode scalar offsets, and the caller turns them into character
 // identities of the version it analyzed. No call here waits by itself: the caller bounds each one with a deadline.
 export namespace lsp {
-    struct query_error : std::invalid_argument, util::retained_error<query_error> {
+    struct query_error : std::invalid_argument {
         using std::invalid_argument::invalid_argument;
     };
 
@@ -594,11 +594,11 @@ export namespace lsp {
                 if (auto finished = co_await coroutine::deadline(io_, std::chrono::seconds{5}, run_until_deadline(*this)))
                     code = static_cast<int>(*finished);
             } catch (...) {
-                failed = util::current_exception();
+                failed = std::current_exception();
             }
             co_await abort();
             if (failed)
-                util::rethrow_exception(failed);
+                std::rethrow_exception(failed);
             co_return code.value_or(-1);
         }
 
@@ -628,9 +628,9 @@ export namespace lsp {
                         pending_->wake();
                     }
                 }
-                ended_ = util::make_exception_ptr(std::runtime_error("language reader stopped"));
+                ended_ = std::make_exception_ptr(std::runtime_error("language reader stopped"));
             } catch (...) {
-                ended_ = util::current_exception();
+                ended_ = std::current_exception();
             }
             if (pending_) {
                 pending_->error = ended_;
@@ -640,7 +640,7 @@ export namespace lsp {
 
         auto call(std::string method, detail::generic params) -> coroutine::task<detail::generic> {
             if (ended_)
-                util::rethrow_exception(ended_);
+                std::rethrow_exception(ended_);
             auto id = ++next_;
             detail::response response;
             struct reset {
@@ -942,13 +942,13 @@ export namespace lsp {
         try {
             finished = co_await coroutine::under(token, work());
         } catch (...) {
-            failed = util::current_exception();
+            failed = std::current_exception();
         }
         co_await coroutine::under(coroutine::stop_token{}, session.abort());
         if (!finished && !failed)
             co_await coroutine::stop;
         if (failed)
-            util::rethrow_exception(failed);
+            std::rethrow_exception(failed);
         co_return out;
     }
 

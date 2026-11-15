@@ -176,7 +176,7 @@ export namespace front {
         bool remote_listener = false;
     };
 
-    struct coded_error : std::runtime_error, util::retained_error<coded_error> {
+    struct coded_error : std::runtime_error {
         http::status status;
         std::string code;
         std::vector<std::string> missing, conflicts, frontier;
@@ -567,10 +567,10 @@ export namespace front {
             try {
                 r = co_await coroutine::under(source.get_token(), handle(rpc, out, who, configuration));
             } catch (...) {
-                failure = util::current_exception();
+                failure = std::current_exception();
             }
             if (failure)
-                util::rethrow_exception(failure);
+                std::rethrow_exception(failure);
             if (!r) {
                 if (parent.stop_requested())
                     co_await coroutine::stop;

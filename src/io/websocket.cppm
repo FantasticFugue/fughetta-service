@@ -37,12 +37,12 @@ export namespace web::ws {
                     frame = state_->decoder_.next();
                 } catch (const http::websocket::failure& e) {
                     status = e.status;
-                    failed = util::current_exception();
+                    failed = std::current_exception();
                 }
                 if (failed) {
                     std::array reason{std::byte(status >> 8), std::byte(status & 255)};
                     co_await send(http::websocket::opcode::close, reason);
-                    util::rethrow_exception(failed);
+                    std::rethrow_exception(failed);
                 }
                 if (!frame) {
                     std::array<std::byte, 16384> bytes;

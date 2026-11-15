@@ -15,7 +15,7 @@ import async;
 import native;
 
 export namespace storage {
-    struct stale_blob : std::runtime_error, util::retained_error<stale_blob> {
+    struct stale_blob : std::runtime_error {
         explicit stale_blob(std::string_view hash) : std::runtime_error(std::format("blob {} is no longer in the project (files changed during sync)", hash)) {}
     };
 

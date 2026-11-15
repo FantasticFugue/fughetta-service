@@ -10,11 +10,11 @@ export import language;
 export import allocation;
 
 export namespace config {
-    struct not_found : std::invalid_argument, util::retained_error<not_found> {
+    struct not_found : std::invalid_argument {
         using std::invalid_argument::invalid_argument;
     };
 
-    struct revision_conflict : std::runtime_error, util::retained_error<revision_conflict> {
+    struct revision_conflict : std::runtime_error {
         std::uint64_t revision;
         std::string value;
         revision_conflict(std::uint64_t r, std::string v)

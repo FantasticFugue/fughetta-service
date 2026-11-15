@@ -68,7 +68,7 @@ int main(int argc, char** argv) {
     }
     int result = 1;
     try {
-        result = daemon::run(argc, argv, application, service, identity);
+        result = lifecycle::run(argc, argv, application, service, identity);
     } catch (const std::exception& e) {
         std::cerr << e.what() << '\n';
     }

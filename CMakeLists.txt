@@ -1,10 +1,11 @@
-cmake_minimum_required(VERSION 4.0)
+cmake_minimum_required(VERSION 4.5)
 project(fughetta-service VERSION 0.1.0 LANGUAGES CXX)
 
 ## Language
 #
-# C++23 modules with the standard library as a module; the compiler comes from
-# the xclang tree that cmake/toolchain.cmake selects.
+# C++23 modules with the standard library as a module; cmake/toolchain.cmake
+# picks clang — the platform's, or the tree named by CLANG_ROOT — and lets
+# CMake synthesize std from libc++'s manifest.
 
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -13,8 +14,8 @@ set(CMAKE_CXX_SCAN_FOR_MODULES ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
-  # Disable Debug symbols even when configuring without a preset.
-  add_compile_options(-Wall -Wextra "$<$<CONFIG:Debug>:-g0>")
+  # -Wall is off: clang 23 crashes in module AST reading with it on this tree.
+  add_compile_options(-Wextra)
 endif()
 
 ## Options
@@ -23,6 +24,21 @@ endif()
 
 option(FUGHETTA_BUILD_TESTS "Build the testing tree" ${PROJECT_IS_TOP_LEVEL})
 option(FUGHETTA_BUILD_BENCHMARKS "Build benchmarks" OFF)
+set(FUGHETTA_INSTANCE "" CACHE STRING "Workspace instance for launchd registration")
+if(NOT FUGHETTA_INSTANCE MATCHES "^[A-Za-z0-9_-]*$")
+  message(FATAL_ERROR "FUGHETTA_INSTANCE must contain letters, digits, underscores or hyphens")
+endif()
+
+## Platform
+#
+# cmake/platform/<system>.cmake describes the target: its platform units and
+# libraries, its I/O backend and its service-manager template. A system without
+# a description is not supported.
+
+include("${CMAKE_CURRENT_LIST_DIR}/cmake/platform/${CMAKE_SYSTEM_NAME}.cmake" OPTIONAL RESULT_VARIABLE PLATFORM_DESCRIPTION)
+if(NOT PLATFORM_DESCRIPTION)
+  message(FATAL_ERROR "No platform description for ${CMAKE_SYSTEM_NAME} under cmake/platform")
+endif()
 
 ## Dependencies and modules
 
@@ -42,30 +58,17 @@ target_link_libraries(fughetta-service PRIVATE service)
 # the hosted gateway builds the layers from source as a subproject instead.
 
 if(PROJECT_IS_TOP_LEVEL)
-include(GNUInstallDirs)
-set(FUGHETTA_INSTANCE "" CACHE STRING "Workspace instance for launchd registration")
-set(FUGHETTA_SERVICE_USER "fughetta" CACHE STRING "Native service account")
-if(FUGHETTA_INSTANCE AND NOT FUGHETTA_INSTANCE MATCHES "^[A-Za-z0-9_-]+$")
-  message(FATAL_ERROR "FUGHETTA_INSTANCE must contain letters, digits, underscores or hyphens")
-endif()
-# Service-manager definitions are installed as templates; registration belongs to deployment.
-if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
-  set(DAEMON_DEFINITION fughetta-service.service)
-elseif(APPLE AND FUGHETTA_INSTANCE)
-  set(DAEMON_DEFINITION dev.fughetta.service.plist)
-endif()
-if(DAEMON_DEFINITION)
-  configure_file("cmake/daemon/${DAEMON_DEFINITION}.in" "${DAEMON_DEFINITION}" @ONLY)
-  if(APPLE)
-    set(DAEMON_INSTALL_NAME "dev.fughetta.service.${FUGHETTA_INSTANCE}.plist")
-  else()
-    set(DAEMON_INSTALL_NAME "fughetta-service@.service")
+  include(GNUInstallDirs)
+  set(FUGHETTA_SERVICE_USER "fughetta" CACHE STRING "Native service account")
+  # Service-manager definitions are installed as templates; registration
+  # belongs to deployment.
+  if(DAEMON_DEFINITION)
+    configure_file("cmake/daemon/${DAEMON_DEFINITION}.in" "${DAEMON_DEFINITION}" @ONLY)
+    install(FILES "${CMAKE_CURRENT_BINARY_DIR}/${DAEMON_DEFINITION}"
+      DESTINATION "${CMAKE_INSTALL_DATADIR}/fughetta-service/daemon" RENAME "${DAEMON_INSTALL_NAME}")
   endif()
-  install(FILES "${CMAKE_CURRENT_BINARY_DIR}/${DAEMON_DEFINITION}"
-    DESTINATION "${CMAKE_INSTALL_DATADIR}/fughetta-service/daemon" RENAME "${DAEMON_INSTALL_NAME}")
-endif()
-install(TARGETS fughetta-service RUNTIME DESTINATION "${CMAKE_INSTALL_BINDIR}")
-install(FILES LICENSE DESTINATION "${CMAKE_INSTALL_DATADIR}/licenses/fughetta-service")
+  install(TARGETS fughetta-service RUNTIME DESTINATION "${CMAKE_INSTALL_BINDIR}")
+  install(FILES LICENSE DESTINATION "${CMAKE_INSTALL_DATADIR}/licenses/fughetta-service")
 endif()
 
 ## Tests and benchmarks
@@ -81,8 +84,8 @@ if(FUGHETTA_BUILD_BENCHMARKS)
   add_executable(crossing-bench bench/crossing.cpp)
   target_compile_definitions(crossing-bench PRIVATE ASIO_NO_DEPRECATED ASIO_NO_TS_EXECUTORS)
   target_link_libraries(crossing-bench PRIVATE io asio::asio)
-  if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
-    add_executable(engine-bench bench/engine.cpp)
-    target_link_libraries(engine-bench PRIVATE source)
-  endif()
+  foreach(BENCHMARK IN LISTS PLATFORM_BENCHMARKS)
+    add_executable(${BENCHMARK}-bench bench/${BENCHMARK}.cpp)
+    target_link_libraries(${BENCHMARK}-bench PRIVATE source)
+  endforeach()
 endif()

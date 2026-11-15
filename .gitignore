@@ -4,7 +4,7 @@
 .vscode/
 .clice/
 build/
-# Machine-specific (absolute xclang/vcpkg paths).
+# Machine-specific (absolute clang/vcpkg paths).
 CMakeUserPresets.json
 # Local configure/build logs contain absolute paths.
 *.log
@@ -16,3 +16,9 @@ state/
 vcpkg_installed/
 # Local runtime configuration: bearer-token hashes and revision counters.
 config.json
+
+# Local test and review outputs.
+__pycache__/
+*.pyc
+.logs/
+.review/

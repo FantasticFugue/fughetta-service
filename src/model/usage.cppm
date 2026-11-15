@@ -67,7 +67,7 @@ export namespace usage {
         std::uint64_t oldest = 0;
     };
 
-    struct quota_exceeded : std::runtime_error, util::retained_error<quota_exceeded> {
+    struct quota_exceeded : std::runtime_error {
         using std::runtime_error::runtime_error;
     };
 

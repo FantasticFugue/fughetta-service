@@ -20,14 +20,24 @@ the head of its main branch by `FetchContent` in `cmake/dependencies.cmake` and
 built as a subproject, so its module BMIs are compiled by this build's compiler;
 the manifest lists its dependencies too. `FetchContent` stays until httpant has
 a vcpkg port. A local checkout replaces the fetched one through
-`FETCHCONTENT_SOURCE_DIR_HTTPANT`. The service selects io_uring
-on Linux, IOCP on Windows, and kqueue on macOS. The layers link
+`FETCHCONTENT_SOURCE_DIR_HTTPANT`. `cmake/platform/<system>.cmake` describes
+each target system: its platform units, its I/O backend (io_uring on Linux,
+IOCP on Windows, kqueue on macOS) and its service-manager template;
+`tests/platform/<system>.cmake` adds that system's tests. Platform choices go in
+those files, not in `if()` branches elsewhere. The layers link
 `httpant::httpant`, `httpant::io` and `httpant::tls`.
 
-`cmake/toolchain.cmake` reads `XCLANG_ROOT` and `VCPKG_ROOT` from the
-environment and writes the vcpkg triplet for `XCLANG_TARGET` into the build
-directory. CI checks vcpkg out at the baseline in `vcpkg-configuration.json`,
-which must be a microsoft/vcpkg commit.
+`cmake/toolchain.cmake` reads `CLANG_ROOT` and `VCPKG_ROOT` from the
+environment and writes the vcpkg triplet into the build directory. Everything
+builds with clang and libc++: the platform's clang (`clang++-23` or newer, `clang-cl` on Windows), or
+the clang tree named by `CLANG_ROOT`, compiling the library `CLANG_STDLIB`
+selects (`libc++` by default, or `libstdc++` on Linux). On Windows clang-cl
+compiles for the MSVC ABI (`<arch>-pc-windows-msvc`) with libc++ and the static
+CRT. CMake 4.5's `import std` support synthesizes the std module from the
+selected library's own manifest, the compiler's own scanner and archivers are
+named over the packaged ones, and the ports build with the same compiler, tools
+and flags. CI checks vcpkg out at the
+baseline in `vcpkg-configuration.json`, which must be a microsoft/vcpkg commit.
 
 ## Build and verify
 
