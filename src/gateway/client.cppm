@@ -1,5 +1,4 @@
 export module client;
-import utility;
 import std;
 import coroutine;
 import protocol;

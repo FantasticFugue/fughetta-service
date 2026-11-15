@@ -1,4 +1,5 @@
 export module ty;
+import lsp;
 import std;
 import meta;
 import reflection;
@@ -51,6 +52,8 @@ namespace language {
     // python names the environment ty resolves imports from, as the adapter's does. ty finds it in VIRTUAL_ENV when no configuration
     // names one, so the server is started with that variable, bound to the tree like any other path of its environment.
     template <> struct server<"ty"> {
+        static auto channels() -> std::vector<semantic::channel_definition> { return source_channels(); }
+        using adapter = lsp_adapter;
         struct hint_settings {
             std::optional<bool> variable_types;
             std::optional<bool> call_argument_names;
@@ -75,11 +78,8 @@ namespace language {
         };
         static constexpr std::array<std::pair<std::string_view, std::string_view>, 3> documents{{{"py", "python"}, {"pyi", "python"}, {"pyw", "python"}}};
         static constexpr std::array<std::string_view, 1> inputs{"python_environment"};
-        static auto input_paths(const options& o) -> std::map<std::string, std::string> {
-            if (o.python && !builds::absolute_path(*o.python))
-                return {{"python_environment", *o.python}};
-            return {};
-        }
+        static constexpr std::array<std::string_view, 4> facts{"symbols", "definitions", "scopes", "diagnostics"};
+        static constexpr semantic::unit_kind unit_kind = semantic::unit_kind::file;
         static auto required_inputs(const options& o) -> std::vector<std::string> {
             if (o.python && !builds::absolute_path(*o.python))
                 return {"python_environment"};
@@ -196,7 +196,9 @@ namespace language {
     }
 
     auto server<"ty">::launch(const options& o, const std::vector<builds::context>& inputs) -> program {
-        if (o.python && !builds::absolute_path(*o.python) &&
+        if (inputs.size() > 1 && !o.python)
+            throw std::invalid_argument("ty with multiple Python environments requires an explicit python selection");
+        if (o.python && (!builds::absolute_path(*o.python) || !inputs.empty()) &&
             !std::ranges::any_of(inputs, [&](const auto& input) { return input.type == "python_environment" && input.path == *o.python; }))
             throw std::invalid_argument("the bound build does not produce the ty Python environment: " + *o.python);
         auto& s = o.server;
@@ -231,6 +233,8 @@ namespace language {
         program out{.argv = {o.executable, "server"}, .env = o.env, .initialization = std::move(init)};
         if (o.python)
             out.env["VIRTUAL_ENV"] = bound(*o.python);
+        else if (!inputs.empty())
+            out.env["VIRTUAL_ENV"] = bound(inputs.front().path);
         return out;
     }
 } // namespace language

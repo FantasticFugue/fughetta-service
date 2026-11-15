@@ -4,6 +4,8 @@ import coroutine;
 import native;
 import http;
 import protocol;
+import provider;
+import reflection;
 
 namespace {
     using namespace boost::ut;
@@ -30,7 +32,7 @@ namespace {
         auto l = native::listener{io, {net::ip::address_v4::loopback(), 0}};
         std::optional<std::string> out;
         auto s = co_await io::connect(io, {net::ip::address_v4{{127, 0, 0, 1}}, l.local_endpoint().port()});
-        auto peer = co_await execution::then(net::async_accept(l), [](auto socket, auto) { return std::move(socket); });
+        auto [peer, remote] = co_await net::async_accept(l);
         transport::channel<socket> chan{s};
         auto run_children = [&](coroutine::scope& children) -> coroutine::task<> {
             children.spawn(answer(peer, reply, fail));
@@ -73,7 +75,7 @@ namespace {
     auto fragmented_frames(ctx& io, std::size_t chunk) -> coroutine::task<> {
         auto listener = native::listener{io, {net::ip::address_v4::loopback(), 0}};
         auto writer = co_await io::connect(io, {net::ip::address_v4{{127, 0, 0, 1}}, listener.local_endpoint().port()});
-        auto reader = co_await execution::then(net::async_accept(listener), [](auto socket, auto) { return std::move(socket); });
+        auto [reader, remote] = co_await net::async_accept(listener);
         auto progress = transport::encode(jobs::progress{.done = 7, .total = 11});
         auto cancel = transport::encode(jobs::cancel{});
         auto bytes = encode_frame(jobs::code<jobs::progress>, 0xfedcba9876543210ULL, progress);
@@ -100,7 +102,7 @@ namespace {
     auto frame_limit(ctx& io, bool oversized) -> coroutine::task<> {
         auto listener = native::listener{io, {net::ip::address_v4::loopback(), 0}};
         auto writer = co_await io::connect(io, {net::ip::address_v4{{127, 0, 0, 1}}, listener.local_endpoint().port()});
-        auto reader = co_await execution::then(net::async_accept(listener), [](auto socket, auto) { return std::move(socket); });
+        auto [reader, remote] = co_await net::async_accept(listener);
         auto bytes = encode_frame(jobs::code<jobs::heartbeat>, 13, {});
         auto length = static_cast<std::uint32_t>(transport::max_payload + (oversized ? 1 : 0));
         std::memcpy(bytes.data(), &length, 4);
@@ -128,6 +130,81 @@ namespace {
         co_await coroutine::with_scope(std::move(run_children));
     }
 
+    // A staged object can be complete JSON and still have no committed contribution.
+    auto committed_calls(ctx& io) -> coroutine::task<> {
+        auto listener = native::listener{io, {net::ip::address_v4::loopback(), 0}};
+        auto client = co_await io::connect(io, {net::ip::address_v4{{127, 0, 0, 1}}, listener.local_endpoint().port()});
+        auto [peer, remote] = co_await net::async_accept(listener);
+        transport::channel<socket> channel{client}, server{peer};
+        std::size_t delivered = 0;
+        auto send = [&]() -> coroutine::task<> {
+            for (unsigned pass = 0; pass < 3; ++pass) {
+                auto frame = co_await server.recv();
+                if (pass == 2) {
+                    co_await server.fail(frame.corr, "worker is full", "worker_overloaded");
+                    continue;
+                }
+                const bool commit = pass == 1;
+                auto request = transport::decode<jobs::analysis_request>(frame);
+                language::evaluated_unit unit{
+                    .session =
+                        {.id = "session", .slot = request.analysis.slot_id, .project = "app", .snapshot = "source", .epoch = 1, .phase = std::string{"ready"}},
+                    .request = {.execution = request.analysis.execution,
+                                .slot_id = request.analysis.slot_id,
+                                .unit = {"app", "python", "ty", "evaluate", semantic::unit_kind::file, "a.py"},
+                                .epoch = 1},
+                    .shards = {{.diagnostics = {{.id = "diagnostic", .severity = "warning", .message = "staged diagnostic"}}}}};
+                semantic::recipe recipe{unit.request.unit, "options"};
+                unit.shards.front().unit = semantic::make_unit(recipe, semantic::context_identifier(recipe));
+                unit.shards.front().diagnostics.front().ownership = {
+                    unit.shards.front().unit.id, unit.shards.front().unit.context, {.provider = "ty", .kind = std::string{"source"}}};
+                auto data = rfl::json::write(unit);
+                auto bytes = std::as_bytes(std::span{data});
+                co_await server.post(jobs::facts_batch{0, {bytes.begin(), bytes.end()}}, frame.corr);
+                jobs::build_report report{.analysis_execution = request.analysis.execution};
+                if (commit) {
+                    co_await server.post(
+                        jobs::unit_committed{request.analysis.execution, request.analysis.slot_id, unit.request.unit, 1, data.size(), jobs::inventory(unit)},
+                        frame.corr);
+                    report.committed_units = 1;
+                    co_await server.post(jobs::analysis_completed{request.analysis.execution, 1}, frame.corr);
+                } else {
+                    report.analysis_error = "evaluation failed before commit";
+                    co_await server.post(jobs::analysis_failed{request.analysis.execution, 0, "analysis_failed", *report.analysis_error}, frame.corr);
+                }
+                co_await server.reply(frame.corr, report);
+            }
+        };
+        auto run_children = [&](coroutine::scope& children) -> coroutine::task<> {
+            children.spawn(send());
+            children.spawn(channel.pump([](const transport::frame&) {}));
+            jobs::analysis_request request{.preparation = {.project = "app", .tree = "work"},
+                                           .analysis =
+                                               jobs::analysis_plan{.provider = "ty", .execution = {"first", "calculation", "python"}, .slot_id = "app/work"}};
+            auto inputs = std::make_shared<jobs::analysis_exchange>(io, io);
+            auto close = jobs::analysis_exchange::lifetime{inputs};
+            auto receive = [&]() -> coroutine::task<> {
+                while (auto item = co_await inputs->next()) {
+                    const auto& unit = std::get<language::evaluated_unit>(item->data);
+                    ++delivered;
+                    expect(unit.shards.front().diagnostics.front().message == "staged diagnostic");
+                    item->answer(std::monostate{});
+                }
+            };
+            children.spawn(receive());
+            auto failed = co_await channel.call(request, nullptr, inputs);
+            expect(failed && failed->analysis_error && delivered == 0u) << "a failed staged contribution is never published";
+            request.analysis.execution.request_id = "second";
+            auto complete = co_await channel.call(request, nullptr, inputs);
+            expect(complete && !complete->analysis_error && complete->committed_units == 1u && delivered == 1u);
+            request.analysis.execution.request_id = "third";
+            auto refused = co_await channel.call(request, nullptr, inputs);
+            expect(!refused && std::get<jobs::failure>(refused.error()).code == "worker_overloaded" && delivered == 1u)
+                << "admission refusal precedes any provider execution";
+        };
+        co_await coroutine::with_scope(std::move(run_children));
+    }
+
     static constexpr auto edge_suite = [] {
         "jobs frames preserve signal kinds and correlation across arbitrary byte chunks"_test = [] {
             for (auto chunk : {1u, 7u, 16u, 4096u}) {
@@ -143,6 +220,12 @@ namespace {
                 auto io = context.get_scheduler();
                 expect(cores::run(context, frame_limit(io, oversized)));
             }
+        };
+
+        "semantic publication waits for unit commit and consumes its terminal event"_test = [] {
+            native::context context;
+            auto io = context.get_scheduler();
+            expect(cores::run(context, committed_calls(io)));
         };
 
         "a call is answered through the pump"_test = [] {

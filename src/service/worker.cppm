@@ -1,5 +1,4 @@
 export module worker;
-import utility;
 import std;
 import runtime;
 import coroutine;
@@ -45,6 +44,7 @@ namespace worker {
                           .inherit_env = cfg_.inherit_env,
                           .tools = cfg_.tools,
                           .parallel = cfg_.parallel,
+                          .memory_bytes = cfg_.memory_bytes,
                           .dependency_cache = cfg_.dependency_cache ? std::optional{std::filesystem::path{*cfg_.dependency_cache}} : std::nullopt,
                           .dependency_upstream = cfg_.dependency_upstream ? std::optional{std::filesystem::path{*cfg_.dependency_upstream}} : std::nullopt,
                           .dependency_publish = cfg_.dependency_publish ? std::optional{std::filesystem::path{*cfg_.dependency_publish}} : std::nullopt,
@@ -63,8 +63,9 @@ namespace worker {
             });
             if (!identity)
                 throw std::runtime_error(identity.error());
-            tools_ = std::move(identity->tools);
-            toolchain_ = std::move(identity->id);
+            tools_ = identity->tools;
+            toolchain_ = identity->id;
+            builds_.set_runtime(std::move(*identity));
             if (!cfg_.worker_id) {
                 co_await serve(io, core);
                 co_return;
@@ -96,13 +97,11 @@ namespace worker {
 
     private:
         auto serve(native::scheduler& io, std::size_t core) -> coroutine::task<> {
-            auto connected = co_await coroutine::deadline(io, std::chrono::seconds{10}, connect(io));
-            if (!connected) {
+            std::optional<socket> sock;
+            if (!co_await coroutine::deadline(io, std::chrono::seconds{10}, connect(io, sock)))
                 throw std::runtime_error(std::format("worker '{}': no answer from {} in 10s", name_, cfg_.gateway));
-            }
-            auto sock = std::move(*connected);
             logging::info(std::format("worker '{}': connected to {}", name_, cfg_.gateway));
-            co_await session(io, core, sock);
+            co_await session(io, core, *sock);
         }
 
         template <io::stream S> auto session(native::scheduler& io, std::size_t core, S& stream) -> coroutine::task<> {
@@ -129,7 +128,8 @@ namespace worker {
                                            .workspace_id = cfg_.workspace_id,
                                            .heartbeat_seconds = cfg_.worker_id ? cfg_.heartbeat_seconds : 2,
                                            .toolchain_id = toolchain_,
-                                           .dependency_publisher = cfg_.dependency_publish.has_value()});
+                                           .dependency_publisher = cfg_.dependency_publish.has_value(),
+                                           .memory_bytes = cfg_.memory_bytes});
 
             if (cfg_.worker_id) {
                 auto first = co_await coroutine::deadline(io, std::chrono::seconds{30}, chan.recv(constants::worker_hello_bytes));
@@ -148,32 +148,40 @@ namespace worker {
             std::cerr << "service-ready:worker\n";
             // Child requests can finish after the scope body; keep their counter alive through the join.
             std::atomic<std::size_t> inflight{0};
+            // The pump ends on a handler's exception without rethrowing it, so a refusal mid-session is raised after it ends.
+            std::optional<std::string> refusal;
             auto run_requests = [&](coroutine::scope& requests) -> coroutine::task<> {
-                requests.spawn(beat(io, chan, core));
+                requests.spawn(beat(io, chan));
+                requests.spawn(report_slots(io, chan, core));
                 // The Core picks this Worker by the same limit; enforcing it locally keeps a misbehaving Core from driving unbounded concurrency.
                 auto max_inflight = static_cast<std::size_t>(cfg_.max_inflight);
-                for (;;) {
-                    auto frame = co_await chan.recv();
+                co_await chan.pump([&](const transport::frame& incoming) -> coroutine::task<> {
+                    auto frame = incoming;
                     if (cfg_.worker_id && frame.kind == jobs::code<jobs::admission>) {
                         auto admitted = transport::decode<jobs::admission>(frame);
-                        if (!admitted.accepted)
-                            reject(admitted.code);
-                        continue;
+                        if (!admitted.accepted) {
+                            refusal = admitted.code;
+                            throw io::closed{};
+                        }
+                        co_return;
                     }
                     // Cancellation is cheap and must always reach the running call, so it never waits for a slot.
                     if (frame.kind == jobs::code<jobs::cancel>) {
                         requests.spawn(serve.handle(chan, std::move(frame)));
-                        continue;
+                        co_return;
                     }
                     if (inflight.load(std::memory_order_relaxed) >= max_inflight) {
                         co_await chan.fail(frame.corr, "worker is at max_inflight", "worker_overloaded");
-                        continue;
+                        co_return;
                     }
                     inflight.fetch_add(1, std::memory_order_relaxed);
                     requests.spawn(tracked(serve, chan, std::move(frame), inflight));
-                }
+                });
             };
             co_await coroutine::with_scope(std::move(run_requests));
+            if (refusal)
+                reject(*refusal);
+            throw io::closed{};
         }
 
         template <io::stream S>
@@ -186,12 +194,21 @@ namespace worker {
             co_await serve.handle(chan, std::move(frame));
         }
 
-        auto connect(native::scheduler& io) -> coroutine::task<socket> { co_return co_await io::connect(io, io::parse_endpoint(cfg_.gateway)); }
+        auto connect(native::scheduler& io, std::optional<socket>& sock) -> coroutine::task<> {
+            sock.emplace(co_await io::connect(io, io::parse_endpoint(cfg_.gateway)));
+        }
 
-        template <io::stream S> auto beat(native::scheduler& io, transport::channel<S>& chan, std::size_t core) -> coroutine::task<> {
+        template <io::stream S> auto beat(native::scheduler& io, transport::channel<S>& chan) -> coroutine::task<> {
             for (;;) {
-                co_await execution::schedule_after(io, std::chrono::seconds{cfg_.worker_id ? cfg_.heartbeat_seconds : 2});
                 co_await chan.post(jobs::heartbeat{});
+                co_await execution::schedule_after(io, std::chrono::seconds{cfg_.worker_id ? cfg_.heartbeat_seconds : 2});
+            }
+        }
+
+        template <io::stream S> auto report_slots(native::scheduler& io, transport::channel<S>& chan, std::size_t core) -> coroutine::task<> {
+            for (;;) {
+                co_await chan.post(co_await builds_.status(core));
+                co_await execution::schedule_after(io, std::chrono::seconds{2});
                 co_await builds_.reclaim(core);
             }
         }

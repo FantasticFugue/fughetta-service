@@ -8,6 +8,7 @@ find_package(asio CONFIG REQUIRED)
 find_package(unofficial-sodium CONFIG REQUIRED)
 find_package(unofficial-sqlite3 CONFIG REQUIRED)
 find_package(zstd CONFIG REQUIRED)
+find_package(ZLIB REQUIRED)
 find_package(c-ares CONFIG REQUIRED)
 
 # httpant builds from source, since module BMIs are not portable between

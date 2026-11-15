@@ -43,6 +43,7 @@ endif()
 ## Dependencies and modules
 
 include(cmake/dependencies.cmake)
+include(cmake/providers.cmake)
 set(FUGHETTA_SOURCE "${PROJECT_SOURCE_DIR}/src")
 include(cmake/modules.cmake)
 
@@ -60,6 +61,7 @@ target_link_libraries(fughetta-service PRIVATE service)
 if(PROJECT_IS_TOP_LEVEL)
   include(GNUInstallDirs)
   set(FUGHETTA_SERVICE_USER "fughetta" CACHE STRING "Native service account")
+  set(FUGHETTA_LIBEXEC "${CMAKE_INSTALL_LIBEXECDIR}/fughetta-service")
   # Service-manager definitions are installed as templates; registration
   # belongs to deployment.
   if(DAEMON_DEFINITION)
@@ -69,6 +71,13 @@ if(PROJECT_IS_TOP_LEVEL)
   endif()
   install(TARGETS fughetta-service RUNTIME DESTINATION "${CMAKE_INSTALL_BINDIR}")
   install(FILES LICENSE DESTINATION "${CMAKE_INSTALL_DATADIR}/licenses/fughetta-service")
+  install(PROGRAMS "${FUGHETTA_JVM_EXPORTER}" DESTINATION "${FUGHETTA_LIBEXEC}" RENAME fughetta-gradle-model)
+  install(PROGRAMS "${FUGHETTA_CLR_EXPORTER}" DESTINATION "${FUGHETTA_LIBEXEC}" RENAME fughetta-msbuild-model)
+  # Each provider installs the directory its artifact sits in.
+  foreach(PROVIDER IN LISTS FUGHETTA_PROVIDERS)
+    cmake_path(GET FUGHETTA_PROVIDER_${PROVIDER} PARENT_PATH PROVIDER_DIRECTORY)
+    install(DIRECTORY "${PROVIDER_DIRECTORY}/" DESTINATION "${FUGHETTA_LIBEXEC}/${PROVIDER}")
+  endforeach()
 endif()
 
 ## Tests and benchmarks

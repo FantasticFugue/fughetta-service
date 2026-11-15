@@ -8,6 +8,7 @@ export module reflection;
 export namespace rfl {
     using rfl::DefaultIfMissing;
     using rfl::Description;
+    using rfl::Flatten;
     using rfl::from_generic;
     using rfl::Generic;
     using rfl::get;
@@ -16,6 +17,8 @@ export namespace rfl {
     using rfl::Object;
     using rfl::Reflector;
     using rfl::Rename;
+    using rfl::Skip;
+    using rfl::SnakeCaseToCamelCase;
     using rfl::TaggedUnion;
     using rfl::to_generic;
 

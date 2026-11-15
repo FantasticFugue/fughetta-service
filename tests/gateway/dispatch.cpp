@@ -171,8 +171,7 @@ int main(int argc, char** argv) {
                         }
                     };
                     requests.spawn(run_child(io, chan));
-                    for (;;)
-                        requests.spawn(serve.handle(chan, co_await chan.recv()));
+                    co_await chan.pump([&](const transport::frame& frame) { requests.spawn(serve.handle(chan, frame)); });
                 };
                 co_await coroutine::with_scope(std::move(run_requests));
             } catch (const std::exception&) {

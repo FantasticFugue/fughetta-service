@@ -17,6 +17,7 @@
         "sqlite3",
         "stdexec",
         "wolfssl",
+        "zlib",
         "zstd",
         {
             "name": "liburing",

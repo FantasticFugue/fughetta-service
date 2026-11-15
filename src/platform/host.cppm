@@ -8,6 +8,8 @@ export namespace host {
 
     auto environment() -> std::map<std::string, std::string>;
     void set_environment_if_absent(const std::string& name, const std::string& value);
+    // PATH discovery selects executables. Explicit mappings may also name
+    // readable tool resources launched through an interpreter.
     auto resolve_tools(const std::map<std::string, std::string>& mapped = {}, const std::vector<std::string>& wanted = {})
         -> std::map<std::string, std::string>;
     auto detect_tools(const std::map<std::string, std::string>& mapped = {}) -> std::vector<std::string>;

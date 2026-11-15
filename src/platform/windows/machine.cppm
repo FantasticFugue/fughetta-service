@@ -96,6 +96,12 @@ namespace host {
         }
         for (const auto& [name, path] : mapped) {
             found.erase(name);
+            // A mapped tool can be a helper assembly or an interpreted script.
+            std::error_code ec;
+            if (std::filesystem::is_regular_file(path, ec) && !ec) {
+                found[name] = std::filesystem::absolute(path).string();
+                continue;
+            }
             auto wanted = winapi::wide(path);
             auto count = ::SearchPathW(nullptr, wanted.c_str(), L".exe", 0, nullptr, nullptr);
             if (!count)

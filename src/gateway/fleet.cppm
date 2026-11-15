@@ -7,7 +7,6 @@ import coroutine;
 import protocol;
 import configuration;
 import content;
-import utility;
 
 export namespace routing {
     using clock = std::chrono::steady_clock;
@@ -41,13 +40,14 @@ export namespace routing {
         std::uint64_t silent_ms = 0;
         bool online = true;
         std::vector<std::string> tools;
-        std::vector<std::string> trees;
+        std::vector<jobs::worker_slot> slots;
         std::optional<std::string> worker_id;
         std::optional<std::string> created_by;
         std::optional<std::int64_t> created_at, last_connected_at, revoked_at;
         bool managed = true;
         std::string toolchain_id;
         bool dependency_publisher = false;
+        jobs::worker_memory memory;
     };
 
     struct requirements {
@@ -59,11 +59,42 @@ export namespace routing {
         friend auto operator==(const requirements&, const requirements&) -> bool = default;
     };
 
+    struct location {
+        std::size_t core = 0;
+        std::uint64_t worker = 0;
+    };
+
     struct selection {
         requirements needs;
         std::string tree_key;
+        std::string options, snapshot;
+        std::string stage;
+        std::optional<std::uint64_t> memory_bytes;
+        std::optional<std::uint64_t> worker;
+        std::optional<std::size_t> core;
         friend auto operator==(const selection&, const selection&) -> bool = default;
     };
+
+    struct placement {
+        std::size_t core = 0;
+        std::uint64_t worker = 0;
+        int heat = 0;
+        std::size_t inflight = 0;
+        clock::time_point used;
+        std::optional<double> seconds;
+    };
+    struct proposals {
+        std::vector<placement> candidates;
+        bool busy = false;
+    };
+    inline auto measured(const std::vector<placement>& candidates) -> bool {
+        return !candidates.empty() && std::ranges::all_of(candidates, [](const auto& value) { return value.seconds.has_value(); });
+    }
+    inline auto preferred(const placement& a, const placement& b, bool costs) -> bool {
+        if (costs && a.seconds != b.seconds)
+            return *a.seconds < *b.seconds;
+        return std::tuple{-a.heat, a.inflight, a.used, a.core, a.worker} < std::tuple{-b.heat, b.inflight, b.used, b.core, b.worker};
+    }
 
     // No worker takes a dispatch now. `busy` when one could but is at its dispatch limit, so the dispatch may wait for it.
     struct no_worker : std::runtime_error {
@@ -150,39 +181,80 @@ export namespace routing {
 
         // Whether a live worker meets the selection but has no room for another dispatch.
         auto busy(const selection& sel) const -> bool {
-            auto now = clock::now();
-            return std::ranges::any_of(members_, [&](auto& m) { return !stale(*m, now) && tools_met(*m, sel.needs) && platform_met(*m, sel.needs); }) &&
-                   !holds(sel);
+            auto offered = propose(sel);
+            return offered.busy && offered.candidates.empty();
+        }
+
+        auto propose(const selection& sel) const -> proposals {
+            proposals out;
+            const auto now = clock::now();
+            for (const auto& m : members_) {
+                if (stale(*m, now) || !tools_met(*m, sel.needs) || !platform_met(*m, sel.needs) || (sel.worker && *sel.worker != m->id))
+                    continue;
+                if (sel.memory_bytes && m->hello.memory_bytes && *sel.memory_bytes > *m->hello.memory_bytes)
+                    continue;
+                if (m->inflight >= m->hello.max_inflight || !memory_available(*m, sel)) {
+                    out.busy = true;
+                    continue;
+                }
+                placement value{.core = core_, .worker = m->id, .heat = warmth(*m, sel), .inflight = m->inflight, .used = m->last_used};
+                if (const auto observed = m->costs.find(cost_key(sel, value.heat)); observed != m->costs.end())
+                    value.seconds = observed->second.seconds * (1.0 + double(m->inflight) / m->hello.max_inflight);
+                out.candidates.push_back(std::move(value));
+            }
+            return out;
         }
 
         template <class Work> auto with(const selection& sel, Work work) -> std::invoke_result_t<Work&, transport::channel<socket>&> {
             auto m = pick(sel);
             if (!m)
                 throw no_worker{diagnose(sel), busy(sel)};
+            const auto started = clock::now();
+            const auto heat = warmth(*m, sel);
+            const auto reserved = memory_reservation(*m, sel);
             ++m->inflight;
+            m->memory_reserved += reserved;
             if (changed)
                 changed();
             struct release {
                 std::shared_ptr<member> m;
                 fleet* owner;
+                std::uint64_t reserved;
                 ~release() {
                     --m->inflight;
+                    m->memory_reserved -= reserved;
                     if (owner->changed)
                         owner->changed();
                 }
-            } guard{m, this};
+            } guard{m, this, reserved};
             using yielded = typename std::invoke_result_t<Work&, transport::channel<socket>&>::value_type;
             if constexpr (std::is_void_v<yielded>) {
                 co_await work(m->chan);
-                if (!sel.tree_key.empty())
-                    m->remember(sel.tree_key);
                 m->last_used = clock::now();
+                observe(*m, sel, heat, std::chrono::duration<double>(m->last_used - started).count());
                 co_return;
             } else {
                 auto out = co_await work(m->chan);
-                if (!sel.tree_key.empty())
-                    m->remember(sel.tree_key);
                 m->last_used = clock::now();
+                bool successful = true;
+                if constexpr (requires {
+                                  out->analysis_error;
+                                  out->ok();
+                              })
+                    successful = out && out->ok() && !out->analysis_error;
+                else if constexpr (requires { out->ok(); })
+                    successful = out && out->ok();
+                else if constexpr (requires {
+                                       out.first.analysis_error;
+                                       out.first.ok();
+                                   })
+                    successful = out.first.ok() && !out.first.analysis_error;
+                else if constexpr (requires { out.first.ok(); })
+                    successful = out.first.ok();
+                else if constexpr (requires { bool(out); })
+                    successful = bool(out);
+                if (successful)
+                    observe(*m, sel, heat, std::chrono::duration<double>(m->last_used - started).count());
                 co_return std::move(out);
             }
         }
@@ -254,6 +326,7 @@ export namespace routing {
             std::ranges::fill(hello.auth, '\0');
             hello.auth.clear();
             auto held = std::make_shared<member>(std::move(hello), std::move(peer));
+            held->id = ++next_member_;
             held->registry = registry;
             auto it = members_.insert(members_.end(), held);
             logging::info(say::joined(held->hello));
@@ -274,9 +347,20 @@ export namespace routing {
             try {
                 if (registry)
                     co_await held->chan.post(jobs::admission{true, "", held->hello.worker_id.value_or("")});
-                co_await held->chan.pump([held](const transport::frame& f) {
+                co_await held->chan.pump([held, this](const transport::frame& f) {
                     if (f.kind == jobs::code<jobs::heartbeat>)
                         held->seen = clock::now();
+                    if (f.kind == jobs::code<jobs::slot_report>) {
+                        auto report = transport::decode<jobs::slot_report>(f);
+                        if (report.sequence < held->slot_sequence)
+                            return;
+                        held->slot_sequence = report.sequence;
+                        report.slots.resize(std::min(report.slots.size(), constants::worker_slot_reports));
+                        held->slots = std::move(report.slots);
+                        held->memory = report.memory;
+                        if (changed)
+                            changed();
+                    }
                 });
             } catch (const std::exception&) {
             }
@@ -298,20 +382,23 @@ export namespace routing {
             std::vector<worker_view> out;
             auto now = clock::now();
             for (auto& m : members_) {
-                out.push_back({m->hello.name,
-                               m->hello.platform,
-                               m->hello.max_inflight,
-                               core,
-                               m->inflight,
-                               static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(now - m->seen).count()),
-                               !stale(*m, now),
-                               m->hello.tools,
-                               {m->trees.begin(), m->trees.end()},
-                               m->hello.worker_id});
+                out.push_back({m->hello.name, m->hello.platform, m->hello.max_inflight, core, m->inflight,
+                               static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(now - m->seen).count()), !stale(*m, now),
+                               m->hello.tools, m->slots, m->hello.worker_id});
                 out.back().toolchain_id = m->hello.toolchain_id;
                 out.back().dependency_publisher = m->hello.dependency_publisher;
+                out.back().memory = m->memory;
+                out.back().memory.limit = m->hello.memory_bytes;
+                out.back().memory.reserved = std::max(m->memory.reserved, m->memory_reserved);
             }
             return out;
+        }
+
+        auto locate(const transport::channel<socket>& channel) const -> location {
+            for (const auto& member : members_)
+                if (&member->chan == &channel)
+                    return {core_, member->id};
+            throw no_worker{"Worker connection is no longer attached"};
         }
 
         auto identity(const transport::channel<socket>& channel) const -> std::pair<std::string, std::optional<std::string>> {
@@ -352,33 +439,68 @@ export namespace routing {
         }
         struct member {
             member(jobs::hello h, socket s) : hello(std::move(h)), sock(std::move(s)), chan(sock) {}
+            std::uint64_t id = 0;
+            struct observation {
+                double seconds = 0;
+                clock::time_point used;
+            };
+            std::map<std::tuple<std::string, std::string, std::string, int>, observation> costs;
             jobs::hello hello;
             socket sock;
             transport::channel<socket> chan;
             std::size_t inflight = 0;
             clock::time_point seen = clock::now();
             clock::time_point last_used = clock::now();
-            std::set<std::string> trees;
-            std::deque<std::string> recent_trees;
+            std::vector<jobs::worker_slot> slots;
+            std::uint64_t slot_sequence = 0;
+            jobs::worker_memory memory;
+            std::uint64_t memory_reserved = 0;
             enrollment::store* registry = nullptr;
             bool retiring = false;
-            void remember(const std::string& tree) {
-                if (trees.contains(tree))
-                    std::erase(recent_trees, tree);
-                else if (trees.size() >= constants::worker_tree_hints) {
-                    trees.erase(recent_trees.front());
-                    recent_trees.pop_front();
-                }
-                trees.insert(tree);
-                recent_trees.push_back(tree);
-            }
         };
 
-        static void prefer(std::shared_ptr<member>& cur, const std::shared_ptr<member>& cand) {
-            if (!cur || cand->inflight < cur->inflight ||
-                (cand->inflight == cur->inflight &&
-                 (cand->last_used < cur->last_used || (cand->last_used == cur->last_used && cand->hello.name < cur->hello.name))))
-                cur = cand;
+        static auto memory_reservation(const member& m, const selection& sel) -> std::uint64_t {
+            if (!m.hello.memory_bytes)
+                return 0;
+            const auto baseline = std::min(m.memory.baseline.value_or(0), *m.hello.memory_bytes);
+            return sel.memory_bytes.value_or(*m.hello.memory_bytes - baseline);
+        }
+        static auto memory_available(const member& m, const selection& sel) -> bool {
+            if (!m.hello.memory_bytes)
+                return true;
+            const auto baseline = std::min(m.memory.baseline.value_or(0), *m.hello.memory_bytes);
+            const auto available = *m.hello.memory_bytes - baseline;
+            const auto reserved = std::max(m.memory.reserved, m.memory_reserved);
+            return reserved <= available && memory_reservation(m, sel) <= available - reserved;
+        }
+        static auto cost_key(const selection& sel, int heat) -> std::tuple<std::string, std::string, std::string, int> {
+            return {sel.tree_key.substr(0, sel.tree_key.find('/')), sel.options, sel.stage, heat};
+        }
+        static auto warmth(const member& m, const selection& sel) -> int {
+            int heat = 0;
+            for (const auto& slot : m.slots)
+                if (!slot.busy && slot.project + "/" + slot.tree == sel.tree_key) {
+                    heat = std::max(heat, 1);
+                    for (const auto& session : slot.sessions)
+                        if (!sel.options.empty() && session.options == sel.options && session.stage == sel.stage)
+                            heat = std::max(heat, !sel.snapshot.empty() && session.snapshot == sel.snapshot ? 3 : 2);
+                }
+            return heat;
+        }
+        static void observe(member& m, const selection& sel, int heat, double seconds) {
+            if (sel.options.empty())
+                return;
+            const auto key = cost_key(sel, heat);
+            if (auto found = m.costs.find(key); found != m.costs.end()) {
+                found->second.seconds += constants::worker_cost_weight * (seconds - found->second.seconds);
+                found->second.used = clock::now();
+            } else {
+                if (m.costs.size() >= constants::worker_cost_records) {
+                    auto oldest = std::ranges::min_element(m.costs, {}, [](const auto& value) { return value.second.used; });
+                    m.costs.erase(oldest);
+                }
+                m.costs.emplace(key, member::observation{seconds, clock::now()});
+            }
         }
 
         auto stale(const member& m, clock::time_point now) const -> bool {
@@ -395,55 +517,22 @@ export namespace routing {
             return (!needs.os || m.hello.platform.os == *needs.os) && (!needs.arch || m.hello.platform.arch == *needs.arch);
         }
 
-        auto eligible(const member& m, const selection& sel, clock::time_point now) const -> bool {
-            return !stale(m, now) && m.inflight < m.hello.max_inflight && tools_met(m, sel.needs) && platform_met(m, sel.needs);
-        }
-
         auto pick(const selection& sel) const -> std::shared_ptr<member> {
-            auto now = clock::now();
-            std::shared_ptr<member> best, resident;
-            for (auto& m : members_) {
-                if (!eligible(*m, sel, now))
-                    continue;
-                prefer(best, m);
-                if (!sel.tree_key.empty() && m->trees.contains(sel.tree_key))
-                    prefer(resident, m);
-            }
-            return resident ? resident : best;
+            auto candidates = propose(sel).candidates;
+            if (candidates.empty())
+                return {};
+            const bool costs = measured(candidates);
+            auto best = std::ranges::min_element(candidates, [costs](const auto& a, const auto& b) { return preferred(a, b, costs); });
+            const auto found = std::ranges::find_if(members_, [&](const auto& m) { return m->id == best->worker; });
+            return *found;
         }
 
+        std::uint64_t next_member_ = 0;
         std::atomic<int>& attached_;
         const config::slots* config_;
         std::size_t core_;
         std::chrono::milliseconds stale_;
         std::list<std::shared_ptr<member>> members_;
-    };
-
-    class directory {
-    public:
-        explicit directory(const std::vector<std::atomic<int>>& attached) : attached_(attached), forwarded_(attached.size(), 0) {}
-
-        auto pick(const std::vector<bool>& tried) const -> std::optional<std::size_t> {
-            std::optional<std::size_t> best;
-            int best_n = 0;
-            for (std::size_t c = 0; c < attached_.size(); ++c) {
-                auto n = attached_[c].load(std::memory_order_relaxed);
-                if (n <= 0 || tried[c])
-                    continue;
-                if (!best || forwarded_[c] * best_n < forwarded_[*best] * n) {
-                    best = c;
-                    best_n = n;
-                }
-            }
-            return best;
-        }
-
-        void forwarded(std::size_t core, int delta) { forwarded_[core] += delta; }
-
-    private:
-        // Workers attached to each core, as each core counts its own, and dispatches this core forwarded to it.
-        const std::vector<std::atomic<int>>& attached_;
-        std::vector<int> forwarded_;
     };
 
     class router {
@@ -460,7 +549,6 @@ export namespace routing {
         auto io_context() -> cores::context<native::scheduler>& { return rt_; }
 
         auto workers(std::size_t core) -> fleet& { return cores_[core]->workers; }
-        auto routes(std::size_t core) -> directory& { return cores_[core]->routes; }
 
         // `progress`, when given, outlives the call: a forwarded attempt reports into it from the other core while this one waits.
         template <class Work>
@@ -469,33 +557,34 @@ export namespace routing {
             -> std::invoke_result_t<Work&, channel&, jobs::progress_log*, std::size_t> {
             using result = typename std::invoke_result_t<Work&, channel&, jobs::progress_log*, std::size_t>::value_type;
             auto& s = *cores_[here];
-            std::vector<bool> tried(rt_.size(), false);
-            tried[here] = true;
-            bool busy = s.workers.busy(sel);
-            for (;;) {
-                if (s.workers.holds(sel))
-                    co_return co_await s.workers.with(sel, [&](channel& c) { return work(c, progress, here); });
-
-                auto there = s.routes.pick(tried);
-                if (!there)
-                    throw no_worker{busy ? "every eligible worker is at its dispatch limit" : s.workers.diagnose(sel), busy};
-                tried[*there] = true;
-
-                s.routes.forwarded(*there, +1);
-                struct release {
-                    directory& d;
-                    std::size_t core;
-                    ~release() { d.forwarded(core, -1); }
-                } guard{s.routes, *there};
+            auto offered = co_await propose(here, sel);
+            const bool costs = measured(offered.candidates);
+            std::ranges::sort(offered.candidates, [costs](const auto& a, const auto& b) { return preferred(a, b, costs); });
+            bool busy = offered.busy;
+            for (const auto& candidate : offered.candidates) {
+                auto selected = sel;
+                selected.worker = candidate.worker;
+                if (candidate.core == here) {
+                    try {
+                        co_return co_await s.workers.with(selected, [&](channel& c) { return work(c, progress, here); });
+                    } catch (const no_worker& e) {
+                        busy = busy || e.busy;
+                        continue;
+                    }
+                }
                 std::optional<result> out;
                 try {
-                    out.emplace(co_await cores::call(rt_.get_scheduler(here), rt_.get_scheduler(*there), remote(*there, sel, work, progress)));
+                    out.emplace(
+                        co_await cores::call(rt_.get_scheduler(here), rt_.get_scheduler(candidate.core), remote(candidate.core, selected, work, progress)));
                 } catch (const no_worker& e) {
                     busy = busy || e.busy;
                     continue;
                 }
                 co_return std::move(*out);
             }
+            if (sel.worker && !busy)
+                throw no_worker{"the worker reserved for this directory group is no longer available"};
+            throw no_worker{busy ? "every eligible worker is at its dispatch limit" : s.workers.diagnose(sel), busy};
         }
 
         template <jobs::request Req>
@@ -527,12 +616,26 @@ export namespace routing {
         }
 
     private:
+        auto propose(std::size_t here, const selection& sel) -> coroutine::task<proposals> {
+            proposals out;
+            for (std::size_t core = 0; core < rt_.size(); ++core) {
+                if ((sel.core && *sel.core != core) || !attached_[core].load(std::memory_order_relaxed))
+                    continue;
+                auto value = core == here ? workers(core).propose(sel)
+                                          : co_await cores::call(rt_.get_scheduler(here), rt_.get_scheduler(core),
+                                                                 [this, core, sel] { return local_proposal(core, sel); });
+                out.busy = out.busy || value.busy;
+                out.candidates.insert(out.candidates.end(), value.candidates.begin(), value.candidates.end());
+            }
+            co_return out;
+        }
+        auto local_proposal(std::size_t core, const selection& sel) -> coroutine::task<proposals> { co_return workers(core).propose(sel); }
+
         auto local_description(std::size_t core) -> coroutine::task<std::vector<worker_view>> { co_return workers(core).describe(core); }
 
         struct core_state {
-            core_state(router& owner, std::size_t core) : workers(owner.attached_[core], owner.config_, core, owner.stale_), routes(owner.attached_) {}
+            core_state(router& owner, std::size_t core) : workers(owner.attached_[core], owner.config_, core, owner.stale_) {}
             fleet workers;
-            directory routes;
         };
 
         template <class Work> auto remote(std::size_t there, selection sel, const Work& work, jobs::progress_log* progress) {

@@ -283,19 +283,23 @@ namespace durability {
         if (fresh)
             sync_dir(path.parent_path());
     }
-    void durable_remove(const std::filesystem::path& path) {
-        winapi::handle file{
-            ::CreateFileW(winapi::path(path).c_str(), DELETE, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING, 0, nullptr)};
+    auto remove_file(const std::filesystem::path& path) -> bool {
+        winapi::handle file{::CreateFileW(winapi::path(path).c_str(), DELETE, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
+                                          FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS, nullptr)};
         if (file.value == INVALID_HANDLE_VALUE) {
             auto error = ::GetLastError();
-            if (error != ERROR_FILE_NOT_FOUND)
-                winapi::fail("open file for deletion", error);
-        } else {
-            FILE_DISPOSITION_INFO_EX disposition{FILE_DISPOSITION_FLAG_DELETE | FILE_DISPOSITION_FLAG_POSIX_SEMANTICS};
-            if (!::SetFileInformationByHandle(file.value, FileDispositionInfoEx, &disposition, sizeof disposition))
-                winapi::fail("delete durable data");
-            file.reset();
+            if (error == ERROR_FILE_NOT_FOUND || error == ERROR_PATH_NOT_FOUND)
+                return false;
+            winapi::fail("open file for deletion", error);
         }
+        FILE_DISPOSITION_INFO_EX disposition{FILE_DISPOSITION_FLAG_DELETE | FILE_DISPOSITION_FLAG_POSIX_SEMANTICS |
+                                             FILE_DISPOSITION_FLAG_IGNORE_READONLY_ATTRIBUTE};
+        if (!::SetFileInformationByHandle(file.value, FileDispositionInfoEx, &disposition, sizeof disposition))
+            winapi::fail("delete file");
+        return true;
+    }
+    void durable_remove(const std::filesystem::path& path) {
+        remove_file(path);
         sync_dir(path.parent_path());
     }
     void durable_directories(const std::filesystem::path& path) {

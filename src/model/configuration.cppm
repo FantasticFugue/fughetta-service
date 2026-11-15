@@ -1,11 +1,11 @@
 export module configuration;
-import utility;
 import constants;
 import std;
 import reflection;
 import durability;
 import async;
 import host;
+import toolchain;
 export import language;
 export import allocation;
 
@@ -67,6 +67,7 @@ export namespace config {
         std::map<std::string, run_configuration> run_configurations;
         std::vector<std::string> default_configurations;
         std::map<std::string, language::configuration> analysis;
+        language::defaults analysis_defaults;
     };
 
     // A bearer token of this core: its SHA-256 hash, the name its writes carry, and the role it acts with.
@@ -180,6 +181,7 @@ export namespace config {
         std::vector<std::string> default_configurations;
         effective_limits limits;
         std::map<std::string, language::configuration> analysis;
+        language::defaults analysis_defaults;
 
         auto config(std::string_view name) const -> const effective_config& {
             auto it = configs.find(name);
@@ -278,7 +280,12 @@ export namespace config {
         }
 
         inline auto resolve(const settings& s, std::string project, const effective_limits& limits) -> effective {
-            effective e{.project = std::move(project), .ignore = s.ignore, .env = s.env, .limits = limits, .analysis = s.analysis};
+            effective e{.project = std::move(project),
+                        .ignore = s.ignore,
+                        .env = s.env,
+                        .limits = limits,
+                        .analysis = s.analysis,
+                        .analysis_defaults = s.analysis_defaults};
             auto where = e.project;
             for (auto& [name, build] : s.build_configurations) {
                 effective_config c{.name = name, .build = build, .env = with(s.env, build.env), .enabled = build.enabled};
@@ -337,11 +344,7 @@ export namespace config {
         builds::validate_environment(s.env);
         for (auto& [name, a] : s.analysis) {
             check_name("analysis", name);
-            language::validate(a);
-            auto bound = s.build_configurations.find(a.build_configuration);
-            if (bound == s.build_configurations.end())
-                throw std::invalid_argument("analysis " + name + " names an unknown build_configuration: " + a.build_configuration);
-            language::prepare(a, bound->second);
+            language::expand(a, s.build_configurations, {}, s.analysis_defaults);
         }
         for (auto& [name, c] : s.build_configurations) {
             check_name("build configuration", name);
@@ -454,13 +457,14 @@ export namespace config {
         std::string work_root = "work";
         std::uint32_t compute_threads = 1;
         std::uint32_t parallel = 1;
+        std::optional<std::uint64_t> memory_bytes;
         std::uint32_t max_inflight = 4;
         std::uint64_t max_cache_bytes = 20ull << 30;
         std::uint32_t tree_ttl_days = 14;
         std::map<std::string, std::string> env;
         bool inherit_env = true;
         builds::toolset tools;
-        std::map<std::string, std::string> sdk_manifests;
+        std::map<std::string, toolchain::sdk> sdk_manifests;
         std::optional<std::string> dependency_cache;
         std::optional<std::string> dependency_upstream;
         std::optional<std::string> dependency_publish;
@@ -491,6 +495,8 @@ export namespace config {
             builds::validate(*w.dependency_recipe);
         if (w.compute_threads == 0 || w.parallel == 0)
             throw std::invalid_argument("worker thread and parallel budgets must be positive");
+        if (w.memory_bytes && !*w.memory_bytes)
+            throw std::invalid_argument("Worker memory_bytes must be positive");
         if (w.max_inflight == 0)
             throw std::invalid_argument("Worker max_inflight must be positive");
         if (w.tree_ttl_days == 0)

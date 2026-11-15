@@ -56,9 +56,11 @@ namespace {
             expect(restored.ok() && restored.worker == "local");
             restored.steps.front().timed_out = true;
             expect(!restored.ok() && jobs::build_report{}.ok());
-            language::request request{.config = {.build_configuration = "native"}, .build = mixed()};
+            language::request request{.config = {.build_configuration = "native",
+                                                 .inputs = {{"compilation_database", {language::build_input{"native", "configure", "compilation_database"}}}}},
+                                      .builds = {{"native", mixed()}}};
             auto prepared = transport::decode<language::request>({.payload = transport::encode(request)});
-            expect(language::prepare(prepared.config, prepared.build).inputs.size() == 1u);
+            expect(language::prepare(prepared.config, prepared.builds).inputs.size() == 1u);
         };
 
         "CMake and Bazel compose by typed inputs"_test = [] {
@@ -79,7 +81,9 @@ namespace {
             c.operations["prepare"] = {.tasks = {"configure", "build"}};
             auto once = builds::prepare(c, {.operation = "prepare"});
             expect(once.steps.size() == 3u) << "shared dependencies expand once";
-            auto prepared = language::prepare({.build_configuration = "native"}, mixed());
+            auto prepared = language::prepare(
+                {.build_configuration = "native", .inputs = {{"compilation_database", {language::build_input{"native", "configure", "compilation_database"}}}}},
+                {{"native", mixed()}});
             expect(prepared.build.steps.size() == 2u && prepared.inputs[0].type == "compilation_database");
             expect(prepared.server.provider == "clice" && prepared.server.argv == std::vector<std::string>{"clice", "serve"});
             expect(rfl::json::write(prepared.server.initialization) ==
@@ -93,7 +97,7 @@ namespace {
             auto configuration = mixed();
             configuration.operations.erase("prepare");
             configuration.outputs.clear();
-            auto plan = builds::prepare_inputs(configuration, {"compilation_database"});
+            auto plan = builds::prepare_inputs(configuration, {{{"configure", "compilation_database"}, "compilation_database"}});
             expect(plan.steps.size() == 2u && plan.tasks.size() == 2u);
             expect(plan.tasks.at(0).name == "generate" && plan.tasks.at(1).name == "configure");
             expect(plan.tasks.at(1).dependencies == std::vector<std::string>{"generate"});
@@ -101,9 +105,155 @@ namespace {
             expect(plan.contexts.size() == 1u && plan.contexts.at(0).path == "build/cmake/compile_commands.json");
             expect(std::ranges::any_of(plan.tasks.at(1).outputs, [](auto& output) { return output.type == "compilation_database"; }));
             expect(builds::prepare_inputs(configuration, {}).steps.empty());
-            expect(throws<std::invalid_argument>([&] { builds::prepare_inputs(configuration, {"missing"}); }));
+            expect(
+                throws<std::invalid_argument>([&] { builds::prepare_inputs(configuration, {{{"missing", "compilation_database"}, "compilation_database"}}); }));
             configuration.tasks["another"] = configuration.tasks.at("configure");
-            expect(throws<std::invalid_argument>([&] { builds::prepare_inputs(configuration, {"compilation_database"}); }));
+            expect(builds::prepare_inputs(configuration, {{{"configure", "compilation_database"}, "compilation_database"}}).tasks.size() == 2u)
+                << "an unselected producer of the same type and path stays outside the plan";
+            expect(throws<std::invalid_argument>([&] {
+                builds::prepare_inputs(configuration, {{{"configure", "compilation_database"}, "compilation_database"},
+                                                       {{"another", "compilation_database"}, "compilation_database"}});
+            }));
+            expect(
+                throws<std::invalid_argument>([&] { builds::prepare_inputs(configuration, {{{"configure", "compilation_database"}, "python_environment"}}); }));
+            configuration.builders["release"] = configuration.builders.at("main");
+            fixture::options<"cmake">(configuration.builders.at("release")).build_dir = "build/release";
+            configuration.tasks.at("another").builder = "release";
+            auto paired = language::prepare({.server = language::with<"clice">{.options = {.cache_dir = "build/paired-cache"}},
+                                             .build_configuration = "native",
+                                             .inputs = {{"compilation_database",
+                                                         {language::build_input{"native", "another", "compilation_database"},
+                                                          language::build_input{"native", "configure", "compilation_database"}}}}},
+                                            {{"native", configuration}});
+            expect(paired.inputs.size() == 2u && paired.inputs[0].path == "build/release/compile_commands.json" &&
+                   paired.inputs[1].path == "build/cmake/compile_commands.json")
+                << "multiple producers retain the input order";
+            expect(throws<std::invalid_argument>([&] { language::server<"clice">::launch({}, paired.inputs); }));
+            expect(paired.build.tasks.size() == 3u && paired.build.tasks.front().name == "native/generate") << "shared prerequisites execute once";
+        };
+
+        "analysis consumes selected configurations with their own environments and limits"_test = [] {
+            auto native = fixture::cmake("build/native");
+            auto other = fixture::cmake("build/other");
+            fixture::options<"cmake">(native.builders.at("main")).export_compile_commands = true;
+            fixture::options<"cmake">(other.builders.at("main")).export_compile_commands = true;
+            native.env = {{"PREPARE_OWNER", "native"}, {"NATIVE_ONLY", "yes"}};
+            other.env = {{"PREPARE_OWNER", "other"}};
+            native.limits.timeout_s = 120;
+            other.limits.timeout_s = 60;
+            std::map<std::string, builds::configuration> builds{{"native", native}, {"other", other}, {"unused", native}};
+            language::stage stage{.server = language::with<"clice">{.options = {.cache_dir = "build/stage-cache"}},
+                                  .build_configuration = "native",
+                                  .inputs = {{"compilation_database",
+                                              {language::build_input{"other", "configure", "compilation_database"},
+                                               language::build_input{"native", "configure", "compilation_database"}}}},
+                                  .execution = {.limits = {.timeout_s = 100}}};
+            auto plan = language::prepare(stage, builds);
+            expect(plan.inputs.size() == 2u && plan.inputs.front().name == "other/configure/compilation_database" &&
+                   plan.inputs.back().name == "native/configure/compilation_database");
+            expect(plan.build.tasks.size() == 2u && plan.build.tasks.front().name == "native/configure" && plan.build.tasks.back().name == "other/configure" &&
+                   plan.build.tasks.back().first_step == 1u);
+            expect(plan.build.env.empty() && plan.build.steps.front().env.at("PREPARE_OWNER") == "native" &&
+                   plan.build.steps.back().env.at("PREPARE_OWNER") == "other" && !plan.build.steps.back().env.contains("NATIVE_ONLY") &&
+                   plan.server.env.at("NATIVE_ONLY") == "yes");
+            auto graph = language::expand({.stages = {{"main", stage}}, .outputs = {{"facts", {{"main", "facts"}}}}}, builds);
+            expect(graph.nodes.back().dependencies ==
+                   std::vector<std::string>{"directory/native/build/other/configure", "directory/native/build/native/configure"});
+            expect(graph.nodes.back().execution->limits.timeout_s == 60u && graph.nodes.back().origins.at("limits.timeout_s") == "build/other");
+            const auto identity = language::fingerprint(stage, builds);
+            builds.at("unused").env["PREPARE_OWNER"] = "changed";
+            expect(language::fingerprint(stage, builds) == identity && language::select_builds(stage, builds).size() == 2u);
+        };
+
+        "analysis profiles expand selected stages and shared preparation into one graph"_test = [] {
+            language::stage cpp{.build_configuration = "native",
+                                .inputs = {{"compilation_database", {language::build_input{"native", "configure", "compilation_database"}}}}};
+            auto review = cpp;
+            review.after = {"cpp"};
+            language::configuration profile{
+                .stages = {{"cpp", cpp}, {"review", review}, {"lint", {.server = language::with<"ruff">{}, .build_configuration = "native"}}},
+                .outputs = {{"reviewed", {{"review", "facts"}}}, {"lint", {{"lint", "facts"}}}}};
+            auto graph = language::expand(profile, {{"native", mixed()}}, {"reviewed"});
+            expect(graph.stages == std::vector<std::string>{"cpp", "review"});
+            expect(graph.nodes.size() == 4u && graph.outputs.size() == 1u);
+            expect(graph.nodes[0].id == "directory/native/build/native/generate" && graph.nodes[1].id == "directory/native/build/native/configure");
+            expect(graph.nodes[1].outputs.at("compilation_database") == "compilation_database");
+            expect(graph.nodes.back().dependencies == std::vector<std::string>{"stage/cpp", "directory/native/build/native/configure"});
+            expect(graph.nodes.back().outputs.at("facts") == "semantic_shard" && graph.nodes.back().server->provider == "clice");
+            const auto saved = config::parse_as<language::configuration>(rfl::json::write(profile), "analysis");
+            const auto saved_graph = language::expand(saved, {{"native", mixed()}}, {"reviewed"});
+            expect(std::get<language::build_input>(saved_graph.nodes.back().inputs.at("compilation_database").front()).configuration == "native");
+            auto linked = profile;
+            linked.stages.at("review").inputs.at("compilation_database") = {language::reference{"cpp", "facts"}};
+            linked = config::parse_as<language::configuration>(rfl::json::write(linked), "analysis");
+            expect(std::get<language::reference>(linked.stages.at("review").inputs.at("compilation_database").front()).stage == "cpp");
+            try {
+                language::expand(linked, {{"native", mixed()}}, {"reviewed"});
+                expect(false) << "semantic facts cannot supply a compilation database";
+            } catch (const std::invalid_argument& error) {
+                expect(std::string_view{error.what()}.contains("review/compilation_database requires compilation_database; cpp/facts produces semantic_shard"));
+            }
+            auto native = fixture::cmake("build/native");
+            auto& native_options = fixture::options<"cmake">(native.builders.at("main"));
+            native_options.export_compile_commands = true;
+            native_options.outputs["app"] = {"native-artifact", "build/native/app"};
+            auto artifact_profile = fixture::profile(cpp);
+            artifact_profile.stages["artifact"] = {
+                .server = language::with<"native-artifact">{.options = {.module = "app"}},
+                .build_configuration = "native",
+                .inputs = {{"artifact", {language::build_input{"native", "build", "app"}}}, {"source_facts", {language::reference{"main", "facts"}}}}};
+            artifact_profile.outputs = {{"native", {{"artifact", "facts"}}}};
+            const auto artifact_graph = language::expand(artifact_profile, {{"native", native}}, {"native"});
+            expect(artifact_graph.stages == std::vector<std::string>{"main", "artifact"});
+            expect(std::ranges::contains(artifact_graph.nodes.back().dependencies, "stage/main"));
+            expect(std::ranges::contains(artifact_graph.directory_groups.at("native").tools, "llvm-symbolizer"));
+            auto cross_project = artifact_profile;
+            cross_project.stages.at("artifact").inputs.at("source_facts") = {language::project_input{"library", "release", "cpp", "source", std::nullopt}};
+            const auto restored_cross = config::parse_as<language::configuration>(rfl::json::write(cross_project), "analysis");
+            const auto foreign_graph = language::expand(restored_cross, {{"native", native}}, {"native"});
+            expect(foreign_graph.stages == std::vector<std::string>{"artifact"});
+            const auto& foreign = std::get<language::project_input>(foreign_graph.nodes.back().inputs.at("source_facts").front());
+            expect(foreign.project == "library" && foreign.worldline == "release" && foreign.configuration == "cpp" && foreign.output == "source");
+            cross_project.stages.at("main").inputs.at("compilation_database") = {foreign};
+            expect(throws<std::invalid_argument>([&] { language::expand(cross_project, {{"native", native}}, {"native"}); }))
+                << "semantic project output cannot fill a compilation database input";
+            language::defaults project{
+                .fact_limit = 25, .relation_depth = 3, .execution = {.limits = {.timeout_s = 90}, .budget = {.units = 8}, .directory_group = "project"}};
+            profile.defaults = {.fact_limit = 4, .execution = {.budget = {.units = 4}, .directory_group = "shared"}};
+            profile.stages.at("review").execution = {
+                .needs = builds::tools({"clang"}), .limits = {.timeout_s = 50}, .budget = {.units = 2}, .directory_group = "review"};
+            auto build = mixed();
+            build.limits.timeout_s = 60;
+            auto expanded = language::expand(profile, {{"native", build}}, {"reviewed"}, project);
+            const auto& execution = *expanded.nodes.back().execution;
+            expect(expanded.defaults.fact_limit == 4u && expanded.defaults.relation_depth == 3u);
+            expect(expanded.nodes.size() == 6u && expanded.directory_groups.size() == 2u);
+            expect(expanded.nodes[2].execution->directory_group == "shared" && execution.directory_group == "review");
+            expect(expanded.nodes[2].origins.at("directory_group") == "profile" && expanded.nodes.back().origins.at("directory_group") == "stage");
+            expect(std::ranges::contains(expanded.directory_groups.at("review").tools, "clang"));
+            expect(expanded.nodes[2].execution->limits.timeout_s == 60u && execution.limits.timeout_s == 50u);
+            expect(execution.budget.units == 2u && std::ranges::contains(execution.needs.get().tools, "clang"));
+            expect(expanded.origins.at("fact_limit") == "profile" && expanded.origins.at("relation_depth") == "project");
+            expect(expanded.nodes[2].origins.at("limits.timeout_s") == "build/native" && expanded.nodes.back().origins.at("budget.units") == "stage");
+            expect(semantic::tighten(execution.budget, {.units = 20}).units == 2u && semantic::tighten(execution.budget, {.units = 1}).units == 1u);
+            auto controlled = language::resolve(cpp, project);
+            expect(language::fingerprint(controlled, {{"native", build}}) == language::fingerprint(cpp, {{"native", mixed()}}));
+            auto merged = profile;
+            merged.stages.at("review").execution.directory_group = "shared";
+            merged.stages.at("review").build_configuration = "other";
+            std::get<language::build_input>(merged.stages.at("review").inputs.at("compilation_database").front()).configuration = "other";
+            expect(throws<std::invalid_argument>([&] { language::expand(merged, {{"native", build}, {"other", build}}, {"reviewed"}, project); }))
+                << "two configurations cannot overwrite each other's declared outputs in a shared directory";
+            merged.stages.at("review").build_configuration = "native";
+            std::get<language::build_input>(merged.stages.at("review").inputs.at("compilation_database").front()).configuration = "native";
+            auto group_build = build;
+            fixture::needs(group_build.builders.at("main")).platform = {};
+            merged.stages.at("cpp").execution.needs.get().platform.os = "linux";
+            merged.stages.at("review").execution.needs.get().platform.os = "windows";
+            expect(throws<std::invalid_argument>([&] { language::expand(merged, {{"native", group_build}}, {"reviewed"}, project); }))
+                << "a directory group needs one worker platform";
+            profile.stages.at("cpp").after = {"review"};
+            expect(throws<std::invalid_argument>([&] { language::expand(profile, {{"native", mixed()}}); }));
         };
 
         "graph and type failures are rejected before any execution"_test = [] {
@@ -123,8 +273,12 @@ namespace {
             reject([](auto& c) { c.outputs.at("archive").output = "missing"; });
             expect(throws<std::invalid_argument>([&] { builds::prepare(baseline, {.operation = "prepare", .parameters = {.targets = {"app"}}}); }));
             expect(throws<std::invalid_argument>([&] { builds::prepare(baseline, {.operation = "build", .parameters = {.labels = "unit"}}); }));
-            expect(throws<std::invalid_argument>([&] { language::prepare({.build_configuration = "native"}, {}); })) << "clice requires an artifact producer";
-            expect(throws<std::invalid_argument>([&] { language::prepare({}, baseline); })) << "analysis requires a build reference";
+            expect(throws<std::invalid_argument>([&] {
+                language::prepare({.build_configuration = "native",
+                                   .inputs = {{"compilation_database", {language::build_input{"native", "configure", "compilation_database"}}}}},
+                                  {{"native", {}}});
+            })) << "clice requires an artifact producer";
+            expect(throws<std::invalid_argument>([&] { language::prepare({}, {{"native", baseline}}); })) << "analysis requires a build reference";
             expect(!rfl::json::read<builds::builder>(R"({"adapter":"missing","options":{}})")) << "an unknown adapter is refused when parsed";
             expect(!rfl::json::read<language::provider>(R"({"provider":"clangd"})")) << "so is an unknown language provider";
         };
@@ -309,17 +463,6 @@ namespace {
                 c.tasks.at("test").reports = {r};
                 expect(throws<std::invalid_argument>([&] { builds::validate(c); })) << r.file;
             }
-        };
-        "worker reports carry language diagnostics to source publication"_test = [] {
-            jobs::build_report report;
-            report.outline = semantic::outline{};
-            report.outline->diagnostics.push_back({.range = {.place = semantic::place{"app.py", 2, 5}}, .severity = "error", .message = "invalid assignment"});
-            auto decoded = transport::codec<jobs::build_report>::decode(transport::encode(report));
-            expect((decoded.outline.has_value()) >> fatal);
-            expect(decoded.outline->diagnostics.size() == 1u);
-            auto& diagnostic = decoded.outline->diagnostics.front();
-            expect(diagnostic.message == "invalid assignment" && diagnostic.range.place->path == "app.py");
-            expect(diagnostic.range.place->begin == 2u && diagnostic.range.place->end == 5u);
         };
     };
 } // namespace

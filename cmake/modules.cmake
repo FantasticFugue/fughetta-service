@@ -44,19 +44,19 @@ add_implementation(io io entropy dns)
 
 # model
 add_layer(model)
-add_modules(model model allocation content codec archive semantic world nodes provider report cmake bazel
-  commands clice vcpkg typescript bun uv ty ruff build language protocol configuration usage runner replica delivery lsp toolchain)
-add_implementation(model model crypto planning generator analysis)
+add_modules(model model allocation content codec archive records objects profiles semantic enumeration reuse channels indexing knowledge world nodes provider report cmake bazel
+  commands clice artifact jvm kmetadata clr pinvoke jni vcpkg typescript bun uv ty ruff gradle msbuild projectmodel build language protocol configuration usage runner replica delivery lsp evaluation helper kotlin fsharp toolchain)
+add_implementation(model model crypto planning generator analysis impact comparison reanalysis)
 
 # gateway
 add_layer(gateway)
-add_modules(gateway gateway fleet front mcp settings tools registry client keyring templates enrollment)
+add_modules(gateway gateway fleet front mcp settings tool publication toolbase worldlines dispatch queries tools registry client keyring templates enrollment)
 add_implementation(gateway gateway exchange routes broadcast backlog pairing)
 
 # source
 add_layer(source)
-add_modules(source source server storage index kernel engine package)
-add_implementation(source source database)
+add_modules(source source server storage index kernel nodestore engineapi nodestate engine package)
+add_implementation(source source database objects validation projections history coordination worldstate replication)
 
 # worker
 add_layer(worker)
@@ -80,7 +80,7 @@ target_link_libraries(platform PRIVATE ${PLATFORM_LIBRARIES})
 target_link_libraries(core PUBLIC STDEXEC::stdexec httpant::io reflectcpp::reflectcpp)
 target_link_libraries(platform PUBLIC core)
 target_link_libraries(io PUBLIC platform httpant::httpant httpant::tls PRIVATE unofficial-sodium::sodium c-ares::cares)
-target_link_libraries(model PUBLIC io PRIVATE unofficial-sodium::sodium zstd::libzstd)
+target_link_libraries(model PUBLIC io PRIVATE unofficial-sodium::sodium ZLIB::ZLIB zstd::libzstd unofficial::sqlite3::sqlite3)
 target_link_libraries(gateway PUBLIC model PRIVATE unofficial-sodium::sodium)
 target_link_libraries(source PUBLIC model PRIVATE unofficial::sqlite3::sqlite3)
 target_link_libraries(worker PUBLIC model)

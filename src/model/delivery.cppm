@@ -4,10 +4,70 @@ import content;
 import protocol;
 import constants;
 import durability;
+import reflection;
+import projectmodel;
 
 export namespace delivery {
-    inline void collect(const std::filesystem::path& storage, std::chrono::seconds retention = constants::export_retention,
-                        std::uint64_t budget = constants::export_cache_bytes, const std::set<std::string>& receiving = {}) {
+    using pins = std::vector<std::shared_ptr<const std::string>>;
+    // Callers serialize acquisition and collection with their storage lock.
+    class retention {
+        std::map<std::string, std::weak_ptr<const std::string>> live_;
+
+    public:
+        void acquire(const std::string& id, pins& held) {
+            auto& slot = live_[id];
+            auto pin = slot.lock();
+            if (!pin)
+                slot = pin = std::make_shared<const std::string>(id);
+            held.push_back(std::move(pin));
+        }
+        auto roots() -> std::set<std::string> {
+            std::erase_if(live_, [](const auto& item) { return item.second.expired(); });
+            std::set<std::string> result;
+            for (const auto& [id, _] : live_)
+                result.insert(id);
+            return result;
+        }
+    };
+    inline void readonly(const std::filesystem::path& path) {
+        std::filesystem::permissions(path, std::filesystem::perms::owner_read | std::filesystem::perms::group_read | std::filesystem::perms::others_read);
+    }
+    inline auto model(const std::filesystem::path& storage, const content::hash& id) -> projectmodel::document {
+        if (!content::is_hash(id))
+            throw std::invalid_argument("invalid model digest");
+        std::string bytes;
+        for (auto part : durability::read_plain(storage / id.view(), projectmodel::format::max_bytes))
+            bytes.append(reinterpret_cast<const char*>(part.data()), part.size());
+        return projectmodel::read(bytes);
+    }
+
+    inline auto references(const std::filesystem::path& storage, const content::hash& id) -> std::vector<builds::exported_object> {
+        if (!content::is_hash(id))
+            throw std::invalid_argument("invalid model digest");
+        const auto path = storage / "references" / id.view();
+        if (!std::filesystem::exists(path))
+            return {};
+        std::ifstream input{path, std::ios::binary};
+        return rfl::json::read<std::vector<builds::exported_object>>(std::string{std::istreambuf_iterator<char>{input}, {}}).value();
+    }
+
+    // The model bytes determine the reference graph; an untrusted sender's list is ignored.
+    inline auto retain_model(const std::filesystem::path& storage, const content::hash& id) -> std::vector<builds::exported_object> {
+        std::vector<builds::exported_object> refs;
+        for (const auto& hash : projectmodel::objects(model(storage, id))) {
+            const auto path = storage / hash;
+            if (!std::filesystem::is_regular_file(std::filesystem::symlink_status(path)))
+                throw std::runtime_error("missing model object: " + hash);
+            refs.push_back({hash, std::filesystem::file_size(path)});
+        }
+        std::filesystem::create_directories(storage / "references");
+        durability::durable_write(storage / "references" / id.view(), rfl::json::write(refs));
+        return refs;
+    }
+
+    inline auto collect(const std::filesystem::path& storage, std::chrono::seconds retention = constants::export_retention,
+                        std::uint64_t budget = constants::export_cache_bytes, const std::set<std::string>& receiving = {},
+                        const std::set<std::string>& retained = {}) -> std::vector<std::string> {
         using clock = std::filesystem::file_time_type::clock;
         struct object {
             std::filesystem::path path;
@@ -15,6 +75,16 @@ export namespace delivery {
             std::uint64_t size;
         };
         std::vector<object> objects;
+        std::vector<std::string> errors;
+        auto attempt = [&](const std::filesystem::path& path, auto&& action) {
+            try {
+                action();
+                return true;
+            } catch (const std::exception& failure) {
+                errors.push_back(path.string() + ": " + failure.what());
+                return false;
+            }
+        };
         std::uint64_t total = 0;
         std::error_code ec;
         const auto now = clock::now();
@@ -31,14 +101,63 @@ export namespace delivery {
             total += size;
             objects.push_back({entry.path(), used, size});
         }
+        std::map<std::string, std::vector<builds::exported_object>> models;
+        std::map<std::string, std::size_t> counts;
+        std::set<std::string> children;
+        std::vector<std::filesystem::path> orphaned;
+        for (const auto& entry : std::filesystem::directory_iterator(storage / "references", ec)) {
+            const auto id = entry.path().filename().string();
+            if (!content::is_hash(id) || !entry.is_regular_file())
+                continue;
+            auto refs = references(storage, id);
+            for (const auto& child : refs)
+                children.insert(child.digest.str());
+            if (std::filesystem::is_regular_file(storage / id)) {
+                for (const auto& child : refs)
+                    ++counts[child.digest.str()];
+                models.emplace(id, std::move(refs));
+            } else
+                orphaned.push_back(entry.path());
+        }
+        auto remove = [&](const std::filesystem::path& path) {
+            if (retained.contains(path.filename().string()))
+                return false;
+            return attempt(path, [&] {
+                const auto size = std::filesystem::file_size(path, ec);
+                if (ec == std::errc::no_such_file_or_directory)
+                    return;
+                if (ec)
+                    throw std::filesystem::filesystem_error("measure export for collection", path, ec);
+                // Reserve this eviction in the current pass even if deletion
+                // fails. A blocked object must not evict newer entries in its
+                // place; the next collection measures it again and retries.
+                total -= size;
+                durability::remove_file(path);
+            });
+        };
+        for (const auto& child : children)
+            if (!counts.contains(child))
+                remove(storage / child);
+        for (const auto& path : orphaned)
+            attempt(path, [&] { durability::remove_file(path); });
         std::ranges::sort(objects, {}, &object::used);
         for (const auto& item : objects) {
+            const auto id = item.path.filename().string();
+            if (children.contains(id) || retained.contains(id))
+                continue;
             if (now - item.used < constants::export_transfer_grace)
                 continue;
             if (now - item.used < retention && total <= budget)
                 continue;
-            if (std::filesystem::remove(item.path, ec))
-                total -= item.size;
+            if (!remove(item.path))
+                continue;
+            if (auto found = models.find(id); found != models.end()) {
+                for (const auto& child : found->second)
+                    if (--counts.at(child.digest.str()) == 0)
+                        remove(storage / child.digest.view());
+                const auto path = storage / "references" / id;
+                attempt(path, [&] { durability::remove_file(path); });
+            }
         }
         // Interrupted receivers leave only partial files; unfinished capture directories are private scratch.
         for (const auto& entry : std::filesystem::directory_iterator(storage / "partial", ec)) {
@@ -48,15 +167,16 @@ export namespace delivery {
                 continue;
             const auto used = entry.last_write_time(ec);
             if (!ec && now - used > std::chrono::hours{24})
-                std::filesystem::remove(entry.path(), ec);
+                attempt(entry.path(), [&] { durability::remove_file(entry.path()); });
         }
         for (const auto& entry : std::filesystem::directory_iterator(storage, ec)) {
             if (!entry.path().filename().string().starts_with("pending-") || !std::filesystem::is_directory(entry.symlink_status(ec)) || ec)
                 continue;
             const auto used = entry.last_write_time(ec);
             if (!ec && now - used > std::chrono::hours{24})
-                std::filesystem::remove_all(entry.path(), ec);
+                attempt(entry.path(), [&] { durability::remove_tree(entry.path()); });
         }
+        return errors;
     }
 
     // Serialize parts for the same digest through staging, verification, and publication.
@@ -89,6 +209,7 @@ export namespace delivery {
     }
 
     inline void publish(const std::filesystem::path& storage, const content::hash& digest) {
+        readonly(storage / "partial" / digest.view());
         durability::durable_rename(storage / "partial" / digest.view(), storage / digest.view());
     }
 
@@ -115,7 +236,7 @@ export namespace delivery {
             std::filesystem::path path;
             ~cleanup() {
                 std::error_code ignored;
-                std::filesystem::remove_all(path, ignored);
+                durability::remove_tree(path, ignored);
             }
         } guard{temporary};
         std::uint64_t total = 0;
@@ -165,14 +286,17 @@ export namespace delivery {
                 throw std::runtime_error("cannot finish export");
             auto digest = content::to_hex(hash.finish());
             const auto target = storage / digest.view();
+            readonly(staged);
             // Concurrent captures of identical bytes can share an already published object.
             std::error_code ec;
             std::filesystem::create_hard_link(staged, target, ec);
             if (ec && ec != std::errc::file_exists)
                 throw std::filesystem::filesystem_error("publish export", staged, target, ec);
+            durability::remove_file(staged);
             std::filesystem::last_write_time(target, std::filesystem::file_time_type::clock::now());
             auto executable = durability::is_executable(path);
-            result.push_back({name, std::move(relative), std::move(digest), size, executable});
+            auto refs = references(storage, digest);
+            result.push_back({name, std::move(relative), std::move(digest), size, executable, {}, std::move(refs)});
         };
         for (const auto& [name, path] : requested) {
             content::checked_name(name);
@@ -201,6 +325,21 @@ export namespace delivery {
         }
         std::ranges::sort(result, {}, [](const auto& file) { return std::pair{file.name, file.path}; });
         return result;
+    }
+
+    // Build processes only write staging. Capture hashes a private copy before publishing it
+    // under the computed digest; a false claim can never overwrite another object's bytes.
+    inline auto capture_model(const std::filesystem::path& tree, const builds::context& output, const std::filesystem::path& staging,
+                              const std::filesystem::path& storage) -> builds::exported_file {
+        auto file = capture(tree, {{"model", output.path}}, storage).at(0);
+        file.name = output.name;
+        for (const auto& expected : projectmodel::objects(model(storage, file.digest))) {
+            const auto object = capture(staging, {{"object", expected}}, storage).at(0);
+            if (object.digest != expected)
+                throw std::invalid_argument("staged model object does not match its digest: " + expected);
+        }
+        file.objects = retain_model(storage, file.digest);
+        return file;
     }
 
     inline auto read(const std::filesystem::path& storage, const jobs::export_read& request) -> jobs::source_bytes {

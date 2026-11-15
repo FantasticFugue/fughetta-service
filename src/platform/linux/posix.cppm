@@ -8,8 +8,72 @@ module;
 
 module posix;
 import std;
+import async;
 
 namespace posix {
+    namespace {
+        auto sample_process(int pid, bool children) -> std::optional<io::process_usage> {
+            std::ifstream file{std::format("/proc/{}/stat", pid)};
+            std::string line;
+            if (!std::getline(file, line))
+                return {};
+            auto end = line.rfind(')');
+            if (end == line.npos)
+                return {};
+            std::istringstream fields{line.substr(end + 2)};
+            std::array<std::string, 22> values;
+            for (auto& value : values)
+                if (!(fields >> value))
+                    return {};
+            auto number = [&](std::size_t index) -> std::uint64_t {
+                std::uint64_t value = 0;
+                auto& text = values[index];
+                auto [last, error] = std::from_chars(text.data(), text.data() + text.size(), value);
+                if (error != std::errc{} || last != text.data() + text.size())
+                    throw std::runtime_error("invalid process counter");
+                return value;
+            };
+            auto ticks = number(11) + number(12);
+            if (children)
+                ticks += number(13) + number(14);
+            auto frequency = ::sysconf(_SC_CLK_TCK);
+            auto pages = ::sysconf(_SC_PAGESIZE);
+            if (frequency <= 0 || pages <= 0)
+                return {};
+            return io::process_usage{.resident_bytes = number(21) * static_cast<std::uint64_t>(pages),
+                                     .cpu_nanoseconds = ticks / frequency * 1'000'000'000 + ticks % frequency * 1'000'000'000 / frequency,
+                                     .threads = static_cast<std::uint32_t>(number(17)),
+                                     .processes = 1};
+        }
+    } // namespace
+    auto process_usage(int pid, bool group) noexcept -> std::optional<io::process_usage> {
+        try {
+            if (!group)
+                return sample_process(pid, false);
+            io::process_usage total;
+            for (auto& entry : std::filesystem::directory_iterator{"/proc"}) {
+                auto name = entry.path().filename().string();
+                int member = 0;
+                auto [last, error] = std::from_chars(name.data(), name.data() + name.size(), member);
+                if (error != std::errc{} || last != name.data() + name.size() || ::getpgid(member) != pid)
+                    continue;
+                auto sample = sample_process(member, true);
+                if (!sample) {
+                    if (::getpgid(member) != pid)
+                        continue; // The process exited while the group was enumerated.
+                    return {};
+                }
+                total.resident_bytes += sample->resident_bytes;
+                total.cpu_nanoseconds += sample->cpu_nanoseconds;
+                total.threads += sample->threads;
+                total.processes += sample->processes;
+            }
+            return total.processes ? std::optional{total} : std::nullopt;
+        } catch (...) {
+            return {};
+        }
+    }
+
     namespace {
         // The xclang sysroot's headers predate these calls; numbers from 424 up
         // are the same on every Linux architecture.

@@ -74,7 +74,10 @@ namespace host {
         }
         for (const auto& [name, path] : mapped) {
             found.erase(name);
-            if (::access(path.c_str(), X_OK) == 0)
+            // Explicit tools also include resources passed to an interpreter,
+            // such as helper JARs and model-export scripts.
+            std::error_code ec;
+            if (std::filesystem::is_regular_file(path, ec) && !ec && ::access(path.c_str(), R_OK) == 0)
                 found[name] = std::filesystem::absolute(path).string();
         }
         return found;

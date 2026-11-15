@@ -27,6 +27,7 @@ namespace {
         tools::services services{config.slot(0), router, files, 0};
         tools::backlog queue{rt, services};
         std::vector<std::string> ran, trees;
+        std::vector<tools::backlog::placements> groups;
         std::size_t running = 0, most = 0;
 
         explicit harness(std::uint32_t concurrent, std::size_t cores = 1) : rt(cores) {
@@ -40,10 +41,11 @@ namespace {
 
         // A job runs on core zero, as the backlog's own jobs do, whichever core asked for it.
         auto job(ctx&, std::string name, std::chrono::milliseconds takes = 30ms) -> tools::backlog::runner {
-            auto run_job = [this, name, takes](tools::services&, jobs::progress_log& progress,
-                                               std::string tree) -> coroutine::task<std::optional<tools::backlog::outcome>> {
+            auto run_job = [this, name, takes](tools::services&, jobs::progress_log& progress, tools::backlog::placements placed,
+                                               std::string) -> coroutine::task<std::optional<tools::backlog::outcome>> {
                 ran.push_back(name);
-                trees.push_back(std::move(tree));
+                trees.push_back(placed.empty() ? std::string{} : placed.begin()->second);
+                groups.push_back(placed);
                 most = std::max(most, ++running);
                 progress.push({.stage = name});
                 co_await execution::schedule_after(rt.get_scheduler(0), takes);
@@ -125,11 +127,12 @@ namespace {
             expect(h.ran == std::vector<std::string>{"first"});
         };
 
-        "a job takes the free tree that last built the most of its files"_test = [] {
+        "worldlines share free directories while concurrent computations remain exclusive"_test = [] {
             harness h{2};
             auto job = [](std::string key, std::vector<std::string> files) {
                 auto e = harness::entry(key, key, key);
-                e.trees = "set";
+                e.trees = {"set", "side"};
+                e.worldline = key == "a" || key == "d" ? "main" : "branch";
                 e.files = std::move(files);
                 return e;
             };
@@ -147,13 +150,16 @@ namespace {
             expect(h.trees[0] != h.trees[1]) << "jobs running at once take different trees";
             expect(h.trees[2] == h.trees[0]) << "c builds on where a left off";
             expect(h.trees[3] == h.trees[1]) << "d builds on where b left off";
+            expect(h.groups[0].size() == 2u && h.groups[0].at("side") != h.groups[1].at("side") && std::ranges::equal(h.groups[2], h.groups[0]) &&
+                   std::ranges::equal(h.groups[3], h.groups[1]))
+                << "the computation reserves and releases every directory group together";
         };
 
         "preparation updates the files used to select a hot directory"_test = [] {
             harness h{2};
             auto entry = [](std::string key, std::vector<std::string> files) {
                 auto e = harness::entry(key, key, key);
-                e.trees = "set";
+                e.trees = {"set"};
                 e.files = std::move(files);
                 return e;
             };
@@ -162,10 +168,10 @@ namespace {
                 auto a = co_await h.queue.submit(0, entry("a", {"old-a"}), h.job(io, "a"));
                 auto b = co_await h.queue.submit(0, entry("b", {"old-b"}), h.job(io, "b"));
                 expect(co_await harness::done(io, a) && co_await harness::done(io, b));
-                auto run_operation = [&prepared](tools::services&, jobs::progress_log&,
-                                                 std::string tree) -> coroutine::task<std::optional<tools::backlog::outcome>> {
-                    prepared = tree;
-                    co_return language::result{.status = "prepared", .worker = "w"};
+                auto run_operation = [&prepared](tools::services&, jobs::progress_log&, tools::backlog::placements placed,
+                                                 std::string computation) -> coroutine::task<std::optional<tools::backlog::outcome>> {
+                    prepared = placed.begin()->second;
+                    co_return language::result{.status = "prepared", .analysis = "analyzed", .worker = "w"};
                 };
                 auto p = co_await h.queue.submit(0, entry("prepare", {"old-b", "new"}), std::move(run_operation));
                 expect(co_await harness::done(io, p));
@@ -212,6 +218,74 @@ namespace {
             };
             h.run(std::move(exercise));
             expect(h.ran == std::vector<std::string>{"first", "fresh"});
+        };
+
+        "an analysis graph shares covered demand and survives its original caller leaving"_test = [] {
+            harness h{2};
+            auto exercise = [&](ctx& io) -> coroutine::task<> {
+                auto wide = harness::entry("whole-project", "one");
+                wide.operation = "prepare";
+                wide.family = "source-and-stage-recipes";
+                wide.demands = {{"main", {.modules = {"app"}, .contexts = {"debug"}, .facts = {std::string{"symbols"}, std::string{"diagnostics"}}}},
+                                {"bindings", {.facts = {std::string{"relations"}}}}};
+                auto first = co_await h.queue.submit(0, wide, h.job(io, "whole-project", 100ms));
+                auto narrow = wide;
+                narrow.key = "one-file";
+                narrow.actor = "two";
+                narrow.demands.at("main").files = {"a.cpp"};
+                narrow.demands.at("main").facts = {std::string{"diagnostics"}};
+                narrow.demands.at("bindings").modules = {"native"};
+                auto second = co_await h.queue.submit(0, narrow, h.job(io, "duplicate"));
+                auto references = narrow;
+                references.key = "references";
+                references.demands.at("bindings").facts.push_back(std::string{"references"});
+                auto extra = co_await h.queue.submit(0, references, h.job(io, "references"));
+                expect(second->job() == first->job() && second->reuse() == "shared");
+                expect(extra->job() != first->job()) << "every stage must cover the joined request";
+                first->leave();
+                expect(co_await harness::done(io, second) && co_await harness::done(io, extra));
+                expect(harness::built(second).configuration == "whole-project");
+                expect(harness::built(extra).configuration == "references");
+            };
+            h.run(std::move(exercise));
+            expect(h.ran == std::vector<std::string>{"whole-project", "references"});
+        };
+
+        "expanded analysis waits for committed work and keeps it alive after its caller leaves"_test = [] {
+            harness h{2};
+            auto exercise = [&](ctx& io) -> coroutine::task<> {
+                bool committed = false, release = false;
+                auto producer = [&](tools::services&, jobs::progress_log&, tools::backlog::placements,
+                                    std::string) -> coroutine::task<std::optional<tools::backlog::outcome>> {
+                    while (!release)
+                        co_await execution::schedule_after(io, 5ms);
+                    committed = true;
+                    co_return language::result{.status = "prepared", .analysis = "analyzed", .worker = "w"};
+                };
+                auto consumer = [&](tools::services&, jobs::progress_log&, tools::backlog::placements,
+                                    std::string) -> coroutine::task<std::optional<tools::backlog::outcome>> {
+                    expect(committed) << "the successor reads the predecessor's committed unit directory";
+                    co_return language::result{.status = "prepared", .analysis = "analyzed", .worker = "w"};
+                };
+                auto narrow = harness::entry("diagnostics", "one");
+                narrow.operation = "prepare";
+                narrow.family = "same-inputs";
+                narrow.demands = {{"main", {.files = {"a.cpp"}, .facts = {std::string{"diagnostics"}}}}};
+                auto first = co_await h.queue.submit(0, narrow, producer);
+                auto wider = narrow;
+                wider.key = "symbols";
+                wider.actor = "two";
+                wider.demands.at("main") = {.facts = {std::string{"symbols"}}};
+                auto next = co_await h.queue.submit(0, wider, consumer);
+                first->leave();
+                auto independent = co_await h.queue.submit(0, harness::entry("independent", "three"), h.job(io, "independent"));
+                expect(co_await harness::done(io, independent));
+                expect(!next->done()) << "waiting for a predecessor leaves dispatch capacity available";
+                release = true;
+                expect(co_await harness::done(io, next));
+                expect(committed && std::get<language::result>(next->result()).analysis == "analyzed");
+            };
+            h.run(std::move(exercise));
         };
 
         "equal fills from different callers run once, and a finished fill is not cached"_test = [] {
@@ -287,7 +361,8 @@ namespace {
             harness h{1};
             bool started = false, exited = false, completed = false;
             auto exercise = [&](ctx& io) -> coroutine::task<> {
-                auto work = [&](tools::services&, jobs::progress_log&, std::string) -> coroutine::task<std::optional<tools::backlog::outcome>> {
+                auto work = [&](tools::services&, jobs::progress_log&, tools::backlog::placements,
+                                std::string) -> coroutine::task<std::optional<tools::backlog::outcome>> {
                     started = true;
                     struct finish {
                         bool& value;
@@ -317,7 +392,7 @@ namespace {
         "dependency publication failures are not cached as completed builds"_test = [] {
             harness h{1};
             auto exercise = [&](ctx& io) -> coroutine::task<> {
-                static constexpr auto run_operation = [](tools::services&, jobs::progress_log&,
+                static constexpr auto run_operation = [](tools::services&, jobs::progress_log&, tools::backlog::placements,
                                                          std::string) -> coroutine::task<std::optional<tools::backlog::outcome>> {
                     tools::config_result result{.configuration = "first", .worker = "w", .ok = true};
                     result.steps.push_back({.name = "install", .exit_code = 0, .cache_error = "publication failed"});
@@ -335,7 +410,7 @@ namespace {
         "export capture failures are not cached as completed builds"_test = [] {
             harness h{1};
             auto exercise = [&](ctx& io) -> coroutine::task<> {
-                static constexpr auto run_operation = [](tools::services&, jobs::progress_log&,
+                static constexpr auto run_operation = [](tools::services&, jobs::progress_log&, tools::backlog::placements,
                                                          std::string) -> coroutine::task<std::optional<tools::backlog::outcome>> {
                     co_return tools::config_result{.configuration = "first", .worker = "w", .ok = true, .export_error = "disk full"};
                 };
@@ -382,17 +457,35 @@ namespace {
         "a job no worker can take now waits for one"_test = [] {
             harness h{4};
             int tries = 0;
+            std::vector<std::string> computations;
+            std::vector<tools::backlog::placements> attempts;
             auto exercise = [&](ctx& io) -> coroutine::task<> {
-                auto run_operation = [&tries](tools::services&, jobs::progress_log&, std::string) -> coroutine::task<std::optional<tools::backlog::outcome>> {
+                auto run_operation = [&](tools::services&, jobs::progress_log&, tools::backlog::placements placed,
+                                         std::string computation) -> coroutine::task<std::optional<tools::backlog::outcome>> {
+                    computations.push_back(std::move(computation));
+                    attempts.push_back(std::move(placed));
                     if (++tries == 1)
                         co_return std::nullopt;
                     co_return tools::config_result{.configuration = "busy", .worker = "w", .ok = true};
                 };
-                auto held = co_await h.queue.submit(0, harness::entry("busy", "x"), std::move(run_operation));
-                expect(co_await harness::done(io, held) && harness::built(held).ok);
+                auto waiting = harness::entry("busy", "x");
+                waiting.trees = {"set", "side"};
+                auto held = co_await h.queue.submit(0, waiting, std::move(run_operation));
+                while (tries == 0)
+                    co_await execution::schedule_after(io, 5ms);
+                auto other = harness::entry("other", "y", "Other");
+                other.trees = waiting.trees;
+                auto parallel = co_await h.queue.submit(0, other, h.job(io, "other"));
+                expect(co_await harness::done(io, parallel) && co_await harness::done(io, held) && harness::built(held).ok);
+                expect(harness::built(held).timings.queue_seconds.value_or(0) >= 0.9);
             };
             h.run(std::move(exercise));
             expect(tries == 2);
+            expect(computations.size() == 2u && !computations.front().empty() && computations.front() == computations.back())
+                << "worker admission retries remain part of the same shared computation";
+            expect(attempts.size() == 2u && std::ranges::equal(attempts.front(), attempts.back()) && attempts.front().at("set") != h.groups.front().at("set") &&
+                   attempts.front().at("side") != h.groups.front().at("side"))
+                << "waiting preserves every directory while allowing another computation to run";
         };
 
         "askers take turns, and a newer request replaces the same asker's queued one"_test = [] {
@@ -475,12 +568,13 @@ namespace {
             auto exercise = [&](ctx& io) -> coroutine::task<> {
                 auto what = harness::entry("push", "same");
                 what.operation = "prepare";
-                auto work = [&runs](tools::services&, jobs::progress_log&, std::string) -> coroutine::task<std::optional<tools::backlog::outcome>> {
+                auto work = [&runs](tools::services&, jobs::progress_log&, tools::backlog::placements,
+                                    std::string) -> coroutine::task<std::optional<tools::backlog::outcome>> {
                     ++runs;
                     language::result out{.status = "prepared"};
                     out.analysis = "analyzed";
                     out.worker = "worker";
-                    out.outline = semantic::outline{.complete = true, .cacheable = false};
+                    out.cacheable = false;
                     co_return out;
                 };
                 auto first = co_await h.queue.submit(0, what, work);

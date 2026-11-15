@@ -25,7 +25,9 @@ namespace {
             config::document document;
             document.projects["app"].build_configurations["native"] = fixture::cmake("build/native");
             fixture::options<"cmake">(document.projects["app"].build_configurations["native"].builders.at("main")).export_compile_commands = true;
-            document.projects["app"].analysis["Cpp"] = {.build_configuration = "native"};
+            document.projects["app"].analysis["Cpp"] =
+                fixture::profile({.build_configuration = "native",
+                                  .inputs = {{"compilation_database", {language::build_input{"native", "configure", "compilation_database"}}}}});
             config::validate(document);
             config::slots config{1, std::make_shared<const config::document>(std::move(document))};
             cores::io_context<native::context> rt{1};
@@ -62,8 +64,12 @@ namespace {
                     expect(!first.replayed && repeated.replayed && repeated.replacements == 1u);
                     bool failed = false;
                     try {
-                        co_await tools::language_query::run(
-                            services, {}, {.project = "app", .worldline = std::string{"main"}, .configuration = "Cpp", .action = "diagnostics"}, note, tester);
+                        co_await tools::language_query::run(services, {},
+                                                            {.project = "app",
+                                                             .worldline = std::string{"main"},
+                                                             .configuration = "Cpp",
+                                                             .action = semantic::tool_action::make<"diagnostics">()},
+                                                            note, tester);
                     } catch (const tools::tool_error& error) {
                         failed = error.code == "no_worker";
                     }
@@ -130,15 +136,16 @@ namespace {
             };
             expect(call(alice, {.action = "initialize"}).code == "ok");
             auto operation = content::hash_of("shared-operation-id").str();
-            auto seed = call(alice, {.action = "apply", .operation = operation, .edits = {{.kind = "create", .path = "x", .text = "ab"}}});
+            auto seed = call(alice, {.action = "apply", .operation = operation, .edits = {{.kind = std::string{"create"}, .path = "x", .text = "ab"}}});
             expect((seed.code == "ok") >> fatal) << seed.reason;
             expect(seed.operation == operation) << "the caller sees its own operation ID";
-            auto other = call(
-                bob,
-                {.action = "apply", .operation = operation, .expected = seed.frontier, .edits = {{.kind = "edit", .path = "x", .text = "c", .offset = 2}}});
+            auto other = call(bob, {.action = "apply",
+                                    .operation = operation,
+                                    .expected = seed.frontier,
+                                    .edits = {{.kind = std::string{"edit"}, .path = "x", .text = "c", .offset = 2}}});
             expect((other.code == "ok") >> fatal) << other.reason;
             expect(!other.replayed && other.receipt != seed.receipt) << "the same ID from another caller is a new operation";
-            auto again = call(alice, {.action = "apply", .operation = operation, .edits = {{.kind = "create", .path = "x", .text = "ab"}}});
+            auto again = call(alice, {.action = "apply", .operation = operation, .edits = {{.kind = std::string{"create"}, .path = "x", .text = "ab"}}});
             expect(again.replayed && again.receipt == seed.receipt);
             auto history = call(alice, {.action = "history"});
             std::set<std::string> actors;
@@ -149,7 +156,7 @@ namespace {
             expect(actors == std::set<std::string>{"token:alice", "token:bob"});
             auto token = alice;
             token.caller = "renamed-token";
-            auto retried = call(token, {.action = "apply", .operation = operation, .edits = {{.kind = "create", .path = "x", .text = "ab"}}});
+            auto retried = call(token, {.action = "apply", .operation = operation, .edits = {{.kind = std::string{"create"}, .path = "x", .text = "ab"}}});
             expect(retried.replayed && retried.receipt == seed.receipt) << "another credential of the same user replays";
             auto by_receipt = call(bob, {.action = "receipt", .target = other.receipt});
             expect(by_receipt.operation == operation);

@@ -3,9 +3,10 @@ import std;
 import meta;
 import reflection;
 import content;
+export import records;
 
 // What every build system and language server shares, and the templates each one specializes by name. The set of
-// providers is closed when the program is compiled; the build and language modules list them.
+// built-in providers is listed by the build and language modules; configured helpers share the language transport.
 export namespace builds {
     inline auto absolute_path(std::string_view value) -> bool {
         return value.starts_with('/') || value.starts_with("\\\\") ||
@@ -51,6 +52,12 @@ export namespace builds {
         std::vector<std::string> features;
         bool default_features = true;
     };
+    struct generation {
+        std::string producer;
+        // Empty until the producer's final step; a file in ${reports} thereafter.
+        std::string manifest;
+        std::vector<context> outputs;
+    };
     struct step {
         std::string name;
         std::vector<std::string> argv;
@@ -62,7 +69,47 @@ export namespace builds {
         // A provider-authored description, never an executable command for the publisher.
         std::optional<dependency_input> dependencies;
         bool preparation = false;
+        std::optional<builds::generation> generation;
+        std::vector<context> inputs;
+        // The provider permits adjacent tasks to share one invocation when
+        // these leading argv entries, the directory and environment agree.
+        // Remaining argv entries are ordered tasks for that same build instance.
+        std::optional<std::size_t> batch_prefix;
     };
+    struct invocation {
+        step command;
+        std::vector<std::string> tasks;
+    };
+    inline auto invocations(const std::vector<step>& steps) -> std::vector<invocation> {
+        std::vector<invocation> out;
+        for (const auto& step : steps) {
+            if (step.batch_prefix && (!*step.batch_prefix || *step.batch_prefix >= step.argv.size()))
+                throw std::invalid_argument("build step has an invalid task batch prefix");
+            auto standalone = [](const auto& command) {
+                return command.batch_prefix && command.reports.empty() && !command.standard_output && !command.dependencies && !command.generation;
+            };
+            bool joined = false;
+            if (!out.empty()) {
+                auto& previous = out.back();
+                auto& command = previous.command;
+                if (standalone(command) && standalone(step) && command.batch_prefix == step.batch_prefix && command.cwd == step.cwd &&
+                    command.env == step.env && command.preparation == step.preparation &&
+                    std::equal(command.argv.begin(), command.argv.begin() + *command.batch_prefix, step.argv.begin())) {
+                    command.argv.insert(command.argv.end(), step.argv.begin() + *step.batch_prefix, step.argv.end());
+                    for (const auto& input : step.inputs)
+                        if (!std::ranges::any_of(command.outputs, [&](const auto& output) { return output.path == input.path; }))
+                            command.inputs.push_back(input);
+                    command.outputs.insert(command.outputs.end(), step.outputs.begin(), step.outputs.end());
+                    previous.tasks.push_back(step.name);
+                    command.name = "batch";
+                    joined = true;
+                }
+            }
+            if (!joined)
+                out.push_back({step, {step.name}});
+        }
+        return out;
+    }
     struct artifact {
         std::string type;
         std::string path;
@@ -71,6 +118,10 @@ export namespace builds {
     struct reference {
         std::string task;
         std::string output;
+    };
+    struct input {
+        reference producer;
+        std::string type;
     };
     struct parameters {
         std::vector<std::string> targets;
@@ -95,6 +146,10 @@ export namespace builds {
         std::uint64_t units = 0;
         std::string kind = "file";
     };
+    struct exported_object {
+        content::hash digest;
+        std::uint64_t size = 0;
+    };
     struct exported_file {
         std::string name;
         std::string path;
@@ -102,6 +157,7 @@ export namespace builds {
         std::uint64_t size = 0;
         bool executable = false;
         std::string delivery_error;
+        std::vector<exported_object> objects;
     };
     struct task_plan {
         std::string name;
@@ -179,12 +235,100 @@ export namespace builds {
 } // namespace builds
 
 export namespace language {
+    struct resolution_error : std::invalid_argument {
+        using std::invalid_argument::invalid_argument;
+    };
+
+    struct document {
+        std::string path, language, text;
+        friend auto operator==(const document&, const document&) -> bool = default;
+    };
+    struct session_state {
+        std::string id, slot, project, provider, options, stage, snapshot;
+        std::uint64_t epoch = 0;
+        std::vector<semantic::input_object> inputs;
+        rfl::Literal<"created", "opening", "ready", "updating", "evaluating", "resolving", "failed", "closing", "closed"> phase;
+    };
+    struct evaluation_identity {
+        std::string request_id, computation_id, stage_id;
+        friend auto operator==(const evaluation_identity&, const evaluation_identity&) -> bool = default;
+    };
+    struct evaluation_request {
+        evaluation_identity execution;
+        std::string slot_id;
+        semantic::unit_key unit;
+        std::uint64_t epoch = 0;
+        std::vector<semantic::input_object> inputs;
+        semantic::extent demand;
+        semantic::budget budget;
+        bool retained_only = false;
+    };
+    struct evaluated_unit {
+        session_state session;
+        evaluation_request request;
+        std::vector<semantic::shard> shards;
+        std::optional<semantic::candidate_id> reused;
+        bool deferred = false;
+    };
+
+    struct port {
+        std::string name, type, direction;
+        bool required = false, multiple = false;
+        std::vector<semantic::fact_kind> facts;
+    };
+    inline auto source_channels() -> std::vector<semantic::channel_definition> {
+        return {{.name = "declarations", .projections = {std::string{"symbols"}, std::string{"types"}}},
+                {.name = "definition_bodies",
+                 .projections = {std::string{"definition_bodies"}},
+                 .symbol_kinds = {std::string{"function"}, std::string{"method"}, std::string{"constructor"}, std::string{"destructor"}}}};
+    }
+    template <class Provider> auto operations() -> std::vector<std::string> {
+        if constexpr (requires { Provider::operations; })
+            return {Provider::operations.begin(), Provider::operations.end()};
+        else
+            return {"evaluate", "resolve"};
+    }
+    struct input_validator {
+        std::string_view type;
+        bool (*validate)(const semantic::input_object&, std::span<const semantic::input_object>);
+    };
+    template <class Provider> auto input_validators() -> std::vector<input_validator> {
+        if constexpr (requires { Provider::input_validators(); })
+            return Provider::input_validators();
+        else
+            return {};
+    }
+    enum class adapter_kind { lsp, clice, helper, reader };
+    struct description {
+        std::string id;
+        std::vector<std::string> roles, languages;
+        rfl::Generic configuration_schema;
+        std::vector<port> ports;
+        std::vector<semantic::channel_definition> channels;
+        // The adapter's export surface; a session may supply a subset after negotiation.
+        std::vector<semantic::fact_kind> facts;
+        std::vector<std::string> operations{"evaluate", "resolve"};
+        bool negotiated = true;
+        adapter_kind adapter = adapter_kind::lsp;
+        semantic::unit_kind unit_kind = semantic::unit_kind::file;
+        std::string update_granularity = "document";
+        bool dependency_reads = false, cancellation = true, exclusive_directory = true;
+        builds::requirements needs;
+    };
     struct program {
         std::string provider;
         std::vector<std::string> argv;
         builds::environment env;
         // Sent as the initialize request's initializationOptions.
         rfl::Generic initialization;
+        // Additional provider operations; each argv is resolved in the same worker slot.
+        std::map<std::string, std::vector<std::string>> commands;
+        // Auxiliary executable inputs selected by the provider, such as tsserver.
+        std::vector<std::string> executables;
+        // Configured helpers carry their public contract independently of the
+        // built-in catalog entry used to configure the transport.
+        std::optional<description> registration;
+        std::map<std::string, std::string> documents;
     };
 
     // A language server: `options` is what an analysis configures it with, `documents` maps file extensions to the
@@ -193,10 +337,14 @@ export namespace language {
     template <meta::fixed_string Name> using config = typename server<Name>::options;
     template <class T>
     concept speaker = requires(const typename T::options& options, const std::vector<builds::context>& inputs) {
+        typename T::adapter;
         { T::validate(options) } -> std::same_as<void>;
         { T::launch(options, inputs) } -> std::same_as<program>;
         { T::documents.size() } -> std::convertible_to<std::size_t>;
         { T::inputs.size() } -> std::convertible_to<std::size_t>;
+        { T::facts.size() } -> std::convertible_to<std::size_t>;
+        { T::channels() } -> std::same_as<std::vector<semantic::channel_definition>>;
+        { T::unit_kind } -> std::convertible_to<semantic::unit_kind>;
     };
 } // namespace language
 

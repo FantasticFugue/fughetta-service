@@ -1,9 +1,11 @@
 export module posix;
 import std;
+import async;
 
 // What Linux and Darwin do differently. Each platform directory implements it,
 // and cmake/modules.cmake selects the directory.
 export namespace posix {
+    auto process_usage(int pid, bool group) noexcept -> std::optional<io::process_usage>;
     // The process environment; a forked child replaces it before exec.
     auto environment() noexcept -> char**&;
     auto executable() -> std::filesystem::path;

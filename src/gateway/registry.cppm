@@ -6,12 +6,14 @@ import coroutine;
 import content;
 import configuration;
 import usage;
+import knowledge;
 import durability;
 import protocol;
 import client;
 import async;
 import native;
 import delivery;
+import projectmodel;
 import constants;
 
 export namespace storage {
@@ -28,6 +30,16 @@ export namespace storage {
             : rt_(rt), storage_(std::move(storage)), lock_(storage_, "storage"), config_(config), pool_(pool), source_(source) {}
 
         std::function<void()> changed;
+
+        auto pin_exports(std::size_t here, std::set<std::string> ids) -> coroutine::task<delivery::pins> {
+            co_return co_await io::blocking(rt_.get_scheduler(here), pool_, [this, ids = std::move(ids)] {
+                std::lock_guard held{exports_mutex_};
+                delivery::pins pins;
+                for (const auto& id : ids)
+                    export_retention_.acquire(id, pins);
+                return pins;
+            });
+        }
 
         auto has_export(std::size_t here, content::hash digest, std::uint64_t size) -> coroutine::task<bool> {
             if (!content::is_hash(digest))
@@ -101,6 +113,11 @@ export namespace storage {
                         std::filesystem::create_directories(directory);
                         if (!content::is_hash(file.digest))
                             throw std::invalid_argument("invalid export digest");
+                        for (const auto& object : file.objects) {
+                            if (!content::is_hash(object.digest) ||
+                                std::filesystem::file_size(storage_ / ".exports/blobs" / object.digest.view()) != object.size)
+                                throw std::runtime_error("model object is no longer available");
+                        }
                         const auto blob = storage_ / ".exports/blobs" / file.digest.view();
                         if (std::filesystem::file_size(blob) != file.size)
                             throw std::runtime_error("export size mismatch");
@@ -108,7 +125,7 @@ export namespace storage {
                         std::error_code ec;
                         const auto granted = directory / file.digest.view();
                         if (std::filesystem::exists(granted) && !std::filesystem::equivalent(blob, granted))
-                            std::filesystem::remove(granted);
+                            durability::remove_file(granted);
                         std::filesystem::create_hard_link(blob, granted, ec);
                         if (ec && ec != std::errc::file_exists)
                             throw std::filesystem::filesystem_error("grant export", blob, ec);
@@ -117,6 +134,46 @@ export namespace storage {
                     }
                 }
                 return files;
+            });
+        }
+
+        auto retain_models(std::size_t here, std::vector<builds::exported_file> models) -> coroutine::task<std::vector<builds::exported_file>> {
+            co_return co_await io::blocking(rt_.get_scheduler(here), pool_, [this, models = std::move(models)] mutable {
+                std::lock_guard held{exports_mutex_};
+                for (auto& file : models) {
+                    if (!file.delivery_error.empty())
+                        continue;
+                    try {
+                        const auto refs = delivery::retain_model(storage_ / ".exports/blobs", file.digest);
+                        std::map<content::hash, std::uint64_t> expected, supplied;
+                        for (const auto& ref : refs)
+                            expected.emplace(ref.digest, ref.size);
+                        for (const auto& ref : file.objects)
+                            supplied.emplace(ref.digest, ref.size);
+                        if (expected != supplied)
+                            throw std::invalid_argument("model transfer references differ from its contents");
+                    } catch (const std::exception& error) {
+                        file.delivery_error = std::string{error.what()}.substr(0, 512);
+                    }
+                }
+                return models;
+            });
+        }
+
+        auto read_model(std::size_t here, std::string project, jobs::model_read request) -> coroutine::task<jobs::source_bytes> {
+            config::resolve(*config_.current(here), project);
+            content::checked_name(project);
+            co_return co_await io::blocking(rt_.get_scheduler(here), pool_, [this, project, request] {
+                std::lock_guard held{exports_mutex_};
+                collect_exports();
+                if (!content::is_hash(request.model) || !std::filesystem::is_regular_file(storage_ / ".exports/projects" / project / request.model.view()))
+                    throw std::invalid_argument("model is not available to this project");
+                const auto blobs = storage_ / ".exports/blobs";
+                const auto refs = delivery::references(blobs, request.model);
+                if (std::ranges::find(refs, request.object.digest, &builds::exported_object::digest) == refs.end())
+                    throw std::invalid_argument("object is not referenced by this model");
+                std::filesystem::last_write_time(blobs / request.model.view(), std::filesystem::file_time_type::clock::now());
+                return delivery::read(blobs, request.object);
             });
         }
 
@@ -171,6 +228,22 @@ export namespace storage {
             });
         }
 
+        template <class F>
+            requires std::copy_constructible<F>
+        auto with_semantic(std::size_t here, F f) -> coroutine::task<std::invoke_result_t<F&, semantic::store&>> {
+            co_return co_await io::blocking(rt_.get_scheduler(here), pool_, [this, f = std::move(f)]() mutable {
+                std::lock_guard held{semantic_mutex_};
+                if (!semantic_)
+                    semantic_ = std::make_unique<semantic::store>(storage_ / ".semantic");
+                const auto now = std::chrono::steady_clock::now();
+                if (now >= semantic_collect_) {
+                    semantic_->sweep();
+                    semantic_collect_ = now + constants::semantic_collect_interval;
+                }
+                return f(*semantic_);
+            });
+        }
+
         // The usage ledger lives on core zero; every use of it runs there, one at a time, on the disk pool.
         template <class F>
             requires std::copy_constructible<F>
@@ -206,7 +279,17 @@ export namespace storage {
             for (const auto& [digest, lock] : export_receivers_)
                 if (!lock.expired())
                     receiving.insert(digest);
-            delivery::collect(blobs, constants::export_retention, constants::export_cache_bytes, receiving);
+            auto retained = export_retention_.roots();
+            // Export callers hold exports_mutex_; keep the storage lock order
+            // exports -> semantic for both persistent and active shard roots.
+            {
+                std::lock_guard held{semantic_mutex_};
+                if (!semantic_)
+                    semantic_ = std::make_unique<semantic::store>(storage_ / ".semantic");
+                auto artifacts = semantic_->artifact_roots();
+                retained.insert(artifacts.begin(), artifacts.end());
+            }
+            auto errors = delivery::collect(blobs, constants::export_retention, constants::export_cache_bytes, receiving, retained);
             std::error_code ec;
             for (const auto& project : std::filesystem::directory_iterator(storage_ / ".exports/projects", ec)) {
                 if (!std::filesystem::is_directory(project.symlink_status(ec)) || ec)
@@ -215,16 +298,21 @@ export namespace storage {
                     if (!std::filesystem::is_regular_file(file.symlink_status(ec)) || ec || !content::is_hash(file.path().filename().string()))
                         continue;
                     const auto blob = blobs / file.path().filename();
-                    if (!std::filesystem::exists(blob, ec) && !ec)
-                        std::filesystem::remove(file.path(), ec);
-                    else if (!ec && !std::filesystem::equivalent(blob, file.path(), ec) && !ec) {
-                        std::filesystem::remove(file.path(), ec);
-                        if (!ec)
-                            std::filesystem::create_hard_link(blob, file.path(), ec);
+                    try {
+                        if (!std::filesystem::exists(blob))
+                            durability::remove_file(file.path());
+                        else if (!std::filesystem::equivalent(blob, file.path())) {
+                            durability::remove_file(file.path());
+                            std::filesystem::create_hard_link(blob, file.path());
+                        }
+                    } catch (const std::exception& failure) {
+                        errors.push_back(file.path().string() + ": " + failure.what());
                     }
                 }
                 std::filesystem::remove(project.path(), ec);
             }
+            for (const auto& error : errors)
+                std::println(std::cerr, "export collection: {}", error);
         }
 
         template <class Request> auto remote(std::size_t here, Request request) -> coroutine::task<jobs::reply_t<Request>> {
@@ -292,7 +380,11 @@ export namespace storage {
         std::vector<std::function<void(usage::ledger&)>> pending_;
         bool draining_ = false;
         std::unique_ptr<usage::ledger> ledger_;
+        std::mutex semantic_mutex_;
+        std::unique_ptr<semantic::store> semantic_;
+        std::chrono::steady_clock::time_point semantic_collect_{};
         std::mutex exports_mutex_;
+        delivery::retention export_retention_;
         std::map<std::string, std::weak_ptr<std::mutex>> export_receivers_;
         std::chrono::steady_clock::time_point export_collect_{};
     };

@@ -1,15 +1,18 @@
 export module protocol;
 import std;
 import constants;
+export import reuse;
 export import utility;
 import reflection;
 import coroutine;
+import native;
 import meta;
 export import content;
 export import world;
 export import nodes;
 export import build;
 export import language;
+export import runner;
 
 // A content digest is sent as its lowercase hex text, so the frames and the JSON schema are unchanged by the
 // digest being its own type.
@@ -40,6 +43,7 @@ export namespace jobs {
         std::uint32_t heartbeat_seconds = 2;
         std::string toolchain_id;
         bool dependency_publisher = false;
+        std::optional<std::uint64_t> memory_bytes;
     };
 
     struct admission {
@@ -48,15 +52,39 @@ export namespace jobs {
         std::string worker_id;
     };
 
+    struct warm_session {
+        std::string stage, provider, options, snapshot;
+        std::uint64_t epoch = 0;
+        std::optional<io::process_usage> usage;
+        double rebuild_seconds = 0;
+        std::uint64_t high_water_bytes = 0;
+    };
+    struct worker_slot {
+        std::string project, tree;
+        bool busy = false;
+        std::vector<warm_session> sessions;
+    };
+
     struct heartbeat {
         std::uint32_t running = 0;
         std::uint32_t queued = 0;
+    };
+    struct worker_memory {
+        std::optional<std::uint64_t> limit;
+        std::uint64_t reserved = 0;
+        std::optional<std::uint64_t> resident, baseline;
+    };
+    struct slot_report {
+        std::vector<worker_slot> slots;
+        std::uint64_t sequence = 0;
+        worker_memory memory;
     };
 
     struct progress {
         std::uint64_t done = 0;
         std::uint64_t total = 0;
         std::string stage;
+        std::optional<language::evaluation_identity> execution;
     };
 
     // The progress of one call, kept where the call is awaited: the core that hears a report appends it, and the caller reads what is new
@@ -82,6 +110,7 @@ export namespace jobs {
 
     struct cancel {
         std::string why;
+        std::optional<language::evaluation_identity> execution;
     };
 
     struct failure {
@@ -192,20 +221,52 @@ export namespace jobs {
     using step = builds::step;
 
     // A language server to ask about a tree's documents once its steps succeeded.
-    struct survey {
+    struct analysis_plan {
         std::string provider;
+        std::string options, configuration;
+        semantic::input_vector inputs;
+        std::vector<builds::context> artifacts;
         std::vector<std::string> argv;
         rfl::Generic initialization;
         std::map<std::string, std::string> env;
         std::uint32_t seconds = 600;
-        semantic::query query;
+        semantic::request query;
+        semantic::budget budget;
+        language::evaluation_identity execution;
+        std::string slot_id;
+        semantic::extent demand;
+        std::map<std::string, std::vector<semantic::shard_id>> source_facts;
+        std::map<std::string, std::vector<std::string>> commands;
+        std::vector<std::string> executables;
+        std::vector<semantic::candidate> candidates;
+        std::map<semantic::unit_id, std::vector<semantic::shard_id>> retained;
+        std::optional<language::description> registration;
+        std::map<std::string, std::string> documents;
     };
+
+    // These labels identify files in one transfer, not semantic units.
+    inline auto analysis_exports(const analysis_plan& analysis) -> std::map<std::string, builds::context> {
+        const bool reader = analysis.registration ? std::ranges::contains(analysis.registration->roles, "artifact-reader")
+                                                  : language::providers::dispatch(analysis.provider, []<class Provider>() {
+                                                        if constexpr (requires { Provider::roles; })
+                                                            return std::ranges::contains(Provider::roles, std::string_view{"artifact-reader"});
+                                                        else
+                                                            return false;
+                                                    });
+        std::map<std::string, builds::context> out;
+        if (!reader)
+            return out;
+        for (std::size_t index = 0; index < analysis.artifacts.size(); ++index)
+            out.emplace("analysis-artifact-" + std::to_string(index), analysis.artifacts[index]);
+        return out;
+    }
 
     struct build_request {
         std::string project;
         std::string tree;
         content::hash snapshot;
         std::vector<step> steps;
+        std::vector<builds::task_plan> preparation_tasks;
         std::uint32_t timeout_s = 1800;
         std::uint64_t output_limit = 1u << 20;
         std::map<std::string, std::string> env;
@@ -213,9 +274,15 @@ export namespace jobs {
         std::optional<std::uint32_t> max_cpu_seconds;
         // Measure outputs and analyze the tree after successful steps. These operations must preserve tracked source files.
         std::vector<builds::context> measure;
-        std::optional<jobs::survey> survey;
         bool fresh = false;
         std::map<std::string, std::string> exports;
+        // Complete producer inventory for this directory group, including other analysis stages.
+        std::set<std::string> generation_producers;
+    };
+
+    struct analysis_request {
+        build_request preparation;
+        analysis_plan analysis;
     };
 
     struct dependency_fill {
@@ -227,36 +294,241 @@ export namespace jobs {
         std::uint32_t timeout_s = 1800;
     };
 
-    struct step_report {
-        std::string name;
-        std::int32_t exit_code = -1;
-        bool timed_out = false;
-        double seconds = 0;
-        std::string output;
-        bool truncated = false;
-        // What the step's reports say, read on the worker.
-        std::vector<builds::finding> diagnostics;
-        std::optional<builds::tally> tests;
-        std::optional<builds::exported_file> log;
-        bool log_truncated = false;
-        std::string log_error;
-        std::string cache_error;
+    // Facts are staged until the separate commit event names their complete inventory.
+    struct facts_batch {
+        std::uint64_t offset = 0;
+        std::vector<std::byte> data;
     };
+    struct unit_contribution {
+        std::string unit;
+        semantic::contribution records;
+        std::uint64_t typed_ranges = 0;
+        friend auto operator==(const unit_contribution&, const unit_contribution&) -> bool = default;
+    };
+    inline auto inventory(const language::evaluated_unit& unit) -> std::vector<unit_contribution> {
+        std::vector<unit_contribution> out;
+        for (const auto& shard : unit.shards)
+            out.push_back({shard.unit.id, semantic::contributions(shard), shard.typed_ranges.size()});
+        return out;
+    }
+    struct unit_committed {
+        language::evaluation_identity execution;
+        std::string slot_id;
+        semantic::unit_key unit;
+        std::uint64_t epoch = 0, bytes = 0;
+        std::vector<unit_contribution> contributions;
+    };
+    struct analysis_completed {
+        language::evaluation_identity execution;
+        std::uint64_t committed_units = 0;
+    };
+    struct analysis_failed {
+        language::evaluation_identity execution;
+        std::uint64_t committed_units = 0;
+        std::string code, message;
+    };
+    struct reuse_request {
+        language::evaluation_identity execution;
+        language::session_state session;
+        semantic::input_vector inputs;
+    };
+    struct reuse_reply {
+        std::vector<reuse::key> accepted;
+    };
+    struct shard_read {
+        language::evaluation_identity execution;
+        semantic::shard_id id;
+        std::uint64_t offset = 0, limit = 0;
+    };
+    struct shard_piece {
+        std::uint64_t offset = 0, total = 0;
+        std::vector<std::byte> data;
+    };
+
+    struct model_read {
+        std::uint64_t parent = 0;
+        content::hash model;
+        export_read object;
+    };
+
+    template <class T> struct analysis_response;
+    template <> struct analysis_response<language::evaluated_unit> {
+        using type = std::monostate;
+    };
+    template <> struct analysis_response<reuse_request> {
+        using type = reuse_reply;
+    };
+    template <> struct analysis_response<shard_read> {
+        using type = shard_piece;
+    };
+    template <> struct analysis_response<model_read> {
+        using type = source_bytes;
+    };
+
+    // Request-scoped rendezvous. A producer cannot send another message until
+    // the owning task has consumed and answered the current one.
+    class analysis_exchange {
+        class signal {
+            std::mutex mutex_;
+            bool ready_ = false;
+            std::coroutine_handle<> waiter_;
+
+        public:
+            struct awaiter {
+                signal& owner;
+                auto await_ready() const noexcept -> bool { return false; }
+                auto await_suspend(std::coroutine_handle<> continuation) -> bool {
+                    std::lock_guard held{owner.mutex_};
+                    if (owner.ready_)
+                        return false;
+                    owner.waiter_ = continuation;
+                    return true;
+                }
+                void await_resume() const noexcept {}
+            };
+            auto wait() -> awaiter { return {*this}; }
+            void reset() {
+                std::lock_guard held{mutex_};
+                ready_ = false;
+            }
+            void set() {
+                std::coroutine_handle<> next;
+                {
+                    std::lock_guard held{mutex_};
+                    ready_ = true;
+                    next = std::exchange(waiter_, {});
+                }
+                if (next)
+                    next.resume();
+            }
+        };
+
+    public:
+        using request = std::variant<language::evaluated_unit, reuse_request, shard_read, model_read>;
+        using response = std::variant<std::monostate, reuse_reply, shard_piece, source_bytes>;
+        struct message {
+            request data;
+            explicit message(request data) : data(std::move(data)), unanswered_(std::make_exception_ptr(std::runtime_error("analysis input task stopped"))) {}
+            template <class T> void answer(T value) {
+                {
+                    std::lock_guard held{mutex};
+                    if (done)
+                        return;
+                    value_ = std::move(value);
+                    done = true;
+                }
+                ready.set();
+            }
+            void fail(std::exception_ptr error) {
+                {
+                    std::lock_guard held{mutex};
+                    if (done)
+                        return;
+                    error_ = std::move(error);
+                    done = true;
+                }
+                ready.set();
+            }
+            void abandon() { fail(unanswered_); }
+
+        private:
+            friend class analysis_exchange;
+            std::mutex mutex;
+            signal ready;
+            bool done = false;
+            response value_;
+            std::exception_ptr error_, unanswered_;
+            auto take() -> response {
+                std::lock_guard held{mutex};
+                if (error_)
+                    std::rethrow_exception(error_);
+                return std::move(value_);
+            }
+        };
+        struct lifetime {
+            std::shared_ptr<analysis_exchange> inputs;
+            ~lifetime() { inputs->close(); }
+        };
+        struct completion {
+            std::shared_ptr<message> item;
+            ~completion() { item->abandon(); }
+        };
+        analysis_exchange(native::scheduler producer, native::scheduler consumer) : producer_(producer), consumer_(consumer) {}
+        template <class T> auto ask(T value) -> coroutine::task<typename analysis_response<T>::type> {
+            co_await execution::schedule(producer_);
+            auto serial = co_await writing_.lock();
+            auto item = std::make_shared<message>(request{std::move(value)});
+            {
+                std::lock_guard held{mutex_};
+                if (closed_)
+                    throw std::runtime_error("analysis input exchange is closed");
+                pending_ = item;
+                taken_ = false;
+            }
+            available_.set();
+            co_await item->ready.wait();
+            co_await coroutine::under(coroutine::stop_token{}, arrive(producer_));
+            {
+                std::lock_guard held{mutex_};
+                pending_.reset();
+            }
+            co_return std::get<typename analysis_response<T>::type>(item->take());
+        }
+        auto next() -> coroutine::task<std::shared_ptr<message>> {
+            co_await available_.wait();
+            co_await execution::schedule(consumer_);
+            std::lock_guard held{mutex_};
+            if (closed_)
+                co_return nullptr;
+            if (!pending_ || taken_)
+                throw std::logic_error("analysis exchange has no pending message");
+            taken_ = true;
+            available_.reset();
+            co_return pending_;
+        }
+        void close() {
+            std::shared_ptr<message> item;
+            {
+                std::lock_guard held{mutex_};
+                closed_ = true;
+                item = pending_;
+            }
+            if (item)
+                item->abandon();
+            available_.set();
+        }
+
+    private:
+        static auto arrive(native::scheduler scheduler) -> coroutine::task<> { co_await execution::schedule(scheduler); }
+        native::scheduler producer_, consumer_;
+        coroutine::mutex writing_;
+        std::mutex mutex_;
+        signal available_;
+        std::shared_ptr<message> pending_;
+        bool closed_ = false, taken_ = false;
+    };
+    using analysis_link = std::shared_ptr<analysis_exchange>;
 
     struct build_report {
         std::string worker;
         std::optional<std::string> worker_id;
         std::string tree;
-        std::vector<step_report> steps;
+        std::vector<runner::result> steps;
         double seconds = 0;
         std::vector<builds::artifact_result> measured;
-        // The survey's outline and the documents it covered, or why it failed.
-        std::optional<semantic::outline> outline;
-        std::vector<semantic::location> locations;
-        std::vector<std::string> surveyed;
-        std::optional<std::string> survey_error;
-        std::string survey_error_code = "analysis_failed";
+        // Survey coverage summary and covered documents; facts arrive in unit batches.
+        bool analyzed = false, analysis_cacheable = true;
+        std::optional<language::session_state> analysis_session;
+        std::optional<language::evaluation_identity> analysis_execution;
+        std::uint64_t committed_units = 0;
+        // Filled by the gateway after durable unit publication.
+        std::vector<semantic::view_id> stage_views;
+        std::vector<semantic::missing> missing;
+        std::uint64_t reused_units = 0;
+        std::optional<std::string> analysis_error;
+        std::string analysis_error_code = "analysis_failed";
         std::vector<builds::exported_file> exports;
+        std::vector<builds::exported_file> models;
         std::string export_error;
         std::vector<std::string> export_skipped;
         std::optional<double> preparation_seconds, execution_seconds;
@@ -273,18 +545,49 @@ export namespace jobs {
         static constexpr std::uint32_t code = kind<Name>;
     };
 
+    template <class Request> struct traits {};
+    template <> struct traits<build_request> {
+        static auto preparation(auto& request) -> decltype(auto) { return (request); }
+        static auto analysis(auto&) -> analysis_plan* { return nullptr; }
+    };
+    template <> struct traits<analysis_request> {
+        static auto preparation(auto& request) -> decltype(auto) { return (request.preparation); }
+        static auto analysis(auto& request) { return &request.analysis; }
+        static auto identity(const analysis_request& request) { return request.analysis.execution; }
+        static auto slot(const analysis_request& request) { return request.analysis.slot_id; }
+        static void validate(const build_report& report, const language::evaluation_identity& identity, std::uint64_t count, bool succeeded) {
+            if (report.analysis_execution != identity || report.committed_units != count || (report.ok() && !report.analysis_error) != succeeded)
+                throw std::invalid_argument("provider reply differs from its terminal event");
+        }
+        static auto terminal(const std::optional<build_report>& report, const language::evaluation_identity& identity, std::uint64_t count,
+                             const std::string& error, const std::string& code) -> std::variant<analysis_completed, analysis_failed> {
+            if (report && report->ok() && !report->analysis_error)
+                return analysis_completed{identity, count};
+            const bool timed_out = report && std::ranges::any_of(report->steps, [](const auto& step) { return step.timed_out; });
+            auto failed_code = report ? (report->analysis_error ? report->analysis_error_code : timed_out ? "resource_limit" : "preparation_failed") : code;
+            auto message = report ? report->analysis_error.value_or(timed_out ? "execution time budget exhausted" : "preparation did not complete") : error;
+            return analysis_failed{identity, count, std::move(failed_code), std::move(message)};
+        }
+    };
+    template <class Request>
+    concept execution_request = std::same_as<Request, build_request> || std::same_as<Request, analysis_request>;
+
     template <meta::fixed_string Name, class Request, class Reply> struct rpc {
         using request = Request;
         using reply = Reply;
         static constexpr std::uint32_t code = kind<Name>;
     };
 
-    using signals = meta::list<signal<"hello", hello>, signal<"worker.admission", admission>, signal<"heartbeat", heartbeat>, signal<"progress", progress>,
-                               signal<"cancel", cancel>>;
+    using signals = meta::list<signal<"hello", hello>, signal<"worker.admission", admission>, signal<"heartbeat", heartbeat>,
+                               signal<"worker.slots", slot_report>, signal<"progress", progress>, signal<"cancel", cancel>,
+                               signal<"analysis.facts_batch", facts_batch>, signal<"analysis.unit_committed", unit_committed>,
+                               signal<"analysis.completed", analysis_completed>, signal<"analysis.failed", analysis_failed>>;
 
     using requests = meta::list<rpc<"node.call", node_call, nodes::node_reply>, rpc<"node.capture", node_capture, nodes::node_reply>,
                                 rpc<"node.usage", node_usage, node_usage_reply>, rpc<"hash_file", hash_file, digest>, rpc<"sync.offer", sync_offer, sync_plan>,
                                 rpc<"sync.parts", source_bytes, authority_ack>, rpc<"build", build_request, build_report>,
+                                rpc<"analysis", analysis_request, build_report>, rpc<"analysis.reuse", reuse_request, reuse_reply>,
+                                rpc<"analysis.shard", shard_read, shard_piece>, rpc<"model.read", model_read, source_bytes>,
                                 rpc<"export.read", export_read, source_bytes>, rpc<"dependency.fill", dependency_fill, build_report>>;
 
     inline constexpr std::uint32_t result = kind<"result">;
@@ -420,6 +723,46 @@ export namespace transport {
         }
     };
 
+    template <> struct codec<jobs::facts_batch> {
+        static auto encode(const jobs::facts_batch& batch) -> std::vector<std::byte> {
+            if (batch.data.size() > constants::semantic_batch_bytes)
+                throw std::length_error("semantic batch exceeds its frame budget");
+            std::vector<std::byte> out(8 + batch.data.size());
+            std::memcpy(out.data(), &batch.offset, 8);
+            std::ranges::copy(batch.data, out.begin() + 8);
+            return out;
+        }
+        static auto decode(std::span<const std::byte> in) -> jobs::facts_batch {
+            if (in.size() < 8 || in.size() - 8 > constants::semantic_batch_bytes)
+                throw std::length_error("invalid semantic batch frame");
+            jobs::facts_batch batch;
+            std::memcpy(&batch.offset, in.data(), 8);
+            batch.data.assign(in.begin() + 8, in.end());
+            return batch;
+        }
+    };
+
+    template <> struct codec<jobs::shard_piece> {
+        static auto encode(const jobs::shard_piece& piece) -> std::vector<std::byte> {
+            if (piece.data.size() > constants::semantic_batch_bytes)
+                throw std::length_error("semantic object slice exceeds its frame budget");
+            std::vector<std::byte> bytes(16 + piece.data.size());
+            std::memcpy(bytes.data(), &piece.offset, 8);
+            std::memcpy(bytes.data() + 8, &piece.total, 8);
+            std::ranges::copy(piece.data, bytes.begin() + 16);
+            return bytes;
+        }
+        static auto decode(std::span<const std::byte> bytes) -> jobs::shard_piece {
+            if (bytes.size() < 16 || bytes.size() - 16 > constants::semantic_batch_bytes)
+                throw std::length_error("invalid semantic object frame");
+            jobs::shard_piece piece;
+            std::memcpy(&piece.offset, bytes.data(), 8);
+            std::memcpy(&piece.total, bytes.data() + 8, 8);
+            piece.data.assign(bytes.begin() + 16, bytes.end());
+            return piece;
+        }
+    };
+
     template <class T> auto encode(const T& value) -> std::vector<std::byte> { return codec<T>::encode(value); }
 
     template <class T> auto decode(const frame& f) -> T { return codec<T>::decode(f.payload); }
@@ -480,21 +823,32 @@ export namespace transport {
             co_await send(jobs::failure_code, corr, jobs::failure{std::move(message), std::move(code)});
         }
 
-        template <jobs::request Req> auto call(const Req& req, jobs::progress_log* progress = nullptr) -> coroutine::task<call_result<jobs::reply_t<Req>>> {
+        template <jobs::request Req>
+        auto call(const Req& req, jobs::progress_log* progress = nullptr, jobs::analysis_link inputs = {}) -> coroutine::task<call_result<jobs::reply_t<Req>>> {
             using Res = jobs::reply_t<Req>;
             if (ended_)
                 co_return std::unexpected(call_error{ended_});
-            pending slot{.progress = progress};
+            auto owned = std::make_shared<pending>();
+            auto& slot = *owned;
+            slot.progress = progress;
+            slot.inputs = std::move(inputs);
+            if constexpr (requires { jobs::traits<Req>::identity(req); }) {
+                slot.identity = jobs::traits<Req>::identity(req);
+                slot.slot_id = jobs::traits<Req>::slot(req);
+            }
             auto corr = next_corr_++;
-            pending_.emplace(corr, &slot);
+            pending_.emplace(corr, owned);
             auto drop = scope_exit{[&] { pending_.erase(corr); }};
             auto sent = co_await coroutine::expect(send(jobs::code<Req>, corr, req));
             if (!sent)
                 co_return std::unexpected(call_error{std::move(sent.error())});
             auto received = co_await slot;
             if (slot.cancelled) {
+                slot.receiving.request_stop();
                 try {
-                    co_await coroutine::under(coroutine::stop_token{}, post(jobs::cancel{"the caller stopped"}, corr));
+                    jobs::cancel cancelled{.why = "the caller stopped"};
+                    cancelled.execution = slot.identity;
+                    co_await coroutine::under(coroutine::stop_token{}, post(cancelled, corr));
                 } catch (const std::exception&) {
                 }
                 co_await coroutine::stop;
@@ -502,10 +856,15 @@ export namespace transport {
             if (!received)
                 co_return std::unexpected(call_error{std::move(received.error())});
             auto& f = *received;
-            if (f.kind == jobs::failure_code) {
+            // Admission can reject an RPC before a provider evaluation exists.
+            if (f.kind == jobs::failure_code)
                 co_return std::unexpected(call_error{decode<jobs::failure>(f)});
-            }
-            co_return decode<Res>(f);
+            if (slot.identity && !slot.finished)
+                throw std::invalid_argument("provider request ended without a terminal event");
+            auto report = decode<Res>(f);
+            if constexpr (requires { jobs::traits<Req>::validate(report, *slot.identity, slot.committed, slot.succeeded); })
+                jobs::traits<Req>::validate(report, *slot.identity, slot.committed, slot.succeeded);
+            co_return report;
         }
 
         template <std::invocable<const frame&> Other> auto pump(Other other) -> coroutine::task<> {
@@ -519,12 +878,67 @@ export namespace transport {
                         break;
                     }
                     auto& f = *next;
-                    auto it = pending_.find(f.corr);
-                    if (it == pending_.end()) {
-                        other(f);
+                    if (f.kind == jobs::code<jobs::reuse_request>) {
+                        co_await answer<jobs::reuse_request>(f);
                         continue;
                     }
-                    if (f.kind == jobs::code<jobs::progress>) {
+                    if (f.kind == jobs::code<jobs::model_read>) {
+                        co_await answer<jobs::model_read>(f);
+                        continue;
+                    }
+                    if (f.kind == jobs::code<jobs::shard_read>) {
+                        co_await answer<jobs::shard_read>(f);
+                        continue;
+                    }
+                    const bool response = f.kind == jobs::result || f.kind == jobs::failure_code || f.kind == jobs::code<jobs::progress> ||
+                                          f.kind == jobs::code<jobs::facts_batch> || f.kind == jobs::code<jobs::unit_committed> ||
+                                          f.kind == jobs::code<jobs::analysis_completed> || f.kind == jobs::code<jobs::analysis_failed>;
+                    if (!response) {
+                        if constexpr (std::same_as<std::invoke_result_t<Other&, const frame&>, coroutine::task<>>)
+                            co_await other(f);
+                        else
+                            other(f);
+                        continue;
+                    }
+                    auto it = pending_.find(f.corr);
+                    if (it == pending_.end())
+                        continue;
+                    auto slot = it->second;
+                    if (f.kind == jobs::code<jobs::facts_batch>) {
+                        auto batch = decode<jobs::facts_batch>(f);
+                        if (!slot->identity || slot->finished || batch.offset != slot->unit_bytes ||
+                            batch.data.size() > constants::semantic_object_bytes - slot->unit_bytes)
+                            throw std::invalid_argument("invalid semantic unit batch");
+                        slot->unit_bytes += batch.data.size();
+                        if (slot->inputs && !slot->cancelled)
+                            slot->unit.append(reinterpret_cast<const char*>(batch.data.data()), batch.data.size());
+                    } else if (f.kind == jobs::code<jobs::unit_committed>) {
+                        auto committed = decode<jobs::unit_committed>(f);
+                        if (slot->finished || committed.execution != slot->identity || committed.slot_id != slot->slot_id || !committed.bytes ||
+                            committed.bytes != slot->unit_bytes)
+                            throw std::invalid_argument("invalid semantic unit commit");
+                        if (slot->inputs && !slot->cancelled) {
+                            auto unit = rfl::json::read<language::evaluated_unit>(slot->unit);
+                            if (!unit || unit->request.execution != committed.execution || unit->request.slot_id != committed.slot_id ||
+                                unit->request.unit != committed.unit || unit->request.epoch != committed.epoch ||
+                                jobs::inventory(*unit) != committed.contributions)
+                                throw std::invalid_argument("semantic contribution differs from its commit");
+                            co_await slot->deliver(std::move(*unit));
+                        }
+                        slot->unit.clear();
+                        slot->unit_bytes = 0;
+                        ++slot->committed;
+                    } else if (f.kind == jobs::code<jobs::analysis_completed>) {
+                        auto completed = decode<jobs::analysis_completed>(f);
+                        if (slot->unit_bytes)
+                            throw std::invalid_argument("provider completed with an uncommitted unit");
+                        slot->finish(completed.execution, completed.committed_units, true);
+                    } else if (f.kind == jobs::code<jobs::analysis_failed>) {
+                        auto failed = decode<jobs::analysis_failed>(f);
+                        slot->finish(failed.execution, failed.committed_units, false);
+                        slot->unit.clear();
+                        slot->unit_bytes = 0;
+                    } else if (f.kind == jobs::code<jobs::progress>) {
                         if (auto* log = it->second->progress)
                             log->push(decode<jobs::progress>(f));
                     } else {
@@ -537,16 +951,42 @@ export namespace transport {
             if (!why && !stopped)
                 why = std::make_exception_ptr(io::closed{});
             ended_ = why ? why : std::make_exception_ptr(io::closed{});
-            std::vector<pending*> waiting;
+            std::vector<std::shared_ptr<pending>> waiting;
             for (auto& [corr, slot] : pending_)
                 waiting.push_back(slot);
-            for (auto* slot : waiting)
+            for (auto& slot : waiting)
                 stopped ? slot->stop() : slot->abort(why);
             if (stopped)
                 co_await coroutine::stop;
         }
 
     private:
+        template <jobs::request Req> auto answer(const frame& frame) -> coroutine::task<> {
+            auto request = decode<Req>(frame);
+            auto parent = [&] {
+                if constexpr (std::same_as<Req, jobs::model_read>)
+                    return pending_.find(request.parent);
+                else
+                    return std::ranges::find_if(pending_, [&](const auto& entry) { return entry.second->identity == request.execution; });
+            }();
+            if (parent == pending_.end() || parent->second->finished || parent->second->cancelled || !parent->second->inputs) {
+                co_await fail(frame.corr, "execution has no active input receiver");
+                co_return;
+            }
+            auto slot = parent->second;
+            std::optional<jobs::reply_t<Req>> result;
+            std::string failed;
+            try {
+                result = co_await slot->inputs->ask(std::move(request));
+            } catch (const std::exception& error) {
+                failed = error.what();
+            }
+            if (result)
+                co_await reply(frame.corr, *result);
+            else
+                co_await fail(frame.corr, failed);
+        }
+
         auto send_frame(std::uint32_t kind, std::uint64_t corr, std::vector<std::byte> body) -> coroutine::task<> {
             if (body.size() > max_payload)
                 throw std::length_error("frame too large");
@@ -562,12 +1002,36 @@ export namespace transport {
 
         struct pending {
             jobs::progress_log* progress = nullptr;
+            jobs::analysis_link inputs;
+            coroutine::stop_source receiving;
+            std::string unit, slot_id;
+            std::uint64_t unit_bytes = 0, committed = 0;
+            std::optional<language::evaluation_identity> identity;
+            bool finished = false, succeeded = false;
+            void finish(const language::evaluation_identity& expected, std::uint64_t count, bool success) {
+                if (finished || identity != expected || count != committed)
+                    throw std::invalid_argument("invalid provider terminal event");
+                finished = true;
+                succeeded = success;
+            }
             std::optional<frame> value;
             std::exception_ptr error;
             bool stopped = false;
             bool cancelled = false;
             std::coroutine_handle<> waiter;
             std::coroutine_handle<> (*stop_chain)(std::coroutine_handle<>) noexcept = nullptr;
+
+            auto deliver(language::evaluated_unit unit) -> coroutine::task<> {
+                struct forward {
+                    coroutine::stop_source* source;
+                    void operator()() const noexcept { source->request_stop(); }
+                };
+                auto parent = co_await coroutine::current_token;
+                std::optional<execution::stop_callback_for_t<coroutine::stop_token, forward>> link;
+                if (parent.stop_possible())
+                    link.emplace(parent, forward{&receiving});
+                co_await coroutine::under(receiving.get_token(), inputs->ask(std::move(unit)));
+            }
 
             struct on_stop {
                 pending* self;
@@ -633,7 +1097,7 @@ export namespace transport {
         coroutine::mutex writing_;
         std::uint64_t next_corr_ = 1;
         std::exception_ptr ended_;
-        std::unordered_map<std::uint64_t, pending*> pending_;
+        std::unordered_map<std::uint64_t, std::shared_ptr<pending>> pending_;
     };
 
     template <io::stream S> class dispatcher {
@@ -641,15 +1105,37 @@ export namespace transport {
         struct exchange {
             channel<S>& chan;
             std::uint64_t corr;
+            std::uint64_t committed = 0;
+            std::optional<language::evaluation_identity> execution;
 
-            auto progress(jobs::progress p) -> coroutine::task<> { co_await chan.post(p, corr); }
+            auto progress(jobs::progress p) -> coroutine::task<> {
+                p.execution = execution;
+                co_await chan.post(p, corr);
+            }
+            auto commit(language::evaluated_unit unit) -> coroutine::task<> {
+                if (execution && unit.request.execution != *execution)
+                    throw std::logic_error("provider unit belongs to another execution");
+                jobs::unit_committed done{unit.request.execution, unit.request.slot_id, unit.request.unit, unit.request.epoch, 0, jobs::inventory(unit)};
+                auto data = rfl::json::write(unit);
+                done.bytes = data.size();
+                if (data.size() > constants::semantic_object_bytes)
+                    throw std::length_error("semantic unit exceeds its storage budget");
+                for (std::size_t offset = 0; offset < data.size();) {
+                    auto length = std::min(constants::semantic_batch_bytes, data.size() - offset);
+                    auto bytes = std::as_bytes(std::span{data.data() + offset, length});
+                    co_await chan.post(jobs::facts_batch{offset, {bytes.begin(), bytes.end()}}, corr);
+                    offset += length;
+                }
+                co_await chan.post(done, corr);
+                co_await progress({.done = ++committed, .stage = "analysis"});
+            }
         };
 
         template <jobs::request Req, class F>
             requires std::same_as<std::invoke_result_t<F&, Req, exchange&>, coroutine::task<jobs::reply_t<Req>>>
         void on(F handler) {
-            auto dispatch = [handler = std::move(handler)](channel<S>& chan, frame f) mutable -> coroutine::task<> {
-                return serve<Req>(handler, chan, std::move(f));
+            auto dispatch = [handler = std::move(handler)](exchange& ex, frame f) mutable -> coroutine::task<> {
+                return serve<Req>(handler, ex, std::move(f));
             };
             handlers_[jobs::code<Req>] = std::move(dispatch);
         }
@@ -658,8 +1144,9 @@ export namespace transport {
 
         auto handle(channel<S>& chan, frame f) -> coroutine::task<> {
             if (f.kind == jobs::code<jobs::cancel>) {
-                if (auto r = running_.find({&chan, f.corr}); r != running_.end())
-                    r->second->request_stop();
+                auto cancelled = decode<jobs::cancel>(f);
+                if (auto r = running_.find({&chan, f.corr}); r != running_.end() && cancelled.execution == r->second.active->execution)
+                    r->second.source->request_stop();
                 co_return;
             }
             auto it = handlers_.find(f.kind);
@@ -677,37 +1164,49 @@ export namespace transport {
             if (parent.stop_possible())
                 link.emplace(parent, forward{&source});
             std::pair key{&chan, f.corr};
-            running_[key] = &source;
+            exchange ex{chan, f.corr};
+            running_[key] = {&source, &ex};
             struct forget {
                 dispatcher* self;
                 std::pair<channel<S>*, std::uint64_t> key;
                 ~forget() { self->running_.erase(key); }
             } done{this, key};
-            co_await coroutine::under(source.get_token(), it->second(chan, std::move(f)));
+            co_await coroutine::under(source.get_token(), it->second(ex, std::move(f)));
         }
 
     private:
-        template <class Req, class F> static auto serve(F& handler, channel<S>& chan, frame f) -> coroutine::task<> {
-            exchange ex{chan, f.corr};
+        template <class Req, class F> static auto serve(F& handler, exchange& ex, frame f) -> coroutine::task<> {
             std::optional<jobs::reply_t<Req>> out;
             std::string error, code;
             try {
-                out.emplace(co_await handler(decode<Req>(f), ex));
+                auto request = decode<Req>(f);
+                if constexpr (requires { jobs::traits<Req>::identity(request); })
+                    ex.execution = jobs::traits<Req>::identity(request);
+                out.emplace(co_await handler(std::move(request), ex));
             } catch (const coded_error& e) {
                 error = e.what();
                 code = e.code;
             } catch (const std::exception& e) {
                 error = e.what();
             }
+            if constexpr (requires { jobs::traits<Req>::terminal(out, *ex.execution, ex.committed, error, code); })
+                if (ex.execution) {
+                    auto event = jobs::traits<Req>::terminal(out, *ex.execution, ex.committed, error, code);
+                    co_await std::visit([&](const auto& value) { return ex.chan.post(value, ex.corr); }, event);
+                }
             if (out)
-                co_await chan.reply(f.corr, *out);
+                co_await ex.chan.reply(ex.corr, *out);
             else
-                co_await chan.fail(f.corr, std::move(error), std::move(code));
+                co_await ex.chan.fail(ex.corr, std::move(error), std::move(code));
         }
 
         static auto unknown_kind(std::uint32_t kind) -> std::string { return std::format("unknown request kind {:#010x}", kind); }
 
-        std::unordered_map<std::uint32_t, util::move_only_function<coroutine::task<>(channel<S>&, frame)>> handlers_;
-        std::map<std::pair<channel<S>*, std::uint64_t>, coroutine::stop_source*> running_;
+        std::unordered_map<std::uint32_t, util::move_only_function<coroutine::task<>(exchange&, frame)>> handlers_;
+        struct running_request {
+            coroutine::stop_source* source;
+            exchange* active;
+        };
+        std::map<std::pair<channel<S>*, std::uint64_t>, running_request> running_;
     };
 } // namespace transport

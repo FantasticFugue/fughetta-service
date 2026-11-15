@@ -253,7 +253,7 @@ c-ares queries on the native scheduler. `httpant.tls` wraps `web::stream` over a
 native socket and bounds pending ciphertext at 128 KiB; cloud-gateway uses
 these modules for its public tunnels and sends `close_notify` after a normal end. Certificate rejection uses
 `http::tls::verification_failure`; the local `tls` module retains URL parsing. Tree coordination state is released after its last active
-or waiting build; Core scheduling retains at most 256 recent tree hints per
+or waiting build; Core scheduling retains at most 256 worker-reported slots per
 Worker. The hosted transport and its deployment limits are documented in the
 gateway's [Worker tunnel entry](../cloud-gateway/README.md#worker-tunnels).
 
@@ -482,8 +482,9 @@ The gateway reads the consumer manifest from its pinned source snapshot and
 projects it to package/feature/version selectors. Project commands, environment,
 registry definitions and source files never reach the publisher. Provider steps
 with custom overlays or opaque arguments, and snapshots with custom registry
-configuration, build privately. Empty triplets use the first operator-admitted
-triplet; specify it as the publisher's native host triplet. Package ABI matching
+configuration, build privately. Empty triplets use the sole operator-admitted
+triplet. Publishers allowing several triplets require explicit target and host
+selections on every request. Package ABI matching
 remains vcpkg's responsibility. The builtin registry resolves selected versions
 through the operator root's version database; a requested baseline selects
 versions, not an arbitrary port script tree ([registry implementation](https://github.com/microsoft/vcpkg-tool/blob/2026-09-26/src/vcpkg/registries.cpp#L527)). A different consumer toolchain, environment or
@@ -555,6 +556,72 @@ partial archive. These checks also establish the mount's lock and hard-link
 semantics. The current local RPC test covers two worker services on one host;
 it does not establish this deployment boundary or cross-host behavior. No such
 deployment is provisioned by this repository yet.
+
+Kotlin/JVM and F# build models use the `gradle` and `msbuild` adapters. Map
+`fughetta-gradle-model` and `fughetta-msbuild-model` to the correspondingly named
+files installed in `<prefix>/libexec/fughetta-service`. Gradle loads its init
+script; .NET runs its F# script through `dotnet fsi`. Each adapter exposes
+`source_dir`, `model_dir`, `executable` and `exporter` options.
+
+| Adapter | Preparation output | Required model inputs | Model output |
+| --- | --- | --- | --- |
+| `gradle` | `prepare/dependencies`: `gradle_dependencies` | `dependencies`, plus configured generated ports | `model/model`: `project_model` file |
+| `msbuild` | `restore/assets`: `nuget_assets` | `assets`, plus configured generated ports | `model/model`: `project_model` file |
+
+Connect these ports through task `inputs`. The graph derives execution order
+and rejects missing or mismatched bindings. `generated` declares outputs of
+`generate` with type `generated_sources`; every declared port is required by
+`model` and `compile`. A discovered Gradle generated source root must exist and
+belong to a bound generated input. Gradle task lists are `prepare_tasks`,
+`generate_tasks`, `compile_tasks`; MSBuild uses `projects`, `properties` and
+`generate_targets`. Final compilation outputs are declared in `artifacts`.
+
+Adjacent Gradle preparation/model steps with the same declared batch prefix,
+working directory and environment run in one managed Gradle process. Their typed
+tasks, receipts and outputs retain their original identities; the process result's
+`tasks` lists all participating tasks, sharing its elapsed time, failure and log.
+Generated-output and independent-report steps form batch boundaries. Each model
+export still checks the dependency receipt against the current resolution.
+
+Both exporters write `model.json`, using the `projectmodel` C++ contract:
+`schema`, `producer`, `producer_version`, and ordered `units`. Units contain
+ordered source paths, generated source objects, tagged project/artifact/SDK/tree
+references, outputs, compiler arguments, published `variants` and language-specific `extensions`.
+Tree references name a file without claiming project ownership and cannot name a
+declared unit output or a file beneath it. Model intake resolves every project reference;
+exporters omit project-produced classpath entries already represented by project references.
+Consumers select
+project units through `projectmodel::resolve`, using an explicit unit or the complete
+published variant attributes; missing or ambiguous matches fail. MSBuild project
+references must select one TFM, and all units must use the same .NET SDK version.
+Artifact intake parses and validates this contract. Gradle project identities
+include their build-tree path. The exporter records its tested KGP ranges,
+checks the accessors it uses, and records the actual plugin version in each
+unit's extensions. Model export recomputes the preparation receipt's digest of
+resolved references, including included builds, and rejects changed resolution.
+NuGet receipts contain SHA-256 digests of root and transitive project assets;
+model export verifies those contents before evaluating projects.
+
+External libraries, plugins and generated text are referenced as `{hash, name}`
+objects (`artifact` references contain an `object` field). Preparation commands
+receive `FUGHETTA_STAGING` and `FUGHETTA_SDKS`; exporters write objects only into
+the step's staging directory. The worker hashes private copies before admitting
+them into its existing export store. Model publication transfers missing objects
+to the gateway through the export channel. A receiving worker fetches missing
+objects before running a step with a `project_model` input or measuring the model.
+CAS files are published read-only. Transfers and installations pin their models
+and objects before collection can run; active language sessions retain their model
+pins until update or close. Objects remain retained while any cached or pinned
+model references them and are collected when its last model is evicted.
+If a cached build's model or referenced object has been evicted, the gateway discards
+that cached result and executes the build again during the same request.
+Model files contain no dependency bundle.
+
+JDKs and .NET reference packs use the worker's `sdk_manifests` mappings below,
+with logical SDK names and relative paths. A selected SDK must have a mapping;
+the consumer resolves it against its own installed roots. The provider host contract
+allows nested SDK bindings: exporters assign each path to the longest matching root,
+record that binding's name and relative path, and consumers resolve by that name.
 
 Results come from reports in fixed protocols, never from the text a tool prints
 for people, so a new tool version does not break them. A step writes its reports
@@ -690,26 +757,563 @@ language sessions. Equal immutable inputs retain job deduplication and build
 cache reuse. `fresh` explicitly requests a clean build. Artifact grants remain
 project-scoped even when the content is shared internally.
 
+Analysis queries join queued or running computations whose per-stage demands
+cover their files, modules, contexts and requested facts. Sharing requires the
+same project inputs, stage graph, toolchains, execution budgets and result
+projection. Each caller retains its own wait ticket and query view; leaving
+one ticket preserves the computation for the other callers.
+Overlapping demands that need additional results wait for earlier computations
+to commit, then consult the unit reuse directory. These waits hold no dispatch
+slot and keep the earlier work alive while a successor still needs it.
+C/C++ file-scoped symbol queries evaluate the selected translation unit; headers
+select their owning translation units. Diagnostics and scope queries also honor
+their file scope. A fixed view records the computation's file scope and reports
+partial coverage when queried beyond it.
+Partial queries return a `continuation` containing a view ID and cursor; query
+parameters remain in the store. Send it to `language` with the project and optional budget
+overrides. Analysis resumes the view's recorded source version, profile and
+toolchains, preserving existing units in a newly published `next_view`. Query
+traversal with a larger budget reads the same view. Pagination cursors continue
+to address their original view.
+Unit and node budgets limit each batch. Completed units remain published when
+either budget is exhausted; missing coverage identifies the deferred units and files.
+Continuing with the same unit budget advances the remaining work. Contributions
+already retained by the view are reused when they still match the installed
+inputs and requested data, without spending the unit or node budget again.
+A unit is published whole, so its records must fit the remaining node budget.
+The analysis time budget also returns partial coverage, including when it expires
+before the provider is ready. Completed units remain available; the interrupted
+session is retired and continuation resumes with the recorded inputs. The build's
+execution deadline remains a build failure.
+
+Authorized view reads renew a 24-hour pagination lease. Each worldline/profile's
+current view, active queries and computation results retain their contributions.
+During storage access, the gateway checks reclamation at most once per minute:
+expired query views are withdrawn, and older unrooted unit candidates are evicted
+under an 8 GiB shard budget. Shared shards and internal-stage checkpoints remain
+while referenced. A continuation can reconstruct an evicted candidate from its
+checkpoint. The gateway validates reuse against the snapshot and worker-reported inputs. Reclaimed
+views return `status=expired` with `code=view_expired`.
+
 Worker language sessions negotiate symbol, diagnostic, definition, and reference
-capabilities. Sessions remain attached to their hot directories and receive file
-updates between requests. Queries return results for the selected source snapshot;
+capabilities. Each hot directory retains a separate session for each stage.
+Switching stages preserves the other sessions; each session receives source and
+prepared-input updates before its next evaluation. The worker enforces a total
+session limit and reclaims idle sessions by age or memory pressure. Workers report
+installed directories and ready stage sessions, including their source snapshot and
+epoch. Each report replaces the previous inventory, withdrawing reclaimed state;
+reconnection discovers retained directories from their installed manifests. Build
+results publish updated inventory before their replies, allowing the next stage
+to select the prepared directory immediately. Dispatch considers candidates across
+routing cores. It prefers a ready session for the requested context and snapshot,
+then that context, then an idle materialized directory, before comparing load.
+When all eligible candidates have observations for the project, stage recipe and
+warmth, it instead compares smoothed successful dispatch times, adjusted by
+`1 + inflight / capacity`. Each worker retains at most 256 recent cost records;
+failed or cancelled dispatches do not train this estimate. A directory group keeps
+its selected worker for the computation, including waits for dispatch capacity,
+so later stages consume the prepared files there. Inventory refresh runs
+separately from the lease heartbeat. Queries
+return results for the selected source snapshot;
 source nodes retain only temporary scope descriptors and coordination anchors,
-not language-server sessions or complete semantic analysis results. Definitions
-and references accept a file path, symbol name, and optional one-based line.
-Executable mappings and prepared-tree environment bindings apply on workers. Each analysis configuration
-contains `server` and a `build_configuration` reference. The provider selects
-artifact-producing tasks and their dependencies from that build configuration;
-there are no analysis `build`, `operation`, or `inputs` fields. Preparation and
-builds share the project's worldline and build-configuration directory pool.
-A ty server using a relative Python environment selects its uv environment
-producer automatically. Saving settings validates the reference and graph
-without executing preparation or analysis.
+not language-server sessions or complete semantic analysis results. Queries accept
+`selector: {"name": {"text": "render"}}` for symbol-prefix search and
+`selector: {"entity": {"symbol_id": "…", "context": "…"}}` for a selected
+declaration. A named definition/reference selector includes `name.path`; file
+filters use `scope.files`. Results include a published `view`; pass it on later queries to
+retain the same source and analysis inputs. Definitions, structured types and
+references belong to the selected symbol and compilation context. Returned
+source locations support navigation and edits.
+
+`symbol_id` is an opaque workspace identity retained while any stored shard refers
+to it. View leases, current views, active queries and reusable candidates keep
+those shards alive. After the last reference is collected, an entity selector
+using that ID returns `status: "expired"`, `code: "symbol_expired"`; select the
+declaration again by name to obtain its current ID. Unknown, unretained IDs use
+the same response. A retained ID may have no declaration in the selected view;
+that remains a normal query result. An expired view returns `view_expired` first.
+
+Application types retain ordered `application_arguments`: type and declaration
+references, constant values and nested parameter packs. These references use
+the published view's IDs; `inspect` expands their types, counting shared type
+nodes once against the node budget.
+Generic signatures expose ordered `type_parameters`. Each parameter links its
+declaration, owning `binder` and position; nested templates retain the outer
+parameters they use. Parameter nodes distinguish type, value and template
+parameters, including unused parameters and packs.
+
+`inspect` also returns `symbols`; other queries request them with
+`include: ["declarations"]`. Each record retains its compilation context,
+visibility and modifiers. Parameter details use group/position indices and retain
+names, default argument text and annotations independently of signature types.
+C++ attributes use the `cpp.attributes` extension on declarations and parameters.
+Function redeclarations contribute defaults and attributes; definitions supply
+parameter names when available.
+
+References preserve either a resolved `target` or the provider's `candidates`.
+Dependent overload sets are `ambiguous`; a single remaining candidate or a name
+with no candidates stays `unresolved`. Queries for either overload return the
+same reference ID, and an unselected reference query also includes names with no
+candidates. Candidate call relations share that reference and retain their
+`candidate` resolution. Resolved call references carry `direct`, `virtual` or
+`indirect` dispatch when available.
+Reference roles distinguish reads, writes, combined read/write uses, type uses
+and imports. Write roles include assignments, increments and mutable arguments
+identified by clice.
+Constructor calls link direct, list and copy initialization to the selected
+constructor. Default initialization and implicit conversions retain `call` and
+`implicit` roles at their source location. Their call relations refer to the same
+reference; the owning declaration identifies the initializer or enclosing body.
+
+Scope queries also return `scopes`, with lexical parents, semantic owners,
+declared members and lookup edges. Reopened namespaces, nested blocks and
+unbraced branches retain separate regions. Lookup edges target published
+declaration IDs for using declarations/directives, enum imports, base classes
+and implicit namespace/enum lookup; the language provider performs exact name
+resolution. Source locations in the result can be opened through the scope tool.
+
+Use `action: "relations"` with `relations: ["calls", "overrides", "aliases"]`,
+`direction: "outgoing" | "incoming" | "both"` and `depth` to traverse a selected
+declaration's graph. Results include `relations`, intermediate entity
+`items`, and linked references or declaration occurrences. `limit` and `cursor`
+page edges within the same view. `include: ["relations"]` also adds the graph to
+an inspection. Node and time budgets bound traversal; exhaustion returns partial
+coverage so the query can be repeated with a larger budget.
+
+Use `action: "impact"` with a symbol selector and `depth` for potential change
+propagation. `changes: ["declaration"]` includes reference/type dependencies;
+`changes: ["body"]` follows callers and bindings through source/artifact mappings.
+Omitting `changes` includes both. The `impact` array separates semantic and
+behavior paths, retaining one shortest path per reached entity and category.
+Each step names evidence in the returned reference/relation records. Candidate
+edges mark a path tentative. The selector and scope select the starting entity;
+paths can cross contexts in the authorized view. `limit`/`cursor` page paths;
+budget exhaustion returns partial coverage. With `from_view` and `to_view`,
+impact classifies added/removed declarations and changes to declaration shape,
+metadata, relations and unit inputs. `inputs` reports changed analysis inputs,
+not a proven edit to one function body. Comparison results keep evidence and
+snapshot vectors separated by view, including paths for removed declarations.
+`comparison.reanalysis` reports changed direct inputs and observed dependencies
+for units present in both views. Producer channel values are compared across
+views, so unchanged outputs stop propagation. Missing producer evidence is
+marked unavailable. Each unit lists its stage's associated build/test tasks;
+these are configured task associations, not inferred test coverage.
+`limit`/`cursor` page changed entities and reanalysis units; traversal shares the
+request budget. Both views remain pinned during the query. Requested projections
+are retained in each view's evidence.
+
+Configured stdio helpers use the `external` server entry. Its options contain
+`registration` (a provider description with its own `id`, helper adapter, roles,
+ports, facts, operations, channels and configuration schema), `documents`
+(extension → language ID), `argv`, mapped auxiliary `tools`, `env` and
+`initialization`. The registration ID is the provider identity in sessions,
+units, recipes and emitted identities; `external` only selects the host
+transport. Commands use the same `${tool:name}` and `${tree}` expansion as
+built-in helpers. Helpers receive the existing open/update/units/evaluate/close
+JSON-line protocol and publish the common shard records. The `helper` key of
+`language schema` describes every message, parameter and result of that protocol. Registrations declare
+only the implemented `evaluate` operation; definition/reference queries consume
+its exported records. Their initialization configuration is interpreted by the
+helper. `language describe` with a project
+and optional configuration includes its configured registrations. Names cannot
+shadow built-in providers, and one profile must give each registered name one
+contract. Declared ports participate in the same stage graph, input installation
+and channel-based reuse as built-in providers.
+
+`language` with `action: "schema"` returns JSON Schemas for the S7 request,
+result, shard and view records without starting a worker. The shared records
+describe structured types, occurrences, references, relations, diagnostics and
+unit-owned contributions. Native declaration keys include project, module,
+provider and identity domain; local declaration keys use source file/declaration
+anchors and their owner. The gateway stores immutable unit contributions and
+view manifests under `server.storage/.semantic`. Source declaration anchors
+assign persistent symbol IDs during publication. clice exports structured
+types, scopes and references through its worker session. For structured analysis,
+the adapter runs `clice index` once per installed input epoch, then reads saved
+TU contributions with `clice query`. Each TU supplies a declaration contribution
+and separate file-record contributions under the same TU context. Declaration
+channels retain evaluated constants and inline/template implementation inputs;
+body-only edits can reuse the declaration shard. The live server owns the writable index;
+CLI operations use its initialization overlay and the slot's environment.
+Each saved TU has its own context, such as `cpp/tu/main.cpp`. Shared header
+declarations retain one symbol ID and separate types, scopes and coverage for
+each context. Select an item's context when inspecting an ambiguous declaration.
+Headers already covered by installed TUs use those contributions. Diagnostic
+requests and uncovered files use immediate semantic extraction. Index worker
+counts follow the slot's parallel allocation.
+The running query
+actions are scopes, symbols, definitions, references, relations, diagnostics and inspect.
+Reference queries page uses of the selected symbol with `limit` and `cursor`;
+the cursor retains its view and query conditions. A source edit publishes a new
+view while an existing view continues to answer from its original inputs.
+`language` with `action: "describe"` returns registered provider descriptions;
+`provider: "clice"` selects one. Each description includes its configuration
+schema, typed input/output ports, languages, operations, exported facts, evaluation unit,
+update granularity and tool requirements. The `schema` response also includes
+these descriptions. LSP-based adapters negotiate their available facts with
+the running server. A view records the facts the server supplied: querying
+symbols or references in a diagnostics-only view returns partial coverage
+with the missing fact, while its diagnostic query remains complete.
+Kotlin uses Analysis API locality to keep FIR sessions across function-body edits
+and invalidates consumers when inferred declarations or inline implementations
+change. A cross-module declaration read is qualified by the declaration names the
+consumer's lookups could reach, so unrelated declarations in a dependency keep the
+consumer valid; inline bodies and sealed hierarchies keep whole-module reads. F#
+file demands use file checking and export only those files; a subsequent
+project demand fills in the remaining records. Reuse checks the contribution's
+coverage as well as its inputs, so a partial module result cannot answer a broader
+project demand.
+
+Worker providers share open/update/evaluate/close sessions and declare any additional
+resolve operation they implement. Kotlin and F# helpers export records through
+evaluate; definitions and references query those records in the store. A
+helper registration with `dependency_reads: true` also implements the `observe`
+maintenance RPC. Before offering persistent candidates for reuse, the host sends
+`{session, reads}` for their producer-free declaration, lookup, constant or body
+channel dependencies. The helper observes its currently installed project and
+returns an array of common input objects with `kind: "channel"`, `name` equal to
+the dependency key, `object` equal to its current semantic value and empty `type`.
+Unavailable reads are omitted; they cannot validate a cached result. The gateway
+compares these values through the existing dependency validators. A helper that
+does not declare this capability receives no observe calls; declaring it requires
+the RPC to be implemented. Observe is separate from the registration's unit
+`operations`, which remain `evaluate` for external helpers.
+Their evaluate response also includes `producer_keys`, mapping an observed read
+key to the producer's structured `unit_key` values. The helper uses the same keys
+as its unit inventory; the host derives opaque unit IDs and stores them in the
+read's `producers` provenance. Its scalar `producer` remains absent, so frontend
+observations continue to validate through installed channel inputs. This explicit
+provenance connects module changes to filtered reanalysis without interpreting
+provider-private lookup scopes.
+
+Each session has an ID and an input epoch: source or prepared-input changes advance
+the epoch after synchronization, while repeated installation of unchanged
+inputs preserves it. Evaluation binds the installed epoch and source/prepared
+input objects to its demand and budget. File objects come from the installed
+source manifest, including inputs without a language document. clice TU
+contributions name their main file, runtime and prepared artifacts directly;
+observed reads bind individual source objects or the containing artifact object.
+SDK reads, missing files and source locations bind the named SDK object and its
+relative member path. Unbound external reads keep their facts but prevent
+result caching. Session messages carry
+the source snapshot; individual file bindings come from TU contributions.
+A shared job retains its computation ID across worker admission retries; each execution has a request ID, and the
+analysis configuration names its stage. Units, progress, cancellation and the
+final report carry these execution identities. The gateway checks their input
+and execution binding before publication. LSP evaluation selects declaration
+or diagnostic requests from the demanded facts; clice evaluates the demanded
+contributions from its saved TU export. Diagnostic-only and uncovered-file
+requests retain the immediate path. Interrupted operations
+leave the session failed and the worker closes it before reuse.
+Each evaluation also names its slot. Binary `facts_batch` chunks
+carry at most 1 MiB of data, with a 64 MiB limit per serialized unit.
+A separate `unit_committed` event identifies that object and lists its complete
+contribution inventory. The receiver checks the slot, epoch and inventory
+before anchoring and persisting the contribution; staged facts alone never
+publish. A `completed` or `failed` event closes the evaluation, and its committed
+unit count must agree with the final build reply. Failure discards uncommitted
+staging. The final view selects committed contributions atomically; the build
+reply contains their count and coverage summary. Cancellation uses the request's correlated cancel message,
+stops the active evaluation and retains units already committed to storage.
+Queries accept `budget: {"milliseconds": 5000, "units": 100, "nodes": 20000}`
+to bound analysis time, source documents and returned semantic records. These
+limits also account for clice's structured exports. Exceeding a document or
+record budget returns `resource_limit`; an unfinished unit contributes no
+records, while earlier committed units remain stored. On a fixed view, `nodes` bounds type expansion and exhausted traversal
+is reported as partial coverage.
+
+Executable mappings and prepared-tree environment bindings apply on workers.
+An analysis profile contains named `stages` and `outputs`. Each stage specifies
+`server`, `build_configuration`, typed `inputs` and optional `after` stage names.
+Build input references select task output ports from named configurations:
+
+```json
+{
+  "stages": {
+    "cpp": {
+      "server": { "provider": "clice", "options": {} },
+      "build_configuration": "native",
+      "inputs": {
+        "compilation_database": [{ "configuration": "native", "task": "configure", "output": "compilation_database" }]
+      },
+      "after": []
+    }
+  },
+  "outputs": { "source": [{ "stage": "cpp", "output": "facts" }] }
+}
+```
+
+Each input names its producing build configuration, task and output. Clice can
+consume compilation databases from several configurations with an explicit
+`cache_dir`. Ty's `python_environment` port selects one uv task's output; direct
+server launches with several environments require an explicit `python` selection. The planner preserves input order, expands only
+the selected producers and their prerequisites, and keeps each preparation task's
+environment and output ownership tied to its configuration. `build_configuration`
+sets the stage's execution defaults and server environment. Every participating
+configuration's process limits apply. The planner checks port types, output
+references and stage dependency cycles.
+`language` with `action: "plan"` returns the named analysis and preparation nodes,
+their input bindings, dependencies, output types and commands. Input bindings retain
+the producing configuration/task/output or stage/output reference; dependencies
+record execution order. Its optional `outputs` list selects
+profile outputs; omitting it selects all declared outputs. The same selection
+controls queries and includes each selected stage's `after` prerequisites.
+
+Kotlin and F# source stages consume the build task's `project_model` output.
+Each runs as a platform host that loads one language adapter: map
+`fughetta-jvm` and `fughetta-kotlin` to the JARs installed under
+`libexec/fughetta-service/jvm` and `kotlin`, and `fughetta-clr` and
+`fughetta-fsharp` to the assemblies under `clr` and `fsharp`, alongside `java`
+or `dotnet`. The worker launches `java -jar fughetta-jvm.jar --adapter
+fughetta-kotlin.jar` and `dotnet fughetta-clr.dll --adapter fughetta-fsharp.dll`.
+CLR artifact stages run the same `fughetta-clr` host without an adapter.
+Explicit worker tool mappings can name readable helper resources as well as
+executables. Only declared artifact inputs
+are installed as provider models; preparation receipts remain separate inputs to
+the build tasks.
+
+A `jvm-artifact` stage consumes a `jvm_artifact` through its `artifact` port;
+a `clr-artifact` stage consumes a `clr_artifact` there and accepts an explicit
+`portable_pdb` through `symbols`. Both accept `source_facts` from their source
+stage to publish `emits` relationships. JVM association uses class line tables
+and the primary SMAP stratum; CLR association uses the supplied Portable PDB.
+JVM class signatures contribute scoped type parameters, bounds and parameterized
+base types to the normal type graph. Class, field and method annotations appear
+under `jvm.annotations`, with their descriptor, runtime visibility and tagged
+element values; nested annotations and arrays retain their structure.
+Source file and function-body ownership must be unambiguous. Select the source
+profile output to query before compilation, and an output containing these
+readers and the binding resolver to prepare linked facts on demand. A stage's
+fact ports expose that stage's own contributions. The final query view retains
+its upstream facts so source and artifact endpoints remain navigable.
+
+Fact ports also accept an analysis output from another project:
+
+```json
+"native": [{
+  "project": "native-lib",
+  "worldline": "release",
+  "configuration": "native",
+  "output": "facts"
+}]
+```
+
+The referenced output must have type `semantic_shard`. An optional `version`
+selects a fixed source revision; otherwise each new call selects the dependency
+worldline's current revision. The view retains every participating project's
+snapshot, configuration and toolchain selection. Continuation keeps those
+selections while a fresh call can observe later dependency changes. The gateway
+checks the declared project edge and delegates only the reads needed by that
+analysis; it does not grant the root task direct access to the other project.
+Cross-project input changes and their configured build/test tasks appear in
+view comparison and impact results.
+
+A `native-artifact` stage reads an ELF executable, shared library or relocatable object with
+`llvm-readobj`. Declare that build output with type `native-artifact`, then bind
+it to the stage's `artifact` port. The optional `source_facts` port accepts stage
+outputs; the gateway exposes their committed shard objects and requests source symbols
+and definitions from their producers. For example, alongside the `cpp` stage:
+
+```json
+"native": {
+  "server": { "provider": "native-artifact", "options": { "module": "app" } },
+  "build_configuration": "native",
+  "inputs": {
+    "artifact": [{ "configuration": "native", "task": "build", "output": "app" }],
+    "source_facts": [{ "stage": "cpp", "output": "facts" }]
+  }
+}
+```
+
+Expose `native/facts` through a profile output to request it. Selecting only the
+source output prepares compilation commands without linking. The reader records
+linkage names, imports, exports and artifact locations. `llvm-symbolizer` supplies
+debug positions for `emits` relationships to source definitions; ambiguous positions
+remain unbound. Relationship endpoints carry their own contexts, and the selected
+view retains the source shards needed to inspect either endpoint. Configure worker
+mappings for `llvm-readobj` and `llvm-symbolizer`, or set the stage's `executable`
+and `symbolizer` options. A separate `directory_group` allows the source and artifact
+stages to run on different workers. Stage requests carry shard IDs; workers fetch
+objects on demand and share their cached records. Each provider declares its output
+channels. Source providers expose `declarations` and `definition_bodies` across all
+shards of a unit: declarations omit display origins, while definition bodies retain
+function identities and definition locations. Republishing identical values keeps
+these channels stable. Native units consume `definition_bodies` and reuse stored facts when
+those values, the measured artifact, toolchain and source files read for character
+position conversion match. Their source document selection is an `enumeration`
+read over the installed manifest, with content reads recorded separately. File-set
+reads select named files or recursive directories; additions, removals and renames
+withdraw their cached consumers, while changes outside the selection leave them
+available. Candidates retain these reads in SQLite across gateway restarts.
+Deferred units remain available to continuation.
+The optional `ir` port accepts `llvm_ir`: textual IR is read directly, while
+bitcode uses the mapped `llvm-dis`. Direct calls and available static JNI
+registration tables become native relationships and binding evidence.
+
+A `pinvoke` stage consumes CLR facts through `managed` and native artifact facts
+through `native`. Its `libraries` option maps each DLL import name to the native
+reader's module name, for example `{"libraries":{"native":"app"}}`. Both ports
+accept multiple stage outputs. The resolver emits `binds` relationships with
+endpoint contexts, entry point, calling convention, library selection and
+parameter slots. Missing or ambiguous exports produce diagnostics; ambiguous
+matches remain candidate relationships. Scalar slots use identity conversion;
+string, array and by-reference struct mappings retain their CLR marshal
+descriptors, parameter directions, size parameters and layout. Other explicit
+marshaling operations retain their metadata. Resolver reuse checks the worker
+runtime and each input port's selected `linkage` channel collection. Collections
+retain project/module selection and producer membership, including empty lookups.
+JNI contributions are grouped by project and JVM module; P/Invoke contributions
+by project, CLR module and import library. Adding or
+withdrawing a library invalidates the result even when existing libraries remain
+unchanged; producers outside the selected modules and unrelated call-graph
+channels do not participate in this check.
+
+The `jni` resolver uses the same `managed` and `native` fact ports for JVM and
+native artifacts. Map a JVM module to its native modules with, for example,
+`{"libraries":{"sample":["native"]}}`. It follows JNI short/long export naming,
+including Unicode escaping and overloaded descriptors, and records the implicit
+environment and receiver/class slots. Competing exports remain candidates.
+Static exports and resolved `RegisterNatives` tables can bind JVM methods;
+registration-table evidence can select a local native target without an export.
+
+Project `analysis_defaults`, profile `defaults`, then stage `execution` supply
+execution settings in that order. `fact_limit` and `relation_depth` control the
+query defaults. `execution` contains `requires` (tools/platform), `limits`
+(timeout, retained output, memory and CPU), and `budget` (milliseconds, units,
+nodes). Required tools accumulate; platform selections use the nearest setting
+and must satisfy the bound build's requirements. Build limits also cap stage
+process limits. Request budgets can only tighten the configured budget for each
+selected stage. Plan nodes report effective execution settings and their field
+`origins`. Query defaults are stored in the published view and retained across
+pages. Scheduling order, execution budgets and process limits are excluded from
+the stage's semantic recipe.
+
+Stages execute in dependency order against one pinned source version. Each stage
+has its own semantic context; selected outputs become one immutable query view.
+`execution.directory_group` inherits project and profile defaults and otherwise
+uses the bound build configuration name. Stages assigned to the same group share
+a directory and combine their worker requirements. Declared outputs from distinct
+producers must have distinct paths within that group. Plan nodes identify their
+directory group; `directory_groups` lists each group's required tools and platform.
+Preparation task identities include both the group and the build configuration.
+Directory pools belong to a project, directory group and selected runtime;
+worldlines share these pools. An idle directory is selected by overlap with its
+last installed source objects. The worker synchronizes from that directory's
+actual installed manifest, restoring, replacing and removing tracked source
+files before updating each stage's session epoch. Concurrent computations use
+distinct reserved directories.
+One queued computation reserves a directory from each required group pool until
+all selected stages finish, including when the stage order returns to an earlier
+directory group. Within a live worker directory, subsequent stages reuse completed
+preparation tasks for that computation and source snapshot. Plain builds,
+source changes, failures and session reclamation discard these preparation
+receipts. Each worker prepares its own directory when execution moves between
+workers. Saving settings validates the graph without executing it.
+
+A generating build task can set `generated_manifest: "generated.json"`. Its last
+step writes `{"files":["generated/value.hpp"]}` to `${reports}/generated.json`;
+paths are relative to the working tree and must lie within the task's declared
+outputs. The list is the producer's complete current file contribution. An empty
+list withdraws its former files while preserving other producers' files. Ownership
+is retained across worker restarts and scoped by build configuration and task.
+Each execution includes the complete producer inventory for its directory group;
+producers leaving the selected graph withdraw their files before preparation.
+Analysis stages sharing a directory use the same inventory so one stage preserves
+another stage's outputs.
+Generated file objects enter provider inputs, so changes and withdrawals update
+session epochs and invalidate consumers. Each successful generation currently
+assigns a new object to its reported files. Interrupted or invalid generation
+leaves the slot unfinished; its next use retires sessions and recreates the tree
+before installing source and running preparation again.
+
+The shared semantic store retains up to four input states for each stage recipe
+and unit. Candidates reference immutable shards independently of query views.
+A stage batches new declaration anchors and publishes its completed units in one
+view transaction. Reused units retain their stored anchors. Configuration names
+remain in `view.configuration`; session and recipe `options` identify the effective
+stage and build settings.
+SQLite serves identities, views, recipes and leases by key. The identity cache is
+bounded, and shard metadata, references and identity membership are stored in
+tables. Collection follows removed references and a deletion queue; it does not
+read surviving shard indexes. Query lease renewals are batched in memory.
+Recipes have explicit recipe ID, project, options and access-time columns.
+Accepted reused contributions refresh access times in one UPDATE per publication;
+pressure evicts a batch in LRU order and collects released shards once.
+A project-qualified `candidate_inputs` table indexes source content, file membership
+and directory reads. Source changes mark only their readers for revalidation;
+unchanged candidates retain their previous source check, including across restart.
+Each querying project keeps its own last checked source vector, so querying another
+project does not withdraw unrelated inputs. This metadata is collected when the
+project no longer has candidates, and the project's in-memory resolved-source states
+are dropped with it.
+Candidate payload decoding and resolved source checks use bounded caches: resolved
+results are remembered per querying project and exact source vector, so returning to
+an already checked worldline state reuses them without decoding payloads or
+rechecking, while the durable `dirty` and `source_valid` columns remain the source of record
+across restart. Reclamation scans recipes in bounded `(accessed, key)` pages and
+resolves each page's shard references with one query, adjusting shared-shard counts
+as the page is walked. Runtime roots keep view, candidate and shard IDs in separate
+sets.
+
+Input kinds describe common categories. Provider-specific contracts use
+`kind: "provider"` and a namespaced `type`, such as `clice/configuration`, with a
+validator declared by that provider. Output-channel inputs use `kind: "channel"`.
+Gradle/MSBuild project models use the installation's existing `model` or `projects`
+fields; additional providers do not extend the installation structure.
+The gateway selects source reads against project-qualified snapshots, then uses
+installed inputs grouped by project to validate artifact, model and SDK reads.
+After clice refreshes the unit inventory, the worker reports installed inputs. The
+gateway's dependency validators compare source objects, prepared artifacts,
+runtime/SDK inputs and recorded include reads, including missing include paths,
+and return the reusable candidates. Clice also exports directories
+enumerated by the compiler, including reads inherited from PCH and module inputs.
+Implicit Clang modules retain those observations in their PCM; changed directory
+membership rebuilds the affected cached modules before producing the consuming unit.
+Directory observations participate in clice's index invalidation and persist across
+restart; the service records their source-manifest membership, or the bound SDK or
+generated input for directories supplied by those producers. A match skips semantic
+export and publishes a new view over the existing shards. Reused records retain
+their stored declaration anchors and count toward the node budget.
+`language.reused_units` reports these reused contributions. Candidate metadata
+survives gateway/worker restarts and is reclaimed independently of query views
+under the shard budget.
 
 Workers report a runtime fingerprint before accepting work. It hashes provider-default
 and configured executable contents, the platform, effective worker environment, distribution
 package manifests, and recognized Java/Android SDK release manifests. Standalone
-worker configuration can supply `sdk_manifests: {"name": "/path/to/manifest"}`
-for other managed SDKs. Custom executables must be mapped in `tools`; missing or
+worker configuration can supply
+`sdk_manifests: {"native": {"manifest": "/opt/sdk/release.json", "roots": ["/opt/sdk"]}}`
+for other managed SDKs. Each manifest identifies the immutable contents of its
+installed directory. A binding may list several spellings of that directory,
+including symlinks, but all must resolve to the same real directory. Different
+bindings must have distinct canonical roots; nested roots use the provider host
+contract above. This also applies to automatically detected Java/Android bindings. `ANDROID_HOME` and
+`ANDROID_SDK_ROOT` describe one SDK and must resolve to the same directory. Android package
+manifests contribute to the enclosing SDK identity. The manifest identifies the
+SDK in semantic dependencies; installed roots bind it locally without rereading
+individual SDK headers. Executables, the platform, system
+packages and process environment form a separate execution identity. C++ units
+select the clice programs and their effective process environment, then bind
+clice's exported compiler-tool records and actual SDK reads to the worker's
+installation observations. clice passes those records through its existing
+PCH/module artifacts and saved TU exports; it owns C++ caching and invalidation.
+The same exports carry consumed CDB command identities. When they match clice's
+current build-command inventory, Fughetta uses those records in place of the whole
+preparation artifact, retaining actual generated-file reads as dependencies.
+Fughetta uses the exported inputs to reuse contributions across workers,
+worldlines and stages. An unrelated tool or unread SDK manifest can therefore
+change while a persisted TU is reused. Incomplete tool records or executables
+without an installation observation make that TU ineligible for reuse.
+Other LSP providers select their launcher, operation programs and configured
+auxiliary executables (including TypeScript tsserver). Their SDK inputs remain at
+installation scope because these providers do not export external read records.
+System packages remain a shared platform input for every provider. Native artifact units select the
+installed reader and, when consuming source mappings, symbolizer identities,
+together with the platform, system packages and effective process environment.
+Changes to unrelated installed tools therefore preserve those units. Selection
+uses the worker's existing installation observations; a tool without an observation
+makes the resulting unit ineligible for reuse.
+Custom executables must be mapped in `tools`; missing or
 unreadable executables are omitted from advertised capabilities. SDK releases
 and tools must remain immutable while the
 worker is connected; restart the worker after updating them. Project and step
@@ -726,7 +1330,7 @@ later query can observe diagnostics received in the background.
 Invalid symbol selections return `invalid_record` without restarting the server.
 
 `build` with `fresh: true` bypasses cached and in-flight results, retires the
-selected directory's language session, and recreates that working directory
+selected directory's stage sessions, and recreates that working directory
 from the source snapshot before running the build. Shared dependency caches
 remain available. Builds without `fresh` preserve generated outputs for incremental
 execution. A clean build detaches its old directory under the store lock and
@@ -775,7 +1379,8 @@ The configuration owns the execution thread count and subprocess parallelism:
 | --- | --- |
 | `threads` | Execution threads across gateway, source, and workers. Each process gets one I/O thread. Gateway and source each reserve two blocking workers; each compute worker gets one. Remaining threads are split between the gateway and source blocking pools. Sleeping main and signal-watcher threads are outside this count. |
 | `jobs` | Parallel build jobs, divided evenly among workers and passed to toolchains as parallelism hints; source runs no subprocess work. |
-| `workers` | Worker process count. Each worker admits one task at a time, including its language-analysis phase. |
+| `workers` | Worker process count. Each managed worker admits one task at a time, including its language-analysis phase. |
+| `worker_memory_bytes` | Optional total resident-memory budget for managed workers, divided evenly between them. A standalone worker configures its share as `memory_bytes`. |
 
 `threads` must be at least `6 + 2 * workers`; `jobs` must be positive and at least `workers`.
 A file-only deployment can use `{ "threads": 6, "jobs": 1, "workers": 0 }`.
@@ -792,10 +1397,21 @@ cancellation, and CORS preflight remain available. The main process retains its
 PID and loads the persisted budget for the next process group. See the hosted
 [runtime budget controls](../cloud-gateway/README.md#runtime-budgets).
 
-The top-level `tools` map supplies executable paths to workers.
+The top-level `tools` map supplies executable paths and readable tool resources
+to workers, including helper JARs, assemblies and model-export scripts. Automatic
+PATH discovery selects executables; interpreted resources need explicit mappings.
 
 Build environments receive the assigned parallelism for CMake, CTest, Make,
-and OpenMP. These are scheduling hints within the shared execution environment.
+and OpenMP; JVM `ActiveProcessorCount` and .NET `DOTNET_PROCESSOR_COUNT` receive
+the same allocation for their runtime thread pools.
+
+Memory admission distinguishes reservations from measured resident memory. A task
+with `max_memory_bytes` reserves that allowance; an undeclared allowance reserves
+the whole available task budget and runs alone. Idle language processes are
+reclaimed in LRU order to make room. Worker and child-group resident memory are
+reported with the session inventory; the existing reclaim loop stops work with
+`resource_limit` when observed usage exceeds its budget. Existing platform process
+limits remain separate from this resident-memory accounting.
 
 Gateway metadata stays in `server.storage`; source data lives in its `source/`
 subdirectory, and worker caches in `workers/local-<index>/`. Internal listeners

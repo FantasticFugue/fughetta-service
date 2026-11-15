@@ -97,7 +97,8 @@ export namespace nodes {
         std::string task_id, run_id, execution_token, execution_identity, execution_owner;
         bool execution_writable = true;
         std::vector<std::string> scope_refs, scope_files, scope_entries;
-        std::vector<semantic::scope> analyzed_scopes;
+        std::vector<semantic::records::scope> analyzed_scopes;
+        std::map<std::string, semantic::place> declaration_ranges;
     };
     struct file_view {
         std::string id, path, kind, digest, text;
@@ -145,7 +146,8 @@ export namespace nodes {
         bool truncated = false;
         std::string completeness_scope = "none";
         std::uint64_t storage_bytes = 0;
-        std::vector<semantic::scope> scopes;
+        std::vector<semantic::records::scope> scopes;
+        std::map<std::string, semantic::source_anchor> declaration_anchors;
         std::optional<execution_view> execution;
         std::string state_snapshot;
         std::uint64_t loaded_records = 0, replayed_events = 0, snapshot_events = 0;

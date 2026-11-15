@@ -10,6 +10,9 @@ export import reflection;
 export import configuration;
 
 export namespace fixture {
+    auto profile(language::stage stage) -> language::configuration {
+        return {.stages = {{"main", std::move(stage)}}, .outputs = {{"facts", {{"main", "facts"}}}}};
+    }
     template <meta::fixed_string Name> auto options(builds::builder& b) -> builds::config<Name>& { return rfl::get<builds::with<Name>>(b.variant()).options; }
     template <meta::fixed_string Name> auto options(const builds::builder& b) -> const builds::config<Name>& {
         return rfl::get<builds::with<Name>>(b.variant()).options;
@@ -167,9 +170,9 @@ export namespace fixture {
             auto begin = tools::lines::scalars(std::string_view{file->text}.substr(0, at.front()));
             auto count = tools::lines::scalars(std::string_view{file->text}.substr(at.front(), last - at.front()));
             auto tree = co_await tools::selected(s, in.project, "main", r.version, actor);
-            auto done = co_await tools::main_apply(s, in.project, actor, tree,
-                                                   {tools::change{.kind = "edit", .path = in.path, .offset = begin, .count = count, .text = replaced}},
-                                                   in.operation_id, "edit " + in.path, rfl::json::write(tools::record{input, at.size()}));
+            auto done = co_await tools::main_apply(
+                s, in.project, actor, tree, {tools::change{.kind = std::string{"edit"}, .path = in.path, .offset = begin, .count = count, .text = replaced}},
+                in.operation_id, "edit " + in.path, rfl::json::write(tools::record{input, at.size()}));
             co_return edit_output{done.version, done.receipt, in.operation_id, at.size(), done.replayed};
         };
         co_return co_await tools::once<edit_output>(
@@ -182,8 +185,8 @@ export namespace fixture {
         std::string input = content::hash_of(rfl::json::write(std::tuple{std::string{"remove"}, in.path})).str();
         auto apply_once = [&]() -> coroutine::task<tools::mutation> {
             auto observed = co_await tools::main_tree(s, in.project, actor);
-            auto r = co_await tools::main_apply(s, in.project, actor, observed, {tools::change{.kind = "remove", .path = in.path}}, in.operation_id,
-                                                "remove " + in.path, rfl::json::write(tools::record{input}));
+            auto r = co_await tools::main_apply(s, in.project, actor, observed, {tools::change{.kind = std::string{"remove"}, .path = in.path}},
+                                                in.operation_id, "remove " + in.path, rfl::json::write(tools::record{input}));
             co_return tools::mutation{r.version, r.receipt, in.operation_id, r.replayed};
         };
         co_return co_await tools::once<tools::mutation>(
@@ -196,8 +199,9 @@ export namespace fixture {
         std::string input = content::hash_of(rfl::json::write(std::tuple{std::string{"move"}, in.from, in.to})).str();
         auto apply_once = [&]() -> coroutine::task<tools::mutation> {
             auto observed = co_await tools::main_tree(s, in.project, actor);
-            auto r = co_await tools::main_apply(s, in.project, actor, observed, {tools::change{.kind = "move", .path = in.from, .destination = in.to}},
-                                                in.operation_id, "move " + in.from, rfl::json::write(tools::record{input}));
+            auto r =
+                co_await tools::main_apply(s, in.project, actor, observed, {tools::change{.kind = std::string{"move"}, .path = in.from, .destination = in.to}},
+                                           in.operation_id, "move " + in.from, rfl::json::write(tools::record{input}));
             co_return tools::mutation{r.version, r.receipt, in.operation_id, r.replayed};
         };
         co_return co_await tools::once<tools::mutation>(

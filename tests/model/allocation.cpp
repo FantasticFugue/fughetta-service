@@ -5,6 +5,14 @@ import allocation;
 namespace {
     using namespace boost::ut;
     const auto cases = [] {
+        "hot memory reclamation weighs reconstruction cost size and age"_test = [] {
+            const auto expensive = allocation::retention_value(20, 200, 1);
+            const auto cheap = allocation::retention_value(1, 200, 1);
+            const auto large = allocation::retention_value(20, 2000, 1);
+            const auto abandoned = allocation::retention_value(20, 200, 100);
+            expect(cheap < expensive && large < expensive && abandoned < cheap);
+            expect(std::isfinite(allocation::retention_value(1, 0, 0)));
+        };
         "worker shares use the full global job budget"_test = [] {
             for (std::uint32_t jobs = 1; jobs <= 64; ++jobs)
                 for (std::uint32_t workers = 1; workers <= jobs; ++workers) {
@@ -21,7 +29,11 @@ namespace {
                 }
         };
         "extra execution threads stay inside the shared budget"_test = [] {
-            auto plan = allocation::distribute({.threads = 13, .jobs = 8, .workers = 3});
+            auto plan = allocation::distribute({.threads = 13, .jobs = 8, .workers = 3, .worker_memory_bytes = 1000});
+            std::uint64_t memory = 0;
+            for (auto worker : plan.workers)
+                memory += worker.memory_bytes.value();
+            expect(memory == 1000_u);
             expect(plan.gateway_io + plan.gateway_disk + plan.source_io + plan.source_disk + 2 * plan.workers.size() == 13_u);
         };
         "file-only service needs no worker process"_test = [] {

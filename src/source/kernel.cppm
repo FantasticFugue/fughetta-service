@@ -706,7 +706,7 @@ export namespace nodes {
                 if (type == "mode")
                     f.executable = selected.boolean();
                 if (type == "binary") {
-                    f.kind = "binary";
+                    f.kind = std::string{"binary"};
                     auto found = blobs_.find(selected.text());
                     if (found == blobs_.end())
                         fail(nodes::code::missing_objects, "binary content is unavailable");

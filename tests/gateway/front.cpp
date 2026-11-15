@@ -20,6 +20,8 @@ import usage;
 import support;
 import enrollment;
 import protocol;
+import projectmodel;
+import durability;
 
 namespace {
     using namespace boost::ut;
@@ -118,6 +120,18 @@ namespace {
                 transport::dispatcher<socket> dispatch;
                 const std::string data = "verified artifact";
                 const auto digest = content::hash_of(data);
+                projectmodel::document model{
+                    .producer = "test",
+                    .producer_version = "current",
+                    .units = {{.id = "main",
+                               .project = "app",
+                               .language = "kotlin",
+                               .directory = ".",
+                               .references = {projectmodel::artifact_reference{.object = {digest.str(), "library.jar"}, .role = "classpath"}}}}};
+                const auto model_text = rfl::json::write(model);
+                const auto model_digest = content::hash_of(model_text);
+                builds::exported_file model_file{
+                    .name = "build/model", .path = "model.json", .digest = model_digest, .size = model_text.size(), .objects = {{digest, data.size()}}};
                 const std::string log = "complete compiler log";
                 const auto log_digest = content::hash_of(log);
                 int builds = 0, downloads = 0;
@@ -137,14 +151,15 @@ namespace {
                                                             .output = "log",
                                                             .truncated = true,
                                                             .log = builds::exported_file{"step-0.log", "0.log", log_digest, log.size(), false}}},
-                                                 .exports = {{"binary", "app", digest, data.size(), true}}};
+                                                 .exports = {{"binary", "app", digest, data.size(), true}},
+                                                 .models = {model_file}};
                 };
                 dispatch.on<jobs::build_request>(std::move(handle_build_request));
                 auto handle_export_read = [&](jobs::export_read request, auto&) -> coroutine::task<jobs::source_bytes> {
                     ++downloads;
                     if (fail_download)
                         throw std::runtime_error("artifact transport unavailable");
-                    const auto& value = request.digest == log_digest ? log : data;
+                    const auto& value = request.digest == log_digest ? log : request.digest == model_digest ? model_text : data;
                     auto part = std::as_bytes(std::span{value}).subspan(request.offset, request.length);
                     co_return jobs::source_bytes{{{request.digest, request.offset, value.size(), {part.begin(), part.end()}}}};
                 };
@@ -170,6 +185,8 @@ namespace {
                         co_await execution::schedule_after(io, 1ms);
                     config::settings project;
                     project.build_configurations["native"] = fixture::commands({"true"});
+                    fixture::options<"command">(project.build_configurations["native"].builders.at("main")).operations.at("build").outputs = {
+                        {"model", {"project_model", "out/model.json"}}};
                     project.build_configurations["native"].operations["build"].exports = {{"binary", "out/app"}};
                     project.default_configurations = {"native"};
                     for (auto name : {"app", "other"}) {
@@ -181,6 +198,15 @@ namespace {
                     const auto first = co_await h.mcp(io, call("build", R"({"project":"app"})"));
                     expect(first.status == 200 && first.body.contains(digest.str())) << first.body;
                     expect(builds == 1);
+                    auto model_object = co_await h.files.read_model(0, "app", {.model = model_digest, .object = {digest}});
+                    expect(model_object.parts.at(0).total == data.size());
+                    bool denied = false;
+                    try {
+                        co_await h.files.read_model(0, "other", {.model = model_digest, .object = {digest}});
+                    } catch (const std::invalid_argument&) {
+                        denied = true;
+                    }
+                    expect(denied) << "model references require the requesting project's grant";
                     const auto log_reply = co_await h.ask(io, GET, "/api/v1/projects/app/exports/" + log_digest.str());
                     expect(log_reply.status == 200 && log_reply.body.contains(tools::lines::base64(log)));
                     const auto part = co_await h.ask(io, GET, path + "?offset=9&length=8");
@@ -191,6 +217,8 @@ namespace {
                     const auto cached = co_await h.mcp(io, call("build", R"({"project":"other"})"));
                     expect(cached.status == 200 && cached.body.contains(digest.str())) << cached.body;
                     expect(builds == 1) << "identical inputs reuse the existing result";
+                    model_object = co_await h.files.read_model(0, "other", {.model = model_digest, .object = {digest}});
+                    expect(model_object.parts.at(0).total == data.size()) << "cached models grant their objects to the new project";
                     expect((co_await h.ask(io, GET, other)).status == 200) << "cache recipients gain download access";
                     expect((co_await h.ask(io, GET, "/api/v1/projects/missing/exports/" + digest.str())).status != 200);
                     expect((co_await h.ask(io, GET, path + "?offset=99")).status != 200);
@@ -199,7 +227,7 @@ namespace {
                     const auto reused = co_await h.mcp(io, call("build", R"({"project":"app","fresh":true})"));
                     expect(reused.status == 200 && !reused.body.contains("artifact transport unavailable")) << reused.body;
                     expect(builds == 2 && downloads == previous_downloads) << "fresh execution reuses stored artifact and log bytes";
-                    std::filesystem::remove(h.tmp.dir / "storage/.exports/blobs" / digest.view());
+                    durability::remove_file(h.tmp.dir / "storage/.exports/blobs" / digest.view());
                     const auto failed = co_await h.mcp(io, call("build", R"({"project":"app","fresh":true})"));
                     expect(failed.status == 200 && failed.body.contains("artifact transport unavailable") && failed.body.contains(R"("exit_code":0)"))
                         << failed.body;
@@ -208,7 +236,7 @@ namespace {
                     fail_download = false;
                     const auto rebuilt = co_await h.mcp(io, call("build", R"({"project":"app"})"));
                     expect(rebuilt.status == 200 && builds == 4) << "failed delivery invalidates the result cache";
-                    std::filesystem::remove(h.tmp.dir / "storage/.exports/blobs" / digest.view());
+                    durability::remove_file(h.tmp.dir / "storage/.exports/blobs" / digest.view());
                     const auto stale = co_await h.mcp(io, call("build", R"({"project":"app"})"));
                     struct execution_reply {
                         struct payload {
@@ -217,9 +245,15 @@ namespace {
                         payload result;
                     };
                     const auto stale_result = rfl::json::read<execution_reply>(stale.body).value();
-                    expect(stale.status == 200 && builds == 4 && !stale_result.result.structuredContent.results.at(0).exports.at(0).delivery_error.empty());
+                    expect(stale.status == 200 && builds == 5 && stale_result.result.structuredContent.results.at(0).models.at(0).delivery_error.empty())
+                        << "a missing model dependency makes this call rebuild instead of returning stale cache";
                     const auto repaired = co_await h.mcp(io, call("build", R"({"project":"app"})"));
                     expect(repaired.status == 200 && builds == 5) << "missing objects do not trap later calls in a stale cache";
+                    durability::remove_file(h.tmp.dir / "storage/.exports/blobs" / model_digest.view());
+                    const auto model_miss = co_await h.mcp(io, call("build", R"({"project":"app"})"));
+                    expect(model_miss.status == 200 && builds == 6);
+                    model_object = co_await h.files.read_model(0, "app", {.model = model_digest, .object = {digest}});
+                    expect(model_object.parts.at(0).total == data.size()) << "an evicted model is republished on the same cache lookup";
                     remove_project = true;
                     const auto removed = co_await h.mcp(io, call("build", R"({"project":"app","fresh":true})"));
                     const auto removed_result = rfl::json::read<execution_reply>(removed.body).value();
@@ -348,12 +382,13 @@ namespace {
                     co_await h.ask(
                         io, http::method::POST, "/api/v1/projects/app/worldline",
                         R"({"project":"app","worldline":"main","action":"apply","observed":"","operation_id":"seed","changes":[{"kind":"create","path":"a.txt","text":"a"}]})");
-                    auto run_operation = [&io](tools::services&, jobs::progress_log&, std::string) -> coroutine::task<std::optional<tools::backlog::outcome>> {
+                    auto run_operation = [&io](tools::services&, jobs::progress_log&, std::map<std::string, std::string>,
+                                               std::string) -> coroutine::task<std::optional<tools::backlog::outcome>> {
                         co_await execution::schedule_after(io, 30s);
                         co_return tools::config_result{.ok = true};
                     };
                     auto blocker = co_await h.queue.submit(
-                        0, {.key = "blocker", .project = "app", .configuration = "blocker", .operation = "blocker", .actor = "blocker", .trees = "blocker"},
+                        0, {.key = "blocker", .project = "app", .configuration = "blocker", .operation = "blocker", .actor = "blocker", .trees = {"blocker"}},
                         std::move(run_operation));
                     struct release {
                         std::shared_ptr<tools::backlog::ticket> ticket;
@@ -670,7 +705,8 @@ namespace {
                 co_await h.hub.edit(0, [](config::store& store) {
                     config::settings project;
                     project.build_configurations["Debug"] = fixture::commands({"python3", "-c", "print('built')"});
-                    language::configuration analysis{.build_configuration = "Analysis"};
+                    language::stage analysis{.build_configuration = "Analysis",
+                                             .inputs = {{"compilation_database", {language::build_input{"Analysis", "db", "db"}}}}};
                     builds::configuration analysis_build;
                     builds::config<"command"> command;
                     command.operations["prepare"] = {
@@ -683,7 +719,7 @@ namespace {
                     analysis_build.operations["prepare"] = {.tasks = {"db"}};
                     analysis_build.outputs["db"] = {.task = "db", .output = "db"};
                     project.build_configurations["Analysis"] = analysis_build;
-                    project.analysis["Cpp"] = analysis;
+                    project.analysis["Cpp"] = fixture::profile(analysis);
                     store.put_project("app", project, 0);
                 });
                 const worlds::actor principal{.issuer = "token", .user = "tester", .caller = "tester", .role = "owner"};
@@ -722,9 +758,12 @@ namespace {
                 mcp::notifier note;
                 const worlds::actor actor{.issuer = "token", .user = "tester", .role = "owner"};
                 for (auto action : {"plan", "prepare", "receipt", "scopes"}) {
-                    bool rejected = false;
+                    auto input =
+                        rfl::json::read<tools::language_query::input>(std::format(R"({{"project":"app","configuration":"Cpp","action":"{}"}})", action));
+                    bool rejected = !input;
                     try {
-                        co_await tools::language_query::run(h.services, {}, {.project = "app", .configuration = "Cpp", .action = action}, note, actor);
+                        if (input)
+                            co_await tools::language_query::run(h.services, {}, std::move(*input), note, actor);
                     } catch (const tools::tool_error&) {
                         rejected = true;
                     }
@@ -789,7 +828,7 @@ namespace {
                         nodes::node_request request{.action = "apply",
                                                     .operation = content::hash_of("browser-seed").str(),
                                                     .expected = first->frontier,
-                                                    .edits = {{.kind = "create", .path = "src/hello.txt", .text = "one\ntwo\nthree\n"}}};
+                                                    .edits = {{.kind = std::string{"create"}, .path = "src/hello.txt", .text = "one\ntwo\nthree\n"}}};
                         auto accepted = co_await h.ask(io, http::method::POST, base, rfl::json::write(request));
                         auto parsed = rfl::json::read<nodes::node_reply>(accepted.body);
                         expect(bool(parsed) >> fatal) << accepted.body;
@@ -800,7 +839,7 @@ namespace {
                         auto concurrent = request;
                         concurrent.operation = content::hash_of("browser-concurrent-save").str();
                         concurrent.expected = first->frontier;
-                        concurrent.edits = {{.kind = "create", .path = "src/other.txt", .text = "other\n"}};
+                        concurrent.edits = {{.kind = std::string{"create"}, .path = "src/other.txt", .text = "other\n"}};
                         auto joined = co_await h.ask(io, http::method::POST, base, rfl::json::write(concurrent));
                         auto both = rfl::json::read<nodes::node_reply>(joined.body);
                         expect(joined.status == 200 && bool(both) >> fatal) << joined.body;
@@ -813,7 +852,7 @@ namespace {
                         auto revision = both->version;
                         request.operation = content::hash_of("browser-next").str();
                         request.expected = both->frontier;
-                        request.edits = {{.kind = "write", .path = "src/hello.txt", .text = "changed\n"}};
+                        request.edits = {{.kind = std::string{"write"}, .path = "src/hello.txt", .text = "changed\n"}};
                         replies.push_back(co_await h.ask(io, http::method::POST, base, rfl::json::write(request)));
                         replies.push_back(co_await h.ask(io, GET, base + "/source?revision=" + revision));
                         replies.push_back(co_await h.ask(io, GET, base + "/source/file?revision=" + revision + "&path=src%2Fhello.txt&offset=2&limit=1"));

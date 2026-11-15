@@ -343,6 +343,23 @@ export namespace io {
         return {address, *port};
     }
 
+    struct process_usage {
+        std::uint64_t resident_bytes = 0;
+        std::uint64_t cpu_nanoseconds = 0;
+        std::uint32_t threads = 0;
+        std::uint32_t processes = 0;
+    };
+    struct process_record {
+        std::mutex mutex;
+        bool live = true;
+        int pid = 0;
+        std::uintptr_t handle = 0;
+    };
+    struct process_group {
+        std::mutex mutex;
+        std::map<int, std::shared_ptr<process_record>> children;
+    };
+
     struct command {
         std::vector<std::string> argv;
         std::filesystem::path cwd;
@@ -355,6 +372,7 @@ export namespace io {
         // A file, created or truncated, that receives the child's standard output; its standard error alone is then what this
         // process reads. Not for a conversation.
         std::optional<std::filesystem::path> standard_output;
+        std::shared_ptr<process_group> processes;
     };
 
     // The io layer specializes this for each scheduler that can start processes.

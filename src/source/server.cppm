@@ -267,6 +267,29 @@ export namespace source_server {
             auto root = storage_ / ".nodes" / request.project;
             co_return co_await io::blocking(rt_.get_scheduler(core), pool_, [this, root, request = std::move(request)]() mutable {
                 authorize(request.actor);
+                const bool delegated = request.actor.dependency.has_value();
+                if (delegated) {
+                    const auto& grant = *request.actor.dependency;
+                    static const std::set<std::string, std::less<>> reads{"tree", "read", "content", "scope_register"};
+                    if ((!request.reading && request.request.action != "scope_register") || !reads.contains(request.request.action) ||
+                        grant.project != request.project || grant.worldline != request.request.worldline ||
+                        (grant.version.empty() ? request.request.action != "tree" : grant.version != request.request.revision))
+                        throw transport::coded_error(nodes::code::permission_denied, "operation is outside the dependency read grant");
+                    if (request.actor.execution_token.empty() || request.actor.project.empty())
+                        throw transport::coded_error(nodes::code::permission_denied, "dependency read has no originating execution");
+                    const auto origin = storage_ / ".nodes" / request.actor.project;
+                    auto checked = repositories_.with(
+                        origin,
+                        [&](nodes::local_node& node) {
+                            return node.call({.action = "tree",
+                                              .worldline = request.actor.worldline,
+                                              .run_id = request.actor.run,
+                                              .execution_token = request.actor.execution_token});
+                        },
+                        true);
+                    if (checked.code != "ok")
+                        throw transport::coded_error(checked.code, checked.reason);
+                }
                 // A workspace at its storage limit accepts reversals but no additional source history.
                 static const std::set<std::string, std::less<>> growing{"reference", "mail_send", "apply", "promote", "fork",   "integrate",
                                                                         "admit",     "resolve",   "redo",  "receive", "restore"};
@@ -285,7 +308,7 @@ export namespace source_server {
                         if (request.request.action == "task_lookup" &&
                             !(request.actor.issuer == "source" && request.actor.role == "service" && request.actor.caller == "execution"))
                             throw transport::coded_error(nodes::code::permission_denied, "execution lookup is internal");
-                        if (!request.actor.execution_token.empty()) {
+                        if (!request.actor.execution_token.empty() && !delegated) {
                             if (request.actor.project != request.project)
                                 throw transport::coded_error(nodes::code::permission_denied, "execution belongs to another project");
                             request.request.execution_token = request.actor.execution_token;

@@ -1,5 +1,7 @@
 module;
 #include <windows.h>
+#include <psapi.h>
+#include <tlhelp32.h>
 module process;
 import std;
 import mpmc;
@@ -9,6 +11,80 @@ import winapi;
 
 namespace native_process {
     namespace {
+        auto sample_threads() -> std::optional<std::map<DWORD, std::uint32_t>> {
+            winapi::handle snapshot{::CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)};
+            if (snapshot.value == INVALID_HANDLE_VALUE)
+                return {};
+            PROCESSENTRY32W entry{};
+            entry.dwSize = sizeof entry;
+            if (!::Process32FirstW(snapshot.value, &entry))
+                return {};
+            std::map<DWORD, std::uint32_t> result;
+            do {
+                result.emplace(entry.th32ProcessID, entry.cntThreads);
+            } while (::Process32NextW(snapshot.value, &entry));
+            if (::GetLastError() != ERROR_NO_MORE_FILES)
+                return {};
+            return result;
+        }
+        auto sample_process(HANDLE process, DWORD pid, const std::map<DWORD, std::uint32_t>& threads) -> std::optional<io::process_usage> {
+            PROCESS_MEMORY_COUNTERS memory{};
+            memory.cb = sizeof memory;
+            FILETIME created{}, exited{}, kernel{}, user{};
+            auto count = threads.find(pid);
+            if (count == threads.end() || !::K32GetProcessMemoryInfo(process, &memory, sizeof memory) ||
+                !::GetProcessTimes(process, &created, &exited, &kernel, &user))
+                return {};
+            auto ticks = [](FILETIME value) { return (std::uint64_t{value.dwHighDateTime} << 32) | value.dwLowDateTime; };
+            return io::process_usage{memory.WorkingSetSize, (ticks(kernel) + ticks(user)) * 100, count->second, 1};
+        }
+        auto sample_job(HANDLE job) noexcept -> std::optional<io::process_usage> {
+            try {
+                auto threads = sample_threads();
+                if (!threads)
+                    return {};
+                std::vector<std::byte> storage(sizeof(JOBOBJECT_BASIC_PROCESS_ID_LIST) + 16 * sizeof(ULONG_PTR));
+                JOBOBJECT_BASIC_PROCESS_ID_LIST* members;
+                for (;;) {
+                    members = reinterpret_cast<JOBOBJECT_BASIC_PROCESS_ID_LIST*>(storage.data());
+                    if (::QueryInformationJobObject(job, JobObjectBasicProcessIdList, members, static_cast<DWORD>(storage.size()), nullptr))
+                        break;
+                    if (::GetLastError() != ERROR_MORE_DATA)
+                        return {};
+                    storage.resize(storage.size() * 2);
+                }
+                io::process_usage result;
+                for (DWORD index = 0; index < members->NumberOfProcessIdsInList; ++index) {
+                    auto pid = static_cast<DWORD>(members->ProcessIdList[index]);
+                    winapi::handle process{::OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ | SYNCHRONIZE, FALSE, pid)};
+                    if (!process.value) {
+                        if (::GetLastError() == ERROR_INVALID_PARAMETER)
+                            continue;
+                        return {};
+                    }
+                    auto value = sample_process(process.value, pid, *threads);
+                    if (!value) {
+                        if (::WaitForSingleObject(process.value, 0) == WAIT_OBJECT_0)
+                            continue;
+                        return {};
+                    }
+                    result.resident_bytes += value->resident_bytes;
+                    result.threads += value->threads;
+                    ++result.processes;
+                }
+                JOBOBJECT_BASIC_ACCOUNTING_INFORMATION accounting{};
+                if (!::QueryInformationJobObject(job, JobObjectBasicAccountingInformation, &accounting, sizeof accounting, nullptr))
+                    return {};
+                result.cpu_nanoseconds = static_cast<std::uint64_t>(accounting.TotalKernelTime.QuadPart + accounting.TotalUserTime.QuadPart) * 100;
+                return result;
+            } catch (...) {
+                return {};
+            }
+        }
+        struct observation : io::process_record {
+            winapi::handle job;
+        };
+
         auto quote(std::string_view arg) -> std::wstring {
             auto text = winapi::wide(arg);
             if (text.find(L'\0') != text.npos)
@@ -53,11 +129,34 @@ namespace native_process {
             }
         };
     } // namespace
+    auto sample(const io::process_record& process) noexcept -> std::optional<io::process_usage> { return sample_job(reinterpret_cast<HANDLE>(process.handle)); }
+    auto self_usage() noexcept -> std::optional<io::process_usage> {
+        try {
+            auto threads = sample_threads();
+            return threads ? sample_process(::GetCurrentProcess(), ::GetCurrentProcessId(), *threads) : std::nullopt;
+        } catch (...) {
+            return {};
+        }
+    }
     struct child::state {
         native_io::engine<concurrent::queue>* engine;
         winapi::handle process, out, in, job;
         DWORD pid = 0;
         std::atomic<bool> reaped{false};
+        std::shared_ptr<observation> observed;
+        std::shared_ptr<io::process_group> processes;
+        void stop_observing() noexcept {
+            if (observed) {
+                std::lock_guard lock{observed->mutex};
+                observed->live = false;
+            }
+        }
+        void finished() noexcept {
+            if (auto group = std::exchange(processes, {})) {
+                std::lock_guard held{group->mutex};
+                group->children.erase(static_cast<int>(pid));
+            }
+        }
         explicit state(native_io::engine<concurrent::queue>& e) : engine(&e) {}
         void close_stream(winapi::handle& stream) noexcept {
             auto value = std::exchange(stream.value, nullptr);
@@ -68,12 +167,14 @@ namespace native_process {
             }
         }
         ~state() {
+            stop_observing();
             close_stream(out);
             close_stream(in);
             if (job.value)
                 ::TerminateJobObject(job.value, 1);
             if (process.value && !reaped)
                 ::WaitForSingleObject(process.value, INFINITE);
+            finished();
         }
     };
     auto child::spawn(native_io::engine<concurrent::queue>& engine, const io::command& cmd) -> child {
@@ -168,6 +269,18 @@ namespace native_process {
             ::TerminateProcess(process.hProcess, 126);
             winapi::fail("ResumeThread", error);
         }
+        if (cmd.processes) {
+            s->observed = std::make_shared<observation>();
+            HANDLE duplicate = nullptr;
+            if (!::DuplicateHandle(::GetCurrentProcess(), s->job.value, ::GetCurrentProcess(), &duplicate, 0, FALSE, DUPLICATE_SAME_ACCESS))
+                winapi::fail("duplicate observed job");
+            s->observed->job = winapi::handle{duplicate};
+            s->observed->pid = static_cast<int>(s->pid);
+            s->observed->handle = reinterpret_cast<std::uintptr_t>(duplicate);
+            s->processes = cmd.processes;
+            std::lock_guard held{cmd.processes->mutex};
+            cmd.processes->children.emplace(static_cast<int>(s->pid), s->observed);
+        }
         return child{std::move(s)};
     }
     child::child(std::unique_ptr<state> state) : state_(std::move(state)) {}
@@ -206,7 +319,9 @@ namespace native_process {
         return true;
     }
     auto child::reap() noexcept -> int {
+        state_->stop_observing();
         ::TerminateJobObject(state_->job.value, 1);
+        state_->finished();
         DWORD code = 0;
         if (!::GetExitCodeProcess(state_->process.value, &code))
             return -1;

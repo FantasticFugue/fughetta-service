@@ -154,7 +154,10 @@ namespace {
         settings.run_configurations["tests"] = {.operation = "test", .configurations = {"Debug"}};
         settings.default_configurations = {"Debug"};
         fixture::options<"cmake">(settings.build_configurations["Debug"].builders.at("main")).export_compile_commands = true;
-        settings.analysis["Cpp"] = {.server = fixture::clice("clice", {"--log-level", "off"}), .build_configuration = "Debug"};
+        settings.analysis["Cpp"] =
+            fixture::profile({.server = fixture::clice("clice"),
+                              .build_configuration = "Debug",
+                              .inputs = {{"compilation_database", {language::build_input{"Debug", "configure", "compilation_database"}}}}});
         std::uint64_t revision = 0;
         auto input = arguments("app", body(revision, settings));
         auto saved = result(co_await invoke(h, io, "save_project", input, "sk_member"));
@@ -171,7 +174,7 @@ namespace {
         expect(saved.isError && failed.status == 409 && saved.content.front().text == failed.body);
 
         auto invalid = settings;
-        invalid.analysis.at("Cpp").build_configuration = "missing";
+        invalid.analysis.at("Cpp").stages.at("main").build_configuration = "missing";
         auto payload = body(decoded.revision, invalid);
         auto rejected = result(co_await invoke(h, io, "save_project", arguments("app", payload), "sk_member"));
         auto denied = co_await rest(h, io, PUT, project, rfl::json::write(payload), "sk_member");

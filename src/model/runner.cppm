@@ -3,10 +3,28 @@ import std;
 import native;
 import async;
 import coroutine;
-import protocol;
+import provider;
 import constants;
 
 export namespace runner {
+    struct result {
+        std::string name;
+        std::int32_t exit_code = -1;
+        bool timed_out = false;
+        double seconds = 0;
+        std::string output;
+        bool truncated = false;
+        // What the step's reports say, read on the worker.
+        std::vector<builds::finding> diagnostics;
+        std::optional<builds::tally> tests;
+        std::optional<builds::exported_file> log;
+        bool log_truncated = false;
+        std::string log_error;
+        std::string cache_error;
+        // A batch shares one process outcome and elapsed time across these tasks.
+        std::vector<std::string> tasks;
+    };
+
     class tail {
     public:
         explicit tail(std::uint64_t limit) : limit_(limit) {}
@@ -56,8 +74,8 @@ export namespace runner {
         }
     }
 
-    auto run_step(native::scheduler& io, io::command cmd, std::chrono::milliseconds timeout, std::uint64_t output_limit, std::string name,
-                  std::optional<std::filesystem::path> log_path = {}, std::uint64_t log_limit = constants::log_bytes) -> coroutine::task<jobs::step_report> {
+    auto run_step(native::scheduler& io, io::command cmd, std::optional<std::chrono::milliseconds> timeout, std::uint64_t output_limit, std::string name,
+                  std::optional<std::filesystem::path> log_path = {}, std::uint64_t log_limit = constants::log_bytes) -> coroutine::task<result> {
         auto started = std::chrono::steady_clock::now();
         std::optional<native::file> log;
         std::string log_error;
@@ -70,6 +88,8 @@ export namespace runner {
         std::uint64_t log_size = 0;
         bool log_truncated = false;
         auto proc = io::spawn_process(io, cmd);
+        if (cmd.interactive)
+            proc.close_input();
         tail out{output_limit};
         bool timed_out = false;
         int code = -1;
@@ -80,7 +100,8 @@ export namespace runner {
                 timed_out = true;
                 proc.kill();
             };
-            children.spawn(kill_after_timeout(io, proc, timeout, timed_out));
+            if (timeout)
+                children.spawn(kill_after_timeout(io, proc, *timeout, timed_out));
             static constexpr auto wait_for_exit = [](native::process& proc, int& code) -> coroutine::task<> { code = co_await io::async_wait(proc); };
             static constexpr auto read_output = [](native::process& proc, tail& out, std::optional<native::file>& log, std::uint64_t& size, std::uint64_t limit,
                                                    bool& truncated, std::string& error) -> coroutine::task<> {
@@ -94,14 +115,14 @@ export namespace runner {
         };
         co_await coroutine::with_scope(std::move(run_children));
         auto [text, truncated] = out.take();
-        co_return jobs::step_report{.name = std::move(name),
-                                    .exit_code = code,
-                                    .timed_out = timed_out,
-                                    .seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count(),
-                                    .output = std::move(text),
-                                    .truncated = truncated,
-                                    .log_truncated = log_truncated,
-                                    .log_error = std::move(log_error)};
+        co_return result{.name = std::move(name),
+                         .exit_code = code,
+                         .timed_out = timed_out,
+                         .seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count(),
+                         .output = std::move(text),
+                         .truncated = truncated,
+                         .log_truncated = log_truncated,
+                         .log_error = std::move(log_error)};
     }
 
 } // namespace runner

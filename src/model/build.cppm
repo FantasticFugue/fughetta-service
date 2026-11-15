@@ -14,6 +14,9 @@ export import bun;
 export import uv;
 export import ty;
 export import ruff;
+export import gradle;
+export import msbuild;
+export import projectmodel;
 
 export namespace builds {
     struct timings {
@@ -52,8 +55,8 @@ export namespace builds {
         }
         static constexpr std::array names{Names.view()...};
     };
-    using adapters = catalog<"cmake", "bazel", "command", "vcpkg", "tsc", "bun", "uv", "ty", "ruff">;
-    using artifacts = formats<"compilation_database">;
+    using adapters = catalog<"cmake", "bazel", "command", "vcpkg", "tsc", "bun", "uv", "ty", "ruff", "gradle", "msbuild">;
+    using artifacts = formats<"compilation_database", "project_model">;
     using report_protocols = protocols<"junit", "bep", "codequality">;
     using builder = adapters::builder;
 
@@ -66,6 +69,7 @@ export namespace builds {
         // Reports the task's steps write besides the ones their adapter declares: a command or `uv run` that starts pytest with
         // --junit-xml=${reports}/pytest.xml names {"protocol": "junit", "file": "pytest.xml"}.
         std::vector<report> reports;
+        std::optional<std::string> generated_manifest;
     };
     struct operation {
         std::vector<std::string> tasks;
@@ -93,8 +97,8 @@ export namespace builds {
     auto schemas() -> const std::map<std::string, rfl::Generic>&;
     void validate(const configuration& c);
     auto prepare(const configuration& c, const request& request) -> plan;
-    // Selects only the tasks and prerequisites that produce the artifact types a consumer needs.
-    auto prepare_inputs(const configuration& c, const std::vector<std::string>& types, const std::map<std::string, std::string>& paths = {}) -> plan;
+    // Expands the selected producers and their prerequisites, preserving consumer input order.
+    auto prepare_inputs(const configuration& c, const std::vector<input>& inputs) -> plan;
     // Binds a step to a tree on this machine, its mapped tools, the parallel jobs it may use and the directory of its reports.
     auto locate(step value, const std::filesystem::path& tree, const toolset& tools, std::uint32_t jobs, const std::filesystem::path& reports = {},
                 const std::filesystem::path& dependency_cache = {}, const std::filesystem::path& dependency_upstream = {}) -> step;

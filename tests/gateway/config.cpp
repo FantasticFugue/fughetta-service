@@ -17,7 +17,10 @@ namespace {
         d.limits = {.max_file_bytes = 1000, .max_projects = 5, .read_max_lines = 50};
         d.projects["app"].build_configurations["Debug"] = fixture::cmake("build/debug");
         fixture::options<"cmake">(d.projects["app"].build_configurations["Debug"].builders.at("main")).export_compile_commands = true;
-        d.projects["app"].analysis["Cpp"] = {.server = fixture::clice("clice", {"--log-level", "off"}), .build_configuration = "Debug"};
+        d.projects["app"].analysis["Cpp"] =
+            fixture::profile({.server = fixture::clice("clice", {"--mode", "pipe"}),
+                              .build_configuration = "Debug",
+                              .inputs = {{"compilation_database", {language::build_input{"Debug", "configure", "compilation_database"}}}}});
         return d;
     }
     static constexpr auto cases = [] {
@@ -35,7 +38,7 @@ namespace {
             config::validate(d);
             auto e = config::resolve(d, "app");
             expect(e.limits.max_file_bytes == 1000u && e.limits.read_max_lines == 50u);
-            expect(language::provider_of(e.analysis.at("Cpp").server) == "clice");
+            expect(language::provider_of(e.analysis.at("Cpp").stages.at("main").server) == "clice");
         };
         "source configuration edits use revision preconditions and preserve conflicting drafts"_test = [] {
             test::scratch tmp{"source-config"};
@@ -47,15 +50,15 @@ namespace {
             expect(throws<config::revision_conflict>([&] { s.put_project("app", settings, revision); }));
             auto restored = config::load(tmp.dir / "config.json");
             expect(restored.find("app")->ignore == std::vector<std::string>{"generated"});
-            auto& server = rfl::get<language::with<"clice">>(restored.find("app")->analysis.at("Cpp").server.variant());
-            expect(server.options.args == std::vector<std::string>{"--log-level", "off"});
+            auto& server = rfl::get<language::with<"clice">>(restored.find("app")->analysis.at("Cpp").stages.at("main").server.variant());
+            expect(server.options.args == std::vector<std::string>{"--mode", "pipe"});
         };
         "language servers are known by name and keep their files inside the source"_test = [] {
             expect(throws<std::invalid_argument>([] { language::validate({.server = language::with<"clice">{.options = {.cache_dir = "../cache"}}}); }));
             expect(throws<std::invalid_argument>([] { language::validate({.server = fixture::clice("")}); }));
-            expect(throws<std::invalid_argument>([] { config::parse_as<language::configuration>(R"({"server":{"provider":"clangd"}})", "analysis"); }));
+            expect(throws<std::invalid_argument>([] { config::parse_as<language::stage>(R"({"server":{"provider":"clangd"}})", "analysis"); }));
             expect(throws<std::invalid_argument>(
-                [] { config::parse_as<language::configuration>(R"({"server":{"provider":"clice","command":["sh","-c","touch sentinel"]}})", "analysis"); }));
+                [] { config::parse_as<language::stage>(R"({"server":{"provider":"clice","command":["sh","-c","touch sentinel"]}})", "analysis"); }));
         };
     };
 } // namespace
@@ -163,11 +166,13 @@ namespace {
             source_build.outputs["database"] = {"configure", "compilation_database"};
             source_build.env["OWNER"] = "source";
             d.projects.at("app").build_configurations["Analysis"] = source_build;
-            d.projects.at("app").analysis["cpp"] = {.build_configuration = "Analysis"};
+            d.projects.at("app").analysis["cpp"] =
+                fixture::profile({.build_configuration = "Analysis",
+                                  .inputs = {{"compilation_database", {language::build_input{"Analysis", "configure", "compilation_database"}}}}});
             config::validate(d);
             auto e = config::resolve(d, "app");
             expect(e.config("Debug-gcc").build.env.contains("CC"));
-            auto& analysis = e.config(e.analysis.at("cpp").build_configuration);
+            auto& analysis = e.config(e.analysis.at("cpp").stages.at("main").build_configuration);
             expect(analysis.build.env.at("CC") == "clang" && analysis.build.env.at("OWNER") == "source");
             expect(fixture::options<"cmake">(analysis.build.builders.at("main")).build_dir == "build/source");
         };

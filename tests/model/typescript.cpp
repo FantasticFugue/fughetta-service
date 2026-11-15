@@ -133,7 +133,8 @@ namespace {
             typescript.disable_automatic_typing_acquisition = true;
             typescript.preferences["includeInlayParameterNameHints"] = rfl::Generic{"all"};
             typescript.implicit_project_configuration["checkJs"] = rfl::Generic{true};
-            auto plan = language::prepare({.server = language::with<"typescript">{.options = std::move(typescript)}, .build_configuration = "native"}, {});
+            auto plan = language::prepare({.server = language::with<"typescript">{.options = std::move(typescript)}, .build_configuration = "native"},
+                                          {{"native", {}}});
             expect(plan.server.argv == std::vector<std::string>{"typescript-language-server", "--stdio", "--tsserver-path", "${tool:tsserver}"});
             auto json = rfl::json::write(plan.server.initialization);
             expect(json.contains(R"("hostInfo":"fughetta")") && json.contains(R"("maxTsServerMemory":4096)"));
@@ -142,6 +143,8 @@ namespace {
                 plan.server, ::test::absolute("/work/project"),
                 {{"typescript-language-server", ::test::absolute("/opt/ts/language-server")}, {"tsserver", ::test::absolute("/opt/ts/tsserver")}}, 1);
             expect(local.argv.front() == ::test::absolute("/opt/ts/language-server") && local.argv.back() == ::test::absolute("/opt/ts/tsserver"));
+            expect(local.executables == std::vector<std::string>{::test::absolute("/opt/ts/tsserver")} &&
+                   std::ranges::contains(plan.execution.needs.get().tools, "tsserver"));
             expect(language::providers::document("typescript", "src/app.tsx") == std::optional<std::string_view>{"typescriptreact"});
             expect(language::providers::document("typescript", "src/worker.mts") == std::optional<std::string_view>{"typescript"});
             expect(language::providers::document("typescript", "src/app.py") == std::nullopt);
@@ -149,11 +152,11 @@ namespace {
             language::config<"typescript"> invalid;
             invalid.max_tsserver_memory = 0;
             expect(throws<std::invalid_argument>(
-                [&] { language::prepare({.server = language::with<"typescript">{.options = invalid}, .build_configuration = "native"}, {}); }));
+                [&] { language::prepare({.server = language::with<"typescript">{.options = invalid}, .build_configuration = "native"}, {{"native", {}}}); }));
             invalid.max_tsserver_memory.reset();
             invalid.preferences[""] = rfl::Generic{true};
             expect(throws<std::invalid_argument>(
-                [&] { language::prepare({.server = language::with<"typescript">{.options = invalid}, .build_configuration = "native"}, {}); }));
+                [&] { language::prepare({.server = language::with<"typescript">{.options = invalid}, .build_configuration = "native"}, {{"native", {}}}); }));
         };
 
         "TypeScript and Bun are in the published adapter schemas"_test = [] {

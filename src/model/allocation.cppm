@@ -2,14 +2,21 @@ export module allocation;
 import std;
 
 export namespace allocation {
+    // Retain expensive, recently used state per byte. Age continuously lowers
+    // that value so a once-expensive abandoned session cannot monopolize memory.
+    inline auto retention_value(double rebuild_seconds, std::uint64_t resident_bytes, double idle_seconds) -> double {
+        return rebuild_seconds / (static_cast<double>(std::max(std::uint64_t{1}, resident_bytes)) * (1 + std::max(0.0, idle_seconds)));
+    }
     struct budget {
         std::uint32_t threads = 10;
         std::uint32_t jobs = 3;
         std::uint32_t workers = 2;
+        std::optional<std::uint64_t> worker_memory_bytes;
         friend auto operator==(const budget&, const budget&) -> bool = default;
     };
     struct worker {
         std::uint32_t parallel;
+        std::optional<std::uint64_t> memory_bytes;
     };
     struct plan {
         std::uint32_t gateway_io = 1, gateway_disk = 2;
@@ -19,12 +26,17 @@ export namespace allocation {
     inline auto distribute(budget b) -> plan {
         if (b.threads < 6 || !b.jobs || b.workers > b.jobs || b.workers > (b.threads - 6) / 2)
             throw std::invalid_argument("runtime requires threads >= 6 + 2 * workers, jobs >= 1, and workers <= jobs");
+        if (b.worker_memory_bytes && (!*b.worker_memory_bytes || (b.workers && *b.worker_memory_bytes < b.workers)))
+            throw std::invalid_argument("worker memory budget must give every worker a positive share");
         plan result;
         auto remaining = b.threads - 6 - 2 * b.workers;
         result.gateway_disk += remaining / 2;
         result.source_disk += remaining - remaining / 2;
         for (std::uint32_t i = 0; i < b.workers; ++i)
-            result.workers.push_back({b.jobs / b.workers + (i < b.jobs % b.workers ? 1u : 0u)});
+            result.workers.push_back({b.jobs / b.workers + (i < b.jobs % b.workers ? 1u : 0u),
+                                      b.worker_memory_bytes
+                                          ? std::optional{*b.worker_memory_bytes / b.workers + (i < *b.worker_memory_bytes % b.workers ? 1u : 0u)}
+                                          : std::nullopt});
         return result;
     }
     struct observation {

@@ -33,6 +33,54 @@ export namespace durability {
         std::unique_ptr<state> state_;
     };
     void durable_append(const std::filesystem::path& log, std::string_view record);
+    // Remove one file, including a read-only file, without changing its other
+    // hard links. Returns false when the name is already absent.
+    auto remove_file(const std::filesystem::path& path) -> bool;
+    // Do not follow directory links. Keep deleting siblings after a failure and
+    // return the first error; callers can retry the remaining tree later.
+    void remove_tree(const std::filesystem::path& path, std::error_code& error) noexcept try {
+        error.clear();
+        auto status = std::filesystem::symlink_status(path, error);
+        if (error == std::errc::no_such_file_or_directory) {
+            error.clear();
+            return;
+        }
+        if (error)
+            return;
+        if (!std::filesystem::is_directory(status)) {
+            remove_file(path);
+            return;
+        }
+        std::error_code next;
+        auto entries = std::filesystem::directory_iterator(path, next);
+        while (!next && entries != std::filesystem::directory_iterator{}) {
+            std::error_code child;
+            remove_tree(entries->path(), child);
+            if (child && !error)
+                error = child;
+            entries.increment(next);
+        }
+        if (next && !error)
+            error = next;
+        std::filesystem::remove(path, next);
+        if (next && !error)
+            error = next;
+    } catch (const std::system_error& failure) {
+        if (!error)
+            error = failure.code();
+    } catch (const std::bad_alloc&) {
+        if (!error)
+            error = std::make_error_code(std::errc::not_enough_memory);
+    } catch (...) {
+        if (!error)
+            error = std::make_error_code(std::errc::io_error);
+    }
+    void remove_tree(const std::filesystem::path& path) {
+        std::error_code error;
+        remove_tree(path, error);
+        if (error)
+            throw std::filesystem::filesystem_error("remove tree", path, error);
+    }
     void durable_remove(const std::filesystem::path& path);
     void durable_rename(const std::filesystem::path& from, const std::filesystem::path& to);
     void durable_directories(const std::filesystem::path& dir);

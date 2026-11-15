@@ -1,11 +1,13 @@
 export module lsp;
-import utility;
 import std;
 import host;
 import native;
 import coroutine;
 import reflection;
-import semantic;
+import records;
+import provider;
+import evaluation;
+import toolchain;
 
 // The Language Server Protocol is spoken only inside this module.
 namespace lsp::detail {
@@ -278,6 +280,25 @@ namespace lsp::detail {
             return scalars;
         }
 
+        auto position_of(std::uint64_t offset) const -> std::optional<position> {
+            auto found = std::ranges::upper_bound(starts_, offset, {}, [](const auto& start) { return start.second; });
+            if (found == starts_.begin())
+                return {};
+            --found;
+            const auto line = static_cast<std::uint64_t>(found - starts_.begin());
+            auto [byte, scalar] = *found;
+            std::uint64_t character = 0;
+            while (byte < ends_[line] && scalar < offset) {
+                const auto step = width(byte);
+                character += utf16_ && step == 4 ? 2 : 1;
+                byte += step;
+                ++scalar;
+            }
+            if (scalar != offset)
+                return {};
+            return position{line, character};
+        }
+
     private:
         auto width(std::size_t i) const -> std::size_t {
             auto lead = static_cast<unsigned char>(text_[i]);
@@ -345,13 +366,7 @@ namespace lsp::detail {
 // never an empty answer. Spans name only a place, a path and Unicode scalar offsets, and the caller turns them into character
 // identities of the version it analyzed. No call here waits by itself: the caller bounds each one with a deadline.
 export namespace lsp {
-    struct query_error : std::invalid_argument {
-        using std::invalid_argument::invalid_argument;
-    };
-
-    struct document {
-        std::string path, language, text;
-    };
+    using document = language::document;
     class session {
     public:
         session(native::scheduler io, io::command server) : io_(io) {
@@ -408,27 +423,47 @@ export namespace lsp {
             reader_.spawn(pump());
         }
 
-        // Reports what the server offers about one document.
-        auto describe(const document& d) -> coroutine::task<semantic::outline> {
+        auto document_request(std::string method, const document& d) -> coroutine::task<rfl::Generic> {
             auto held = co_await lock_.lock();
-            co_return co_await reported(d);
+            co_await update(d);
+            co_return co_await call(std::move(method), detail::object({{"uri", detail::text(detail::uri(root_ / d.path))}}));
         }
 
-        auto lookup(const semantic::query& query) -> coroutine::task<std::vector<semantic::location>> {
+        // Reports what the server offers about one document.
+        auto describe(const document& d, semantic::unit unit, std::vector<semantic::fact_kind> facts = {}) -> coroutine::task<semantic::shard> {
+            auto held = co_await lock_.lock();
+            co_return co_await reported(d, std::move(unit), facts);
+        }
+
+        struct lookup_result {
+            std::vector<semantic::locator> targets;
+        };
+        auto definitions() const -> bool { return definitions_; }
+        auto lookup(const semantic::request& query) -> coroutine::task<lookup_result> {
             auto held = co_await lock_.lock();
             using detail::object, detail::text;
             if (query.action != "definitions" && query.action != "references")
-                throw query_error("a location query names definitions or references");
-            if (query.path.empty() || query.symbol.empty() || (query.line && !*query.line))
-                throw query_error("definitions and references require path, symbol and an optional positive line");
+                throw language::resolution_error("a location query names definitions or references");
+            const auto* selected = query.target ? &query.target->name : query.selector && query.selector->name ? &*query.selector->name : nullptr;
+            if (!selected || !selected->path || selected->text.empty())
+                throw language::resolution_error("the selected entity has no retained source declaration");
+            const auto& path_name = *selected->path;
+            const auto& symbol_name = selected->text;
             if (!(query.action == "definitions" ? definitions_ : references_))
-                throw std::runtime_error("language server does not offer " + query.action);
-            auto source = documents_.find(query.path);
+                throw std::runtime_error("language server does not offer " + query.action.str());
+            auto source = documents_.find(path_name);
             if (source == documents_.end())
-                throw query_error("language query path is not an analyzed source file: " + query.path);
-            auto identifier = object({{"textDocument", object({{"uri", text(detail::uri(root_ / query.path))}})}});
+                throw language::resolution_error("language query path is not an analyzed source file: " + path_name);
+            auto identifier = object({{"textDocument", object({{"uri", text(detail::uri(root_ / path_name))}})}});
             std::vector<detail::position> candidates;
-            if (symbols_) {
+            if (query.target && query.target->occurrence) {
+                const auto& at = *query.target->occurrence;
+                auto position = detail::lines{source->second.value.text, utf16_}.position_of(at.begin);
+                if (at.path != path_name || !position)
+                    throw language::resolution_error("selected declaration is outside the installed source");
+                candidates.push_back(*position);
+            }
+            if (candidates.empty() && symbols_) {
                 auto answer = co_await call("textDocument/documentSymbol", identifier);
                 std::size_t seen = 0;
                 if (!detail::bounded(answer, 0, seen))
@@ -436,7 +471,7 @@ export namespace lsp {
                 if (auto symbols = rfl::from_generic<std::vector<detail::symbol>>(answer)) {
                     auto visit = [&](this auto&& self, const detail::symbol& symbol, std::string prefix) -> void {
                         auto qualified = prefix.empty() ? symbol.name : prefix + "::" + symbol.name;
-                        if ((query.symbol == symbol.name || query.symbol == qualified) && (!query.line || symbol.selectionRange.start.line + 1 == *query.line))
+                        if (symbol_name == symbol.name || symbol_name == qualified)
                             candidates.push_back(symbol.selectionRange.start);
                         if (symbol.children)
                             for (const auto& child : *symbol.children)
@@ -450,8 +485,8 @@ export namespace lsp {
             if (candidates.empty()) {
                 const auto& input = source->second.value.text;
                 auto identifier_byte = [](unsigned char c) { return std::isalnum(c) || c == '_' || c >= 0x80; };
-                for (std::size_t at = 0; (at = input.find(query.symbol, at)) != std::string::npos; at += query.symbol.size()) {
-                    auto end = at + query.symbol.size();
+                for (std::size_t at = 0; (at = input.find(symbol_name, at)) != std::string::npos; at += symbol_name.size()) {
+                    auto end = at + symbol_name.size();
                     if ((at && identifier_byte(input[at - 1])) || (end < input.size() && identifier_byte(input[end])))
                         continue;
                     detail::position position;
@@ -467,19 +502,18 @@ export namespace lsp {
                             i += width;
                         }
                     }
-                    if (!query.line || position.line + 1 == *query.line)
-                        candidates.push_back(position);
+                    candidates.push_back(position);
                 }
             }
             if (candidates.size() != 1)
-                throw query_error(candidates.empty() ? "symbol was not found in the selected file/line"
-                                                     : "symbol is ambiguous; select its occurrence with line");
+                throw language::resolution_error(candidates.empty() ? "symbol was not found in the selected file"
+                                                                    : "symbol name is ambiguous in the selected file");
             auto position = candidates.front();
-            auto params = object({{"textDocument", object({{"uri", text(detail::uri(root_ / query.path))}})},
+            auto params = object({{"textDocument", object({{"uri", text(detail::uri(root_ / path_name))}})},
                                   {"position", object({{"line", detail::generic{static_cast<std::int64_t>(position.line)}},
                                                        {"character", detail::generic{static_cast<std::int64_t>(position.character)}}})}});
             if (query.action == "references")
-                params = object({{"textDocument", object({{"uri", text(detail::uri(root_ / query.path))}})},
+                params = object({{"textDocument", object({{"uri", text(detail::uri(root_ / path_name))}})},
                                  {"position", object({{"line", detail::generic{static_cast<std::int64_t>(position.line)}},
                                                       {"character", detail::generic{static_cast<std::int64_t>(position.character)}}})},
                                  {"context", object({{"includeDeclaration", detail::generic{true}}})}});
@@ -487,9 +521,10 @@ export namespace lsp {
             std::size_t seen = 0;
             if (!detail::bounded(answer, 0, seen))
                 throw std::runtime_error("language locations exceed the response limit");
+            lookup_result result;
             std::vector<detail::location> locations;
             if (std::holds_alternative<std::nullopt_t>(answer.get()))
-                co_return std::vector<semantic::location>{};
+                co_return result;
             if (auto list = rfl::from_generic<std::vector<detail::location>>(answer))
                 locations = std::move(*list);
             else if (auto links = rfl::from_generic<std::vector<detail::location_link>, rfl::DefaultIfMissing>(answer)) {
@@ -499,15 +534,16 @@ export namespace lsp {
                 locations.push_back(std::move(*one));
             else
                 throw std::runtime_error("language server returned unreadable locations");
-            std::vector<semantic::location> result;
+            std::map<std::string, std::string> external_texts;
+            std::map<std::string, detail::lines> indexes;
             for (const auto& location : locations) {
                 auto path = detail::path_of(location.uri);
                 if (!path)
                     throw std::runtime_error("language server returned a non-file location");
                 auto relative = path->lexically_relative(root_).generic_string();
                 auto found = documents_.find(relative);
-                std::string external;
-                if (found == documents_.end()) {
+                auto& external = external_texts[relative];
+                if (found == documents_.end() && !indexes.contains(relative)) {
                     std::error_code error;
                     auto bytes = std::filesystem::file_size(*path, error);
                     if (error || bytes > (4u << 20))
@@ -517,23 +553,21 @@ export namespace lsp {
                     if (external.size() != bytes || external.contains('\0'))
                         throw std::runtime_error("language target is not readable text: " + path->string());
                 }
-                detail::lines lines{found == documents_.end() ? std::string_view{external} : std::string_view{found->second.value.text}, utf16_};
+                const auto& lines =
+                    indexes.try_emplace(relative, found == documents_.end() ? std::string_view{external} : std::string_view{found->second.value.text}, utf16_)
+                        .first->second;
                 auto first = lines.offset(location.range.start), last = lines.offset(location.range.end);
                 auto first_line = lines.offset({location.range.start.line, 0}), last_line = lines.offset({location.range.end.line, 0});
                 if (!first || !last || !first_line || !last_line || *last < *first)
                     throw std::runtime_error("language server returned a range outside its document");
-                std::string context;
-                if (auto outline = outlines_.find(relative); outline != outlines_.end()) {
-                    std::uint64_t width = std::numeric_limits<std::uint64_t>::max();
-                    for (const auto& scope : outline->second.scopes)
-                        if (scope.range.place && scope.range.place->begin <= *first && scope.range.place->end >= *last &&
-                            scope.range.place->end - scope.range.place->begin < width) {
-                            width = scope.range.place->end - scope.range.place->begin;
-                            context = scope.symbol;
-                        }
-                }
-                result.push_back({relative.starts_with("../") || relative == ".." ? path->generic_string() : relative, location.range.start.line + 1,
-                                  *first - *first_line + 1, location.range.end.line + 1, *last - *last_line + 1, std::move(context)});
+                semantic::locator at;
+                if (found != documents_.end())
+                    at.source = semantic::place{relative, *first, *last};
+                else
+                    at.artifact = semantic::artifact_location{path->generic_string(), path->parent_path().generic_string(), symbol_name, *first};
+                at.position =
+                    semantic::coordinates{location.range.start.line + 1, *first - *first_line + 1, location.range.end.line + 1, *last - *last_line + 1};
+                result.targets.push_back(std::move(at));
             }
             co_return result;
         }
@@ -552,7 +586,6 @@ export namespace lsp {
                     continue;
                 }
                 co_await notify("textDocument/didClose", object({{"textDocument", object({{"uri", text(detail::uri(root_ / it->first))}})}}));
-                outlines_.erase(it->first);
                 it = documents_.erase(it);
             }
             for (const auto& d : documents)
@@ -755,12 +788,16 @@ export namespace lsp {
             }
         }
 
-        // Point diagnostics anchor to the adjacent character so source edits can track them.
-        void located(const document& d, const std::vector<detail::diagnostic>& items, std::vector<semantic::diagnostic>& out) const {
+        static auto ownership(const semantic::shard& shard) -> semantic::ownership {
+            return {.owner_unit = shard.unit.id,
+                    .context = shard.unit.context,
+                    .origin = {.provider = shard.unit.recipe.unit.provider, .kind = std::string{"source"}}};
+        }
+        void located(const document& d, const std::vector<detail::diagnostic>& items, semantic::shard& out) const {
             detail::lines lines{d.text, utf16_};
-            auto text = static_cast<std::uint64_t>(std::ranges::count_if(d.text, [](char c) { return (static_cast<unsigned char>(c) & 0xC0) != 0x80; }));
-            for (auto& item : items) {
-                if (out.size() >= detail::document_records)
+            const auto text = static_cast<std::uint64_t>(std::ranges::count_if(d.text, [](char c) { return (static_cast<unsigned char>(c) & 0xC0) != 0x80; }));
+            for (const auto& item : items) {
+                if (out.diagnostics.size() >= detail::document_records)
                     throw std::runtime_error("language server diagnostic count exceeds the document limit");
                 auto begin = lines.offset(item.range.start), end = lines.offset(item.range.end);
                 if (!begin || !end || *begin > *end || *end > text)
@@ -772,13 +809,19 @@ export namespace lsp {
                     else
                         --first;
                 }
-                out.push_back({.range = semantic::span{.place = semantic::place{d.path, first, last}},
-                               .severity = detail::severity_name(item.severity),
-                               .message = detail::message_text(item)});
+                std::string code;
+                if (item.code)
+                    code = std::holds_alternative<std::string>(item.code->get()) ? std::get<std::string>(item.code->get()) : rfl::json::write(*item.code);
+                out.diagnostics.push_back({.id = out.unit.id + ":diagnostic:" + std::to_string(out.diagnostics.size()),
+                                           .producer = out.unit.recipe.unit.provider,
+                                           .code = std::move(code),
+                                           .severity = detail::severity_name(item.severity),
+                                           .message = detail::message_text(item),
+                                           .ownership = ownership(out),
+                                           .location = {.source = semantic::place{d.path, first, last}}});
             }
         }
-        // A full report must include diagnostics when the request has no previous result ID.
-        void converted(const detail::generic& answer, const document& d, std::vector<semantic::diagnostic>& out) const {
+        void converted(const detail::generic& answer, const document& d, semantic::shard& out) const {
             std::size_t seen = 0;
             if (!detail::bounded(answer, 0, seen))
                 throw std::runtime_error("language server diagnostic report is nested too deeply or too large");
@@ -789,48 +832,72 @@ export namespace lsp {
                 throw std::runtime_error("language server answered a " + parsed->kind + " diagnostic report, which holds no diagnostics");
             located(d, parsed->items.value_or(std::vector<detail::diagnostic>{}), out);
         }
-        // Turns one document symbol answer into scopes and symbols of the document; a symbol whose place is empty or outside
-        // the text read is left out with everything it contains.
-        void described(const detail::generic& answer, const document& d, semantic::outline& out) const {
+        void described(const detail::generic& answer, const document& d, semantic::shard& out) const {
             if (std::holds_alternative<std::nullopt_t>(answer.get()))
                 return;
             std::size_t seen = 0;
             if (!detail::bounded(answer, 0, seen))
-                throw std::runtime_error("language server outline is nested too deeply or too large");
+                throw std::runtime_error("language server symbols are nested too deeply or too large");
             auto symbols = rfl::from_generic<std::vector<detail::symbol>>(answer);
             if (!symbols)
-                throw std::runtime_error("language server returned no hierarchical outline: " + std::string{symbols.error().what()});
+                throw std::runtime_error("language server returned unreadable document symbols: " + std::string{symbols.error().what()});
             detail::lines lines{d.text, utf16_};
-            auto span = [&](const detail::range& r) -> std::optional<semantic::span> {
+            auto span = [&](const detail::range& r) -> std::optional<semantic::place> {
                 auto begin = lines.offset(r.start), end = lines.offset(r.end);
                 if (!begin || !end || *begin >= *end)
                     return std::nullopt;
-                return semantic::span{.place = semantic::place{d.path, *begin, *end}};
+                return semantic::place{d.path, *begin, *end};
             };
-            // A symbol's identity is its document and qualified name, so it survives edits elsewhere in the file; same-named
-            // siblings (overloads) are told apart by their order among themselves.
-            std::map<std::string, std::size_t> named;
-            auto visit = [&](this auto& self, const detail::symbol& s, const std::string& scope, const std::string& qualified, std::size_t depth) -> void {
-                auto range = span(s.range);
-                auto name = span(s.selectionRange);
+            std::map<std::string, std::size_t> named, scopes;
+            auto visit = [&](this auto& self, const detail::symbol& row, std::optional<std::string> scope, std::optional<std::string> parent,
+                             const std::string& qualified, std::size_t depth) -> void {
+                auto range = span(row.range), name = span(row.selectionRange);
                 if (!range || !name || depth > detail::depth_limit)
                     return;
-                auto path = qualified.empty() ? s.name : qualified + "::" + s.name;
-                auto nth = named[path]++;
+                auto path = qualified.empty() ? row.name : qualified + "::" + row.name;
+                const auto nth = named[path]++;
                 auto id = d.path + "#" + path + (nth ? "~" + std::to_string(nth) : std::string{});
-                std::string kind{detail::kind_name(s.kind)};
-                out.symbols.push_back({.id = id, .name = s.name, .kind = kind, .scope = scope, .definitions = {*name}});
+                std::string kind{detail::kind_name(row.kind)};
+                semantic::anchored_identity identity{
+                    out.unit.recipe.unit.project, out.unit.recipe.unit.project, out.unit.recipe.unit.provider, {.file = d.path, .declaration = id}};
+                out.identities.push_back({identity, id});
+                out.symbols.push_back({.id = id,
+                                       .ownership = ownership(out),
+                                       .language = d.language,
+                                       .domain = "source",
+                                       .module = out.unit.recipe.unit.project,
+                                       .name = row.name,
+                                       .qualified_name = path,
+                                       .kind = kind,
+                                       .owner = parent,
+                                       .declaring_scope = scope,
+                                       .native_key = identity});
+                out.occurrences.push_back({.id = id + ":definition",
+                                           .ownership = ownership(out),
+                                           .symbol = id,
+                                           .location = {.source = *name},
+                                           .roles = {std::string{"definition"}},
+                                           .selection = *name,
+                                           .body = *range});
+                if (scope)
+                    out.scopes.at(scopes.at(*scope)).declared_members.push_back(id);
                 auto inner = scope;
                 if (detail::encloses(kind)) {
-                    out.scopes.push_back({.id = id, .parent = scope, .kind = kind, .symbol = id, .range = *range});
-                    inner = id;
+                    inner = "scope:" + id;
+                    scopes.emplace(*inner, out.scopes.size());
+                    out.scopes.push_back({.id = *inner,
+                                          .ownership = ownership(out),
+                                          .lexical_parent = scope,
+                                          .semantic_owner = id,
+                                          .location = {.source = *range},
+                                          .kind = kind});
                 }
-                if (s.children)
-                    for (auto& child : *s.children)
-                        self(child, inner, path, depth + 1);
+                if (row.children)
+                    for (const auto& child : *row.children)
+                        self(child, inner, id, path, depth + 1);
             };
-            for (auto& s : *symbols)
-                visit(s, "", "", 0);
+            for (const auto& row : *symbols)
+                visit(row, {}, {}, "", 0);
         }
         struct opened {
             document value;
@@ -855,31 +922,52 @@ export namespace lsp {
             } else if (found->second.value.text != d.text) {
                 auto version = ++version_;
                 found->second = opened{d, version};
-                outlines_.erase(d.path);
                 co_await notify("textDocument/didChange", object({{"textDocument", object({{"uri", uri}, {"version", detail::generic{version}}})},
                                                                   {"contentChanges", detail::generic::Array{object({{"text", text(d.text)}})}}}));
             }
         }
 
-        auto reported(const document& d) -> coroutine::task<semantic::outline> {
-            if (!symbols_ && !pull_)
-                throw std::runtime_error(
-                    std::format("the language server declares neither documentSymbolProvider nor diagnosticProvider, so {} cannot be described", d.path));
+        auto reported(const document& d, semantic::unit unit, const std::vector<semantic::fact_kind>& facts) -> coroutine::task<semantic::shard> {
+            if (!symbols_ && !pull_ && !definitions_ && !references_)
+                throw std::runtime_error("the language server declares no supported analysis request for " + d.path);
             using detail::object, detail::text;
             co_await update(d);
             auto identifier = object({{"textDocument", object({{"uri", text(detail::uri(root_ / d.path))}})}});
-            semantic::outline out;
-            if (symbols_)
+            semantic::shard out{.unit = std::move(unit)};
+            out.unit.contributions.files = {d.path};
+            out.unit.coverage.requested = {.files = {d.path},
+                                           .contexts = {out.unit.context},
+                                           .facts = facts.empty() ? std::vector<semantic::fact_kind>{std::string{"symbols"}, std::string{"definitions"},
+                                                                                                     std::string{"scopes"}, std::string{"diagnostics"}}
+                                                                  : facts};
+            auto available = out.unit.coverage.requested;
+            available.facts.clear();
+            const auto wants = [&](const std::string& name) { return facts.empty() || std::ranges::contains(facts, name); };
+            if (symbols_ && (wants("symbols") || wants("definitions") || wants("scopes"))) {
                 described(co_await call("textDocument/documentSymbol", identifier), d, out);
-            if (pull_)
-                converted(co_await call("textDocument/diagnostic", identifier), d, out.diagnostics);
-            else {
-                const auto& latest = documents_.at(d.path);
-                located(d, latest.diagnostics, out.diagnostics);
-                out.complete = latest.current_diagnostics;
-                out.cacheable = false; // A document version cannot certify cross-file dependencies of pushed diagnostics.
+                available.facts = {std::string{"symbols"}, std::string{"definitions"}, std::string{"scopes"}};
             }
-            outlines_[d.path] = out;
+            if (wants("diagnostics")) {
+                bool current = true;
+                if (pull_)
+                    converted(co_await call("textDocument/diagnostic", identifier), d, out);
+                else {
+                    const auto& latest = documents_.at(d.path);
+                    located(d, latest.diagnostics, out);
+                    current = latest.current_diagnostics;
+                    out.unit.cacheable = false;
+                }
+                if (current)
+                    available.facts.push_back(std::string{"diagnostics"});
+            }
+            out.unit.coverage.available.push_back(available);
+            for (const auto& name : out.unit.coverage.requested.facts)
+                if (!std::ranges::contains(available.facts, name)) {
+                    auto missing = out.unit.coverage.requested;
+                    missing.facts = {name};
+                    out.unit.coverage.missing.push_back(
+                        {.scope = std::move(missing), .reason = "the language server has no current " + name.str() + " records"});
+                }
             co_return out;
         }
 
@@ -895,7 +983,6 @@ export namespace lsp {
         std::array<std::byte, 16 * 1024> chunk_{};
         std::filesystem::path root_;
         std::map<std::string, opened> documents_;
-        std::map<std::string, semantic::outline> outlines_;
         detail::generic settings_ = detail::null;
         std::int64_t next_ = 0;
         bool started_ = false, utf16_ = true, symbols_ = false, pull_ = false, definitions_ = false, references_ = false;
@@ -909,47 +996,229 @@ export namespace lsp {
         std::chrono::seconds per_document{30}, total{600};
     };
 
-    // Asks the server about each document; a document the server cannot describe in time ends the survey with an error.
-    auto survey(native::scheduler io, io::command server, rfl::Generic initialization, std::filesystem::path tree, std::vector<document> documents,
-                limits bounds = {}) -> coroutine::task<semantic::outline> {
-        if (documents.size() > bounds.documents)
-            throw std::runtime_error(std::format("the survey covers at most {} documents", bounds.documents));
-        session session{io, std::move(server)};
-        semantic::outline out;
-        std::exception_ptr failed;
-        auto until = std::chrono::steady_clock::now() + bounds.total;
-        auto left = [&] {
-            return std::max(std::chrono::seconds{1}, std::chrono::duration_cast<std::chrono::seconds>(until - std::chrono::steady_clock::now()));
-        };
-        auto token = co_await coroutine::current_token;
-        bool finished = false;
-        auto work = [&]() -> coroutine::task<> {
-            if (!co_await coroutine::deadline(io, std::min(bounds.per_document, left()), session.start(tree, std::move(initialization))))
-                throw std::runtime_error("the language server did not start in time");
-            std::size_t records = 0;
-            for (auto& d : documents) {
-                auto described = co_await coroutine::deadline(io, std::min(bounds.per_document, left()), session.describe(d));
-                if (!described)
-                    throw std::runtime_error("the language server did not describe " + d.path + " in time");
-                records += described->scopes.size() + described->symbols.size() + described->diagnostics.size();
-                if (records > bounds.records)
-                    throw std::runtime_error(std::format("the language server reported more than {} scopes, symbols and diagnostics", bounds.records));
-                std::ranges::move(described->scopes, std::back_inserter(out.scopes));
-                std::ranges::move(described->symbols, std::back_inserter(out.symbols));
-                std::ranges::move(described->diagnostics, std::back_inserter(out.diagnostics));
-            }
-        };
-        try {
-            finished = co_await coroutine::under(token, work());
-        } catch (...) {
-            failed = std::current_exception();
+} // namespace lsp
+
+export namespace language {
+    class lsp_adapter : public adapter {
+    public:
+        static constexpr adapter_kind transport = adapter_kind::lsp;
+        lsp_adapter(native::scheduler io, io::command command, session_state identity, std::map<std::string, std::vector<std::string>> commands = {},
+                    toolchain::identity runtime = {}, document_loader loader = {})
+            : adapter(io, command, std::move(identity), std::move(commands), std::move(runtime), std::move(loader)), server_(io, std::move(command)) {}
+
+    protected:
+        auto do_open(rfl::Generic initialization) -> coroutine::task<> override { co_await server_.start(root_, std::move(initialization)); }
+        auto do_update(language::installation input, const std::vector<std::string>& changed) -> coroutine::task<> override {
+            install(std::move(input));
+            const auto& documents = installed_.documents;
+            co_await server_.synchronize(documents, changed);
         }
-        co_await coroutine::under(coroutine::stop_token{}, session.abort());
-        if (!finished && !failed)
-            co_await coroutine::stop;
-        if (failed)
-            std::rethrow_exception(failed);
-        co_return out;
+        auto do_units(const semantic::extent& demand) -> coroutine::task<std::vector<semantic::unit_key>> override {
+            std::vector<semantic::unit_key> result;
+            for (const auto& document : installed_.documents)
+                if (demand.files.empty() || std::ranges::contains(demand.files, document.path))
+                    result.push_back({state_.project, state_.stage, state_.provider, "evaluate", semantic::unit_kind::file, document.path});
+            co_return result;
+        }
+        auto do_evaluate(const evaluation_request& request) -> coroutine::task<evaluated_unit> override {
+            const auto found = std::ranges::find(installed_.documents, request.unit.name, &document::path);
+            if (found == installed_.documents.end())
+                throw std::invalid_argument("LSP document is not installed");
+            auto unit = make_unit(request.unit);
+            evaluated_unit result;
+            auto facts = request.demand.facts;
+            std::erase(facts, semantic::fact_kind::make<"references">());
+            result.shards.push_back(co_await server_.describe(*found, std::move(unit), std::move(facts)));
+            co_return result;
+        }
+        auto resolves() const -> bool override { return true; }
+        auto make_unit(const semantic::unit_key& key) const -> semantic::unit {
+            semantic::recipe recipe{key, state_.options};
+            auto unit = semantic::make_unit(recipe, semantic::context_identifier(recipe));
+            unit.direct_inputs = state_.inputs;
+            unit.cacheable = !runtime_.execution.empty();
+            return unit;
+        }
+        auto do_resolve(const evaluation_request& request, const semantic::request& query) -> coroutine::task<evaluated_unit> override;
+        auto do_close() -> coroutine::task<> override { co_await server_.abort(); }
+        void install(installation input) {
+            texts_.clear();
+            for (const auto& document : input.documents)
+                texts_.emplace(document.path, document.text);
+            installed_ = std::move(input);
+        }
+        installation installed_;
+        std::map<std::string, std::string> texts_;
+        lsp::session server_;
+    };
+    auto lsp_adapter::do_resolve(const evaluation_request& request, const semantic::request& query) -> coroutine::task<evaluated_unit> {
+        if (!query.selector || (!query.target && (!query.selector->name || !query.selector->name->path)))
+            throw resolution_error("the selected entity has no retained source declaration");
+        const auto& selected = query.target ? query.target->name : *query.selector->name;
+        semantic::shard shard{.unit = make_unit(request.unit)};
+        shard.unit.resolution = semantic::unit_resolution{query.action.str(), *query.selector, {}};
+        auto own = [&] { return semantic::ownership{shard.unit.id, shard.unit.context, {.provider = state_.provider, .kind = std::string{"source"}}}; };
+        std::set<std::string> documents;
+        auto load = [&](const std::string& path) -> coroutine::task<> {
+            if (!documents.insert(path).second)
+                co_return;
+            auto found = std::ranges::find(installed_.documents, path, &document::path);
+            if (found == installed_.documents.end())
+                throw resolution_error("LSP target document is not installed: " + path);
+            auto rows = co_await server_.describe(*found, shard.unit, {std::string{"symbols"}, std::string{"definitions"}, std::string{"scopes"}});
+            auto append = [](auto& into, auto& from) { std::ranges::move(from, std::back_inserter(into)); };
+            append(shard.identities, rows.identities);
+            append(shard.symbols, rows.symbols);
+            append(shard.occurrences, rows.occurrences);
+            append(shard.scopes, rows.scopes);
+            shard.unit.contributions.files.push_back(path);
+        };
+        co_await load(*selected.path);
+        auto definitions = query;
+        definitions.action = "definitions";
+        lsp::session::lookup_result declarations;
+        if (server_.definitions())
+            declarations = co_await server_.lookup(definitions);
+        auto uses = query.action == "references" ? co_await server_.lookup(query) : declarations;
+        for (const auto& target : declarations.targets)
+            if (target.source)
+                co_await load(target.source->path);
+        for (const auto& target : uses.targets)
+            if (target.source)
+                co_await load(target.source->path);
+        auto enclosing = [&](const semantic::place& at) -> const semantic::records::scope* {
+            const semantic::records::scope* result = nullptr;
+            std::uint64_t width = std::numeric_limits<std::uint64_t>::max();
+            for (const auto& scope : shard.scopes)
+                if (scope.location.source) {
+                    const auto& range = *scope.location.source;
+                    if (range.path == at.path && range.begin <= at.begin && range.end >= at.end && range.end - range.begin < width) {
+                        result = &scope;
+                        width = range.end - range.begin;
+                    }
+                }
+            return result;
+        };
+        auto add_target = [&](const std::string& id) {
+            auto& targets = shard.unit.resolution->targets;
+            if (!std::ranges::any_of(targets, [&](const auto& target) { return target.symbol_id == id; }))
+                targets.push_back({id, shard.unit.context});
+        };
+        std::set<std::pair<std::string, std::string>> external_reads;
+        auto normalize = [&](semantic::locator& at) {
+            if (!at.artifact)
+                return true;
+            const auto member = toolchain::locate(runtime_.inputs, at.artifact->artifact);
+            if (!member) {
+                shard.unit.cacheable = false;
+                shard.unit.coverage.missing.push_back(
+                    {.scope = {.facts = {query.action.str()}, .selector = query.selector}, .reason = "the external location has no declared SDK input"});
+                return false;
+            }
+            at.artifact->artifact = member->input->object;
+            at.artifact->module = member->input->name;
+            at.artifact->member = member->path;
+            if (external_reads.emplace(member->input->name, member->path).second)
+                shard.unit.observed_dependencies.push_back({.kind = semantic::dependency_kind::artifact,
+                                                            .project = state_.project,
+                                                            .key = member->path,
+                                                            .value = member->input->object,
+                                                            .scope = member->input->name});
+            return true;
+        };
+        for (auto at : declarations.targets) {
+            if (!normalize(at))
+                continue;
+            std::optional<std::string> existing;
+            std::uint64_t width = std::numeric_limits<std::uint64_t>::max();
+            if (at.source)
+                for (const auto& occurrence : shard.occurrences)
+                    if (occurrence.selection && occurrence.selection->path == at.source->path && occurrence.selection->begin <= at.source->begin &&
+                        occurrence.selection->end >= at.source->end && occurrence.selection->end - occurrence.selection->begin < width) {
+                        existing = occurrence.symbol;
+                        width = occurrence.selection->end - occurrence.selection->begin;
+                    }
+            if (existing) {
+                add_target(*existing);
+                continue;
+            }
+            const auto id = shard.unit.id + ":target:" + std::to_string(shard.identities.size());
+            std::optional<std::string> parent, scope;
+            std::optional<semantic::declaration_identity> identity;
+            std::string language, module = state_.project;
+            if (at.source) {
+                const auto document = std::ranges::find(installed_.documents, at.source->path, &document::path);
+                language = document->language;
+                if (at.source->begin == at.source->end) {
+                    const auto length = std::ranges::count_if(document->text, [](unsigned char c) { return (c & 0xC0) != 0x80; });
+                    if (at.source->end < static_cast<std::uint64_t>(length))
+                        ++at.source->end;
+                    else if (at.source->begin)
+                        --at.source->begin;
+                    else
+                        throw resolution_error("LSP returned a declaration in an empty document");
+                }
+                if (const auto* owner = enclosing(*at.source)) {
+                    parent = owner->semantic_owner;
+                    scope = owner->id;
+                }
+                identity = semantic::anchored_identity{state_.project, module, state_.provider, {.file = at.source->path, .declaration = id}};
+            } else if (at.artifact) {
+                module = at.artifact->module;
+            } else
+                continue;
+            if (identity)
+                shard.identities.push_back({*identity, id});
+            shard.symbols.push_back({.id = id,
+                                     .ownership = own(),
+                                     .language = language,
+                                     .domain = "source",
+                                     .module = module,
+                                     .name = selected.text,
+                                     .qualified_name = selected.text,
+                                     .kind = std::string{"other"},
+                                     .owner = parent,
+                                     .declaring_scope = scope,
+                                     .native_key = identity});
+            shard.occurrences.push_back(
+                {.id = id + ":definition", .ownership = own(), .symbol = id, .location = std::move(at), .roles = {std::string{"definition"}}});
+            add_target(id);
+        }
+        if (!server_.definitions())
+            for (const auto& symbol : shard.symbols)
+                if (symbol.name == selected.text || symbol.qualified_name == selected.text)
+                    add_target(symbol.id);
+        if (query.action == "references")
+            for (auto at : uses.targets) {
+                if (!normalize(at))
+                    continue;
+                semantic::records::reference row{.id = shard.unit.id + ":reference:" + std::to_string(shard.references.size()),
+                                                 .ownership = own(),
+                                                 .location = std::move(at),
+                                                 .roles = {std::string{"reference"}},
+                                                 .resolution = std::string{"unresolved"}};
+                if (row.location.source)
+                    if (const auto* owner = enclosing(*row.location.source))
+                        row.from = owner->semantic_owner;
+                const auto& targets = shard.unit.resolution->targets;
+                if (targets.size() == 1) {
+                    row.target = targets.front().symbol_id;
+                    row.resolution = "resolved";
+                } else if (!targets.empty()) {
+                    for (const auto& target : targets)
+                        row.candidates.push_back(target.symbol_id);
+                    row.resolution = "ambiguous";
+                }
+                shard.references.push_back(std::move(row));
+            }
+        shard.unit.coverage.requested = request.demand;
+        shard.unit.coverage.requested.selector = query.selector;
+        shard.unit.coverage.available.push_back({.contexts = {shard.unit.context},
+                                                 .facts = {std::string{"symbols"}, std::string{"definitions"}, std::string{"scopes"}, query.action.str()},
+                                                 .selector = query.selector});
+        evaluated_unit result;
+        result.shards.push_back(std::move(shard));
+        co_return result;
     }
 
-} // namespace lsp
+} // namespace language

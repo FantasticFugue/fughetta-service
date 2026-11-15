@@ -4,6 +4,9 @@ export import content;
 
 // Who is asking: the identity every source request names and every node write is attributed to.
 export namespace worlds {
+    struct dependency_read {
+        std::string project, worldline, version;
+    };
     struct actor {
         std::string issuer;
         std::string user;
@@ -13,6 +16,9 @@ export namespace worlds {
         std::optional<std::string> client;
         // Set only after the source resolves a task execution credential.
         std::string run, task, project, worldline, execution_token;
+        // Internal gateway grant for configured semantic dependencies.
+        // The source still validates the originating task execution on every read.
+        std::optional<dependency_read> dependency;
     };
 
     // The caller as one string: issuer, user and caller name, each length-prefixed so no two callers share a key.

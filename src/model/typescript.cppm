@@ -1,4 +1,5 @@
 export module typescript;
+import lsp;
 import std;
 import meta;
 import reflection;
@@ -44,6 +45,8 @@ namespace language {
     // typescript-language-server owns tsserver and speaks LSP to the source service. Its documented initialization options are sent
     // unchanged where they are open-ended (preferences and implicitProjectConfiguration); the other settings retain typed fields.
     template <> struct server<"typescript"> {
+        static auto channels() -> std::vector<semantic::channel_definition> { return source_channels(); }
+        using adapter = lsp_adapter;
         struct options {
             std::string executable = "typescript-language-server";
             builds::environment env;
@@ -66,6 +69,8 @@ namespace language {
             {"cjs", "javascript"},
         }};
         static constexpr std::array<std::string_view, 0> inputs{};
+        static constexpr std::array<std::string_view, 4> facts{"symbols", "definitions", "scopes", "diagnostics"};
+        static constexpr semantic::unit_kind unit_kind = semantic::unit_kind::file;
 
         static void validate(const options& o);
         static auto launch(const options& o, const std::vector<builds::context>& inputs) -> program;
@@ -188,6 +193,7 @@ namespace language {
     auto server<"typescript">::launch(const options& o, const std::vector<builds::context>&) -> program {
         program out{.argv = {o.executable, "--stdio"}, .env = o.env};
         if (o.tsserver_path) {
+            out.executables.push_back(*o.tsserver_path);
             out.argv.push_back("--tsserver-path");
             out.argv.push_back(builds::absolute_path(*o.tsserver_path) || o.tsserver_path->find_first_of("/\\") != std::string::npos
                                    ? tree_path(*o.tsserver_path)

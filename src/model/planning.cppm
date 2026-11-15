@@ -195,6 +195,11 @@ namespace builds {
             }
             if (value.standard_output)
                 plain(*value.standard_output);
+            if (value.generation && !value.generation->manifest.empty()) {
+                plain(value.generation->manifest);
+                if (std::ranges::any_of(value.reports, [&](const auto& report) { return report.file == value.generation->manifest; }))
+                    throw std::invalid_argument("generated manifest duplicates another report of task " + task);
+            }
         }
         auto plan_of(const configuration& c, const descriptions& d, const request& request) -> plan {
             auto op = c.operations.find(request.operation);
@@ -250,7 +255,18 @@ namespace builds {
                     throw std::invalid_argument("adapter produced no steps: " + id);
                 for (auto& [port, artifact] : spec.outputs)
                     steps.back().outputs.push_back({id + "/" + port, artifact.type, artifact.path, artifact.kind});
+                if (t.generated_manifest) {
+                    if (t.generated_manifest->empty() || task.outputs.empty())
+                        throw std::invalid_argument("generated task requires a manifest file and declared outputs: " + id);
+                    for (auto& step : steps)
+                        step.generation = generation{.producer = id, .outputs = task.outputs};
+                    steps.back().generation->manifest = *t.generated_manifest;
+                }
                 for (auto& step : steps) {
+                    for (const auto& [port, ref] : t.inputs) {
+                        const auto artifact = output(c, d, ref);
+                        step.inputs.push_back({port, artifact.type, artifact.path, artifact.kind});
+                    }
                     step.name = steps.size() == 1 ? id : id + "/" + step.name;
                     step.reports.insert(step.reports.end(), t.reports.begin(), t.reports.end());
                     reports(step, id);
@@ -297,38 +313,31 @@ namespace builds {
         check(c, d);
         return plan_of(c, d, request);
     }
-    auto prepare_inputs(const configuration& c, const std::vector<std::string>& types, const std::map<std::string, std::string>& selected_paths) -> plan {
+    auto prepare_inputs(const configuration& c, const std::vector<input>& bindings) -> plan {
         auto descriptions = describe(c);
         check(c, descriptions);
         if (!c.enabled)
             throw std::invalid_argument("analysis build configuration is disabled");
-        if (types.empty())
+        if (bindings.empty())
             return {.needs = c.needs.get(), .env = c.env};
         std::vector<std::string> roots;
         std::vector<context> inputs;
-        std::set<std::string> seen;
-        for (auto& type : types) {
-            if (!seen.insert(type).second)
+        std::map<std::string, std::string> paths;
+        std::set<std::pair<std::string, std::string>> selected_outputs;
+        for (const auto& binding : bindings) {
+            const auto& ref = binding.producer;
+            const auto& artifact = output(c, descriptions, ref);
+            if (artifact.type != binding.type)
+                throw std::invalid_argument("analysis input type mismatch: " + ref.task + "/" + ref.output);
+            if (!selected_outputs.emplace(ref.task, ref.output).second)
                 continue;
-            std::vector<std::pair<std::string, context>> producers;
-            for (auto& [id, task] : c.tasks)
-                for (auto& [port, artifact] : spec_of(c, descriptions, id).outputs)
-                    if (artifact.type == type && (!selected_paths.contains(type) || selected_paths.at(type) == artifact.path))
-                        producers.push_back({id, {id + "/" + port, artifact.type, artifact.path, artifact.kind}});
-            if (producers.empty())
-                throw std::invalid_argument("analysis has no producer of " + type);
-            std::map<std::string, std::string> paths;
-            for (auto& [id, artifact] : producers) {
-                if (auto existing = paths.find(artifact.path); existing != paths.end()) {
-                    if (existing->second != id)
-                        throw std::invalid_argument("analysis producers write the same artifact: " + artifact.path);
-                    continue;
-                }
-                paths.emplace(artifact.path, id);
-                if (!std::ranges::contains(roots, id))
-                    roots.push_back(id);
-                inputs.push_back(artifact);
-            }
+            const auto id = ref.task + "/" + ref.output;
+            if (auto existing = paths.find(artifact.path); existing != paths.end() && existing->second != id)
+                throw std::invalid_argument("analysis producers write the same artifact: " + artifact.path);
+            paths.emplace(artifact.path, id);
+            if (!std::ranges::contains(roots, ref.task))
+                roots.push_back(ref.task);
+            inputs.push_back({id, artifact.type, artifact.path, artifact.kind});
         }
         auto selected = c;
         selected.operations["__analysis"] = {.tasks = std::move(roots)};

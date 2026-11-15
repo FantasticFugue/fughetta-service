@@ -134,7 +134,10 @@ namespace {
             auto environments = project();
             environments.builders["other"] = builds::with<"uv">{.options = {.env_dir = "build/other", .build_dir = "build/other-dist"}};
             environments.tasks["other"] = {.builder = "other", .operation = "sync"};
-            auto plan = language::prepare({.server = language::with<"ty">{.options = std::move(ty)}, .build_configuration = "native"}, environments);
+            auto plan = language::prepare({.server = language::with<"ty">{.options = std::move(ty)},
+                                           .build_configuration = "native",
+                                           .inputs = {{"python_environment", {language::build_input{"native", "sync", "python_environment"}}}}},
+                                          {{"native", environments}});
             expect(plan.server.argv == std::vector<std::string>{"ty", "server"});
             expect(plan.build.steps.size() == 1u && plan.inputs.size() == 1u && plan.inputs.front().type == "python_environment");
             expect(rfl::json::write(plan.server.initialization) ==
@@ -145,19 +148,23 @@ namespace {
                    local.env.at("VIRTUAL_ENV") == ::test::absolute("/work/project/build/venv"));
             expect(language::providers::document("ty", "src/app.py") == std::optional<std::string_view>{"python"});
 
+            const std::vector<builds::context> multiple{{"first", "python_environment", "build/venv"}, {"second", "python_environment", "build/other"}};
+            expect(throws<std::invalid_argument>([&] { language::server<"ty">::launch({}, multiple); }));
+            expect(language::server<"ty">::launch({.python = "build/other"}, multiple).env.at("VIRTUAL_ENV") == "${tree}/build/other");
             language::config<"ruff"> ruff;
             ruff.server.linter.select = std::vector<std::string>{"ANN", "I"};
             ruff.server.line_length = 100;
             ruff.server.formatter.backend = "uv";
             ruff.server.actions.fix_violation.enable = false;
             ruff.server.exclude = {"build/**"};
-            auto launched = language::prepare({.server = language::with<"ruff">{.options = std::move(ruff)}, .build_configuration = "native"}, {}).server;
+            auto launched =
+                language::prepare({.server = language::with<"ruff">{.options = std::move(ruff)}, .build_configuration = "native"}, {{"native", {}}}).server;
             expect(launched.argv == std::vector<std::string>{"ruff", "server"});
             expect(rfl::json::write(launched.initialization) == R"({"settings":{"lineLength":100,"exclude":["build/**"],"lint":{"select":["ANN","I"]},)"
                                                                 R"("format":{"backend":"uv"},"codeAction":{"fixViolation":{"enable":false}}}})");
 
             auto reject = [](auto provider) {
-                expect(throws<std::invalid_argument>([&] { language::prepare({.server = provider, .build_configuration = "native"}, {}); }));
+                expect(throws<std::invalid_argument>([&] { language::prepare({.server = provider, .build_configuration = "native"}, {{"native", {}}}); }));
             };
             reject(language::with<"ty">{.options = {.executable = ::test::absolute("/usr/local/bin/ty")}});
             reject(language::with<"ty">{.options = {.env = {{"VIRTUAL_ENV", "other"}}, .python = "build/venv"}});

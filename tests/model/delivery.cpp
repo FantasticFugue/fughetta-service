@@ -4,10 +4,130 @@ import support;
 import delivery;
 import protocol;
 import build;
+import projectmodel;
+import reflection;
+import durability;
+import registry;
+import configuration;
+import coroutine;
+import native;
 
 namespace {
     using namespace boost::ut;
+    static_assert(noexcept(durability::remove_tree(std::declval<const std::filesystem::path&>(), std::declval<std::error_code&>())));
     static constexpr auto cases = [] {
+        "gateway collection releases expired grants and replaces stale read-only links"_test = [] {
+            test::scratch tmp{"grant-collection"};
+            const auto storage = tmp.dir / "storage", blobs = storage / ".exports/blobs", grants = storage / ".exports/projects/app";
+            const auto tree = tmp.dir / "tree";
+            test::spit(tree / "expired", "expired");
+            test::spit(tree / "current", "current");
+            const auto expired = delivery::capture(tree, {{"expired", "expired"}}, blobs).at(0);
+            const auto current = delivery::capture(tree, {{"current", "current"}}, blobs).at(0);
+            std::filesystem::create_directories(grants);
+            std::filesystem::create_hard_link(blobs / expired.digest.view(), grants / expired.digest.view());
+            expect(std::filesystem::hard_link_count(blobs / expired.digest.view()) == 2_u);
+            const auto stale = grants / current.digest.view();
+            test::spit(stale, "previous inode");
+            delivery::readonly(stale);
+            std::filesystem::last_write_time(blobs / expired.digest.view(), std::filesystem::file_time_type::clock::now() - std::chrono::hours{24 * 8});
+            cores::io_context<native::context> rt{1};
+            execution::thread_pool pool{2};
+            auto document = std::make_shared<config::document>();
+            document->projects.emplace("app", config::settings{});
+            config::slots config{1, document};
+            storage::registry files{rt, storage, config, pool, {}};
+            auto run = [&](auto&, std::size_t) -> coroutine::task<> {
+                auto granted = co_await files.grant_exports(0, "app", {current});
+                expect(granted.at(0).delivery_error.empty());
+                expect(!std::filesystem::exists(blobs / expired.digest.view()) && !std::filesystem::exists(grants / expired.digest.view()))
+                    << "both links to the expired file are removed";
+                expect(std::filesystem::equivalent(blobs / current.digest.view(), stale));
+                durability::remove_file(stale);
+                test::spit(stale, "another inode");
+                delivery::readonly(stale);
+                granted = co_await files.grant_exports(0, "app", {current});
+                expect(granted.at(0).delivery_error.empty());
+                expect(std::filesystem::equivalent(blobs / current.digest.view(), stale));
+            };
+            rt.run(std::move(run));
+            durability::remove_tree(storage / ".exports");
+        };
+
+        "model pins bridge installation and live sessions across forced collection"_test = [] {
+            test::scratch tmp{"model-pins"};
+            const auto tree = tmp.dir / "tree", storage = tmp.dir / "exports";
+            const auto hash = content::hash_of("library");
+            projectmodel::document model{
+                .producer = "test",
+                .producer_version = "current",
+                .units = {{.id = "main",
+                           .project = "app",
+                           .language = "kotlin",
+                           .directory = ".",
+                           .references = {projectmodel::artifact_reference{.object = {hash.str(), "library.jar"}, .role = "classpath"}}}}};
+            test::spit(tree / "model.json", rfl::json::write(model));
+            test::spit(tree / "library.jar", "library");
+            const auto file = delivery::capture(tree, {{"model", "model.json"}}, storage).at(0);
+            delivery::capture(tree, {{"library", "library.jar"}}, storage);
+            const auto linked = tmp.dir / "linked-library.jar";
+            std::filesystem::create_hard_link(storage / hash.view(), linked);
+            delivery::retention retention;
+            delivery::pins installing, session;
+            retention.acquire(file.digest.str(), installing);
+            retention.acquire(hash.str(), installing);
+            const auto old = std::filesystem::file_time_type::clock::now() - std::chrono::hours{48};
+            for (const auto& id : {file.digest, hash}) {
+                std::filesystem::last_write_time(storage / id.view(), old);
+                expect((std::filesystem::status(storage / id.view()).permissions() & std::filesystem::perms::owner_write) == std::filesystem::perms::none);
+            }
+            delivery::collect(storage, std::chrono::seconds{0}, 0, {}, retention.roots());
+            expect(std::filesystem::exists(storage / file.digest.view()) && std::filesystem::exists(storage / hash.view()));
+            delivery::retain_model(storage, file.digest);
+            retention.acquire(file.digest.str(), session);
+            installing.clear();
+            delivery::collect(storage, std::chrono::seconds{0}, 0, {}, retention.roots());
+            expect(std::filesystem::exists(storage / hash.view()));
+            session.clear();
+            delivery::collect(storage, std::chrono::seconds{0}, 0, {}, retention.roots());
+            expect(!std::filesystem::exists(storage / file.digest.view()) && !std::filesystem::exists(storage / hash.view()));
+            expect(test::slurp(linked) == "library");
+            expect((std::filesystem::status(linked).permissions() & std::filesystem::perms::owner_write) == std::filesystem::perms::none);
+        };
+        "model admission rejects forged objects and collection follows shared model references"_test = [] {
+            test::scratch tmp{"model-delivery"};
+            const auto tree = tmp.dir / "tree", staging = tmp.dir / "staging", storage = tmp.dir / "exports";
+            const auto hash = content::hash_of("library");
+            projectmodel::document model{
+                .producer = "test",
+                .producer_version = "current",
+                .units = {{.id = "main",
+                           .project = "app",
+                           .language = "kotlin",
+                           .directory = ".",
+                           .references = {projectmodel::artifact_reference{.object = {hash.str(), "library.jar"}, .role = "classpath"}}}}};
+            test::spit(staging / hash.view(), "library");
+            test::spit(tree / "model.json", rfl::json::write(model));
+            const builds::context output{"model", "project_model", "model.json"};
+            auto first = delivery::capture_model(tree, output, staging, storage);
+            expect(first.objects.size() == 1_u);
+            model.units.front().project = "other";
+            test::spit(tree / "model.json", rfl::json::write(model));
+            auto second = delivery::capture_model(tree, output, staging, storage);
+            test::spit(staging / hash.view(), "poison");
+            expect(throws<std::invalid_argument>([&] { delivery::capture_model(tree, output, staging, storage); }));
+            expect(test::slurp(storage / hash.view()) == "library");
+            const auto old = std::filesystem::file_time_type::clock::now() - std::chrono::hours{24 * 8};
+            std::filesystem::last_write_time(storage / first.digest.view(), old);
+            std::filesystem::last_write_time(storage / hash.view(), old);
+            delivery::collect(storage);
+            expect(!std::filesystem::exists(storage / first.digest.view()));
+            expect(std::filesystem::exists(storage / hash.view())) << "the remaining model pins the shared object";
+            std::filesystem::last_write_time(storage / second.digest.view(), old);
+            delivery::collect(storage);
+            expect(!std::filesystem::exists(storage / hash.view()));
+            expect(std::filesystem::is_empty(storage / "references"));
+        };
         "exported bytes survive changes to the hot tree and support bounded reads"_test = [] {
             test::scratch tmp{"delivery"};
             const auto tree = tmp.dir / "tree", storage = tmp.dir / "exports";
@@ -71,12 +191,18 @@ namespace {
             const auto ago = std::filesystem::file_time_type::clock::now() - std::chrono::hours{24 * 8};
             std::filesystem::last_write_time(old, ago);
             test::spit(storage / "partial/interrupted", "partial");
+            delivery::readonly(storage / "partial/interrupted");
             std::filesystem::last_write_time(storage / "partial/interrupted", ago);
+            const auto receiver = storage / "pending-model-crashed";
+            test::spit(receiver / "partial/object", "received");
+            delivery::readonly(receiver / "partial/object");
+            std::filesystem::last_write_time(receiver, ago);
             test::spit(storage / "unrelated.txt", "keep");
-            delivery::collect(storage, std::chrono::hours{24 * 7}, 0);
+            expect(delivery::collect(storage, std::chrono::hours{24 * 7}, 0).empty());
             expect(!std::filesystem::exists(old));
             expect(std::filesystem::exists(recent)) << "active transfers survive size pressure";
             expect(!std::filesystem::exists(storage / "partial/interrupted"));
+            expect(!std::filesystem::exists(receiver));
             expect(std::filesystem::exists(storage / "unrelated.txt"));
             std::filesystem::last_write_time(recent, std::filesystem::file_time_type::clock::now() - std::chrono::hours{1});
             delivery::collect(storage, std::chrono::hours{24 * 7}, 0);

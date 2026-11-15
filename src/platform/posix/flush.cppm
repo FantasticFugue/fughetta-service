@@ -164,9 +164,15 @@ namespace durability {
         return read_checked(path, limit, true);
     }
 
+    auto remove_file(const std::filesystem::path& p) -> bool {
+        if (::unlink(p.c_str()) == 0)
+            return true;
+        if (errno == ENOENT)
+            return false;
+        fail("cannot remove", p);
+    }
     void durable_remove(const std::filesystem::path& p) {
-        if (::unlink(p.c_str()) != 0 && errno != ENOENT)
-            fail("cannot remove", p);
+        remove_file(p);
         sync_dir(p.parent_path());
     }
 

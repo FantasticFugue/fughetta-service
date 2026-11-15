@@ -8,6 +8,8 @@ import archive;
 import async;
 import native;
 import utility;
+import reflection;
+import codec;
 
 export namespace replica {
     struct limits {
@@ -28,6 +30,21 @@ export namespace replica {
 
         auto root() const -> const std::filesystem::path& { return root_; }
         auto cache_bytes() const -> std::uint64_t { return cache_bytes_; }
+
+        auto slots() const -> std::vector<jobs::worker_slot> {
+            std::vector<std::pair<std::filesystem::file_time_type, std::filesystem::path>> recent;
+            for (const auto& manifest : manifests())
+                if (std::filesystem::is_directory(tree(key_of(manifest))))
+                    recent.emplace_back(std::filesystem::last_write_time(manifest), manifest);
+            std::ranges::sort(recent, std::greater{});
+            std::vector<jobs::worker_slot> out;
+            for (const auto& [_, manifest] : recent) {
+                if (out.size() == constants::worker_slot_reports)
+                    break;
+                out.push_back({.project = manifest.parent_path().filename().string(), .tree = manifest.stem().string()});
+            }
+            return out;
+        }
 
         static auto checked_project(std::string_view name) -> std::string_view { return content::checked_name(name); }
 
@@ -121,6 +138,7 @@ export namespace replica {
                 std::filesystem::rename(dir, retired / "tree");
             }
             std::filesystem::remove(manifest_path(key));
+            std::filesystem::remove(generation_path(key));
             return retired;
         }
 
@@ -153,6 +171,8 @@ export namespace replica {
                     throw std::runtime_error(std::format("snapshot {} needs blob {}, which was not pushed", snapshot, e.digest));
 
             auto key = tree_key(project, target);
+            if (!read_generation(key).pending.empty())
+                discard(detach(project, target));
             auto dir = tree(key);
             // Nothing between the cache root and the tree may be a link a build planted.
             unlinked(root_, dir.lexically_relative(root_).generic_string());
@@ -194,6 +214,83 @@ export namespace replica {
             return dir;
         }
 
+        void begin_generation(std::string_view project, std::string_view target, const builds::generation& producer) {
+            if (producer.producer.empty() || producer.outputs.empty())
+                throw std::invalid_argument("generated output requires a producer and output scope");
+            const auto key = tree_key(project, target);
+            auto state = read_generation(key);
+            state.pending.insert(producer.producer);
+            write_generation(key, state);
+        }
+
+        void commit_generation(std::string_view project, std::string_view target, const builds::generation& producer, const std::vector<std::string>& files) {
+            const auto key = tree_key(project, target);
+            auto state = read_generation(key);
+            if (!state.pending.contains(producer.producer))
+                throw std::logic_error("generated output has no active producer");
+            const auto dir = tree(key);
+            std::set<std::string> source;
+            for (const auto& placed : read_manifest(key))
+                source.insert(placed.e.path);
+            std::set<std::string> selected;
+            for (const auto& file : files) {
+                content::checked_path(file);
+                if (source.contains(file) || !std::ranges::any_of(producer.outputs, [&](const auto& output) {
+                        return file == output.path || (output.kind == "directory" && file.starts_with(output.path + "/"));
+                    }))
+                    throw std::invalid_argument("generated file is outside the producer's output scope: " + file);
+                for (const auto& [owner, value] : state.producers)
+                    if (owner != producer.producer && value.files.contains(file))
+                        throw std::invalid_argument("generated file already belongs to another producer: " + file);
+                unlinked(dir, file);
+                if (!std::filesystem::is_regular_file(std::filesystem::symlink_status(dir / file)))
+                    throw std::invalid_argument("generated manifest names no regular file: " + file);
+                selected.insert(file);
+            }
+            auto& previous = state.producers[producer.producer];
+            source.insert(selected.begin(), selected.end());
+            withdraw_generated(dir, previous.files, source);
+            durability::sync_filesystem(dir);
+            previous = {.object = "generation-" + nodes::hex(nodes::random_bytes(16)), .files = std::move(selected)};
+            state.pending.erase(producer.producer);
+            write_generation(key, state);
+        }
+
+        void reconcile_generations(std::string_view project, std::string_view target, const std::set<std::string>& producers) {
+            const auto key = tree_key(project, target);
+            auto state = read_generation(key);
+            std::set<std::string> removed;
+            for (const auto& [producer, value] : state.producers)
+                if (!producers.contains(producer))
+                    removed.insert(producer);
+            if (removed.empty())
+                return;
+            state.pending.insert(removed.begin(), removed.end());
+            write_generation(key, state);
+            std::set<std::string> source;
+            for (const auto& placed : read_manifest(key))
+                source.insert(placed.e.path);
+            const auto dir = tree(key);
+            for (const auto& producer : removed) {
+                withdraw_generated(dir, state.producers.at(producer).files, source);
+                state.producers.erase(producer);
+                state.pending.erase(producer);
+            }
+            durability::sync_filesystem(dir);
+            write_generation(key, state);
+        }
+
+        auto generated_inputs(std::string_view project, std::string_view target) const -> std::map<std::string, std::string> {
+            std::map<std::string, std::string> out;
+            for (const auto& [producer, value] : read_generation(tree_key(project, target)).producers)
+                for (const auto& path : value.files)
+                    out.emplace(path, value.object);
+            return out;
+        }
+        auto unfinished_generation(std::string_view project, std::string_view target) const -> bool {
+            return !read_generation(tree_key(project, target)).pending.empty();
+        }
+
         void collect(const std::set<std::string>& busy = {}) {
             auto now = std::chrono::system_clock::now();
             std::error_code ec;
@@ -210,6 +307,7 @@ export namespace replica {
                 std::error_code ignored;
                 std::filesystem::remove_all(tree(k), ignored);
                 std::filesystem::remove(manifest_path(k), ignored);
+                std::filesystem::remove(generation_path(k), ignored);
             }
             if (cache_bytes_ <= limits_.max_cache_bytes)
                 return;
@@ -258,6 +356,42 @@ export namespace replica {
         auto has_blob(std::string_view h) const -> bool { return std::filesystem::exists(blob_path(h)); }
         void touch(const content::hash& h) { used_[h] = std::chrono::system_clock::now(); }
         auto manifest_path(std::string_view key) const -> std::filesystem::path { return root_ / "trees" / (std::string{key} + ".manifest"); }
+        static void withdraw_generated(const std::filesystem::path& dir, const std::set<std::string>& files, const std::set<std::string>& retained) {
+            for (const auto& file : files)
+                if (!retained.contains(file)) {
+                    content::checked_path(file);
+                    unlinked(dir, file);
+                    // A former generated file may now contain source or output files.
+                    if (!std::filesystem::is_directory(std::filesystem::symlink_status(dir / file)))
+                        std::filesystem::remove(dir / file);
+                }
+        }
+        auto generation_path(std::string_view key) const -> std::filesystem::path { return root_ / "trees" / (std::string{key} + ".generated"); }
+        struct generated {
+            struct contribution {
+                std::string object;
+                std::set<std::string> files;
+            };
+            std::map<std::string, contribution> producers;
+            std::set<std::string> pending;
+        };
+        auto read_generation(std::string_view key) const -> generated {
+            if (!std::filesystem::exists(generation_path(key)))
+                return {};
+            std::string bytes;
+            for (auto part : durability::read_plain(generation_path(key), constants::generated_manifest_bytes))
+                bytes.append(reinterpret_cast<const char*>(part.data()), part.size());
+            auto value = rfl::json::read<generated>(bytes);
+            if (!value)
+                throw std::runtime_error("invalid generated output ownership: " + value.error().what());
+            return std::move(*value);
+        }
+        void write_generation(std::string_view key, const generated& state) const {
+            auto bytes = rfl::json::write(state);
+            if (bytes.size() > constants::generated_manifest_bytes)
+                throw std::length_error("generated output ownership exceeds storage limit");
+            durability::durable_write(generation_path(key), bytes);
+        }
 
         auto manifests() const -> std::vector<std::filesystem::path> {
             std::vector<std::filesystem::path> out;

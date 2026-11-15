@@ -115,6 +115,7 @@ export namespace runtime {
                 worker.max_inflight = 1;
                 worker.tools = doc.tools;
                 worker.parallel = plan.workers[i].parallel;
+                worker.memory_bytes = plan.workers[i].memory_bytes;
                 auto file = directory / (worker.name + ".json");
                 std::ofstream out{file, std::ios::trunc};
                 out << config::write(worker);

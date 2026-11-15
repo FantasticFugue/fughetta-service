@@ -15,15 +15,36 @@ import httpant.io;
 import posix;
 
 namespace native_process {
+    namespace {
+        struct observation : io::process_record {};
+    } // namespace
+    auto sample(const io::process_record& process) noexcept -> std::optional<io::process_usage> { return posix::process_usage(process.pid, true); }
+    auto self_usage() noexcept -> std::optional<io::process_usage> { return posix::process_usage(::getpid(), false); }
     struct child::state {
         state(native_io::engine<concurrent::queue>* engine, int pid, int out, bool conversation, int pidfd)
             : engine(engine), pid(pid), out(out), conversation(conversation), exit(pidfd) {}
+        std::shared_ptr<observation> observed;
+        std::shared_ptr<io::process_group> processes;
+        void stop_observing() noexcept {
+            if (observed) {
+                std::lock_guard lock{observed->mutex};
+                observed->live = false;
+            }
+        }
+        void finished() noexcept {
+            if (auto group = std::exchange(processes, {})) {
+                std::lock_guard held{group->mutex};
+                group->children.erase(static_cast<int>(pid));
+            }
+        }
         ~state() {
+            stop_observing();
             if (!reaped) {
                 ::kill(-pid, SIGKILL);
                 while (::waitpid(pid, nullptr, 0) < 0 && errno == EINTR) {
                 }
             }
+            finished();
             engine->cancel_file(out);
             ::close(out);
             if (exit >= 0) {
@@ -39,6 +60,7 @@ namespace native_process {
         int exit;
         bool reaped = false;
         auto reap() noexcept -> int {
+            stop_observing();
             ::kill(-pid, SIGKILL);
             int status = 0;
             pid_t got;
@@ -46,6 +68,7 @@ namespace native_process {
                 got = ::waitpid(pid, &status, 0);
             } while (got < 0 && errno == EINTR);
             reaped = true;
+            finished();
             if (got != pid)
                 return -1;
             if (WIFEXITED(status))
@@ -180,7 +203,15 @@ namespace native_process {
             ::close(out[0]);
             throw;
         }
-        return child{std::make_unique<state>(&engine, pid, out[0], cmd.interactive, pidfd)};
+        auto state = std::make_unique<child::state>(&engine, pid, out[0], cmd.interactive, pidfd);
+        if (cmd.processes) {
+            state->observed = std::make_shared<observation>();
+            state->observed->pid = pid;
+            state->processes = cmd.processes;
+            std::lock_guard held{cmd.processes->mutex};
+            cmd.processes->children.emplace(pid, state->observed);
+        }
+        return child{std::move(state)};
     }
 
     child::child(std::unique_ptr<state> state) : state_(std::move(state)) {}

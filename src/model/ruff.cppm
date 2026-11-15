@@ -1,4 +1,5 @@
 export module ruff;
+import lsp;
 import std;
 import meta;
 import reflection;
@@ -50,6 +51,8 @@ namespace language {
     //   - fixAll, organizeImports, showSyntaxErrors and codeAction {disableRuleComment, fixViolation} with enable;
     //   - logLevel and logFile.
     template <> struct server<"ruff"> {
+        static auto channels() -> std::vector<semantic::channel_definition> { return {{.name = "diagnostics", .projections = {std::string{"diagnostics"}}}}; }
+        using adapter = lsp_adapter;
         struct lint {
             std::optional<std::vector<std::string>> select;
             std::optional<std::vector<std::string>> extend_select;
@@ -89,6 +92,8 @@ namespace language {
         };
         static constexpr std::array<std::pair<std::string_view, std::string_view>, 3> documents{{{"py", "python"}, {"pyi", "python"}, {"pyw", "python"}}};
         static constexpr std::array<std::string_view, 0> inputs{};
+        static constexpr std::array<std::string_view, 1> facts{"diagnostics"};
+        static constexpr semantic::unit_kind unit_kind = semantic::unit_kind::file;
 
         static void validate(const options& o);
         static auto launch(const options& o, const std::vector<builds::context>& inputs) -> program;

@@ -57,6 +57,7 @@ add_suite(cancel gateway/cancel.cpp)
 add_suite(build model/build.cpp)
 add_suite(python model/python.cpp)
 add_suite(typescript model/typescript.cpp)
+add_suite(managed model/managed.cpp)
 add_suite(toolchain model/toolchain.cpp)
 add_suite(tooling model/tooling.cpp)
 add_suite(config gateway/config.cpp)
@@ -93,7 +94,7 @@ endif()
 add_suite(lsp source/lsp.cpp ENVIRONMENT ${CLICE_ENVIRONMENT})
 add_suite(server source/server.cpp source)
 
-add_suite(analysis system/analysis.cpp SERVICE ENVIRONMENT ${CLICE_ENVIRONMENT})
+add_suite(analysis system/analysis.cpp SERVICE TIMEOUT 360 ENVIRONMENT ${CLICE_ENVIRONMENT})
 
 add_suite(workflow system/workflow.cpp SERVICE)
 add_suite(lifecycle system/lifecycle.cpp SERVICE)
@@ -119,7 +120,76 @@ add_compile_failure(naming "an MCP tool name is")
 
 ## Scripted scenarios
 #
-# Python drivers that exercise the real binaries through the services.
+# Python drivers that exercise the real binaries through the services. The
+# managed providers' scenarios run when cmake/providers.cmake built them.
+
+# Each provider's model exporter runs against the sample projects.
+function(add_model_test PROVIDER TOOL EXPORTER)
+  add_test(NAME model.${PROVIDER} COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/model/managed.py"
+    "${PROVIDER}" "${TOOL}" "${EXPORTER}" --work "${CMAKE_BINARY_DIR}/providers/tests" --validator "$<TARGET_FILE:managed-test>")
+  set_tests_properties(model.${PROVIDER} PROPERTIES TIMEOUT 300)
+endfunction()
+
+find_program(FUGHETTA_JAVAC javac)
+if(FUGHETTA_JAVAC)
+  add_executable(jvm-test model/jvm.cpp)
+  target_link_libraries(jvm-test PRIVATE testing)
+  add_test(NAME model.jvm COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/model/jvm.py"
+    "$<TARGET_FILE:jvm-test>" "${FUGHETTA_JAVAC}" "${CMAKE_BINARY_DIR}/jvm-tests")
+  set_tests_properties(model.jvm PROPERTIES TIMEOUT 120)
+endif()
+
+if(GRADLE_TOOL)
+  add_test(NAME helper.kotlin COMMAND ${FUGHETTA_GRADLE} test)
+  set_tests_properties(helper.kotlin PROPERTIES TIMEOUT 300 ENVIRONMENT
+    "FUGHETTA_RECORD_VALIDATOR=$<TARGET_FILE:managed-test>;FUGHETTA_WORKER_TEST=$<TARGET_FILE:executor-test>")
+  add_model_test(kotlin "${GRADLE_TOOL}" "${FUGHETTA_JVM_EXPORTER}")
+  if(FUGHETTA_JAVAC AND TEST_MANAGED_HOSTS)
+    cmake_path(GET FUGHETTA_JAVAC PARENT_PATH FUGHETTA_JAVA_BIN)
+    add_test(NAME model.kotlin-jni COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/model/jvm.py" --kotlin
+      "$<TARGET_FILE:jvm-test>" "${GRADLE_TOOL}" "${FUGHETTA_JVM_EXPORTER}" "${FUGHETTA_JAVA_BIN}/java"
+      "${FUGHETTA_PROVIDER_jvm}" "${FUGHETTA_PROVIDER_kotlin}"
+      "$<TARGET_FILE:managed-test>" "${CMAKE_CXX_COMPILER}" "${CMAKE_BINARY_DIR}/jvm-tests")
+    set_tests_properties(model.kotlin-jni PROPERTIES TIMEOUT 600)
+  endif()
+endif()
+
+if(DOTNET_TOOL)
+  add_executable(clr-test model/clr.cpp)
+  target_link_libraries(clr-test PRIVATE testing)
+  if(TEST_MANAGED_HOSTS)
+    add_test(NAME model.clr COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/model/clr.py"
+      "${DOTNET_TOOL}" "${FUGHETTA_PROVIDER_clr}" "${FUGHETTA_PROVIDER_fsharp}" "$<TARGET_FILE:managed-test>"
+      "$<TARGET_FILE:clr-test>" "${CMAKE_BINARY_DIR}/clr-tests"
+      --exporter "${FUGHETTA_CLR_EXPORTER}" --compiler "${CMAKE_CXX_COMPILER}")
+    set_tests_properties(model.clr PROPERTIES TIMEOUT 300)
+  endif()
+  add_test(NAME helper.fsharp COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/model/fsharp.py"
+    "${DOTNET_TOOL}" "${FUGHETTA_PROVIDER_clr}" "${FUGHETTA_PROVIDER_fsharp}" "$<TARGET_FILE:managed-test>"
+    --worker "$<TARGET_FILE:executor-test>" --work "${CMAKE_BINARY_DIR}/fsharp-tests" --exporter "${FUGHETTA_CLR_EXPORTER}")
+  set_tests_properties(helper.fsharp PROPERTIES TIMEOUT 300)
+  add_model_test(fsharp "${DOTNET_TOOL}" "${FUGHETTA_CLR_EXPORTER}")
+endif()
+
+# The analysis suite runs the whole managed flow when both providers and a JDK
+# are present.
+if(TEST_MANAGED_HOSTS AND GRADLE_TOOL AND DOTNET_TOOL AND FUGHETTA_JAVAC)
+  file(REAL_PATH "${FUGHETTA_JAVAC}" FUGHETTA_JDK_BIN)
+  cmake_path(GET FUGHETTA_JDK_BIN PARENT_PATH FUGHETTA_JDK_BIN)
+  cmake_path(GET FUGHETTA_JDK_BIN PARENT_PATH FUGHETTA_JDK)
+  set_property(TEST analysis APPEND PROPERTY ENVIRONMENT
+    "TEST_GRADLE=${GRADLE_TOOL}"
+    "TEST_DOTNET=${DOTNET_TOOL}"
+    "TEST_JAVA=${FUGHETTA_JDK_BIN}/java"
+    "TEST_JDK=${FUGHETTA_JDK}"
+    "TEST_CXX=${CMAKE_CXX_COMPILER}"
+    "TEST_JVM_HOST=${FUGHETTA_PROVIDER_jvm}"
+    "TEST_KOTLIN_ADAPTER=${FUGHETTA_PROVIDER_kotlin}"
+    "TEST_CLR_HOST=${FUGHETTA_PROVIDER_clr}"
+    "TEST_FSHARP_ADAPTER=${FUGHETTA_PROVIDER_fsharp}"
+    "TEST_GRADLE_MODEL=${FUGHETTA_JVM_EXPORTER}"
+    "TEST_MSBUILD_MODEL=${FUGHETTA_CLR_EXPORTER}")
+endif()
 
 add_executable(shell source/shell.cpp source/${PLATFORM_FAMILY}/binary.cpp)
 target_link_libraries(shell PRIVATE source)
@@ -133,6 +203,17 @@ endforeach()
 #
 # Every test runs inside the build directory with the same token, so a service
 # started by one driver is reachable by the next.
+
+# The binary tools come from the compiler's own tree.
+file(REAL_PATH "${CMAKE_CXX_COMPILER}" FUGHETTA_COMPILER_BIN)
+cmake_path(GET FUGHETTA_COMPILER_BIN PARENT_PATH FUGHETTA_COMPILER_BIN)
+foreach(TOOL IN ITEMS readobj symbolizer objdump)
+  string(TOUPPER "${TOOL}" VARIABLE)
+  find_program(FUGHETTA_${VARIABLE} NAMES llvm-${TOOL} HINTS "${FUGHETTA_COMPILER_BIN}")
+  if(FUGHETTA_${VARIABLE})
+    list(APPEND TEST_ENVIRONMENT "TEST_LLVM_${VARIABLE}=${FUGHETTA_${VARIABLE}}")
+  endif()
+endforeach()
 
 get_property(PROJECT_TESTS DIRECTORY PROPERTY TESTS)
 set_property(TEST ${PROJECT_TESTS} APPEND PROPERTY ENVIRONMENT ${TEST_ENVIRONMENT})
