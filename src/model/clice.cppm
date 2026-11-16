@@ -25,6 +25,7 @@ namespace language {
         static auto channels() -> std::vector<semantic::channel_definition> {
             auto out = source_channels();
             out.front().projections = {std::string{"declarations"}};
+            out.push_back(linkage_channel());
             return out;
         }
         static auto input_validators() -> std::vector<input_validator> {
@@ -408,6 +409,16 @@ export namespace language::cpp {
                 type.application_arguments.push_back(application_argument(argument));
             out.types.push_back(std::move(type));
         }
+        // A function's body is the first block its own declaration scope opens.
+        std::map<std::string, range> bodies;
+        std::map<std::string, const scope*> scopes;
+        for (const auto& value : input.scopes)
+            scopes.emplace(value.id, &value);
+        for (const auto& value : input.scopes)
+            if (value.kind == "block" && value.owner && value.parent)
+                if (const auto parent = scopes.find(*value.parent);
+                    parent != scopes.end() && parent->second->owner == value.owner && scope_kind(parent->second->kind) == "function")
+                    bodies.try_emplace(*value.owner, value.location);
         std::vector<const occurrence*> reference_sources;
         std::vector<const occurrence*> declaration_sources;
         for (const auto& value : input.occurrences) {
@@ -426,7 +437,9 @@ export namespace language::cpp {
                      .location = location,
                      .roles = {lower(value.role)},
                      .selection = location.source,
-                     .body = value.extent ? locate(*value.extent).source : std::nullopt,
+                     .body = value.role == "Definition" && bodies.contains(*value.symbol) ? locate(bodies.at(*value.symbol)).source
+                             : value.extent                                               ? locate(*value.extent).source
+                                                                                          : std::nullopt,
                      .declaration_kind = value.declaration_kind ? std::optional<semantic::symbol_kind>{kind(*value.declaration_kind)} : std::nullopt});
                 declaration_sources.push_back(&value);
             } else {

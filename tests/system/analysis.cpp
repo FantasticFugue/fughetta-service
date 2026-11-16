@@ -1459,10 +1459,10 @@ namespace {
                        ",\"changes\":[{\"kind\":\"edit\",\"path\":\"main.cpp\",\"offset\":" + std::to_string(replacement) +
                        ",\"count\":" + std::to_string(replaced_expression.size()) + ",\"text\":" + rfl::json::write(replacement_expression) + "}]}";
             };
-            // A lease persists across a source restart and fences writes that omit its token.
+            // A lease persists across a source restart and fences another caller's writes.
             expect(source->stop() == 0);
             source = start_source(tmp.dir, source_port);
-            auto refused = agent("worldline", edit("main", "unclaimed", false), true);
+            auto refused = test::tool(port, "worldline", edit("main", "unclaimed", false), true);
             expect(refused.contains("scope_conflict"));
             test::tool(port, "worldline", R"({"project":"app","action":"fork","name":"parallel","operation_id":"fork"})");
             auto independent = test::decode<tools::worldline::output>(test::tool(port, "worldline", edit("parallel", "parallel-fix", false)));

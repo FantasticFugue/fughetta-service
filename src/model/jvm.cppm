@@ -520,7 +520,7 @@ export namespace language {
         static auto channels() -> std::vector<semantic::channel_definition> {
             return {{.name = "declarations", .projections = {std::string{"symbols"}, std::string{"types"}}},
                     {.name = "relations", .projections = {std::string{"references"}, std::string{"relations"}}},
-                    {.name = "linkage", .projections = {std::string{"symbols"}, std::string{"types"}, std::string{"occurrences"}}}};
+                    linkage_channel()};
         }
         static auto input_validators() -> std::vector<input_validator> {
             return {{"jvm/class",

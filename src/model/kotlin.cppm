@@ -24,6 +24,7 @@ export namespace language {
         static auto channels() -> std::vector<semantic::channel_definition> {
             auto out = source_channels();
             out.front().projections = {std::string{"declarations"}};
+            out.push_back(linkage_channel());
             return out;
         }
         static auto requirements(const options& o) -> builds::requirements { return builds::tools({o.executable, o.host, o.adapter}); }

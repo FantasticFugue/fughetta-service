@@ -138,7 +138,7 @@ namespace nodes {
                "KEY(author,operation));"
                "CREATE TABLE IF NOT EXISTS receipts(id TEXT PRIMARY KEY, worldline TEXT NOT NULL, operation TEXT NOT NULL, "
                "caller_operation TEXT NOT NULL, author TEXT NOT NULL, result TEXT NOT NULL, prior BLOB NOT NULL, frontier BLOB NOT NULL, "
-               "version TEXT NOT NULL, base_version TEXT NOT NULL);"
+               "version TEXT NOT NULL, base_version TEXT NOT NULL, reach TEXT NOT NULL DEFAULT '');"
                "DROP TABLE IF EXISTS semantics;"
                "DROP TABLE IF EXISTS locks;"
                "DROP TABLE IF EXISTS roots;"

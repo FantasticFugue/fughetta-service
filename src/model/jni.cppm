@@ -12,6 +12,8 @@ export namespace jni {
     class resolver;
     struct group {
         std::string project, module, native;
+        // Kotlin source declarations bound to C++ source definitions, before any artifact exists.
+        bool source = false;
         auto operator<=>(const group&) const = default;
     };
     struct options {
@@ -73,6 +75,49 @@ export namespace jni {
         const auto short_name = "Java_" + *klass + "_" + *method;
         return {short_name, short_name + "__" + *arguments};
     }
+    // A named Kotlin external function. Property accessors end their CallableId
+    // with "get" or "set" instead of their own name.
+    inline auto source_declaration(const semantic::records::symbol& symbol) {
+        if (symbol.domain != "kotlin" || !std::ranges::contains(symbol.modifiers, "external") || (symbol.kind != "function" && symbol.kind != "method"))
+            return false;
+        const std::string_view id = symbol.qualified_name;
+        if (symbol.name.empty() || !id.ends_with(symbol.name))
+            return false;
+        const auto prefix = id.substr(0, id.size() - symbol.name.size());
+        return prefix.empty() || prefix.ends_with('.') || prefix.ends_with('/');
+    }
+    inline auto source_definition(const semantic::records::symbol& symbol) {
+        return symbol.domain == "source" && symbol.language == "cpp" && symbol.kind == "function" && symbol.name.starts_with("Java_");
+    }
+    // An artifact unit publishes its exports; a source unit does not.
+    inline auto artifact(const semantic::unit& unit) { return std::ranges::contains(unit.output_channels, std::string{"exports"}, &semantic::channel::name); }
+    // The JVM class of a Kotlin declaration, from its CallableId
+    // "pkg/Outer.Inner.name". A top-level function belongs to its file facade
+    // "<File>Kt"; a @file:JvmName rename is not visible in source records.
+    inline auto source_class(const semantic::records::symbol& symbol, std::string_view file) -> std::string {
+        const std::string_view id = symbol.qualified_name;
+        const auto slash = id.rfind('/');
+        const auto package = slash == std::string_view::npos ? std::string_view{} : id.substr(0, slash);
+        const auto rest = slash == std::string_view::npos ? id : id.substr(slash + 1);
+        std::string klass;
+        if (const auto dot = rest.rfind('.'); dot != std::string_view::npos) {
+            klass = std::string{rest.substr(0, dot)};
+            std::ranges::replace(klass, '.', '$');
+        } else {
+            auto stem = std::filesystem::path{std::string{file}}.stem().string();
+            if (stem.empty())
+                return {};
+            for (auto& c : stem)
+                if (!std::isalnum(static_cast<unsigned char>(c)) && c != '_' && c != '$')
+                    c = '_';
+            // Kotlin's package part naming prefixes a stem that cannot start a Java identifier.
+            if (std::isdigit(static_cast<unsigned char>(stem.front())))
+                stem.insert(stem.begin(), '_');
+            stem.front() = static_cast<char>(std::toupper(static_cast<unsigned char>(stem.front())));
+            klass = stem + "Kt";
+        }
+        return package.empty() ? klass : std::string{package} + "/" + klass;
+    }
     inline auto parameter(std::string_view descriptor) -> semantic::records::jni_parameter {
         static const std::map<char, std::string> primitives{{'Z', "jboolean"}, {'B', "jbyte"},  {'C', "jchar"},   {'S', "jshort"}, {'I', "jint"},
                                                             {'J', "jlong"},    {'F', "jfloat"}, {'D', "jdouble"}, {'V', "void"}};
@@ -109,7 +154,7 @@ export namespace jni {
             const semantic::shard* shard;
             const semantic::records::symbol* symbol;
             semantic::artifact_location location;
-            bool registered = false;
+            bool registered = false, source = false;
         };
         struct registration {
             std::string klass, name, descriptor, function, table;
@@ -119,8 +164,15 @@ export namespace jni {
             lookups.try_emplace(shard, *shard);
         std::map<std::pair<std::string, std::string>, std::vector<target>> exports;
         std::map<std::tuple<std::string, std::string, std::string, std::string>, std::vector<target>> registrations;
+        std::map<std::string, std::vector<target>> definitions;
         for (const auto* shard : inputs)
             for (const auto& symbol : shard->symbols) {
+                if (source_definition(symbol)) {
+                    if (std::ranges::any_of(lookups.at(shard).positions(symbol.id),
+                                            [](const auto* occurrence) { return std::ranges::contains(occurrence->roles, std::string{"definition"}); }))
+                        definitions[symbol.name].push_back({shard, &symbol, {}, false, true});
+                    continue;
+                }
                 if (symbol.domain != "native")
                     continue;
                 for (const auto* occurrence : lookups.at(shard).positions(symbol.id))
@@ -144,15 +196,36 @@ export namespace jni {
         };
         for (const auto* shard : inputs)
             for (const auto& symbol : shard->symbols) {
-                if (symbol.domain != "jvm" || !std::ranges::contains(symbol.modifiers, "native"))
+                const bool source = source_declaration(symbol);
+                if (!source && (symbol.domain != "jvm" || !std::ranges::contains(symbol.modifiers, "native")))
                     continue;
-                if (selected_group && (shard->unit.recipe.unit.project != selected_group->project || symbol.module != selected_group->module))
+                if (selected_group &&
+                    (shard->unit.recipe.unit.project != selected_group->project || symbol.module != selected_group->module || selected_group->source != source))
                     continue;
+                const auto occurrences = lookups.at(shard).positions(symbol.id);
+                const auto location = occurrences.empty() ? semantic::locator{} : occurrences.front()->location;
+                // A source declaration has no descriptor: its short name binds
+                // exactly, and descriptor-qualified long names are candidates.
+                const bool facade = source && symbol.qualified_name.substr(symbol.qualified_name.rfind('/') + 1).find('.') == std::string::npos;
+                const auto klass = source ? source_class(symbol, location.source ? std::string_view{location.source->path} : std::string_view{})
+                                          : property(symbol, "jvm.class");
+                const bool is_static = source ? facade : std::ranges::contains(symbol.modifiers, "static");
                 std::vector<target> targets;
                 const auto libraries = config.libraries.find(symbol.module);
-                const auto spellings = names(symbol);
+                std::vector<std::string> spellings;
+                if (!source)
+                    spellings = names(symbol);
+                else if (const auto escaped_class = escape(klass), method = escape(symbol.name); !klass.empty() && escaped_class && method)
+                    spellings = {"Java_" + *escaped_class + "_" + *method};
                 std::string entry;
-                if (libraries != config.libraries.end())
+                if (source && !spellings.empty()) {
+                    if (auto found = definitions.find(spellings.front()); found != definitions.end())
+                        targets = found->second;
+                    else
+                        for (auto it = definitions.lower_bound(spellings.front() + "__");
+                             it != definitions.end() && it->first.starts_with(spellings.front() + "__"); ++it)
+                            targets.insert(targets.end(), it->second.begin(), it->second.end());
+                } else if (!source && libraries != config.libraries.end())
                     for (const auto& library : libraries->second)
                         if (const auto found = registrations.find({library, property(symbol, "jvm.class"), symbol.name, property(symbol, "jvm.descriptor")});
                             found != registrations.end())
@@ -161,7 +234,7 @@ export namespace jni {
                 // long name when no explicit registration applies. Preserve all
                 // matches at the selected rank, including registration ambiguity.
                 for (const auto& spelling : spellings) {
-                    if (!targets.empty())
+                    if (source || !targets.empty())
                         break;
                     if (libraries != config.libraries.end())
                         for (const auto& library : libraries->second)
@@ -172,23 +245,28 @@ export namespace jni {
                         break;
                     }
                 }
-                const auto occurrences = lookups.at(shard).positions(symbol.id);
-                const auto location = occurrences.empty() ? semantic::locator{} : occurrences.front()->location;
+                // Source binding is opportunistic: the native function may come
+                // from a prebuilt library, so only ambiguity is reported.
+                if (source && targets.empty())
+                    continue;
                 const semantic::ownership owner{out.unit.id, out.unit.context, {.provider = "jni", .kind = std::string{"resolver"}, .location = location}};
                 const auto id = out.unit.id + ":" + symbol.id;
-                semantic::records::library_selection selection{.name = symbol.module, .strategy = std::string{"search"}};
-                for (const auto& target : targets)
-                    selection.candidates.push_back(target.location);
-                if (targets.size() == 1)
-                    selection.selected = targets.front().location;
-                else if (!selected_group || selected_group->native.empty()) {
+                semantic::records::library_selection selection{.name = symbol.module, .strategy = std::string{source ? "source" : "search"}};
+                // A source definition has no artifact location to select.
+                if (!source)
+                    for (const auto& target : targets)
+                        selection.candidates.push_back(target.location);
+                if (targets.size() == 1) {
+                    if (!source)
+                        selection.selected = targets.front().location;
+                } else if (!selected_group || selected_group->native.empty()) {
                     ++out.unit.coverage.unresolved_count;
                     out.diagnostics.push_back({.id = id,
                                                .producer = "jni",
-                                               .code = spellings.empty()                     ? "name_unresolvable"
-                                                       : libraries == config.libraries.end() ? "library_unmapped"
-                                                       : targets.empty()                     ? "entry_missing"
-                                                                                             : "entry_ambiguous",
+                                               .code = spellings.empty()                                ? "name_unresolvable"
+                                                       : !source && libraries == config.libraries.end() ? "library_unmapped"
+                                                       : targets.empty()                                ? "entry_missing"
+                                                                                                        : "entry_ambiguous",
                                                .severity = "warning",
                                                .message = "JNI method " + symbol.qualified_name + " requires one native export",
                                                .ownership = owner,
@@ -204,14 +282,14 @@ export namespace jni {
                     semantic::records::binding_detail detail{.mechanism = std::string{target.registered ? "jni_dynamic" : "jni_static"},
                                                              .convention = std::string{"platform"},
                                                              .library_selection = selection,
-                                                             .entry_point = target.registered ? property(*target.symbol, "native.linkage_name") : entry};
+                                                             .entry_point = target.registered ? property(*target.symbol, "native.linkage_name")
+                                                                            : target.source   ? target.symbol->name
+                                                                                              : entry};
                     detail.parameter_mapping.push_back({{std::string{"environment"}}, {std::string{"parameter"}, 0}, std::string{"pointer"}});
-                    detail.parameter_mapping.push_back({{std::string{std::ranges::contains(symbol.modifiers, "static") ? "class" : "receiver"}},
-                                                        {std::string{"parameter"}, 1},
-                                                        std::string{"pointer"}});
+                    detail.parameter_mapping.push_back(
+                        {{std::string{is_static ? "class" : "receiver"}}, {std::string{"parameter"}, 1}, std::string{"pointer"}});
                     detail.parameter_mapping[0].jni = semantic::records::jni_parameter{.native_type = "JNIEnv*"};
-                    detail.parameter_mapping[1].jni =
-                        parameter(std::ranges::contains(symbol.modifiers, "static") ? "Ljava/lang/Class;" : "L" + property(symbol, "jvm.class") + ";");
+                    detail.parameter_mapping[1].jni = parameter(is_static ? "Ljava/lang/Class;" : "L" + klass + ";");
                     const auto descriptor = property(symbol, "jvm.descriptor");
                     std::size_t offset = 1;
                     auto next = [&] {
@@ -235,13 +313,15 @@ export namespace jni {
                         // arrays and strings are not automatically copied to C buffers.
                         detail.parameter_mapping.push_back({from, to, std::string{value.reference ? "pointer" : "identity"}, {}, std::move(value)});
                     };
-                    std::uint64_t at = 0;
-                    while (offset < descriptor.size() && descriptor[offset] != ')') {
-                        mapping(next(), {std::string{"parameter"}, at}, {std::string{"parameter"}, at + 2});
-                        ++at;
+                    if (!source) {
+                        std::uint64_t at = 0;
+                        while (offset < descriptor.size() && descriptor[offset] != ')') {
+                            mapping(next(), {std::string{"parameter"}, at}, {std::string{"parameter"}, at + 2});
+                            ++at;
+                        }
+                        ++offset;
+                        mapping(next(), {std::string{"return_value"}}, {std::string{"return_value"}});
                     }
-                    ++offset;
-                    mapping(next(), {std::string{"return_value"}}, {std::string{"return_value"}});
                     out.relations.push_back({.id = id + ":" + target.symbol->id,
                                              .kind = std::string{"binds"},
                                              .ownership = owner,
@@ -310,16 +390,16 @@ export namespace jni {
                     for (const auto& symbol : object->data->symbols)
                         if (symbol.domain == "jvm" && std::ranges::contains(symbol.modifiers, "native"))
                             groups.insert({object->data->unit.recipe.unit.project, symbol.module});
+                        else if (source_declaration(symbol))
+                            groups.insert({.project = object->data->unit.recipe.unit.project, .module = symbol.module, .source = true});
             const auto managed_groups = groups;
             for (const auto& group : managed_groups) {
-                semantic::record_selection native;
-                if (const auto found = config_.libraries.find(group.module); found != config_.libraries.end())
-                    native.modules = found->second;
-                if (native.modules.empty())
+                const auto native = selection(group);
+                if (!group.source && native.modules.empty())
                     continue;
                 if (const auto objects = installed_.source_facts.find("native"); objects != installed_.source_facts.end())
                     for (const auto& object : objects->second)
-                        if (channels::selects(object->data->unit, native)) {
+                        if (artifact(object->data->unit) != group.source && channels::selects(object->data->unit, native)) {
                             auto selected = group;
                             selected.native = object->data->unit.id;
                             groups.insert(std::move(selected));
@@ -333,26 +413,27 @@ export namespace jni {
         auto do_evaluate(const language::evaluation_request& request) -> coroutine::task<language::evaluated_unit> override {
             const auto selected = rfl::json::read<group>(request.unit.name).value();
             semantic::record_selection managed{.projects = {selected.project}, .modules = {selected.module}};
-            semantic::record_selection native;
-            if (const auto libraries = config_.libraries.find(selected.module); libraries != config_.libraries.end())
-                native.modules = libraries->second;
+            const auto native = this->selection(selected);
             std::vector<const semantic::shard*> shards;
             std::vector<semantic::dependency> reads;
             std::vector<const semantic::unit*> native_units;
             for (const std::string port : {"managed", "native"}) {
-                if (port == "native" && native.modules.empty())
+                if (port == "native" && !selected.source && native.modules.empty())
                     continue;
                 const auto& selection = port == "managed" ? managed : native;
                 std::vector<const semantic::unit*> units;
                 if (const auto objects = installed_.source_facts.find(port); objects != installed_.source_facts.end())
                     for (const auto& object : objects->second) {
+                        // Artifact and source natives may share a port; each group reads its own kind.
+                        if (port == "native" && artifact(object->data->unit) == selected.source)
+                            continue;
                         units.push_back(&object->data->unit);
                         if (channels::selects(object->data->unit, selection))
                             shards.push_back(object->data.get());
                     }
                 // Keep the complete selected membership, including an empty
                 // lookup. A new export in a configured library must invalidate it.
-                reads.push_back(channels::collection(state_.project, port, units, port == "native" ? "exports" : "linkage", selection));
+                reads.push_back(channels::collection(state_.project, port, units, port == "native" && !selected.source ? "exports" : "linkage", selection));
                 if (port == "native")
                     native_units = std::move(units);
             }
@@ -377,6 +458,16 @@ export namespace jni {
         }
 
     private:
+        // The native units a group reads: its configured libraries, or the
+        // C++ sources of its own project.
+        auto selection(const group& value) const -> semantic::record_selection {
+            semantic::record_selection out;
+            if (value.source)
+                out.projects = {value.project};
+            else if (const auto found = config_.libraries.find(value.module); found != config_.libraries.end())
+                out.modules = found->second;
+            return out;
+        }
         options config_;
     };
 } // namespace jni

@@ -24,7 +24,7 @@ export namespace language {
                      .projections = {std::string{"symbols"}},
                      .symbol_extensions = std::vector<std::string>{"native.linkage_name", "native.jni_registrations"}},
                     {.name = "relations", .projections = {std::string{"relations"}}},
-                    {.name = "linkage", .projections = {std::string{"symbols"}, std::string{"types"}, std::string{"occurrences"}}}};
+                    linkage_channel()};
         }
         using adapter = native_artifact::reader;
         struct options {

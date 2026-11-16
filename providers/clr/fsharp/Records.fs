@@ -227,6 +227,21 @@ module Records =
                                                                        "fsharp.in", flag value.IsInArg; "fsharp.out", flag value.IsOutArg]]
                         value.Name |> Option.iter (fun name -> parameter["name"] <- text name)
                         parameter)) |> Seq.concat |> array
+                // A DllImport extern binds by library and entry point, as the compiled P/Invoke row does.
+                value.Attributes
+                |> Seq.tryFind (fun attribute -> attribute.AttributeType.TryFullName = Some "System.Runtime.InteropServices.DllImportAttribute")
+                |> Option.iter (fun attribute ->
+                    let named key = attribute.NamedArguments |> Seq.tryPick (fun (_, name, _, argument) -> if name = key then Some argument else None)
+                    modifiers.Add "pinvoke"
+                    extensions["clr.pinvoke.library"] <- text (attribute.ConstructorArguments |> Seq.tryHead |> Option.map (snd >> string) |> Option.defaultValue "")
+                    extensions["clr.pinvoke.entry_point"] <- text (named "EntryPoint" |> Option.map string |> Option.defaultValue value.CompiledName)
+                    extensions["clr.pinvoke.convention"] <- text (
+                        match named "CallingConvention" |> Option.map System.Convert.ToInt32 with
+                        | Some 2 -> "cdecl"
+                        | Some 3 -> "stdcall"
+                        | Some 4 -> "thiscall"
+                        | Some 5 -> "fastcall"
+                        | _ -> "platform"))
                 value.LiteralValue |> Option.iter (fun value ->
                     modifiers.Add "literal"
                     extensions["fsharp.constant_value"] <- if isNull value then null else System.Text.Json.JsonSerializer.SerializeToNode(value, value.GetType()))

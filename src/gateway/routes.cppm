@@ -348,7 +348,7 @@ namespace front {
                     throw coded_error(400, nodes::code::invalid_record, in.error().what());
                 if (in->action.starts_with("scope_") || in->action.starts_with("task_") || !in->task_id.empty() || !in->run_id.empty() ||
                     !in->execution_token.empty() || !in->execution_identity.empty() || !in->execution_owner.empty() || !in->analyzed_scopes.empty() ||
-                    !in->scope_refs.empty() || !in->scope_files.empty() || !in->scope_entries.empty())
+                    !in->body_ranges.empty() || !in->scope_refs.empty() || !in->scope_files.empty() || !in->scope_entries.empty())
                     throw coded_error(403, nodes::code::permission_denied, "task and scope coordination require their typed tools");
                 in->caller_operation.clear();
                 auto reply = co_await c.files.node(c.core, p[0], *in, *c.who, in->action == "receipt");

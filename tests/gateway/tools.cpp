@@ -103,6 +103,36 @@ namespace {
                 expect(binary.data_base64 == "AP8=" && binary.size == 2u && !binary.text);
                 expect(throws<tools::tool_error>([&] { tools::worldline::render_read(file, 0, 1, 32); }));
             };
+            "replace finds its old text once within the window and edits by Unicode scalar"_test = [] {
+                nodes::node_reply observed;
+                observed.files.push_back({.path = "f", .kind = std::string{"text"}, .text = "é{ret 1}\né{ret 1}\n"});
+                const std::map<std::string, semantic::place> located{{"second", {"f", 9, 18}}, {"elsewhere", {"g", 0, 1}}};
+                auto edits = [&](std::string_view changes) {
+                    return tools::edits_of(rfl::json::read<std::vector<tools::change>>(changes).value(), observed, {}, located);
+                };
+                auto scoped = edits(R"([{"kind":"replace","path":"f","old_text":"ret 1","new_text":"ret 2","scope":"second"}])");
+                expect(fatal(scoped.size() == 1u));
+                expect(scoped[0].kind == "edit" && scoped[0].offset == 11u && scoped[0].count == 5u && scoped[0].text == "ret 2");
+                auto windowed = edits(R"([{"kind":"replace","path":"f","old_text":"ret 1","new_text":"","offset":0,"count":9}])");
+                expect(windowed[0].offset == 2u && windowed[0].count == 5u);
+                expect(edits(R"([{"kind":"replace","path":"f","old_text":"é","new_text":"e","offset":9}])")[0].offset == 9u);
+                auto refused = [&](std::string_view changes, std::string_view reason) {
+                    try {
+                        edits(changes);
+                    } catch (const tools::tool_error& e) {
+                        return std::string_view{e.what()}.contains(reason);
+                    }
+                    return false;
+                };
+                expect(refused(R"([{"kind":"replace","path":"f","old_text":"ret 1","new_text":"x"}])", "more than once"));
+                expect(refused(R"([{"kind":"replace","path":"f","old_text":"ret 9","new_text":"x"}])", "does not occur"));
+                expect(refused(R"([{"kind":"replace","path":"f","old_text":"ret 1","new_text":"x","offset":0,"count":4}])", "does not occur"));
+                expect(refused(R"([{"kind":"replace","path":"f","old_text":"","new_text":"x"}])", "non-empty"));
+                expect(refused(R"([{"kind":"replace","path":"f","old_text":"ret","new_text":"x","scope":"elsewhere"}])", "is in g"));
+                expect(refused(R"([{"kind":"replace","path":"f","old_text":"ret","new_text":"x","scope":"unknown"}])", "resolved"));
+                expect(refused(R"([{"kind":"replace","path":"f","old_text":"ret","new_text":"x","scope":"second","offset":0}])", "not both"));
+                expect(refused(R"([{"kind":"replace","path":"absent","old_text":"ret","new_text":"x"}])", "not a text file"));
+            };
             "preparation errors retain a bounded diagnostic tail"_test = [] {
                 jobs::build_report report;
                 report.steps.push_back({.name = "configure", .exit_code = 2, .output = std::string(5000, 'x') + "missing compiler"});

@@ -705,11 +705,37 @@ The agent loop uses the execution credential on `/mcp`:
    `source_conflict`; a moved target head returns `stale_frontier`. Scope leases,
    publication policy, quotas and receipt recovery apply. The source history is
    not added to the target's parents.
-3. `language` with `action: "scopes"` returns scope IDs, hierarchy, Unicode
-   scalar ranges `[begin,end)` and opaque `reference` values. A reference binds
-   one analysis configuration, source version, worldline, file identity and range;
-   it expires after 600 seconds. IDs alone do not identify a lockable range.
-4. `scope` with `action: "acquire"`, `scopes: [reference, ...]` and `operation_id`
+3. `language` with `inspect` or `definitions` returns each definition's body
+   text and registers its body range, and any returned source scopes, with
+   source. `action: "scopes"` (or `include: ["scope"]`) also returns scope IDs,
+   hierarchy, Unicode scalar ranges `[begin,end)` and opaque `reference`
+   values. A reference binds one analysis configuration, source version,
+   worldline, file identity and range, keeps the characters around that range,
+   and expires after 600 seconds; analyzing the same text again refreshes it.
+   IDs alone do not identify a lockable range.
+4. Submit `worldline` `apply` with `observed`, `operation_id` and range edits
+   (`kind: "edit"`, `offset`, `count`, `text`). Offsets count Unicode scalars
+   in `observed`. A `kind: "replace"` change names `old_text` and `new_text`
+   instead; the gateway finds `old_text` in the observed file and sends the
+   matching range edit. It must occur exactly once in the search window: the
+   whole file, the scalars from `offset` for `count`, or the structure a
+   `scope` reference from `language` names, located in `observed` through its
+   anchors. Zero or several matches fail with `invalid_record` and nothing is
+   written. Without `leases`, source locks each text edit for its caller
+   (the run, or the account and client) after the write: the lease covers the
+   smallest registered scope that encloses the edit, skipping translation
+   units, modules and namespaces, or only the edited characters when no scope
+   encloses it or another caller holds part of that scope. Later edits by the
+   same caller renew it for 120 seconds; `task(stop)`, `task(close)` or expiry
+   releases it. Another caller whose edit touches the locked range or its
+   boundary characters receives `scope_conflict` naming the scope, its holder
+   and its expiry. Whole-file changes take no implicit lease but are checked
+   against other callers' leases. The reply's `reach` is `body_only` when
+   every change edits text inside a registered function body, so local
+   diagnostics suffice; otherwise it is `declaration_touched`, and
+   `language(impact, changes: ["declaration"])` finds the affected callers.
+5. An orchestrator that divides work before dispatching it uses `scope` with
+   `action: "acquire"`, `scopes: [reference, ...]` and `operation_id`. It
    acquires the whole set atomically and returns `leases`. Source resolves the
    references; callers cannot supply coordinates. For whole-file changes use
    `files: [path, ...]`; for creation or path changes use `entries: [path, ...]`.
@@ -718,14 +744,11 @@ The agent loop uses the execution credential on `/mcp`:
    including move destinations. Resource lists may accompany scope references.
    Overlap within one worldline returns `scope_conflict` immediately, with no
    partially acquired set. References must describe the current version;
-   `scope_stale` means query the current source/scopes again.
-5. Submit `worldline` `apply` with `observed`, `operation_id`, `leases: [token]`
-   and range edits (`kind: "edit"`, `offset`, `count`, `text`). Offsets count
-   Unicode scalars in `observed`. An edit must stay inside its held scope;
-   whole-file replacement requires a lease covering the whole file. Other
-   callers cannot edit leased ranges or their boundary anchors. Unleased,
-   disjoint work remains possible. Renew the lease while working and release
-   it when finished. Defaults are 120 seconds, with a maximum of 600 seconds.
+   `scope_stale` means query the current source/scopes again. An apply that
+   passes `leases: [token]` must stay inside the held scopes; whole-file
+   replacement requires a lease covering the whole file. A caller's own leases
+   never refuse its edits. Renew the lease while working and release it when
+   finished. Defaults are 120 seconds, with a maximum of 600 seconds.
    Renewing never changes the protected region. Replaying an acquisition after
    any token has expired or been released returns `scope_expired`; a new
    acquisition requires a new operation ID.
@@ -745,8 +768,9 @@ without invalidating its lease. Lease ranges returned by `scope` are relative
 to that response's current version. A lease whose anchors disappeared is
 invalid and must be released before acquiring a fresh analyzed range. Leases
 survive source restarts until expiry; a missing/expired token returns
-`scope_expired`. History-changing operations require leases on that worldline
-to be released first. Forking remains available. A changed input after a
+`scope_expired`. History-changing operations require other callers' explicit
+leases on that worldline to be released first; implicit leases guard only text
+edits. Forking remains available. A changed input after a
 refused operation uses a new operation ID.
 
 Leases live in local coordination metadata, outside worldline history, source
@@ -1197,6 +1221,22 @@ including Unicode escaping and overloaded descriptors, and records the implicit
 environment and receiver/class slots. Competing exports remain candidates.
 Static exports and resolved `RegisterNatives` tables can bind JVM methods;
 registration-table evidence can select a local native target without an export.
+
+Both resolvers also bind source declarations before anything is compiled. Wire
+Kotlin or F# source facts to `managed` and clice facts to `native`; the source
+providers publish a `linkage` channel for this. A Kotlin `external` function
+binds to a C++ function definition in the same project named by its JNI short
+name, or else by one of its long names; the JVM class comes from the
+declaration's package and classes, and a top-level function belongs to the
+`<File>Kt` facade. `@file:JvmName`, `@JvmName` and `@JvmStatic` are not
+followed; such declarations bind through their artifacts. An F#
+`[<DllImport>]` function binds to a C++ definition at namespace scope whose name
+is its entry point. Source bindings use the `source` library selection strategy,
+need no `libraries` mapping, and have no artifact candidates or descriptor
+parameter slots. A declaration without a source definition is skipped without
+a diagnostic, since its native function may come from a prebuilt library;
+competing definitions remain candidates. Artifact bindings are evaluated
+separately and stay unchanged.
 
 Project `analysis_defaults`, profile `defaults`, then stage `execution` supply
 execution settings in that order. `fact_limit` and `relation_depth` control the

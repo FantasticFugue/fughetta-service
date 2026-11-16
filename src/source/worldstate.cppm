@@ -480,6 +480,13 @@ namespace nodes {
         interrupt_at("before_commit");
         check_execution(in);
         check_scope_leases(in, prior);
+        if (in.action == "apply") {
+            out.reach = claim_scopes(in, heads);
+            statement reach{*db, "UPDATE receipts SET reach=?1 WHERE id=?2"};
+            reach.text(1, out.reach);
+            reach.text(2, out.receipt);
+            reach.next();
+        }
         tx.commit();
         dirty = false;
         interrupt_at("after_commit");

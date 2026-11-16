@@ -282,6 +282,11 @@ export namespace language {
                  .projections = {std::string{"definition_bodies"}},
                  .symbol_kinds = {std::string{"function"}, std::string{"method"}, std::string{"constructor"}, std::string{"destructor"}}}};
     }
+    // The symbols, types and occurrences a binding resolver reads from one unit.
+    // Source providers whose declarations bind across languages publish it too.
+    inline auto linkage_channel() -> semantic::channel_definition {
+        return {.name = "linkage", .projections = {std::string{"symbols"}, std::string{"types"}, std::string{"occurrences"}}};
+    }
     template <class Provider> auto operations() -> std::vector<std::string> {
         if constexpr (requires { Provider::operations; })
             return {Provider::operations.begin(), Provider::operations.end()};

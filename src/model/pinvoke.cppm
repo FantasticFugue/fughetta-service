@@ -12,6 +12,8 @@ export namespace pinvoke {
     class resolver;
     struct group {
         std::string project, module, library, native;
+        // F# source declarations bound to C++ source definitions, before any artifact exists.
+        bool source = false;
         auto operator<=>(const group&) const = default;
     };
     struct options {
@@ -23,6 +25,17 @@ export namespace pinvoke {
         auto found = symbol.extensions.find(key);
         return found == symbol.extensions.end() ? "" : rfl::from_generic<std::string>(found->second).value();
     }
+    inline auto source_declaration(const semantic::records::symbol& symbol) {
+        return symbol.domain == "fsharp" && std::ranges::contains(symbol.modifiers, "pinvoke");
+    }
+    // A C++ function at namespace scope; extern "C" is not in clice's records,
+    // so the entry point matches by its unqualified spelling.
+    inline auto source_definition(const semantic::records::symbol& symbol) {
+        return symbol.domain == "source" && symbol.language == "cpp" && symbol.kind == "function" &&
+               (symbol.qualified_name == symbol.name || symbol.qualified_name == "::" + symbol.name);
+    }
+    // An artifact unit publishes its exports; a source unit does not.
+    inline auto artifact(const semantic::unit& unit) { return std::ranges::contains(unit.output_channels, std::string{"exports"}, &semantic::channel::name); }
     inline auto resolve(const semantic::recipe& recipe, const options& config, const std::vector<const semantic::shard*>& inputs,
                         const std::optional<group>& selected_group = {}) -> semantic::shard {
         semantic::shard out;
@@ -35,13 +48,21 @@ export namespace pinvoke {
             const semantic::shard* shard;
             const semantic::records::symbol* symbol;
             semantic::artifact_location location;
+            bool source = false;
         };
         std::unordered_map<const semantic::shard*, semantic::record_lookup> lookups;
         for (const auto* shard : inputs)
             lookups.try_emplace(shard, *shard);
         std::map<std::pair<std::string, std::string>, std::vector<target>> exports;
+        std::map<std::string, std::vector<target>> definitions;
         for (const auto* shard : inputs) {
             for (const auto& symbol : shard->symbols) {
+                if (source_definition(symbol)) {
+                    if (std::ranges::any_of(lookups.at(shard).positions(symbol.id),
+                                            [](const auto* occurrence) { return std::ranges::contains(occurrence->roles, std::string{"definition"}); }))
+                        definitions[symbol.name].push_back({shard, &symbol, {}, true});
+                    continue;
+                }
                 if (symbol.domain != "native" || !std::ranges::contains(symbol.modifiers, "export"))
                     continue;
                 for (const auto* occurrence : lookups.at(shard).positions(symbol.id))
@@ -60,34 +81,44 @@ export namespace pinvoke {
         };
         for (const auto* shard : inputs)
             for (const auto& symbol : shard->symbols) {
-                if (symbol.domain != "clr" || !std::ranges::contains(symbol.modifiers, "pinvoke"))
+                const bool source = source_declaration(symbol);
+                if (!source && (symbol.domain != "clr" || !std::ranges::contains(symbol.modifiers, "pinvoke")))
                     continue;
                 if (selected_group && (shard->unit.recipe.unit.project != selected_group->project || symbol.module != selected_group->module ||
-                                       property(symbol, "clr.pinvoke.library") != selected_group->library))
+                                       property(symbol, "clr.pinvoke.library") != selected_group->library || selected_group->source != source))
                     continue;
                 const auto library = property(symbol, "clr.pinvoke.library"), entry = property(symbol, "clr.pinvoke.entry_point");
                 const auto selected = config.libraries.find(library);
-                semantic::records::library_selection selection{.name = library, .strategy = std::string{"exact"}};
+                semantic::records::library_selection selection{.name = library, .strategy = std::string{source ? "source" : "exact"}};
                 std::vector<target> targets;
-                if (selected != config.libraries.end()) {
+                if (source) {
+                    if (auto found = definitions.find(entry); found != definitions.end())
+                        targets = found->second;
+                } else if (selected != config.libraries.end()) {
                     if (auto found = exports.find({selected->second, entry}); found != exports.end())
                         targets = found->second;
                 }
-                for (const auto& target : targets)
-                    selection.candidates.push_back(target.location);
+                // A source definition has no artifact location to select.
+                if (!source)
+                    for (const auto& target : targets)
+                        selection.candidates.push_back(target.location);
+                // Source binding is opportunistic: the native function may come
+                // from a prebuilt library, so only ambiguity is reported.
+                if (source && targets.empty())
+                    continue;
                 const auto occurrences = lookups.at(shard).positions(symbol.id);
                 const auto location = occurrences.empty() ? semantic::locator{} : occurrences.front()->location;
                 const semantic::ownership owner{out.unit.id, out.unit.context, {.provider = "pinvoke", .kind = std::string{"resolver"}, .location = location}};
                 const auto id = out.unit.id + ":" + symbol.id;
-                if (targets.size() == 1)
+                if (targets.size() == 1 && !source)
                     selection.selected = targets.front().location;
                 if (targets.size() != 1 && (!selected_group || selected_group->native.empty())) {
                     ++out.unit.coverage.unresolved_count;
                     out.diagnostics.push_back({.id = id,
                                                .producer = "pinvoke",
-                                               .code = selected == config.libraries.end() ? "library_unmapped"
-                                                       : targets.empty()                  ? "entry_missing"
-                                                                                          : "entry_ambiguous",
+                                               .code = !source && selected == config.libraries.end() ? "library_unmapped"
+                                                       : targets.empty()                             ? "entry_missing"
+                                                                                                     : "entry_ambiguous",
                                                .severity = "warning",
                                                .message = "P/Invoke " + library + "!" + entry + " requires one native export",
                                                .ownership = owner,
@@ -233,16 +264,19 @@ export namespace pinvoke {
                     for (const auto& symbol : object->data->symbols)
                         if (symbol.domain == "clr" && std::ranges::contains(symbol.modifiers, "pinvoke"))
                             groups.insert({object->data->unit.recipe.unit.project, symbol.module, property(symbol, "clr.pinvoke.library")});
+                        else if (source_declaration(symbol))
+                            groups.insert({.project = object->data->unit.recipe.unit.project,
+                                           .module = symbol.module,
+                                           .library = property(symbol, "clr.pinvoke.library"),
+                                           .source = true});
             const auto managed_groups = groups;
             for (const auto& group : managed_groups) {
-                semantic::record_selection native;
-                if (const auto found = config_.libraries.find(group.library); found != config_.libraries.end())
-                    native.modules = {found->second};
-                if (native.modules.empty())
+                const auto native = selection(group);
+                if (!group.source && native.modules.empty())
                     continue;
                 if (const auto objects = installed_.source_facts.find("native"); objects != installed_.source_facts.end())
                     for (const auto& object : objects->second)
-                        if (channels::selects(object->data->unit, native)) {
+                        if (artifact(object->data->unit) != group.source && channels::selects(object->data->unit, native)) {
                             auto selected = group;
                             selected.native = object->data->unit.id;
                             groups.insert(std::move(selected));
@@ -256,26 +290,27 @@ export namespace pinvoke {
         auto do_evaluate(const language::evaluation_request& request) -> coroutine::task<language::evaluated_unit> override {
             const auto selected = rfl::json::read<group>(request.unit.name).value();
             semantic::record_selection managed{.projects = {selected.project}, .modules = {selected.module}};
-            semantic::record_selection native;
-            if (const auto library = config_.libraries.find(selected.library); library != config_.libraries.end())
-                native.modules.push_back(library->second);
+            const auto native = this->selection(selected);
             std::vector<const semantic::shard*> shards;
             std::vector<semantic::dependency> reads;
             std::vector<const semantic::unit*> native_units;
             for (const std::string port : {"managed", "native"}) {
-                if (port == "native" && native.modules.empty())
+                if (port == "native" && !selected.source && native.modules.empty())
                     continue;
                 const auto& selection = port == "managed" ? managed : native;
                 std::vector<const semantic::unit*> units;
                 if (const auto objects = installed_.source_facts.find(port); objects != installed_.source_facts.end())
                     for (const auto& object : objects->second) {
+                        // Artifact and source natives may share a port; each group reads its own kind.
+                        if (port == "native" && artifact(object->data->unit) == selected.source)
+                            continue;
                         units.push_back(&object->data->unit);
                         if (channels::selects(object->data->unit, selection))
                             shards.push_back(object->data.get());
                     }
                 // Keep the complete selected membership, including an empty
                 // lookup. A new export in a configured library must invalidate it.
-                reads.push_back(channels::collection(state_.project, port, units, port == "native" ? "exports" : "linkage", selection));
+                reads.push_back(channels::collection(state_.project, port, units, port == "native" && !selected.source ? "exports" : "linkage", selection));
                 if (port == "native")
                     native_units = std::move(units);
             }
@@ -300,6 +335,16 @@ export namespace pinvoke {
         }
 
     private:
+        // The native units a group reads: its configured library, or the C++
+        // sources of its own project.
+        auto selection(const group& value) const -> semantic::record_selection {
+            semantic::record_selection out;
+            if (value.source)
+                out.projects = {value.project};
+            else if (const auto found = config_.libraries.find(value.library); found != config_.libraries.end())
+                out.modules = {found->second};
+            return out;
+        }
         options config_;
     };
 } // namespace pinvoke

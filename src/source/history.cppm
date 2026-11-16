@@ -609,7 +609,7 @@ namespace nodes {
             out.references.push_back(*record);
             return out;
         }
-        statement row{*db, "SELECT operation,caller_operation,worldline,result,prior,frontier,version,base_version FROM receipts WHERE id=?1"};
+        statement row{*db, "SELECT operation,caller_operation,worldline,result,prior,frontier,version,base_version,reach FROM receipts WHERE id=?1"};
         row.text(1, id);
         if (!row.next())
             fail(nodes::code::outcome_unknown, "original receipt has not been committed");
@@ -618,6 +618,7 @@ namespace nodes {
         out.version = row.data(6);
         out.base_version = row.data(7);
         out.worldline = row.data(2);
+        out.reach = row.data(8);
         for (const auto& event : out.frontier) {
             const auto& batch = get(event);
             if (batch.at("kind").text() != "batch" || batch.at("operation").text() != row.data(0) || batch.at("author").text() != writer)

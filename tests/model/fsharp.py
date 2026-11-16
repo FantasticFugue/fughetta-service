@@ -46,6 +46,12 @@ module Features =
     let speed (distance: float<kg>) (elapsed: float<second>) = distance / elapsed
     let (|Even|Odd|) (value: int) = if value % 2 = 0 then Even else Odd
     let classify value = match value with Even -> 1 | Odd -> 0
+module Interop =
+    open System.Runtime.InteropServices
+    [<DllImport("native", EntryPoint = "add_numbers", CallingConvention = CallingConvention.Cdecl)>]
+    extern int add(int left, int right)
+    [<DllImport("native")>]
+    extern void reset()
 """
     put(root, "Library.fs", library)
     put(root, "App.fs", consumer)
@@ -167,6 +173,12 @@ module Features =
             assert field["extensions"]["fsharp.variant"] == variant and field["extensions"]["fsharp.sequence"] == sequence
             assert field["extensions"]["fsharp.declaring_entity"] == shape["native_key"]["native_key"]
         assert all(symbol["extensions"]["fsharp.assembly"] == "App" for symbol in before["symbols"])
+        imported, reset = named("add"), named("reset")
+        assert "pinvoke" in imported["modifiers"] and "pinvoke" in reset["modifiers"]
+        assert {key: imported["extensions"][key] for key in ("clr.pinvoke.library", "clr.pinvoke.entry_point", "clr.pinvoke.convention")} == \
+            {"clr.pinvoke.library": "native", "clr.pinvoke.entry_point": "add_numbers", "clr.pinvoke.convention": "cdecl"}
+        assert reset["extensions"]["clr.pinvoke.entry_point"] == "reset" and reset["extensions"]["clr.pinvoke.convention"] == "platform"
+        assert "pinvoke" not in named("curried")["modifiers"]
         model_path = root / "model/model.json"
         original_model = model_path.read_text()
         missing_reference_model = json.loads(original_model)

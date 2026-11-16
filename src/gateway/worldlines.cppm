@@ -221,18 +221,34 @@ export namespace tools {
     }
 
     struct change {
-        rfl::Description<"edit, write, create, remove, move or mode", std::string> kind;
+        rfl::Description<"edit, replace, write, create, remove, move or mode", std::string> kind;
         rfl::Description<"Path relative to the project root", std::string> path;
-        rfl::Description<"edit: first Unicode scalar to replace, in the observed version", std::optional<std::uint64_t>> offset;
-        rfl::Description<"edit: number of Unicode scalars to replace (0 inserts)", std::optional<std::uint64_t>> count;
+        rfl::Description<"edit: first Unicode scalar to replace, in the observed version; replace: first scalar of the search window",
+                         std::optional<std::uint64_t>>
+            offset;
+        rfl::Description<"edit: number of Unicode scalars to replace (0 inserts); replace: length of the search window", std::optional<std::uint64_t>> count;
+        rfl::Description<"replace: text that occurs exactly once in the window", std::optional<std::string>> old_text;
+        rfl::Description<"replace: its replacement", std::optional<std::string>> new_text;
+        rfl::Description<"replace: a scope reference from language; the window is that structure in the observed version", std::optional<std::string>> scope;
         rfl::Description<"edit/write/create: new text", std::optional<std::string>> text;
         rfl::Description<"write/create: new bytes, base64", std::optional<std::string>> data_base64;
         rfl::Description<"create/mode: executable flag", std::optional<bool>> executable;
         rfl::Description<"move: new path", std::optional<std::string>> destination;
     };
 
+    // The byte where a text's scalar at `scalar` begins, or its size past the end.
+    auto byte_of(std::string_view text, std::uint64_t scalar) -> std::size_t {
+        std::size_t at = 0;
+        for (; at < text.size(); ++at)
+            if ((static_cast<unsigned char>(text[at]) & 0xC0) != 0x80 && scalar-- == 0)
+                return at;
+        return text.size();
+    }
+
     // Engine edits for one batch. A whole new content is checked against the file limit here; the node checks the state it publishes.
-    auto edits_of(const std::vector<change>& changes, const nodes::node_reply& observed, const config::effective_limits& limits) -> std::vector<nodes::edit> {
+    // `located` holds the observed range of each scope a replace names.
+    auto edits_of(const std::vector<change>& changes, const nodes::node_reply& observed, const config::effective_limits& limits,
+                  const std::map<std::string, semantic::place>& located = {}) -> std::vector<nodes::edit> {
         std::map<std::string, const nodes::file_view*> files;
         for (auto& f : observed.files)
             files.emplace(f.path, &f);
@@ -254,6 +270,39 @@ export namespace tools {
                     throw tool_error(nodes::code::invalid_record, "an edit names offset and text");
                 out.push_back(
                     {.kind = std::string{"edit"}, .path = path, .text = *c.text.value(), .offset = *c.offset.value(), .count = c.count.value().value_or(0)});
+            } else if (kind == "replace") {
+                if (!c.old_text.value() || c.old_text.value()->empty() || !c.new_text.value())
+                    throw tool_error(nodes::code::invalid_record, "a replace names a non-empty old_text and new_text");
+                if (c.scope.value() && (c.offset.value() || c.count.value()))
+                    throw tool_error(nodes::code::invalid_record, "a replace window is a scope or offset and count, not both");
+                if (found == files.end() || found->second->kind != "text")
+                    throw tool_error(nodes::code::invalid_record, path + " is not a text file in the observed version");
+                const std::string_view text = found->second->text;
+                std::uint64_t first = c.offset.value().value_or(0), last = std::numeric_limits<std::uint64_t>::max();
+                if (c.count.value())
+                    last = first + std::min(*c.count.value(), last - first);
+                if (c.scope.value()) {
+                    auto range = located.find(*c.scope.value());
+                    if (range == located.end())
+                        throw tool_error(nodes::code::invalid_record, "replace scopes are resolved by worldline apply");
+                    if (range->second.path != path)
+                        throw tool_error(nodes::code::invalid_record, "scope " + *c.scope.value() + " is in " + range->second.path + ", not " + path);
+                    first = range->second.begin;
+                    last = range->second.end;
+                }
+                const auto begin = byte_of(text, first), end = std::max(begin, byte_of(text, last));
+                const std::string_view window = text.substr(begin, end - begin), needle = *c.old_text.value();
+                auto at = window.find(needle);
+                if (at == std::string_view::npos)
+                    throw tool_error(nodes::code::invalid_record, "old_text does not occur in the window of " + path);
+                if (window.find(needle, at + 1) != std::string_view::npos)
+                    throw tool_error(nodes::code::invalid_record,
+                                     "old_text occurs more than once in the window of " + path + "; narrow it with scope or offset");
+                out.push_back({.kind = std::string{"edit"},
+                               .path = path,
+                               .text = *c.new_text.value(),
+                               .offset = lines::scalars(text.substr(0, begin + at)),
+                               .count = lines::scalars(needle)});
             } else if (kind == "write" || kind == "create") {
                 auto bytes = content();
                 bool text = lines::textual(bytes);
@@ -338,8 +387,11 @@ export namespace tools {
 
     struct worldline
         : tool<"worldline", "Work in an explicit worldline: list, inspect, read, compare, diff, promote, fork, apply, receipt, history, reverse or redo. "
-                            "Concurrent edits within a worldline converge; worldlines never merge. Writes name the observed version and "
-                            "use Unicode scalar offsets. Repeat an operation_id with identical input to recover its recorded result."> {
+                            "Concurrent edits within a worldline converge; worldlines never merge. Writes name the observed version; "
+                            "a replace change swaps old_text, unique within the file, an offset window or a language scope reference, "
+                            "for new_text without offsets. An apply without leases locks the smallest enclosing scope the language tool returned "
+                            "(else the edited text) for the caller and reports reach: body_only or declaration_touched. "
+                            "Repeat an operation_id with identical input to recover its recorded result."> {
         struct input {
             rfl::Description<"Project; supplied by the execution context when absent", std::optional<std::string>> project;
             rfl::Description<"list, inspect, read, compare, diff, promote, fork, apply, receipt, history, contribution, reference, references, "
@@ -353,7 +405,8 @@ export namespace tools {
             rfl::Description<"read: first Unicode scalar to return in a text file", std::optional<std::uint64_t>> offset;
             rfl::Description<"read: Unicode scalars to return; bounded by the project read_max_bytes", std::optional<std::uint64_t>> count;
             rfl::Description<"read: omit content when this digest is unchanged", std::optional<std::string>> known_digest;
-            rfl::Description<"apply/promote/reverse/redo: held scope lease tokens; an expired token refuses the write", std::optional<std::vector<std::string>>>
+            rfl::Description<"apply/promote/reverse/redo: explicit scope lease tokens that must cover the edits; omit them to lock implicitly",
+                             std::optional<std::vector<std::string>>>
                 leases;
             rfl::Description<"read: file path", std::optional<std::string>> path;
             rfl::Description<"fork/restore: name of the new worldline", std::optional<std::string>> name;
@@ -393,6 +446,9 @@ export namespace tools {
         };
         struct output {
             std::optional<std::string> worldline, version, written_version, base_version, path, digest, kind, data_base64, receipt, operation_id, text;
+            // apply: body_only when every change edits text inside a function body the language tool returned,
+            // else declaration_touched; absent on a replay.
+            std::optional<std::string> reach;
             std::optional<std::uint64_t> size, offset, count, total_scalars, next_offset;
             std::optional<bool> executable, replayed, truncated, unchanged;
             std::optional<std::vector<line_entry>> worldlines;
@@ -641,13 +697,26 @@ export namespace tools {
                 if (!in.observed.value())
                     throw tool_error(nodes::code::invalid_record, action + " names the version it observed");
                 auto observed = co_await node_call(s, project, {.action = "head", .worldline = line, .revision = *in.observed.value()}, actor, true);
-                std::set<std::string> loaded;
-                for (const auto& change : in.changes.value().value_or(std::vector<change>{}))
-                    if ((change.kind.value() == "edit" || change.kind.value() == "write") && loaded.insert(change.path.value()).second) {
+                std::set<std::string> loaded, scopes;
+                for (const auto& change : in.changes.value().value_or(std::vector<change>{})) {
+                    const auto& kind = change.kind.value();
+                    if ((kind == "edit" || kind == "replace" || kind == "write") && loaded.insert(change.path.value()).second) {
                         auto file = co_await node_call(
                             s, project, {.action = "read", .worldline = line, .revision = observed.version, .target = change.path.value()}, actor, true);
                         observed.files.insert(observed.files.end(), file.files.begin(), file.files.end());
                     }
+                    if (kind == "replace" && change.scope.value())
+                        scopes.insert(*change.scope.value());
+                }
+                std::map<std::string, semantic::place> located;
+                if (!scopes.empty())
+                    located = (co_await node_call(s, project,
+                                                  {.action = "scope_locate",
+                                                   .worldline = line,
+                                                   .revision = observed.version,
+                                                   .scope_refs = std::vector<std::string>{scopes.begin(), scopes.end()}},
+                                                  actor, true))
+                                  .located;
                 nodes::node_request request{.action = action,
                                             .worldline = line,
                                             .leases = in.leases.value().value_or(std::vector<std::string>{}),
@@ -658,7 +727,7 @@ export namespace tools {
                                             .intent = in.intent.value().value_or("")};
                 if (action == "apply") {
                     auto limits = config::resolve(*s.snapshot(), project).limits;
-                    request.edits = edits_of(in.changes.value().value_or(std::vector<change>{}), observed, limits);
+                    request.edits = edits_of(in.changes.value().value_or(std::vector<change>{}), observed, limits, located);
                     if (request.edits.empty())
                         throw tool_error(nodes::code::invalid_record, "apply needs at least one change");
                 }
@@ -668,6 +737,8 @@ export namespace tools {
                 out.operation_id = in.operation_id.value();
                 out.replayed = r.replayed;
                 out.written_version = r.written_version;
+                if (!r.reach.empty())
+                    out.reach = r.reach;
             } else if (action == "receipt") {
                 auto r = co_await node_call(s, project,
                                             {.action = "receipt",
@@ -685,6 +756,8 @@ export namespace tools {
                 out.operation_id = in.operation_id.value();
                 out.replayed = true;
                 out.written_version = r.written_version;
+                if (!r.reach.empty())
+                    out.reach = r.reach;
             } else if (action == "history") {
                 auto limit = std::min<std::uint64_t>(in.limit.value().value_or(100), config::resolve(*s.snapshot(), project).limits.list_max_entries);
                 auto r = co_await node_call(s, project,

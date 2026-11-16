@@ -84,9 +84,9 @@ namespace nodes {
             ~cache_boundary() { state.trim_kernel(); }
         } cache{s};
         try {
-            static const std::set<std::string> reads{
-                "identity",   "inspect", "tree",         "head",      "stat",       "read",       "compare",          "diff", "history", "receipt",
-                "worldlines", "content", "contribution", "mail_list", "scope_list", "references", "reference_history"};
+            static const std::set<std::string> reads{"identity",     "inspect",   "tree",       "head",         "stat",       "read",
+                                                     "compare",      "diff",      "history",    "receipt",      "worldlines", "content",
+                                                     "contribution", "mail_list", "scope_list", "scope_locate", "references", "reference_history"};
             if (s.read_only && !reads.contains(in.action))
                 fail(nodes::code::policy_denied, "source reader does not accept mutations");
             std::optional<read_snapshot> snapshot;
@@ -108,6 +108,8 @@ namespace nodes {
             s.check_execution(in);
             if (in.action == "scope_register")
                 return s.register_scopes(in);
+            if (in.action == "scope_locate")
+                return s.locate_scopes(in);
             if (in.action.starts_with("scope_"))
                 return s.scope_call(in);
             if (!s.has_object(s.project)) {

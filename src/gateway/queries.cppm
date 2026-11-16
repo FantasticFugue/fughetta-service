@@ -25,7 +25,8 @@ export import :execution;
 export namespace tools {
     struct language_query
         : tool<"language", "Query scopes, symbols, definitions, references or diagnostics for a worldline version; schema reads semantic contracts. "
-                           "Analysis is prepared automatically within the call when missing or stale."> {
+                           "Analysis is prepared automatically within the call when missing or stale. inspect returns body text and registers "
+                           "bodies, so a later worldline apply locks the enclosing function and reports its reach."> {
         struct scope_filter {
             std::optional<std::vector<std::string>> modules, files, contexts, projects;
             auto extent() const -> semantic::extent {
@@ -357,25 +358,46 @@ export namespace tools {
                 item.definitions.assign(definitions.begin(), definitions.end());
                 item.declarations.assign(declarations.begin(), declarations.end());
             }
-            if (request.action == "scopes" || std::ranges::contains(request.include, "scope")) {
-                std::map<std::string, std::vector<semantic::records::scope>> grouped;
+            // Bodies and scopes that inspect or definitions return register
+            // silently, so a later text edit snaps to them; only a scope
+            // request replies with their references.
+            const bool reveal = request.action == "scopes" || std::ranges::contains(request.include, "scope");
+            if (reveal || request.action == "inspect" || request.action == "definitions") {
+                std::map<std::string, nodes::node_request> grouped;
                 std::map<std::string, std::size_t> offsets;
+                auto group = [&](const std::string& input_project) -> nodes::node_request& {
+                    auto [found, created] = grouped.try_emplace(input_project);
+                    if (created) {
+                        const auto& pin = semantic::snapshot_for(description.snapshots, input_project);
+                        found->second = {.action = "scope_register", .worldline = pin.worldline, .revision = pin.version};
+                        found->second.configuration = description.configuration;
+                        found->second.environment = out.environment.value_or("");
+                    }
+                    return found->second;
+                };
                 for (std::size_t i = 0; i < out.scopes.size(); ++i) {
                     const auto& row = out.scopes[i];
                     if (row.location.source) {
-                        grouped[row.location.project.value_or(project)].push_back(row);
+                        group(row.location.project.value_or(project)).analyzed_scopes.push_back(row);
                         offsets.emplace(row.id, i);
                     }
                 }
-                for (auto& [input_project, rows] : grouped) {
+                // A range holding the declared name is a whole declaration, not a body.
+                auto declaration = [](const semantic::records::occurrence& row) {
+                    return row.selection && row.selection->path == row.body->path && row.body->begin <= row.selection->begin &&
+                           row.selection->end <= row.body->end;
+                };
+                for (const auto& row : out.occurrences)
+                    if (row.body && !declaration(row) && std::ranges::contains(row.roles, semantic::role::make<"definition">()) &&
+                        std::ranges::contains(out.items, std::pair{row.symbol, row.ownership.context},
+                                              [](const auto& item) { return std::pair{item.symbol_id, item.context}; }))
+                        group(row.location.project.value_or(project)).body_ranges.try_emplace(row.symbol, *row.body);
+                for (auto& [input_project, registration] : grouped) {
                     const auto& pin = semantic::snapshot_for(description.snapshots, input_project);
-                    nodes::node_request scopes{.action = "scope_register", .worldline = pin.worldline, .revision = pin.version};
-                    scopes.configuration = description.configuration;
-                    scopes.environment = out.environment.value_or("");
-                    scopes.analyzed_scopes = std::move(rows);
-                    auto reply = co_await node_call(s, input_project, std::move(scopes), read_actor(actor, project, pin, declarations));
-                    for (auto& row : reply.scopes)
-                        out.scopes.at(offsets.at(row.id)) = std::move(row);
+                    auto reply = co_await node_call(s, input_project, std::move(registration), read_actor(actor, project, pin, declarations));
+                    if (reveal)
+                        for (auto& row : reply.scopes)
+                            out.scopes.at(offsets.at(row.id)) = std::move(row);
                 }
             }
             co_return out;

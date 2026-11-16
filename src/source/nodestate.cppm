@@ -201,8 +201,13 @@ export namespace nodes {
         auto lease_reply(const value& lease, const source_state& state, bool reveal) -> scope_lease;
         auto scope_references() -> value::array;
         auto register_scopes(const node_request& in) -> node_reply;
+        // Where registered scope references are in one version of a worldline.
+        auto locate_scopes(const node_request& in) -> node_reply;
         auto scope_call(const node_request& in) -> node_reply;
         void check_scope_leases(const node_request& in, const std::vector<std::string>& prior);
+        // Takes or renews the caller's implicit leases for a committed apply
+        // and names how far its text edits reach.
+        auto claim_scopes(const node_request& in, const std::vector<std::string>& heads) -> std::string;
 
         auto promotion(const node_request& in, bool include_text = true) -> std::vector<source_difference>;
 

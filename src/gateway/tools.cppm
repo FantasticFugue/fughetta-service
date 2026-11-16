@@ -179,8 +179,9 @@ export namespace tools {
         co_return co_await generate_files(s, project, std::move(parameters), actor, std::move(operation_id), false);
     }
 
-    struct scope : tool<"scope", "Acquire an atomic set of exclusive scope leases using references returned by language(scopes). Pass tokens to "
-                                 "worldline(apply); renew or release each token. Conflicts return immediately."> {
+    struct scope : tool<"scope", "For orchestrators that divide work before dispatching it: acquire an atomic set of exclusive scope leases using "
+                                 "references returned by language(scopes). Pass tokens to worldline(apply); renew or release each token. "
+                                 "Conflicts return immediately. A single agent never needs this: apply locks implicitly."> {
         struct input {
             rfl::Description<"Project; supplied by the execution context when absent", std::optional<std::string>> project;
             rfl::Description<"acquire, renew, release or list", std::string> action;

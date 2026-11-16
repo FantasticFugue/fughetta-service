@@ -334,7 +334,7 @@ export namespace semantic {
         };
         struct library_selection {
             std::string name;
-            rfl::Literal<"exact", "search", "dynamic"> strategy;
+            rfl::Literal<"exact", "search", "dynamic", "source"> strategy;
             std::vector<artifact_location> candidates;
             std::optional<artifact_location> selected;
         };

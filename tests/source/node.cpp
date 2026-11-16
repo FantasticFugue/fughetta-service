@@ -639,6 +639,82 @@ namespace {
             expect(edited.code == "ok");
             expect(text(good(node, {.action = "read", .target = "target/x"}), "target/x") == "t!ext");
         };
+        "implicit leases snap text edits to registered scopes and report reach"_test = [] {
+            using kind = decltype(semantic::records::scope::kind);
+            test::scratch tmp{"scope-implicit"};
+            nodes::local_node node{tmp.dir / "a"};
+            good(node, {.action = "initialize"});
+            auto state = good(
+                node,
+                {.action = "apply", .operation = op("implicit-seed"), .edits = {{.kind = std::string{"create"}, .path = "x", .text = "aaaa{1111}bbbb{2222}"}}});
+            nodes::node_request registration{
+                .action = "scope_register",
+                .revision = state.version,
+                .analyzed_scopes = {{.id = "unit", .location = {.source = semantic::place{"x", 0, 20}}, .kind = kind::make<"translation_unit">()},
+                                    {.id = "fa", .location = {.source = semantic::place{"x", 0, 10}}, .kind = kind::make<"function">()}},
+                .body_ranges = {{"A", {"x", 4, 10}}, {"B", {"x", 14, 20}}}};
+            auto first = good(node, registration);
+            expect(*good(node, registration).scopes[1].reference == *first.scopes[1].reference);
+            unsigned step = 0;
+            auto edit = [&](std::string owner, std::uint64_t offset, std::string_view replacement = "X") {
+                auto out =
+                    attempt(node, {.action = "apply",
+                                   .lease_owner = std::move(owner),
+                                   .operation = op("implicit-" + std::to_string(++step)),
+                                   .expected = state.frontier,
+                                   .edits = {{.kind = std::string{"edit"}, .path = "x", .text = std::string{replacement}, .offset = offset, .count = 1}}});
+                if (out.code == "ok")
+                    state = out;
+                return out;
+            };
+            auto leases = [&] { return good(node, {.action = "scope_list"}).leases; };
+            auto inside = edit("run-a", 6);
+            expect(inside.code == "ok" && inside.reach == "body_only") << inside.reach;
+            expect(leases().size() == 1u && leases()[0].scope == "A" && leases()[0].implicit && leases()[0].begin == 4u && leases()[0].end == 10u);
+            expect(edit("run-a", 7).code == "ok");
+            expect(leases().size() == 1u);
+            expect(edit("run-b", 16).reach == "body_only");
+            expect(leases().size() == 2u);
+            auto refused = edit("run-b", 5);
+            expect(refused.code == "scope_conflict" && refused.reason.contains("A held by run-a")) << refused.reason;
+            // The enclosing function overlaps run-a's body lease, so run-b
+            // keeps only the characters it edited.
+            auto outside = edit("run-b", 1);
+            expect(outside.code == "ok" && outside.reach == "declaration_touched") << outside.code << outside.reach;
+            auto held = leases();
+            expect(held.size() == 3u && std::ranges::count(held, std::string{"text:x"}, &nodes::scope_lease::scope) == 1);
+            expect(edit("run-a", 2).code == "scope_conflict");
+            expect(edit("run-a", 11).reach == "declaration_touched");
+            expect(text(good(node, {.action = "read", .target = "x"}), "x") == "aXaa{1XX1}bXbb{2X22}");
+            // A scope reference resolves to its structure in a later version.
+            auto located = good(node, {.action = "scope_locate", .revision = state.version, .scope_refs = {*first.scopes[1].reference}});
+            expect(fatal(located.located.size() == 1u));
+            const auto& function = located.located.begin()->second;
+            expect(function.path == "x" && function.begin == 0u && function.end == 10u) << function.begin << " " << function.end;
+            expect(attempt(node, {.action = "scope_locate", .scope_refs = {"missing"}}).code == "scope_stale");
+            // Implicit leases guard text edits, never history actions.
+            state = good(node, {.action = "reverse", .operation = op("implicit-reverse"), .expected = state.frontier, .target = inside.frontier.front()});
+            expect(attempt(node, {.action = "apply",
+                                  .operation = op("implicit-ownerless"),
+                                  .expected = state.frontier,
+                                  .edits = {{.kind = std::string{"write"}, .path = "x", .text = "free"}}})
+                       .code == "scope_conflict");
+            // Text right after a body's closing brace is outside it, and a
+            // replay answers with the recorded reach.
+            nodes::node_request boundary{.action = "apply",
+                                         .lease_owner = "run-a",
+                                         .operation = op("implicit-boundary"),
+                                         .expected = state.frontier,
+                                         .edits = {{.kind = std::string{"edit"}, .path = "x", .text = "Y", .offset = 10, .count = 0}}};
+            state = good(node, boundary);
+            expect(state.reach == "declaration_touched");
+            auto replayed = good(node, boundary);
+            expect(replayed.replayed && replayed.reach == "declaration_touched") << replayed.reach;
+            // That insertion stays outside body A, so text placed before it is too.
+            boundary.operation = op("implicit-after-boundary");
+            boundary.expected = state.frontier;
+            expect(good(node, boundary).reach == "declaration_touched");
+        };
         "task revocation fences delayed source writes and fork binding is atomic"_test = [] {
             test::scratch tmp{"task-source"};
             nodes::local_node node{tmp.dir / "a"};

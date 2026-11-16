@@ -35,6 +35,7 @@ export namespace nodes {
         std::string token, scope, path, worldline, version, owner;
         std::uint64_t begin = 0, end = 0, expires_at = 0;
         bool valid = true;
+        bool implicit = false;
         std::string kind = "scope";
     };
     struct execution_view {
@@ -94,6 +95,8 @@ export namespace nodes {
         std::vector<std::string> scope_refs, scope_files, scope_entries;
         std::vector<semantic::records::scope> analyzed_scopes;
         std::map<std::string, semantic::place> declaration_ranges;
+        // Function bodies by symbol, registered as references without replying with them.
+        std::map<std::string, semantic::place> body_ranges;
     };
     struct file_view {
         std::string id, path, kind, digest, text;
@@ -140,6 +143,10 @@ export namespace nodes {
         std::uint64_t storage_bytes = 0;
         std::vector<semantic::records::scope> scopes;
         std::map<std::string, semantic::source_anchor> declaration_anchors;
+        // scope_locate: each requested reference's range in the selected version.
+        std::map<std::string, semantic::place> located;
+        // apply: body_only when every text edit stays inside a registered body, else declaration_touched.
+        std::string reach;
         std::optional<execution_view> execution;
         std::string state_snapshot;
         std::uint64_t loaded_records = 0, replayed_events = 0, snapshot_events = 0;
