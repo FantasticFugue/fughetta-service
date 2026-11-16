@@ -397,7 +397,7 @@ build manifests before executing its tasks.
 | --- | --- |
 | CMake / CTest | Configure and build with explicit directories, presets, compilers, variables, and targets. The CMake builder's `test` object controls CTest selection, parallelism, timeout, and failure behavior. An empty test selection fails by default. |
 | vcpkg | Install a manifest into `install_dir`; the task exports the installed directory. Point CMake at the selected checkout's `scripts/buildsystems/vcpkg.cmake`, bind `VCPKG_INSTALLED_DIR` to that output, and set `VCPKG_MANIFEST_INSTALL=OFF` when the graph already performs installation. |
-| clice | Read compilation-database outputs derived from the bound build graph, with explicit cache, compile-flag additions/removals, executable, and environment settings. |
+| clice | Read compilation-database outputs derived from the bound build graph, with compile-flag additions/removals, executable, and environment settings. |
 | TypeScript / tsc | Check a selected `tsconfig.json` without emitting, or compile into an explicit output directory. Compiler options are typed fields; terminal diagnostics remain available without being parsed as a structured report. |
 | typescript-language-server | Analyze TypeScript, TSX, JavaScript, and JSX through LSP. Configure tsserver, inlay/completion preferences, implicit-project settings, locale, and memory through initialization options. |
 | Bun | Build and test only. Every operation automatically performs a frozen-lockfile `bun install` first, with lifecycle scripts disabled by default. Build entrypoints, output, bundler options, test paths, and name filters are typed; there is no `run` operation or arbitrary command argument field. Tests use Bun's native JUnit reporter. |
@@ -1090,8 +1090,8 @@ Build input references select task output ports from named configurations:
 ```
 
 Each input names its producing build configuration, task and output. Clice can
-consume compilation databases from several configurations with an explicit
-`cache_dir`. Ty's `python_environment` port selects one uv task's output; direct
+consume compilation databases from several configurations; its cache is the
+worker's, kept outside the build tree. Ty's `python_environment` port selects one uv task's output; direct
 server launches with several environments require an explicit `python` selection. The planner preserves input order, expands only
 the selected producers and their prerequisites, and keeps each preparation task's
 environment and output ownership tied to its configuration. `build_configuration`

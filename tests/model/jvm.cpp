@@ -145,7 +145,7 @@ namespace {
                     const auto program =
                         language::locate(language::server<"jvm-artifact">::launch(
                                              options, {{.type = "jvm_artifact", .path = "sample.jar"}, {.type = "project_model", .path = "model/model.json"}}),
-                                         root, {{"java", java}, {"kotlin-helper", kotlin_files[12].string()}}, 1);
+                                         root, {{"java", java}, {"kotlin-helper", kotlin_files[12].string()}}, 1, scratch.dir);
                     jvm::reader adapter{runtime.get_scheduler(),
                                         {.cwd = root, .env = builds::environment{{"JAVA_TOOL_OPTIONS", "-Djava.io.tmpdir=" + root.string()}}},
                                         {.slot = "slot", .project = "app", .provider = "jvm-artifact", .options = "options", .stage = "jvm"},
@@ -156,6 +156,7 @@ namespace {
                     for (const auto& entry : std::filesystem::directory_iterator(scratch.dir / "exports"))
                         if (entry.is_regular_file())
                             allowed_objects.insert(entry.path().filename().string());
+                    adapter.cache(scratch.dir);
                     adapter.objects({scratch.dir / "exports", std::move(allowed_objects)});
                     auto opened = co_await adapter.open(program.initialization);
                     language::installation installed{.snapshot = "snapshot-" + std::to_string(version),
@@ -365,7 +366,7 @@ namespace {
             expect(std::ranges::count_if(ambiguous.relations, [](const auto& relation) { return relation.resolution == "candidate"; }) == 4);
             expect(ambiguous.unit.coverage.unresolved_count == 2_u);
             const auto stage = language::server<"jvm-artifact">::launch({.module = "sample"}, {{.type = "jvm_artifact", .path = "sample.jar"}});
-            expect(language::locate(stage, scratch.dir, {}, 1).argv.empty()) << "an in-process reader has no tool executable";
+            expect(language::locate(stage, scratch.dir, {}, 1, scratch.dir).argv.empty()) << "an in-process reader has no tool executable";
             native::context runtime;
             auto evaluate = [&]() -> coroutine::task<> {
                 const auto tree = scratch.dir / "tree", objects = scratch.dir / "exports";
@@ -379,6 +380,7 @@ namespace {
                                     {.slot = "slot", .project = "app", .provider = "jvm-artifact", .options = "options", .stage = "jvm"},
                                     {},
                                     {.execution = "runtime"}};
+                adapter.cache(scratch.dir);
                 adapter.objects({objects, {first_object, second_object}});
                 auto opened = co_await adapter.open(stage.initialization);
                 std::vector<semantic::candidate> previous;

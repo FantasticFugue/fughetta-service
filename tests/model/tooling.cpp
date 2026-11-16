@@ -1685,19 +1685,21 @@ namespace {
             expect(std::filesystem::is_empty(scratch.dir / "shards") && std::filesystem::is_empty(scratch.dir / "indexes"));
         };
         "clice initialization and executable mapping use the prepared project"_test = [] {
-            language::stage c{.server = language::with<"clice">{.options = {.args = {"--mode", "pipe"}, .cache_dir = "build/clice", .append = {"-std=c++23"}}},
+            language::stage c{.server = language::with<"clice">{.options = {.args = {"--mode", "pipe"}, .append = {"-std=c++23"}}},
                               .build_configuration = "native",
                               .inputs = {{"compilation_database", {language::build_input{"native", "configure", "compilation_database"}}}}};
             auto plan = language::prepare(c, {{"native", configured()}});
             auto json = rfl::json::write(plan.server.initialization);
             expect(json.contains("build/debug/compile_commands.json") && json.contains("-std=c++23"));
-            auto local = language::locate(plan.server, ::test::absolute("/work/project"), {{"clice", ::test::absolute("/opt/clice/bin/clice")}}, 2);
+            auto local = language::locate(plan.server, ::test::absolute("/work/project"), {{"clice", ::test::absolute("/opt/clice/bin/clice")}}, 2,
+                                          ::test::absolute("/work/analysis"));
             expect(local.argv == std::vector<std::string>{::test::absolute("/opt/clice/bin/clice"), "serve", "--mode", "pipe"});
             expect(local.commands.at("index") == std::vector<std::string>{::test::absolute("/opt/clice/bin/clice"), "index", "--json", "--jobs", "2"});
             expect(local.commands.at("query") == std::vector<std::string>{::test::absolute("/opt/clice/bin/clice"), "query"});
             auto initialized = rfl::json::write(local.initialization);
             expect(initialized.contains("build/debug/compile_commands.json") && initialized.contains("-std=c++23") &&
                    initialized.contains("\"max_stateless_worker_count\":2"));
+            expect(!json.contains("cache_dir") && initialized.contains("/work/analysis/clice")) << "the cache is the worker's, outside the prepared tree";
             auto unbound = c;
             unbound.inputs.clear();
             expect(throws<std::invalid_argument>([&] { language::prepare(unbound, {{"native", configured()}}); }));

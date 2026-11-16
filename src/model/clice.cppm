@@ -18,9 +18,9 @@ export namespace language {
 namespace language {
     // The clice C and C++ language server. It is started as `clice serve [args]` in the project directory, which it takes as its
     // workspace, and is told through initializationOptions what clice.toml documents: `rules`, holding the compile_commands of the
-    // build outputs and flags appended to or removed from their commands, and `project.cache_dir`. Paths are relative to the project,
-    // and the server resolves them from the prepared tree, which a worker may hold elsewhere. The cache holds the PCH, PCM and index
-    // of a session and the logs beneath it, inside the project.
+    // build outputs and flags appended to or removed from their commands, and `project.cache_dir`. Rule paths are relative to the
+    // project, and the server resolves them from the prepared tree, which a worker may hold elsewhere. The cache holds the PCH, PCM
+    // and index of a session and the logs beneath it; the worker keeps it in the session's own directory, outside the tree.
     template <> struct server<"clice"> {
         static auto channels() -> std::vector<semantic::channel_definition> {
             auto out = source_channels();
@@ -44,8 +44,6 @@ namespace language {
             // What follows `serve`.
             std::vector<std::string> args;
             builds::environment env;
-            // Where clice keeps its caches and logs; omitted, a clice directory beside the first database.
-            std::optional<std::string> cache_dir;
             // A rule's compile-time flags, appended to every compilation command.
             std::vector<std::string> append;
             // A rule's compile-time flags, removed from every command.
@@ -79,11 +77,10 @@ namespace language {
         static auto requirements(const options& o) -> builds::requirements { return builds::tools({o.executable}); }
         static auto executes_project_code(const options& o) -> bool { return builds::in_project({o.executable}); }
 
-        static void configure(program& value, std::uint32_t jobs) {
-            if (!value.commands.contains("index"))
-                return;
+        static void configure(program& value, std::uint32_t jobs, const std::filesystem::path& cache) {
             auto initialization = value.initialization.to_object().value();
-            auto project = initialization["project"].to_object().value();
+            rfl::Generic::Object project;
+            project["cache_dir"] = (cache / "clice").generic_string();
             project["stateless_worker_count"] = std::int64_t{std::max(1u, jobs)};
             project["min_stateless_worker_count"] = std::int64_t{1};
             project["max_stateless_worker_count"] = std::int64_t{std::max(1u, jobs)};
@@ -96,8 +93,6 @@ namespace language {
                 throw std::invalid_argument("clice executable is required");
             if (!builds::absolute_path(o.executable))
                 builds::tools({o.executable});
-            if (o.cache_dir)
-                builds::relative(*o.cache_dir);
             builds::validate_environment(o.env);
             for (auto& arg : o.args)
                 if (arg.empty() || arg == "--" || arg.find('\0') != std::string::npos || arg.contains("${"))
@@ -113,16 +108,12 @@ namespace language {
         static auto launch(const options& o, const std::vector<builds::context>& databases) -> program {
             if (databases.empty())
                 throw std::invalid_argument("clice requires a compilation database to read");
-            if (databases.size() > 1 && !o.cache_dir)
-                throw std::invalid_argument("clice with multiple compilation databases requires cache_dir");
             program out{.argv = {o.executable, "serve"}, .env = o.env};
             out.argv.insert(out.argv.end(), o.args.begin(), o.args.end());
             rfl::Generic::Array paths;
             for (auto& database : databases)
                 paths.push_back(database.path);
-            auto& first = databases.front();
-            auto beside = first.kind == "directory" ? first.path : std::filesystem::path(first.path).parent_path().generic_string();
-            rfl::Generic::Object rule, project, init;
+            rfl::Generic::Object rule, init;
             rule["compile_commands"] = std::move(paths);
             if (!o.append.empty()) {
                 rfl::Generic::Array flags;
@@ -137,8 +128,6 @@ namespace language {
                 rule["remove"] = std::move(flags);
             }
             init["rules"] = rfl::Generic::Array{std::move(rule)};
-            project["cache_dir"] = o.cache_dir ? *o.cache_dir : beside + "/clice";
-            init["project"] = std::move(project);
             out.initialization = std::move(init);
             out.commands = {{"index", {o.executable, "index", "--json", "--jobs", "${jobs}"}}, {"query", {o.executable, "query"}}};
             return out;

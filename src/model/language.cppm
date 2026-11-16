@@ -95,7 +95,9 @@ export namespace language {
     auto prepare(const stage& c, const std::map<std::string, builds::configuration>& builds) -> plan;
     auto select_builds(const stage& c, const std::map<std::string, builds::configuration>& builds) -> std::map<std::string, builds::configuration>;
     auto fingerprint(const stage& c, const std::map<std::string, builds::configuration>& builds) -> content::hash;
-    auto locate(program value, const std::filesystem::path& tree, const builds::toolset& tools, std::uint32_t jobs) -> program;
+    // Binds a program to one worker: its tree, its tools, its parallel jobs and `cache`, the directory the session may write.
+    auto locate(program value, const std::filesystem::path& tree, const builds::toolset& tools, std::uint32_t jobs, const std::filesystem::path& cache)
+        -> program;
     // Refuses a plan whose build directories or outputs overlap the tracked files of the tree to prepare.
     void check(const plan& p, const std::vector<content::entry>& files);
     auto timeout(const builds::limits& c) -> std::uint32_t;

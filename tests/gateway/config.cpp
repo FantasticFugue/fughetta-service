@@ -54,7 +54,6 @@ namespace {
             expect(server.options.args == std::vector<std::string>{"--mode", "pipe"});
         };
         "language servers are known by name and keep their files inside the source"_test = [] {
-            expect(throws<std::invalid_argument>([] { language::validate({.server = language::with<"clice">{.options = {.cache_dir = "../cache"}}}); }));
             expect(throws<std::invalid_argument>([] { language::validate({.server = fixture::clice("")}); }));
             expect(throws<std::invalid_argument>([] { config::parse_as<language::stage>(R"({"server":{"provider":"clangd"}})", "analysis"); }));
             expect(throws<std::invalid_argument>(

@@ -87,7 +87,7 @@ namespace {
             expect(prepared.build.steps.size() == 2u && prepared.inputs[0].type == "compilation_database");
             expect(prepared.server.provider == "clice" && prepared.server.argv == std::vector<std::string>{"clice", "serve"});
             expect(rfl::json::write(prepared.server.initialization) ==
-                   R"({"rules":[{"compile_commands":["build/cmake/compile_commands.json"]}],"project":{"cache_dir":"build/cmake/clice"}})");
+                   R"({"rules":[{"compile_commands":["build/cmake/compile_commands.json"]}]})");
             auto build = builds::locate(plan.steps[2], ::test::absolute("/tree"), {}, 3);
             expect(build.env.at("CMAKE_BUILD_PARALLEL_LEVEL") == "3") << "a step uses the jobs its runner allows";
             expect(std::ranges::contains(builds::locate(plan.steps[0], ::test::absolute("/tree"), {}, 3).argv, "--jobs=3"));
@@ -119,8 +119,7 @@ namespace {
             configuration.builders["release"] = configuration.builders.at("main");
             fixture::options<"cmake">(configuration.builders.at("release")).build_dir = "build/release";
             configuration.tasks.at("another").builder = "release";
-            auto paired = language::prepare({.server = language::with<"clice">{.options = {.cache_dir = "build/paired-cache"}},
-                                             .build_configuration = "native",
+            auto paired = language::prepare({.build_configuration = "native",
                                              .inputs = {{"compilation_database",
                                                          {language::build_input{"native", "another", "compilation_database"},
                                                           language::build_input{"native", "configure", "compilation_database"}}}}},
@@ -128,7 +127,6 @@ namespace {
             expect(paired.inputs.size() == 2u && paired.inputs[0].path == "build/release/compile_commands.json" &&
                    paired.inputs[1].path == "build/cmake/compile_commands.json")
                 << "multiple producers retain the input order";
-            expect(throws<std::invalid_argument>([&] { language::server<"clice">::launch({}, paired.inputs); }));
             expect(paired.build.tasks.size() == 3u && paired.build.tasks.front().name == "native/generate") << "shared prerequisites execute once";
         };
 
@@ -142,8 +140,7 @@ namespace {
             native.limits.timeout_s = 120;
             other.limits.timeout_s = 60;
             std::map<std::string, builds::configuration> builds{{"native", native}, {"other", other}, {"unused", native}};
-            language::stage stage{.server = language::with<"clice">{.options = {.cache_dir = "build/stage-cache"}},
-                                  .build_configuration = "native",
+            language::stage stage{.build_configuration = "native",
                                   .inputs = {{"compilation_database",
                                               {language::build_input{"other", "configure", "compilation_database"},
                                                language::build_input{"native", "configure", "compilation_database"}}}},

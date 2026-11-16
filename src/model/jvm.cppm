@@ -1347,7 +1347,7 @@ export namespace jvm {
                     if (paths.size() == 1)
                         command.push_back(paths.front());
                     else {
-                        const auto list = root_ / (".fughetta-jvm-metadata-" + state_.id + ".json");
+                        const auto list = cache_ / ("metadata-" + state_.id + ".json");
                         struct cleanup {
                             std::filesystem::path path;
                             ~cleanup() {

@@ -938,6 +938,8 @@ export namespace replica {
                     }
                     return out;
                 });
+                const auto slot = store::tree_key(r.project, r.tree);
+                const auto cache = store_.analysis(slot) / analysis->execution.stage_id;
                 auto local = language::locate({.provider = analysis->provider,
                                                .argv = analysis->argv,
                                                .env = analysis->env,
@@ -946,7 +948,7 @@ export namespace replica {
                                                .executables = analysis->executables,
                                                .registration = analysis->registration,
                                                .documents = analysis->documents},
-                                              dir, options_.tools, options_.parallel);
+                                              dir, options_.tools, options_.parallel, cache);
                 auto env = environment(r.env, local.env);
                 const auto semantic_environment = env;
                 const auto transport = analysis->registration
@@ -958,7 +960,6 @@ export namespace replica {
                     content::hash_of(rfl::json::write(std::tuple{analysis->provider, analysis->options, local.argv, env, local.initialization, local.commands,
                                                                  local.executables, options_.runtime, r.max_memory_bytes, r.max_cpu_seconds}))
                         .str();
-                const auto slot = store::tree_key(r.project, r.tree);
                 const session_key key{slot, analysis->execution.stage_id};
                 if (auto found = contexts_.find(key); found != contexts_.end() && found->second->identity != identity)
                     co_await retire(key);
@@ -1003,7 +1004,8 @@ export namespace replica {
                                                                                    .stage = analysis->execution.stage_id},
                                                            std::move(local.commands), std::move(runtime),
                                                            language::document_loader{.root = dir, .scheduler = rt_.get_scheduler(home_), .pool = &pool_},
-                                                           std::move(local.registration));
+                                                           std::move(local.registration), {}, cache);
+                    std::filesystem::create_directories(cache);
                     auto& created = *contexts_.emplace(key, std::move(value)).first->second;
                     const auto opening = std::chrono::steady_clock::now();
                     co_await created.server->open(std::move(local.initialization));

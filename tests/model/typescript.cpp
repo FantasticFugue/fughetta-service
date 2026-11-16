@@ -141,7 +141,7 @@ namespace {
             expect(json.contains(R"("includeInlayParameterNameHints":"all")") && json.contains(R"("checkJs":true)"));
             auto local = language::locate(
                 plan.server, ::test::absolute("/work/project"),
-                {{"typescript-language-server", ::test::absolute("/opt/ts/language-server")}, {"tsserver", ::test::absolute("/opt/ts/tsserver")}}, 1);
+                {{"typescript-language-server", ::test::absolute("/opt/ts/language-server")}, {"tsserver", ::test::absolute("/opt/ts/tsserver")}}, 1, {});
             expect(local.argv.front() == ::test::absolute("/opt/ts/language-server") && local.argv.back() == ::test::absolute("/opt/ts/tsserver"));
             expect(local.executables == std::vector<std::string>{::test::absolute("/opt/ts/tsserver")} &&
                    std::ranges::contains(plan.execution.needs.get().tools, "tsserver"));

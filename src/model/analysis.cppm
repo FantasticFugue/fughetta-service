@@ -394,7 +394,8 @@ namespace language {
                 append(producer.stage);
         return result;
     }
-    auto locate(program value, const std::filesystem::path& tree, const builds::toolset& tools, std::uint32_t jobs) -> program {
+    auto locate(program value, const std::filesystem::path& tree, const builds::toolset& tools, std::uint32_t jobs, const std::filesystem::path& cache)
+        -> program {
         if (value.argv.empty()) {
             if (providers::dispatch(value.provider, []<class Implementation> { return frontend<Implementation>; }))
                 throw std::invalid_argument("language server executable is required");
@@ -421,8 +422,8 @@ namespace language {
         }
         if (!value.registration)
             providers::dispatch(value.provider, [&]<class Implementation>() {
-                if constexpr (requires { Implementation::configure(value, jobs); })
-                    Implementation::configure(value, jobs);
+                if constexpr (requires { Implementation::configure(value, jobs, cache); })
+                    Implementation::configure(value, jobs, cache);
             });
         return value;
     }

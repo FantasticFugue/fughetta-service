@@ -165,7 +165,8 @@ export namespace language {
     }
     inline auto make_adapter(native::scheduler scheduler, io::command command, session_state identity,
                              std::map<std::string, std::vector<std::string>> commands = {}, toolchain::identity runtime = {}, document_loader loader = {},
-                             std::optional<description> registration = {}, object_loader objects = {}) -> std::unique_ptr<adapter> {
+                             std::optional<description> registration = {}, object_loader objects = {}, std::filesystem::path cache = {})
+        -> std::unique_ptr<adapter> {
         if (registration) {
             if (registration->id != identity.provider || registration->adapter != adapter_kind::helper)
                 throw std::invalid_argument("external provider registration does not describe its session");
@@ -173,6 +174,7 @@ export namespace language {
                                                            std::move(loader));
             result->dependency_reads(registration->dependency_reads);
             result->objects(std::move(objects));
+            result->cache(std::move(cache));
             return result;
         }
         return providers::dispatch(identity.provider, [&]<class Implementation>() -> std::unique_ptr<adapter> {
@@ -181,6 +183,7 @@ export namespace language {
             if constexpr (std::same_as<typename Implementation::adapter, helper_adapter> && requires { Implementation::dependency_reads; })
                 result->dependency_reads(Implementation::dependency_reads);
             result->objects(std::move(objects));
+            result->cache(std::move(cache));
             return result;
         });
     }

@@ -805,7 +805,7 @@ export namespace native_artifact {
                             std::error_code ignored;
                             durability::remove_tree(path, ignored);
                         }
-                    } response{root_.parent_path() / ("symbolize-" + state_.id + ".rsp")};
+                    } response{cache_ / ("symbolize-" + state_.id + ".rsp")};
                     {
                         std::ofstream output{response.path};
                         for (const auto& address : addresses)

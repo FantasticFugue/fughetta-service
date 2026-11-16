@@ -143,7 +143,7 @@ namespace {
             expect(rfl::json::write(plan.server.initialization) ==
                    R"({"settings":{"configuration":{"rules":{"unresolved-import":"warn"}},"diagnosticMode":"workspace"}})");
             expect(plan.server.env.at("VIRTUAL_ENV") == "${tree}/build/venv") << "ty finds the uv environment by its variable";
-            auto local = language::locate(plan.server, ::test::absolute("/work/project"), {{"ty", ::test::absolute("/opt/ty/bin/ty")}}, 1);
+            auto local = language::locate(plan.server, ::test::absolute("/work/project"), {{"ty", ::test::absolute("/opt/ty/bin/ty")}}, 1, {});
             expect(local.argv == std::vector<std::string>{::test::absolute("/opt/ty/bin/ty"), "server"} &&
                    local.env.at("VIRTUAL_ENV") == ::test::absolute("/work/project/build/venv"));
             expect(language::providers::document("ty", "src/app.py") == std::optional<std::string_view>{"python"});

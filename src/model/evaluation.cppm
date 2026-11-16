@@ -102,6 +102,8 @@ export namespace language {
 
         virtual ~adapter() = default;
         void objects(object_loader loader) { objects_ = std::move(loader); }
+        // The directory this session may write; the tree it reads belongs to the build.
+        void cache(std::filesystem::path directory) { cache_ = std::move(directory); }
         auto open(rfl::Generic initialization) -> coroutine::task<session_state> {
             auto held = co_await lock_.lock();
             if (state_.phase != "created")
@@ -322,7 +324,7 @@ export namespace language {
         io::command command_;
         std::map<std::string, std::vector<std::string>> commands_;
         toolchain::identity runtime_;
-        std::filesystem::path root_;
+        std::filesystem::path root_, cache_;
         session_state state_;
         coroutine::mutex lock_;
         bool closed_ = false;

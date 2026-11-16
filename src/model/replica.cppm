@@ -54,6 +54,8 @@ export namespace replica {
         auto tree(std::string_view key) const -> std::filesystem::path { return root_ / "trees" / key; }
         // Where the steps on a tree write their reports, outside the tree so they never become part of it.
         auto reports(std::string_view key) const -> std::filesystem::path { return root_ / "reports" / key; }
+        // What the analysis sessions of a tree write: their caches live here, so the tree stays the build's alone.
+        auto analysis(std::string_view key) const -> std::filesystem::path { return root_ / "analysis" / key; }
 
         auto offer(const jobs::sync_offer& o) -> jobs::sync_plan {
             checked_project(o.project);
@@ -127,15 +129,19 @@ export namespace replica {
             const auto key = tree_key(project, target);
             auto dir = tree(key);
             unlinked(root_, dir.lexically_relative(root_).generic_string());
+            const auto caches = analysis(key);
             std::filesystem::path retired;
-            if (std::filesystem::exists(dir)) {
+            if (std::filesystem::exists(dir) || std::filesystem::exists(caches)) {
                 const auto parent = root_ / "discarded";
                 std::filesystem::create_directories(parent);
                 static std::atomic<std::uint64_t> next{0};
                 do {
                     retired = parent / std::to_string(next.fetch_add(1));
                 } while (!std::filesystem::create_directory(retired));
-                std::filesystem::rename(dir, retired / "tree");
+                if (std::filesystem::exists(dir))
+                    std::filesystem::rename(dir, retired / "tree");
+                if (std::filesystem::exists(caches))
+                    std::filesystem::rename(caches, retired / "analysis");
             }
             std::filesystem::remove(manifest_path(key));
             std::filesystem::remove(generation_path(key));
@@ -306,6 +312,7 @@ export namespace replica {
             for (auto& k : stale_trees) {
                 std::error_code ignored;
                 std::filesystem::remove_all(tree(k), ignored);
+                std::filesystem::remove_all(analysis(k), ignored);
                 std::filesystem::remove(manifest_path(k), ignored);
                 std::filesystem::remove(generation_path(k), ignored);
             }
