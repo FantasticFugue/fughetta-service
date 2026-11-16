@@ -1054,19 +1054,15 @@ namespace {
                           "profile outputs must preserve both stage interpretations: " + rfl::json::write(combined));
             expect(combined.items[0].symbol_id == combined.items[1].symbol_id && combined.items[0].context != combined.items[1].context);
             expect(combined.snapshots.size() == 1u && combined.version == published.version);
-            std::string graph_preparations = before_preparation;
-            for (std::size_t round = 0; round <= graph_rounds; ++round)
-                graph_preparations += "configure\nconfigure\n";
-            expect(test::slurp(preparations) == graph_preparations)
-                << "each continuation prepares each configuration once while retaining completed contributions";
+            expect(test::slurp(preparations) == before_preparation + "configure\nconfigure\n")
+                << "a continuation on the same snapshot reuses the preparation while retaining completed contributions";
             const auto workspace_directory = last_directory();
             const auto before_isolated = test::slurp(preparations);
             auto separate = test::decode<tools::language_query::output>(agent(
                 "language",
                 R"({"project":"app","configuration":"isolated","action":"symbols","outputs":["combined"],"limit":2,"selector":{"name":{"text":"twice"}}})"));
-            expect(separate.status == "complete" && separate.items.size() == 2u &&
-                   test::slurp(preparations) == before_isolated + "configure\nconfigure\nconfigure\n")
-                << "a stage assigned to a separate directory performs its own preparation";
+            expect(separate.status == "complete" && separate.items.size() == 2u && test::slurp(preparations) == before_isolated + "configure\n")
+                << "only the stage assigned to a separate directory prepares; the shared directory is already prepared";
             tools::language_query::input default_page{.project = "app",
                                                       .action = std::string{"symbols"},
                                                       .selector = semantic::selection{.name = semantic::named{.text = "twice"}},

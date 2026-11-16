@@ -178,7 +178,8 @@ namespace {
         auto run_children = [&](coroutine::scope& children) -> coroutine::task<> {
             children.spawn(send());
             children.spawn(channel.pump([](const transport::frame&) {}));
-            jobs::analysis_request request{.preparation = {.project = "app", .tree = "work"},
+            jobs::analysis_request request{.project = "app",
+                                           .tree = "work",
                                            .analysis =
                                                jobs::analysis_plan{.provider = "ty", .execution = {"first", "calculation", "python"}, .slot_id = "app/work"}};
             auto inputs = std::make_shared<jobs::analysis_exchange>(io, io);

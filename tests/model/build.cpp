@@ -86,8 +86,7 @@ namespace {
                 {{"native", mixed()}});
             expect(prepared.build.steps.size() == 2u && prepared.inputs[0].type == "compilation_database");
             expect(prepared.server.provider == "clice" && prepared.server.argv == std::vector<std::string>{"clice", "serve"});
-            expect(rfl::json::write(prepared.server.initialization) ==
-                   R"({"rules":[{"compile_commands":["build/cmake/compile_commands.json"]}]})");
+            expect(rfl::json::write(prepared.server.initialization) == R"({"rules":[{"compile_commands":["build/cmake/compile_commands.json"]}]})");
             auto build = builds::locate(plan.steps[2], ::test::absolute("/tree"), {}, 3);
             expect(build.env.at("CMAKE_BUILD_PARALLEL_LEVEL") == "3") << "a step uses the jobs its runner allows";
             expect(std::ranges::contains(builds::locate(plan.steps[0], ::test::absolute("/tree"), {}, 3).argv, "--jobs=3"));

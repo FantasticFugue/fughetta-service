@@ -78,7 +78,7 @@ namespace language {
         static auto executes_project_code(const options& o) -> bool { return builds::in_project({o.executable}); }
 
         static void configure(program& value, std::uint32_t jobs, const std::filesystem::path& cache) {
-            auto initialization = value.initialization.to_object().value();
+            auto initialization = value.initialization.to_object().value_or(rfl::Generic::Object{});
             rfl::Generic::Object project;
             project["cache_dir"] = (cache / "clice").generic_string();
             project["stateless_worker_count"] = std::int64_t{std::max(1u, jobs)};

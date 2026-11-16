@@ -54,9 +54,9 @@ namespace {
         Shard shard{};
         Model model{};
     };
-    template <class Channel, jobs::request Request, class Checks>
+    template <class Channel, class Request, class Checks>
     auto analysis_call(Channel& channel, ctx io, const Request& request, Checks checks, jobs::progress_log* progress = nullptr)
-        -> coroutine::task<transport::call_result<jobs::reply_t<Request>>> {
+        -> coroutine::task<transport::call_result<jobs::build_report>> {
         auto inputs = std::make_shared<jobs::analysis_exchange>(io, io);
         auto serve = [&]() -> coroutine::task<> {
             while (auto item = co_await inputs->next()) {
@@ -76,10 +76,13 @@ namespace {
                 }
             }
         };
-        auto run = [&](coroutine::scope& tasks) -> coroutine::task<transport::call_result<jobs::reply_t<Request>>> {
+        auto run = [&](coroutine::scope& tasks) -> coroutine::task<transport::call_result<jobs::build_report>> {
             auto close = jobs::analysis_exchange::lifetime{inputs};
             tasks.spawn(serve());
-            co_return co_await channel.call(request, progress, inputs);
+            if constexpr (std::same_as<Request, jobs::staged_analysis>)
+                co_return co_await transport::staged(channel, request, progress, inputs);
+            else
+                co_return co_await channel.call(request, progress, inputs);
         };
         co_return co_await coroutine::with_scope(std::move(run));
     }
@@ -968,7 +971,7 @@ while True:
                 content::manifest first{{entry("a.py", "x = 1")}};
                 expect((co_await channel.call(jobs::sync_offer{"app", first})).has_value());
                 expect((co_await channel.call(jobs::source_bytes{{blob("x = 1")}})).has_value());
-                jobs::analysis_request request{
+                jobs::staged_analysis request{
                     .preparation = {.project = "app",
                                     .tree = "hot-language",
                                     .snapshot = first.id(),
@@ -1017,6 +1020,20 @@ while True:
                 expect((co_await channel.call(build))->ok());
                 auto rebuilt = co_await analysis_call(channel, io, request, record_checks{.unit = receive});
                 expect(rebuilt && rebuilt->steps.size() == 1u) << "an intervening build invalidates preparation receipts";
+                jobs::analysis_request direct{.project = "app",
+                                              .tree = "hot-language",
+                                              .snapshot = first.id(),
+                                              .inputs = rebuilt->inputs.value().id(),
+                                              .timeout_s = 5,
+                                              .max_memory_bytes = request.preparation.max_memory_bytes,
+                                              .analysis = request.analysis};
+                auto named = co_await analysis_call(channel, io, direct, record_checks{.unit = receive});
+                expect(named && named->analyzed && named->steps.empty()) << "an analysis runs on the inputs its preparation reported";
+                expect((co_await channel.call(build))->ok());
+                auto stale = co_await analysis_call(channel, io, direct, record_checks{.unit = receive});
+                expect(!stale && std::get<jobs::failure>(stale.error()).code == "stale_inputs") << "a build since the preparation withdraws its inputs";
+                rebuilt = co_await analysis_call(channel, io, request, record_checks{.unit = receive});
+                expect(rebuilt && rebuilt->steps.size() == 1u);
                 content::manifest second{{entry("a.py", "x = 2")}};
                 expect((co_await channel.call(jobs::sync_offer{"app", second})).has_value());
                 expect((co_await channel.call(jobs::source_bytes{{blob("x = 2")}})).has_value());
@@ -1080,8 +1097,8 @@ while True:
                     << "a clean build retires all of the directory's stage sessions";
                 sibling.analysis.execution.computation_id = "next-computation";
                 auto next = co_await analysis_call(channel, io, sibling, record_checks{.unit = receive});
-                expect(next && next->steps.size() == 1u && next->analysis_session->id == restarted_review->analysis_session->id)
-                    << "a new computation prepares again while retaining the stage session";
+                expect(next && next->steps.empty() && next->analysis_session->id == restarted_review->analysis_session->id)
+                    << "a new computation on the same snapshot reuses the preparation and the stage session";
 
                 const auto& evaluated = received.back();
                 const semantic::recipe recipe{evaluated.request.unit, evaluated.session.options};
@@ -1191,7 +1208,7 @@ while True:
                 expect((co_await channel.call(jobs::sync_offer{"app", tree})).has_value() >> fatal);
                 expect((co_await channel.call(jobs::source_bytes{{blob("int a;"), blob("int b;"), blob("// shared")}})).has_value() >> fatal);
 
-                jobs::analysis_request request{
+                jobs::staged_analysis request{
                     .preparation =
                         {.project = "app",
                          .tree = "semantic-budget",
@@ -1394,18 +1411,18 @@ while True:
                 auto offered = co_await channel.call(jobs::sync_offer{"app", tree});
                 expect(offered.has_value() >> fatal);
                 expect((co_await channel.call(jobs::source_bytes{{blob("int a;")}})).has_value());
-                jobs::analysis_request request{.preparation = {.project = "app",
-                                                               .tree = "analysis-deadline",
-                                                               .snapshot = tree.id(),
-                                                               .steps = {{.name = "prepare", .argv = {test::shell(), "-c", "sleep 0.7"}}},
-                                                               .timeout_s = 1},
-                                               .analysis = jobs::analysis_plan{.provider = "clice",
-                                                                               .argv = {test::shell(), "-c", "sleep 10"},
-                                                                               .seconds = 30,
-                                                                               .execution = {"deadline-request", "deadline-computation", "cpp"},
-                                                                               .slot_id = "app/analysis-deadline"}};
+                jobs::staged_analysis request{.preparation = {.project = "app",
+                                                              .tree = "analysis-deadline",
+                                                              .snapshot = tree.id(),
+                                                              .steps = {{.name = "prepare", .argv = {test::shell(), "-c", "sleep 0.7"}}},
+                                                              .timeout_s = 1},
+                                              .analysis = jobs::analysis_plan{.provider = "clice",
+                                                                              .argv = {test::shell(), "-c", "sleep 10"},
+                                                                              .seconds = 30,
+                                                                              .execution = {"deadline-request", "deadline-computation", "cpp"},
+                                                                              .slot_id = "app/analysis-deadline"}};
                 auto started = std::chrono::steady_clock::now();
-                auto report = co_await channel.call(request);
+                auto report = co_await transport::staged(channel, request);
                 expect(report.has_value() >> fatal);
                 expect(!report->ok() && report->steps.back().name == "analysis" && report->steps.back().timed_out);
                 expect(std::chrono::steady_clock::now() - started < 3s) << "the survey receives only the remaining execution time";
@@ -1413,7 +1430,7 @@ while True:
                 request.preparation.timeout_s = 30;
                 request.analysis.budget.milliseconds = 100;
                 started = std::chrono::steady_clock::now();
-                auto bounded = co_await channel.call(request);
+                auto bounded = co_await transport::staged(channel, request);
                 expect(bounded.has_value() >> fatal);
                 expect(bounded->ok() && bounded->analyzed && !bounded->missing.empty() && bounded->committed_units == 0u && bounded->missing.size() == 1u &&
                        bounded->missing.front().deferred && !bounded->analysis_session);
@@ -1445,15 +1462,15 @@ int main(int argc, const char** argv) {
             service.set_runtime({.inputs = {{"sdk/dotnet", "dotnet", {sdk}}}});
             const auto model = test::slurp(fixture / "model/model.json");
             const auto consumer = test::slurp(fixture / "App.fs");
-            jobs::analysis_request request{.preparation = {.project = "project", .tree = "fsharp", .measure = {{"model", "project_model", "model/model.json"}}},
-                                           .analysis = {.provider = "fsharp",
-                                                        .options = "fsharp-test",
-                                                        .artifacts = {{"model", "project_model", "model/model.json"}},
-                                                        .argv = {dotnet, host, "--adapter", adapter},
-                                                        .env = {{"TMPDIR", fixture.string()}},
-                                                        .execution = {"request", "computation", "fsharp"},
-                                                        .slot_id = "project/fsharp",
-                                                        .demand = {.files = {"App.fs"}, .facts = {std::string{"symbols"}, std::string{"types"}}}}};
+            jobs::staged_analysis request{.preparation = {.project = "project", .tree = "fsharp", .measure = {{"model", "project_model", "model/model.json"}}},
+                                          .analysis = {.provider = "fsharp",
+                                                       .options = "fsharp-test",
+                                                       .artifacts = {{"model", "project_model", "model/model.json"}},
+                                                       .argv = {dotnet, host, "--adapter", adapter},
+                                                       .env = {{"TMPDIR", fixture.string()}},
+                                                       .execution = {"request", "computation", "fsharp"},
+                                                       .slot_id = "project/fsharp",
+                                                       .demand = {.files = {"App.fs"}, .facts = {std::string{"symbols"}, std::string{"types"}}}}};
             std::size_t reads = 0;
             auto fetch = [&](jobs::model_read request) -> jobs::source_bytes {
                 ++reads;
@@ -1497,14 +1514,14 @@ int main(int argc, const char** argv) {
         auto run = [&](auto& channel, auto&, replica::service& service, ctx& io) -> coroutine::task<> {
             service.set_runtime({.inputs = {{"jdk", "jdk", {jdk}}, {"stdlib", "stdlib", {stdlib}}}});
             const auto model = test::slurp(fixture / "model.json");
-            jobs::analysis_request request{.preparation = {.project = "project", .tree = "kotlin", .measure = {{"model", "project_model", "model.json"}}},
-                                           .analysis = {.provider = "kotlin",
-                                                        .options = "kotlin-test",
-                                                        .artifacts = {{"model", "project_model", "model.json"}},
-                                                        .argv = {java, "-Djava.io.tmpdir=" + fixture.string(), "-jar", host, "--adapter", adapter},
-                                                        .execution = {"request", "computation", "kotlin"},
-                                                        .slot_id = "project/kotlin",
-                                                        .demand = {.files = {"Main.kt"}, .facts = {std::string{"symbols"}, std::string{"types"}}}}};
+            jobs::staged_analysis request{.preparation = {.project = "project", .tree = "kotlin", .measure = {{"model", "project_model", "model.json"}}},
+                                          .analysis = {.provider = "kotlin",
+                                                       .options = "kotlin-test",
+                                                       .artifacts = {{"model", "project_model", "model.json"}},
+                                                       .argv = {java, "-Djava.io.tmpdir=" + fixture.string(), "-jar", host, "--adapter", adapter},
+                                                       .execution = {"request", "computation", "kotlin"},
+                                                       .slot_id = "project/kotlin",
+                                                       .demand = {.files = {"Main.kt"}, .facts = {std::string{"symbols"}, std::string{"types"}}}}};
             std::size_t reads = 0;
             auto fetch = [&](jobs::model_read request) -> jobs::source_bytes {
                 ++reads;

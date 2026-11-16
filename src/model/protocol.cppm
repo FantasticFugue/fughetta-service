@@ -123,6 +123,7 @@ export namespace jobs {
         inline constexpr std::string_view stale_head = "stale_head";
         inline constexpr std::string_view receipt_conflict = "receipt_conflict";
         inline constexpr std::string_view unknown_operation = "unknown_operation";
+        inline constexpr std::string_view stale_inputs = "stale_inputs";
     } // namespace why
 
     struct hash_file {
@@ -273,9 +274,37 @@ export namespace jobs {
         std::map<std::string, std::string> exports;
         // Complete producer inventory for this directory group, including other analysis stages.
         std::set<std::string> generation_producers;
+        // The analysis stage this build prepares the tree for: its report names the inputs it leaves, and a
+        // preparation task that already ran on this snapshot is not run again.
+        std::optional<std::string> prepares;
     };
 
+    // What a preparation leaves for the analysis of one snapshot, by content: the measured outputs of its steps.
+    // The files stay in the build tree; an analysis names the inventory it reads by `id`.
+    struct analysis_inputs {
+        content::hash snapshot;
+        std::vector<builds::artifact_result> outputs;
+        // Advances whenever a preparation step runs in the tree: a measured directory has no digest.
+        std::uint64_t generation = 0;
+        auto id() const -> content::hash { return content::hash_of(rfl::json::write(*this)); }
+    };
+
+    // An analysis of a prepared tree. `inputs` is the inventory its preparation reported; a worker whose tree
+    // holds another refuses with stale_inputs.
     struct analysis_request {
+        std::string project;
+        std::string tree;
+        content::hash snapshot;
+        content::hash inputs;
+        std::uint32_t timeout_s = 1800;
+        std::map<std::string, std::string> env;
+        std::optional<std::uint64_t> max_memory_bytes;
+        std::optional<std::uint32_t> max_cpu_seconds;
+        analysis_plan analysis;
+    };
+
+    // What a caller wants analyzed: sent as the preparation's build, then the analysis of the inputs it reports.
+    struct staged_analysis {
         build_request preparation;
         analysis_plan analysis;
     };
@@ -527,6 +556,8 @@ export namespace jobs {
         std::string export_error;
         std::vector<std::string> export_skipped;
         std::optional<double> preparation_seconds, execution_seconds;
+        // Set by a build that prepares an analysis, once every step succeeded.
+        std::optional<analysis_inputs> inputs;
 
         auto ok() const -> bool {
             return std::ranges::all_of(steps, [](auto& s) { return s.exit_code == 0 && !s.timed_out; });
@@ -545,9 +576,11 @@ export namespace jobs {
         static auto preparation(auto& request) -> decltype(auto) { return (request); }
         static auto analysis(auto&) -> analysis_plan* { return nullptr; }
     };
-    template <> struct traits<analysis_request> {
+    template <> struct traits<staged_analysis> {
         static auto preparation(auto& request) -> decltype(auto) { return (request.preparation); }
         static auto analysis(auto& request) { return &request.analysis; }
+    };
+    template <> struct traits<analysis_request> {
         static auto identity(const analysis_request& request) { return request.analysis.execution; }
         static auto slot(const analysis_request& request) { return request.analysis.slot_id; }
         static void validate(const build_report& report, const language::evaluation_identity& identity, std::uint64_t count, bool succeeded) {
@@ -558,12 +591,12 @@ export namespace jobs {
                              const std::string& error, const std::string& code) -> std::variant<analysis_completed, analysis_failed> {
             if (report && report->ok() && !report->analysis_error)
                 return analysis_completed{identity, count};
-            const bool timed_out = report && std::ranges::any_of(report->steps, [](const auto& step) { return step.timed_out; });
-            auto failed_code = report ? (report->analysis_error ? report->analysis_error_code : timed_out ? "resource_limit" : "preparation_failed") : code;
-            auto message = report ? report->analysis_error.value_or(timed_out ? "execution time budget exhausted" : "preparation did not complete") : error;
+            auto failed_code = report ? (report->analysis_error ? report->analysis_error_code : "resource_limit") : code;
+            auto message = report ? report->analysis_error.value_or("execution time budget exhausted") : error;
             return analysis_failed{identity, count, std::move(failed_code), std::move(message)};
         }
     };
+
     template <class Request>
     concept execution_request = std::same_as<Request, build_request> || std::same_as<Request, analysis_request>;
 
@@ -1094,6 +1127,53 @@ export namespace transport {
         std::exception_ptr ended_;
         std::unordered_map<std::uint64_t, std::shared_ptr<pending>> pending_;
     };
+
+    // Runs a staged analysis on one worker and replies with one report over both stages. The analysis starts
+    // only when the preparation succeeded, and takes the time the preparation left. Another stage may prepare the
+    // same tree between the two; the worker then refuses the analysis and the preparation is asked again.
+    template <class Channel>
+    auto staged(Channel& channel, jobs::staged_analysis work, jobs::progress_log* progress = nullptr, jobs::analysis_link inputs = {})
+        -> coroutine::task<call_result<jobs::build_report>> {
+        const auto started = std::chrono::steady_clock::now();
+        auto& preparation = work.preparation;
+        preparation.prepares = work.analysis.execution.stage_id;
+        for (unsigned attempt = 0;; ++attempt) {
+            auto prepared = co_await channel.call(preparation, progress, inputs);
+            if (!prepared || !prepared->inputs) {
+                if (prepared)
+                    prepared->analysis_execution = work.analysis.execution;
+                co_return prepared;
+            }
+            const auto spent = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now() - started).count();
+            jobs::analysis_request request{.project = preparation.project,
+                                           .tree = preparation.tree,
+                                           .snapshot = preparation.snapshot,
+                                           .inputs = prepared->inputs->id(),
+                                           .timeout_s = preparation.timeout_s - std::min<std::uint32_t>(preparation.timeout_s, spent),
+                                           .env = preparation.env,
+                                           .max_memory_bytes = preparation.max_memory_bytes,
+                                           .max_cpu_seconds = preparation.max_cpu_seconds,
+                                           .analysis = work.analysis};
+            auto analyzed = co_await channel.call(request, progress, inputs);
+            if (!analyzed) {
+                const auto* refused = std::get_if<jobs::failure>(&analyzed.error());
+                if (refused && refused->code == jobs::why::stale_inputs && attempt < 2)
+                    continue;
+                co_return analyzed;
+            }
+            auto& report = *analyzed;
+            report.steps.insert(report.steps.begin(), std::make_move_iterator(prepared->steps.begin()), std::make_move_iterator(prepared->steps.end()));
+            report.exports.insert(report.exports.begin(), std::make_move_iterator(prepared->exports.begin()), std::make_move_iterator(prepared->exports.end()));
+            report.models = std::move(prepared->models);
+            report.export_error = std::move(prepared->export_error);
+            report.export_skipped = std::move(prepared->export_skipped);
+            report.inputs = std::move(prepared->inputs);
+            report.preparation_seconds = prepared->preparation_seconds;
+            report.execution_seconds = prepared->execution_seconds.value_or(0) + report.execution_seconds.value_or(0);
+            report.seconds += prepared->seconds;
+            co_return analyzed;
+        }
+    }
 
     template <io::stream S> class dispatcher {
     public:

@@ -278,13 +278,19 @@ export namespace replica {
             }
         };
 
+        // What a preparation left in a tree: for each task, the digest of the steps that last ran on the
+        // snapshot; the source files and inputs an analysis of it reads; and the model objects those inputs name.
         struct preparation {
-            std::string computation;
             content::hash snapshot;
-            std::set<std::string> tasks;
+            std::map<std::string, std::string> tasks;
+            std::vector<content::entry> files;
+            jobs::analysis_inputs inputs;
+            delivery::pins models;
+            std::chrono::steady_clock::time_point used;
         };
 
         std::uint64_t status_sequence_ = 0;
+        std::uint64_t generations_ = 0;
 
         using session_key = std::pair<std::string, std::string>;
         auto retention(const session_key& key, std::chrono::steady_clock::time_point now) const -> double {
@@ -501,7 +507,8 @@ export namespace replica {
                 }
             }
             std::erase_if(preparations_, [&](const auto& item) {
-                return !active_.contains(item.first) && std::ranges::none_of(contexts_, [&](const auto& context) { return context.first.first == item.first; });
+                return (pressure || now - item.second.used >= constants::language_idle) && !active_.contains(item.first) &&
+                       std::ranges::none_of(contexts_, [&](const auto& context) { return context.first.first == item.first; });
             });
         }
 
@@ -557,14 +564,10 @@ export namespace replica {
             env["DOTNET_PROCESSOR_COUNT"] = jobs;
         }
 
-        template <jobs::execution_request Request> auto build(Request work, jobs::analysis_link messages = {}) -> coroutine::task<jobs::build_report> {
-            auto& r = jobs::traits<Request>::preparation(work);
-            auto* analysis = jobs::traits<Request>::analysis(work);
+        auto build(jobs::build_request r, jobs::analysis_link messages = {}) -> coroutine::task<jobs::build_report> {
             co_await collect_sessions();
             auto started = std::chrono::steady_clock::now();
             auto key = store::tree_key(r.project, r.tree);
-            if (analysis && analysis->slot_id != key)
-                throw std::invalid_argument("analysis request belongs to another slot");
             auto lock = tree_locks_[key].lock();
             if (!lock) {
                 lock = std::make_shared<coroutine::mutex>();
@@ -585,7 +588,7 @@ export namespace replica {
                 std::string key;
                 ~release_resources() { owner->resources_.erase(key); }
             } resource_lease{this, key};
-            auto resource = co_await reserve_memory(key, analysis ? analysis->execution.stage_id : std::string{}, r.max_memory_bytes);
+            auto resource = co_await reserve_memory(key, r.prepares.value_or(std::string{}), r.max_memory_bytes);
             struct holding {
                 std::map<std::string, int>& active;
                 std::string key;
@@ -597,29 +600,32 @@ export namespace replica {
             ++active_[key];
             if (!r.fresh)
                 r.fresh = co_await locked([&](store& s) { return s.unfinished_generation(r.project, r.tree); });
-            // A receipt belongs to this live directory and one computation. Moving
+            // A receipt belongs to this live directory and one snapshot. Moving
             // it out before checkout makes cancellation and intervening builds
             // invalidate it even when they stop before producing a report.
             preparation prepared;
             if (auto found = preparations_.find(key); found != preparations_.end()) {
-                if (!r.fresh && analysis && found->second.computation == analysis->execution.computation_id && found->second.snapshot == r.snapshot)
-                    prepared = std::move(found->second);
+                if (!r.fresh && r.prepares && found->second.snapshot == r.snapshot) {
+                    prepared.tasks = std::move(found->second.tasks);
+                    prepared.inputs.generation = found->second.inputs.generation;
+                }
                 preparations_.erase(found);
             }
-            if (analysis) {
-                prepared.computation = analysis->execution.computation_id;
-                prepared.snapshot = r.snapshot;
-            }
+            prepared.snapshot = r.snapshot;
+            // A task is the same work when its steps and their environment are.
+            std::vector<std::pair<std::string, std::string>> completing;
             if (!r.preparation_tasks.empty()) {
-                if (!analysis || prepared.computation.empty())
-                    throw std::invalid_argument("preparation tasks require an analysis computation");
+                if (!r.prepares)
+                    throw std::invalid_argument("preparation tasks belong to a build that prepares an analysis");
                 std::vector<jobs::step> pending;
                 std::size_t covered = 0;
                 for (const auto& task : r.preparation_tasks) {
                     if (task.first_step != covered || task.step_count == 0 || task.step_count > r.steps.size() - covered)
                         throw std::invalid_argument("invalid preparation task steps");
-                    if (!prepared.tasks.contains(task.name))
-                        pending.insert(pending.end(), r.steps.begin() + covered, r.steps.begin() + covered + task.step_count);
+                    const std::span steps{r.steps.data() + covered, task.step_count};
+                    completing.emplace_back(task.name, content::hash_of(rfl::json::write(std::tuple{steps, r.env})).str());
+                    if (const auto ran = prepared.tasks.find(task.name); ran == prepared.tasks.end() || ran->second != completing.back().second)
+                        pending.insert(pending.end(), steps.begin(), steps.end());
                     covered += task.step_count;
                 }
                 if (covered != r.steps.size())
@@ -628,7 +634,8 @@ export namespace replica {
             }
             if (r.fresh)
                 co_await retire_slot(key);
-            bool preparation = !r.measure.empty() || analysis;
+            bool preparation = !r.measure.empty() || r.prepares;
+            const bool ran_steps = !r.steps.empty();
             // A preparation keeps the snapshot's files, which the offer cache may let go while the steps run.
             auto [dir, reports, files, retired] = co_await locked(
                 [project = r.project, snapshot = r.snapshot, tree = r.tree, key, preparation, fresh = r.fresh, producers = r.generation_producers](store& s) {
@@ -651,58 +658,29 @@ export namespace replica {
             auto token = resource->stop.get_token();
             std::optional<jobs::build_report> report;
             std::exception_ptr failed;
-            bool analysis_expired = false;
             delivery::pins model_pins;
             try {
-                report = co_await coroutine::under(token, run_steps(r, dir, reports, deadline, analysis != nullptr, messages, model_pins));
-                if (report && analysis)
-                    report->analysis_execution = analysis->execution;
+                report = co_await coroutine::under(token, run_steps(r, dir, reports, deadline, r.prepares.has_value(), messages, model_pins));
                 if (report && report->ok() && preparation) {
-                    auto io = rt_.get_scheduler(home_);
                     auto remaining = std::max(std::chrono::steady_clock::duration::zero(), deadline - std::chrono::steady_clock::now());
-                    bool budget_limited = false;
-                    if (analysis) {
-                        auto milliseconds = std::min<std::uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(remaining).count(),
-                                                                    std::uint64_t{analysis->seconds} * 1000);
-                        if (analysis->budget.milliseconds) {
-                            budget_limited = *analysis->budget.milliseconds <= milliseconds;
-                            milliseconds = std::min(milliseconds, *analysis->budget.milliseconds);
-                        }
-                        remaining = std::chrono::milliseconds{milliseconds};
-                        report->missing.push_back({.scope = analysis->demand, .reason = "semantic time budget exhausted", .deferred = true});
-                    }
                     co_await install_models(r.measure, dir, messages, model_pins);
-                    const auto analysis_started = std::chrono::steady_clock::now();
-                    auto finished = co_await coroutine::under(
-                        token, coroutine::deadline(io, remaining, afterwards(r, analysis, dir, files, *report, messages, model_pins)));
-                    *report->execution_seconds += std::chrono::duration<double>(std::chrono::steady_clock::now() - analysis_started).count();
+                    const auto measuring = std::chrono::steady_clock::now();
+                    auto finished = co_await coroutine::under(token, coroutine::deadline(rt_.get_scheduler(home_), remaining, measure(r, dir, files, *report)));
+                    *report->execution_seconds += std::chrono::duration<double>(std::chrono::steady_clock::now() - measuring).count();
                     if (!finished)
                         report.reset();
-                    else if (!*finished) {
-                        analysis_expired = true;
-                        report->analysis_session.reset();
-                        if (budget_limited) {
-                            report->analyzed = true;
-                            if (report->missing.empty())
-                                report->missing.push_back({.scope = analysis->demand, .reason = "semantic time budget exhausted", .deferred = true});
-                        } else {
-                            report->analyzed = false;
-                            report->steps.push_back(
-                                {.name = "analysis", .timed_out = true, .output = "time budget exhausted during artifact or language analysis"});
-                        }
-                    }
+                    else if (!*finished)
+                        report->steps.push_back({.name = "analysis", .timed_out = true, .output = "time budget exhausted while measuring build outputs"});
                 }
             } catch (...) {
                 failed = std::current_exception();
             }
-            if (analysis && (resource->exceeded || failed || !report || !report->ok() || analysis_expired))
+            if (r.prepares && (resource->exceeded || failed || !report || !report->ok()))
                 co_await coroutine::under(coroutine::stop_token{}, retire_slot(key));
             if (resource->exceeded) {
                 jobs::build_report limited{.worker = options_.worker, .tree = dir.string()};
                 limited.analysis_error = "worker resident memory budget exhausted";
                 limited.analysis_error_code = "resource_limit";
-                if (analysis)
-                    limited.analysis_execution = analysis->execution;
                 co_return limited;
             }
             if (failed)
@@ -724,13 +702,132 @@ export namespace replica {
                     report->export_error = std::string{error.what()}.substr(0, 512);
                 }
             }
-            if (analysis && report->ok() && report->analyzed && !report->analysis_error) {
-                for (const auto& task : r.preparation_tasks)
-                    prepared.tasks.insert(task.name);
+            if (r.prepares && report->ok()) {
+                if (ran_steps || !prepared.inputs.generation)
+                    prepared.inputs.generation = ++generations_;
+                report->inputs = jobs::analysis_inputs{r.snapshot, report->measured, prepared.inputs.generation};
+                for (auto& [task, digest] : completing)
+                    prepared.tasks.insert_or_assign(task, std::move(digest));
+                prepared.inputs = *report->inputs;
+                prepared.files = std::move(files);
+                prepared.used = std::chrono::steady_clock::now();
+                prepared.models = std::move(model_pins);
                 preparations_[key] = std::move(prepared);
             }
             report->seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
             co_return std::move(*report);
+        }
+
+        // Analyzes the tree a preparation left. The request names the inputs it reads; the tree is not written.
+        auto build(jobs::analysis_request work, jobs::analysis_link messages = {}) -> coroutine::task<jobs::build_report> {
+            auto* analysis = &work.analysis;
+            // What the analysis session inherits from its preparation.
+            const jobs::build_request r{.project = work.project,
+                                        .tree = work.tree,
+                                        .snapshot = work.snapshot,
+                                        .timeout_s = work.timeout_s,
+                                        .env = work.env,
+                                        .max_memory_bytes = work.max_memory_bytes,
+                                        .max_cpu_seconds = work.max_cpu_seconds};
+            co_await collect_sessions();
+            auto started = std::chrono::steady_clock::now();
+            auto key = store::tree_key(r.project, r.tree);
+            if (analysis->slot_id != key)
+                throw std::invalid_argument("analysis request belongs to another slot");
+            auto lock = tree_locks_[key].lock();
+            if (!lock) {
+                lock = std::make_shared<coroutine::mutex>();
+                tree_locks_[key] = lock;
+            }
+            struct tree_lifetime {
+                std::unordered_map<std::string, std::weak_ptr<coroutine::mutex>>& locks;
+                std::string key;
+                std::shared_ptr<coroutine::mutex> lock;
+                ~tree_lifetime() {
+                    if (lock.use_count() == 1)
+                        locks.erase(key);
+                }
+            } lifetime{tree_locks_, key, std::move(lock)};
+            auto turn = co_await lifetime.lock->lock();
+            struct release_resources {
+                service* owner;
+                std::string key;
+                ~release_resources() { owner->resources_.erase(key); }
+            } resource_lease{this, key};
+            auto resource = co_await reserve_memory(key, analysis->execution.stage_id, r.max_memory_bytes);
+            struct holding {
+                std::map<std::string, int>& active;
+                std::string key;
+                ~holding() {
+                    if (!--active.at(key))
+                        active.erase(key);
+                }
+            } hold{active_, key};
+            ++active_[key];
+            // Any build of the tree since the preparation discarded its receipt.
+            const auto prepared = preparations_.find(key);
+            if (prepared == preparations_.end() || prepared->second.snapshot != r.snapshot || prepared->second.inputs.id() != work.inputs)
+                throw transport::coded_error(jobs::why::stale_inputs, "the tree no longer holds the inputs this analysis names");
+            prepared->second.used = std::chrono::steady_clock::now();
+            jobs::build_report report{.worker = options_.worker, .measured = prepared->second.inputs.outputs, .execution_seconds = 0};
+            auto model_pins = prepared->second.models;
+            const auto files = prepared->second.files;
+            const auto dir = store_.tree(key);
+            report.tree = dir.string();
+            report.analysis_execution = analysis->execution;
+            auto parent_token = co_await coroutine::current_token;
+            struct forward_stop {
+                coroutine::stop_source* source;
+                void operator()() const noexcept { source->request_stop(); }
+            };
+            std::optional<execution::stop_callback_for_t<coroutine::stop_token, forward_stop>> parent_stop;
+            if (parent_token.stop_possible())
+                parent_stop.emplace(parent_token, forward_stop{&resource->stop});
+            auto token = resource->stop.get_token();
+            auto milliseconds = std::min(std::uint64_t{r.timeout_s}, std::uint64_t{analysis->seconds}) * 1000;
+            bool budget_limited = false;
+            if (analysis->budget.milliseconds) {
+                budget_limited = *analysis->budget.milliseconds <= milliseconds;
+                milliseconds = std::min(milliseconds, *analysis->budget.milliseconds);
+            }
+            report.missing.push_back({.scope = analysis->demand, .reason = "semantic time budget exhausted", .deferred = true});
+            std::exception_ptr failed;
+            bool stopped = false, expired = false;
+            try {
+                auto finished = co_await coroutine::under(token, coroutine::deadline(rt_.get_scheduler(home_), std::chrono::milliseconds{milliseconds},
+                                                                                     analyze(r, *analysis, dir, files, report, messages, model_pins)));
+                stopped = !finished;
+                if (finished && !*finished) {
+                    expired = true;
+                    report.analysis_session.reset();
+                    if (budget_limited) {
+                        report.analyzed = true;
+                        if (report.missing.empty())
+                            report.missing.push_back({.scope = analysis->demand, .reason = "semantic time budget exhausted", .deferred = true});
+                    } else {
+                        report.analyzed = false;
+                        report.steps.push_back({.name = "analysis", .timed_out = true, .output = "time budget exhausted during artifact or language analysis"});
+                    }
+                }
+            } catch (...) {
+                failed = std::current_exception();
+            }
+            if (resource->exceeded || failed || stopped || expired)
+                co_await coroutine::under(coroutine::stop_token{}, retire_slot(key));
+            if (resource->exceeded) {
+                jobs::build_report limited{.worker = options_.worker, .tree = dir.string()};
+                limited.analysis_error = "worker resident memory budget exhausted";
+                limited.analysis_error_code = "resource_limit";
+                limited.analysis_execution = analysis->execution;
+                co_return limited;
+            }
+            if (failed)
+                std::rethrow_exception(failed);
+            if (stopped)
+                co_await coroutine::stop;
+            *report.execution_seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
+            report.seconds = *report.execution_seconds;
+            co_return report;
         }
 
         // Once every step succeeded: the artifacts the request names are measured, and the language server it names surveys the tree's
@@ -881,8 +978,7 @@ export namespace replica {
             co_return out;
         }
 
-        auto afterwards(const jobs::build_request& r, const jobs::analysis_plan* analysis, const std::filesystem::path& dir,
-                        const std::vector<content::entry>& files, jobs::build_report& report, const jobs::analysis_link& messages, delivery::pins& model_pins)
+        auto measure(const jobs::build_request& r, const std::filesystem::path& dir, const std::vector<content::entry>& files, jobs::build_report& report)
             -> coroutine::task<> {
             co_await io::blocking(rt_.get_scheduler(home_), pool_, [&] {
                 for (auto& file : files)
@@ -899,8 +995,11 @@ export namespace replica {
                     }
                     return out;
                 });
-            if (!analysis)
-                co_return;
+        }
+
+        auto analyze(const jobs::build_request& r, const jobs::analysis_plan& plan, const std::filesystem::path& dir, const std::vector<content::entry>& files,
+                     jobs::build_report& report, const jobs::analysis_link& messages, delivery::pins& model_pins) -> coroutine::task<> {
+            const auto* analysis = &plan;
             if (!messages)
                 throw std::logic_error("analysis requires an input exchange");
             try {

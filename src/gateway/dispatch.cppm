@@ -331,7 +331,7 @@ export namespace tools {
         return result;
     }
 
-    template <jobs::execution_request Request>
+    template <class Request>
     auto sync_and_run(native::scheduler& io, storage::registry& files, std::size_t core, transport::channel<native::socket>& worker, std::string project,
                       content::manifest tree, Request work, jobs::progress_log* progress, std::string worldline, std::string version, worlds::actor actor,
                       std::shared_ptr<execution_identity> executor, semantic::retention_roots roots = {}, semantic::snapshot_vector snapshots = {},
@@ -429,7 +429,10 @@ export namespace tools {
         auto execute = [&](coroutine::scope& children) -> coroutine::task<jobs::build_report> {
             auto close = jobs::analysis_exchange::lifetime{inputs};
             children.spawn(publication.serve(inputs));
-            co_return co_await within(io, limit, "the build", worker.call(work, progress, inputs));
+            if constexpr (std::same_as<Request, jobs::staged_analysis>)
+                co_return co_await within(io, limit, "the build", transport::staged(worker, work, progress, inputs));
+            else
+                co_return co_await within(io, limit, "the build", worker.call(work, progress, inputs));
         };
         auto r = co_await coroutine::with_scope(std::move(execute));
         if (r.ok() && !r.analysis_error &&
@@ -1017,16 +1020,16 @@ export namespace tools {
             !std::ranges::contains(needs.tools, plan.server.argv.front()))
             needs.tools.push_back(plan.server.argv.front());
         needs.toolchain_id = toolchain;
-        jobs::analysis_request build{.preparation = {.project = project,
-                                                     .tree = std::move(tree),
-                                                     .snapshot = files.id(),
-                                                     .steps = plan.build.steps,
-                                                     .preparation_tasks = plan.build.tasks,
-                                                     .timeout_s = language::timeout(plan.execution.limits),
-                                                     .output_limit = language::output_limit(plan.execution.limits),
-                                                     .env = plan.build.env,
-                                                     .max_memory_bytes = plan.execution.limits.max_memory_bytes,
-                                                     .max_cpu_seconds = plan.execution.limits.max_cpu_seconds}};
+        jobs::staged_analysis build{.preparation = {.project = project,
+                                                    .tree = std::move(tree),
+                                                    .snapshot = files.id(),
+                                                    .steps = plan.build.steps,
+                                                    .preparation_tasks = plan.build.tasks,
+                                                    .timeout_s = language::timeout(plan.execution.limits),
+                                                    .output_limit = language::output_limit(plan.execution.limits),
+                                                    .env = plan.build.env,
+                                                    .max_memory_bytes = plan.execution.limits.max_memory_bytes,
+                                                    .max_cpu_seconds = plan.execution.limits.max_cpu_seconds}};
         build.preparation.generation_producers = std::move(producers);
         for (auto& step : plan.build.steps)
             std::ranges::copy(step.outputs, std::back_inserter(build.preparation.measure));
