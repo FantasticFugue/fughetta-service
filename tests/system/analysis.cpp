@@ -176,6 +176,9 @@ namespace {
             files[path] = "package sample\nimport dependency.scale\nimport dependency.adjust\nimport dependency.choose\n"
                           "fun fromLibrary() = choose(adjust(scale(3)))\nobject Bridge {\n    external fun nativeTwice(input: Int): Int\n"
                           "    fun run(input: Int) = input * 2 + nativeTwice(input)\n}\n"
+                          "fun inferred(values: List<Int>): Int {\n    val first = values.first()\n    var total = 0\n"
+                          "    for (value in values) total = total + value\n    val pair = first to total\n"
+                          "    return listOf(first, pair.second).maxOf { it }\n}\n"
                           "fun main() { System.loadLibrary(\"native\"); check(Bridge.run(3) == 12); java.io.File(" +
                           rfl::json::write(ran.string()) + ").appendText(\"run\\n\") }\n";
             files["library/src/main/kotlin/Library.kt"] = "package dependency\n"
@@ -193,7 +196,9 @@ namespace {
             files["Shared.fs"] = "namespace Sample\nmodule Shared =\n    let separateFile = 17\n";
             files[path] = "namespace Sample\nopen System.Runtime.InteropServices\nmodule Library =\n"
                           "    [<DllImport(\"native\", EntryPoint=\"native_twice\", CallingConvention=CallingConvention.Cdecl)>]\n"
-                          "    extern int Native(int input)\n    let run input = input * 2 + Native input\n";
+                          "    extern int Native(int input)\n    let run input = input * 2 + Native input\n"
+                          "    let inferred (values: int list) =\n        let first = List.head values\n        let (named: int) = first\n"
+                          "        let total = named + 1\n        List.map string values, total\n";
             files["check.fsx"] = "#r \"bin/Debug/net10.0/Library.dll\"\n"
                                  "if Sample.Library.run 3 <> 12 then failwith \"wrong native result\"\nSystem.IO.File.AppendAllText(" +
                                  rfl::json::write(ran.string()) + ", \"run\\n\")\n";
@@ -270,6 +275,20 @@ namespace {
             return item.name == (kotlin ? "nativeTwice" : "Native") && item.domain == (kotlin ? "kotlin" : "fsharp");
         });
         test::require(imported != source_only.items.end(), "source view has no managed native declaration");
+        const auto inferred = test::decode<tools::language_query::output>(
+            agent("language", rfl::json::write(tools::language_query::input{.project = "app",
+                                                                            .configuration = "managed",
+                                                                            .action = std::string{"inspect"},
+                                                                            .selector = semantic::selection{.name = semantic::named{"inferred"}},
+                                                                            .outputs = std::vector<std::string>{"source"}})));
+        const auto spelled = inferred.typed_ranges |
+                             std::views::transform([&](const auto& row) { return files.at(path).substr(row.range.begin, row.range.end - row.range.begin); }) |
+                             std::ranges::to<std::set<std::string>>();
+        const std::set<std::string> expected = kotlin ? std::set<std::string>{"first", "total", "value", "pair", "first()", "first to total", "it"}
+                                                      : std::set<std::string>{"first", "total", "List.head values", "List.map string values"};
+        expect(std::ranges::includes(spelled, expected) && !spelled.contains("named") &&
+               std::ranges::none_of(spelled, [](const std::string& text) { return text.contains('+'); }))
+            << "typed ranges cover only unwritten types: " << rfl::json::write(spelled);
         if (kotlin)
             test::require(std::ranges::any_of(
                               source_only.symbols,
@@ -1341,7 +1360,7 @@ namespace {
                 auto construction = test::decode<tools::language_query::output>(agent("language", rfl::json::write(relation_query)));
                 const auto constructor = std::ranges::find_if(construction.relations, [&](const auto& relation) {
                     return std::ranges::any_of(construction.items, [&](const auto& item) {
-                        return item.symbol_id == relation.to && item.kind == "function" && (item.name == "Widget" || item.name == "Converted");
+                        return item.symbol_id == relation.to && item.kind == "constructor" && (item.name == "Widget" || item.name == "Converted");
                     });
                 });
                 test::require(constructor != construction.relations.end() && constructor->reference.has_value(), "constructor call source missing");
@@ -1401,6 +1420,8 @@ namespace {
             auto integer = std::ranges::find(detail.types, *signature->return_type, &semantic::records::type::id);
             expect(integer != detail.types.end() && integer->kind == "primitive" && integer->name == "int");
             expect(signature->parameter_groups.front().parameters.front().type == *signature->return_type);
+            expect(detail.items.front().source && detail.items.front().source->contains("return x * 3;"))
+                << "inspect returns the definition's body text: " << rfl::json::write(detail.items.front().source);
             auto references = inspect;
             references.action = std::string{"references"};
             references.limit = 1;

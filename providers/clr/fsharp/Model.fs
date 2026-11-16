@@ -10,6 +10,7 @@ open FSharp.Compiler.IO
 open FSharp.Compiler.Text
 open FSharp.Compiler.Symbols
 open FSharp.Compiler.Diagnostics
+open FSharp.Compiler.Syntax
 open Json
 
 module CompilerInputs =
@@ -28,6 +29,7 @@ type CheckedSources = {
     Uses: FSharpSymbolUse array
     Diagnostics: FSharpDiagnostic array
     ImplementationFiles: FSharpImplementationFileContents array
+    ParseTrees: Map<string, ParsedInput>
 }
 
 type Project = { Id: string; Dependencies: string array; Sources: string array; Inputs: string array; Generated: Set<string>; Options: FSharpProjectOptions }
@@ -197,20 +199,24 @@ type Workspace(root: string, host: JsonNode) =
                         diagnostic.FileName = Range.rangeStartup.FileName || diagnostic.FileName = Range.rangeCmdArgs.FileName)
             { OpaqueInputs = result.HasCriticalErrors || CompilerInputs.opaque result.ProjectContext
               Sources = selected; Uses = result.GetAllUsesOfAllSymbols(); Diagnostics = Array.append result.Diagnostics startup |> distinctDiagnostics
-              ImplementationFiles = if result.HasCriticalErrors then [||] else result.AssemblyContents.ImplementationFiles |> Seq.toArray }
+              ImplementationFiles = if result.HasCriticalErrors then [||] else result.AssemblyContents.ImplementationFiles |> Seq.toArray
+              ParseTrees = selected |> Array.map (fun path ->
+                  path, (checker.GetBackgroundParseResultsForFileInProject(path, project.Options) |> Async.RunSynchronously).ParseTree) |> Map.ofArray }
         else
             // FCS owns the ordered prefix and signature/implementation cache.
             // Export only requested files, leaving subsequent files unchecked.
-            let checkedFiles = selected |> Array.map (fun path ->
-                let _, answer = checker.ParseAndCheckFileInProject(path, versions[path], SourceText.ofString(this.Text path), project.Options) |> Async.RunSynchronously
+            let parsed = selected |> Array.map (fun path ->
+                let parse, answer = checker.ParseAndCheckFileInProject(path, versions[path], SourceText.ofString(this.Text path), project.Options) |> Async.RunSynchronously
                 match answer with
-                | FSharpCheckFileAnswer.Succeeded result -> result
+                | FSharpCheckFileAnswer.Succeeded result -> parse, result
                 | FSharpCheckFileAnswer.Aborted -> failwithf "F# file check was cancelled: %s" path)
+            let checkedFiles = parsed |> Array.map snd
             { OpaqueInputs = checkedFiles |> Array.exists (fun result -> not result.HasFullTypeCheckInfo || CompilerInputs.opaque result.ProjectContext)
               Sources = selected
               Uses = checkedFiles |> Array.collect (fun result -> result.GetAllUsesOfAllSymbolsInFile() |> Seq.toArray)
               Diagnostics = checkedFiles |> Array.collect (fun result -> result.Diagnostics) |> distinctDiagnostics
-              ImplementationFiles = checkedFiles |> Array.choose (fun result -> result.ImplementationFile) }
+              ImplementationFiles = checkedFiles |> Array.choose (fun result -> result.ImplementationFile)
+              ParseTrees = Array.zip selected parsed |> Array.map (fun (path, (parse, _)) -> path, parse.ParseTree) |> Map.ofArray }
     member _.Close() =
         checker.InvalidateAll()
         FileSystem <- previousFileSystem

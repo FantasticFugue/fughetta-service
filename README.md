@@ -850,6 +850,28 @@ C++ attributes use the `cpp.attributes` extension on declarations and parameters
 Function redeclarations contribute defaults and attributes; definitions supply
 parameter names when available.
 
+For a selected callable, `inspect` also returns the public constructors, fields,
+properties, enum members and methods of the types its parameters, receiver and
+result name, one hop away. Pointers, references, nullability, aliases and
+library wrappers such as `std::optional`, `kotlin.Result`, `Task` and F#
+`option` are stripped first. Aliases expand to their underlying type. For a
+selected type, `include: ["producers", "consumers"]` adds `producers`, the
+constructors and callables that return the type, and `consumers`, the callables
+that take it as receiver or first argument (instance methods take their owner).
+Both lists are ordered by module, then visibility, and follow the requested
+module and file scope. These symbols and the type records they reference share
+the node budget.
+
+`typed_ranges` record what the compiler knows but the source does not spell:
+local bindings and lambda parameters without a written type (C++ `auto`,
+Kotlin `val`/`var` and implicit `it`, F# `let`, `use` and pattern bindings),
+and generic, overloaded or virtual call sites with the chosen `overload`,
+result `type` and generic `substitutions`. `inspect` returns the ranges inside
+each selected definition's body, and `include: ["type"]` on `scopes` returns
+those inside each returned scope. `inspect`, or `include: ["source"]` on other
+actions, also fills each item's `source` with the text of its definition's
+body, read from the view's snapshot.
+
 References preserve either a resolved `target` or the provider's `candidates`.
 Dependent overload sets are `ambiguous`; a single remaining candidate or a name
 with no candidates stays `unresolved`. Queries for either overload return the
@@ -1019,7 +1041,7 @@ Queries accept `budget: {"milliseconds": 5000, "units": 100, "nodes": 20000}`
 to bound analysis time, source documents and returned semantic records. These
 limits also account for clice's structured exports. Exceeding a document or
 record budget returns `resource_limit`; an unfinished unit contributes no
-records, while earlier committed units remain stored. On a fixed view, `nodes` bounds type expansion and exhausted traversal
+records, while earlier committed units remain stored. On a fixed view, `nodes` bounds the returned symbols and type records, and exhausted traversal
 is reported as partial coverage.
 
 Executable mappings and prepared-tree environment bindings apply on workers.

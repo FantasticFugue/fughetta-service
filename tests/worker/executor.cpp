@@ -1157,7 +1157,7 @@ def publication(path):
                   "dependencies":[path, "shared.inc", os.path.join(sdk, "header.h")] + (["external/header.h"] if path == "a.cpp" else []),
                   "absent":[os.path.join(sdk, "optional.h")],
                   "directories":[],
-                  "symbols":[], "occurrences":[], "scopes":[], "relations":[], "diagnostics":[], "identities":[],
+                  "symbols":[], "occurrences":[], "scopes":[], "relations":[], "diagnostics":[], "identities":[], "typed_ranges":[], "typedRanges":[],
                   "types":[{"id":"int", "kind":"primitive", "name":"int" + "é" * 600000, "arguments":[],
                             "parameters":[], "qualifiers":[], "type_parameters":[], "template_arguments":[]}]}
 if len(sys.argv) > 1:

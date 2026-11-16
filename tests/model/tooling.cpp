@@ -644,8 +644,7 @@ namespace {
             expect(std::ranges::all_of(split->pieces, [&](const auto& part) {
                 const auto& shard = *part->materialized();
                 return channels::consume("app", "source", shard, "declarations", semantic::dependency_kind::declaration) == declarations &&
-                       channels::consume("app", "source", shard, "definition_bodies", semantic::dependency_kind::body) == bodies &&
-                       shard.unit.output_channels.front().shards.size() == 2;
+                       channels::consume("app", "source", shard, "definition_bodies", semantic::dependency_kind::body) == bodies;
             })) << "a channel describes the complete unit independently of its shard layout and publication";
             source.occurrences = body.occurrences;
             source.types.push_back(body.types.front());
@@ -740,13 +739,16 @@ namespace {
             {
                 semantic::store store{scratch.dir, limits, clock};
                 auto header = shard;
+                header.diagnostics = {{.id = "header", .severity = "warning", .message = "header", .ownership = {shard.unit.id, shard.unit.context}}};
                 old = store.publish({.snapshots = {{"app", "main", "v1", "source-1"}}, .configuration = "cpp"}, {shard, header});
                 store.remember(old, {"app", "cpp", "clice", "evaluate", semantic::unit_kind::file, "main.cpp"});
                 auto loaded = store.load(old);
                 shared = loaded->pieces.front()->id;
                 now += seconds{1};
-                main = store.publish({.snapshots = {{"app", "main", "v2", "source-2"}}, .configuration = "cpp"}, {shard});
-                feature = store.publish({.snapshots = {{"app", "feature", "v1", "source-1"}}, .configuration = "cpp"}, {shard});
+                auto edited = shard;
+                edited.unit.direct_inputs = {{semantic::input_kind::file, "main.cpp", "edited"}};
+                main = store.publish({.snapshots = {{"app", "main", "v2", "source-2"}}, .configuration = "cpp"}, {edited});
+                feature = store.publish({.snapshots = {{"app", "feature", "v1", "source-1"}}, .configuration = "cpp"}, {edited});
                 store.make_current(main);
                 store.make_current(feature);
                 const auto dependency = store.publish({.snapshots = {{"library", "main", "v1", "library-source"}}, .configuration = "cpp"}, {});
@@ -1165,7 +1167,7 @@ namespace {
             semantic::store restored{scratch.dir, {.bytes = 0}};
             auto view = restored.load(id);
             semantic::request inspect{
-                .action = std::string{"inspect"}, .selector = semantic::selection{.name = semantic::named{"value"}}, .budget = {.nodes = 3}};
+                .action = std::string{"inspect"}, .selector = semantic::selection{.name = semantic::named{"value"}}, .budget = {.nodes = 4}};
             auto result = view->query(inspect);
             expect((result.status == "complete" && result.types.size() == 3u && result.coverage.unresolved_count == 0u) >> fatal);
             const auto& arguments = result.types.front().application_arguments;
@@ -1178,9 +1180,149 @@ namespace {
             auto declaration =
                 view->query({.action = std::string{"inspect"}, .selector = semantic::selection{.entity = semantic::entity{*arguments[0].declaration}}});
             expect(declaration.items.size() == 1u && declaration.items.front().name == "marker");
-            inspect.budget.nodes = 1;
+            inspect.budget.nodes = 2;
             auto limited = view->query(inspect);
             expect(limited.status == "partial" && limited.types.size() == 1u && !limited.coverage.missing.empty());
+        };
+        "inspect expands a callable's signature types one hop and sees through aliases"_test = [] {
+            ::test::scratch scratch{"type-surface"};
+            language::cpp::publication publication{
+                .column_encoding = "utf8",
+                .symbols = {{.id = "make", .name = "make", .kind = std::string{"Function"}, .type = "signature", .visibility = "public"},
+                            {.id = "options", .name = "Options", .kind = std::string{"Struct"}, .visibility = "public"},
+                            {.id = "level", .name = "level", .kind = std::string{"Field"}, .owner = "options", .type = "integer", .visibility = "public"},
+                            {.id = "secret", .name = "secret", .kind = std::string{"Field"}, .owner = "options", .type = "integer", .visibility = "private"},
+                            {.id = "handle", .name = "Handle", .kind = std::string{"Struct"}, .visibility = "public"},
+                            {.id = "close", .name = "close", .kind = std::string{"Method"}, .owner = "handle", .type = "closing", .visibility = "public"},
+                            {.id = "count", .name = "Count", .kind = std::string{"Type"}, .type = "underlying", .visibility = "public"},
+                            {.id = "optional", .name = "optional", .kind = std::string{"Class"}, .visibility = "public"},
+                            {.id = "task", .name = "Task", .kind = std::string{"Class"}, .visibility = "public"},
+                            {.id = "run", .name = "run", .kind = std::string{"Method"}, .owner = "task", .type = "closing", .visibility = "public"}},
+                .types = {
+                    {.id = "signature", .kind = std::string{"function"}, .return_type = "wrapped", .parameters = {"options_ref", "counted", "job"}},
+                    {.id = "job", .kind = std::string{"application"}, .name = "app::Task", .declaration = "task", .arguments = {"handle_type"}},
+                    {.id = "options_ref", .kind = std::string{"reference"}, .arguments = {"options_type"}},
+                    {.id = "options_type", .kind = std::string{"named"}, .name = "Options", .declaration = "options"},
+                    {.id = "counted", .kind = std::string{"named"}, .name = "Count", .declaration = "count"},
+                    {.id = "underlying", .kind = std::string{"primitive"}, .name = "long"},
+                    {.id = "wrapped", .kind = std::string{"application"}, .name = "std::optional", .declaration = "optional", .arguments = {"handle_type"}},
+                    {.id = "handle_type", .kind = std::string{"named"}, .name = "Handle", .declaration = "handle"},
+                    {.id = "closing", .kind = std::string{"function"}, .return_type = "integer"},
+                    {.id = "integer", .kind = std::string{"primitive"}, .name = "int"}}};
+            semantic::store store{scratch.dir};
+            auto shard = language::cpp::translate(publication, scratch.dir, {}, "app", "cpp", "cpp", "main.cpp", {}, {{"main.cpp", "source"}});
+            auto view = store.load(store.publish_records({.snapshots = {{"app", "main", "v1", "source"}}, .configuration = "cpp"}, {shard}, {}));
+            semantic::request inspect{.action = std::string{"inspect"}, .selector = semantic::selection{.name = semantic::named{"make"}}};
+            auto result = view->query(inspect);
+            expect((result.status == "complete") >> fatal);
+            auto named = [&](std::string_view name) { return std::ranges::contains(result.symbols, name, &semantic::records::symbol::name); };
+            expect(named("make") && named("level") && named("close") && named("run") && !named("secret") && !named("Options"));
+            expect(std::ranges::contains(result.types, std::optional<std::string>{"long"}, &semantic::records::type::name));
+            inspect.budget.nodes = 2;
+            auto limited = view->query(inspect);
+            expect(limited.status == "partial" && limited.symbols.size() == 2u);
+            expect(std::ranges::contains(limited.coverage.missing, std::string{"type surface budget exhausted"}, &semantic::missing::reason));
+        };
+        "inspect lists a type's producers and consumers by module and visibility"_test = [] {
+            ::test::scratch scratch{"type-capabilities"};
+            language::cpp::publication publication{
+                .column_encoding = "utf8",
+                .symbols =
+                    {{.id = "handle", .name = "Handle", .kind = std::string{"Struct"}, .visibility = "public"},
+                     {.id = "optional", .name = "optional", .kind = std::string{"Class"}, .visibility = "public"},
+                     {.id = "build", .name = "Handle", .kind = std::string{"Constructor"}, .owner = "handle", .type = "building", .visibility = "public"},
+                     {.id = "open", .name = "open", .kind = std::string{"Function"}, .type = "opening", .visibility = "public"},
+                     {.id = "start", .name = "start", .kind = std::string{"Function"}, .type = "starting", .visibility = "public"},
+                     {.id = "make",
+                      .name = "make",
+                      .kind = std::string{"Method"},
+                      .owner = "handle",
+                      .type = "making",
+                      .visibility = "public",
+                      .modifiers = {"static"}},
+                     {.id = "close", .name = "close", .kind = std::string{"Method"}, .owner = "handle", .type = "closing", .visibility = "public"},
+                     {.id = "describe", .name = "describe", .kind = std::string{"Function"}, .type = "describing", .visibility = "public"},
+                     {.id = "helper", .name = "helper", .kind = std::string{"Function"}, .type = "describing", .visibility = "private"},
+                     {.id = "nested", .name = "nested", .kind = std::string{"Function"}, .type = "describing", .visibility = "local"}},
+                .types =
+                    {{.id = "building", .kind = std::string{"function"}, .return_type = "nothing"},
+                     {.id = "opening", .kind = std::string{"function"}, .return_type = "wrapped"},
+                     {.id = "making", .kind = std::string{"function"}, .return_type = "handle_type"},
+                     {.id = "starting", .kind = std::string{"function"}, .return_type = "task"},
+                     {.id = "task",
+                      .kind = std::string{"application"},
+                      .name = "[System.Runtime,8.0.0.0]System.Threading.Tasks.Task`1",
+                      .arguments = {"handle_type"}},
+                     {.id = "closing", .kind = std::string{"function"}, .return_type = "integer"},
+                     {.id = "describing", .kind = std::string{"function"}, .return_type = "integer", .parameters = {"handle_ref", "integer"}},
+                     {.id = "wrapped", .kind = std::string{"application"}, .name = "std::optional", .declaration = "optional", .arguments = {"handle_type"}},
+                     {.id = "handle_ref", .kind = std::string{"reference"}, .arguments = {"handle_type"}},
+                     {.id = "handle_type", .kind = std::string{"named"}, .name = "Handle", .declaration = "handle"},
+                     {.id = "nothing", .kind = std::string{"primitive"}, .name = "void"},
+                     {.id = "integer", .kind = std::string{"primitive"}, .name = "int"}},
+                .occurrences = {{.symbol = "handle", .role = "Reference", .location = {"main.cpp", 0, 6}, .owner = "open"}}};
+            semantic::store store{scratch.dir};
+            auto shard = language::cpp::translate(publication, scratch.dir, {}, "app", "cpp", "cpp", "main.cpp", {}, {{"main.cpp", "source"}});
+            auto view = store.load(store.publish_records({.snapshots = {{"app", "main", "v1", "source"}}, .configuration = "cpp"}, {shard}, {}));
+            semantic::request inspect{.action = std::string{"inspect"},
+                                      .selector = semantic::selection{.name = semantic::named{.text = "Handle", .kind = semantic::symbol_kind::make<"type">()}},
+                                      .include = {"producers", "consumers"}};
+            auto result = view->query(inspect);
+            expect((result.status == "complete") >> fatal) << result.status.str();
+            auto names = [](const std::vector<semantic::records::symbol>& rows) {
+                return rows | std::views::transform(&semantic::records::symbol::name) | std::ranges::to<std::vector>();
+            };
+            const auto producers = names(result.producers);
+            expect(std::ranges::is_permutation(producers, std::vector<std::string>{"Handle", "open", "start", "make"})) << rfl::json::write(producers);
+            const auto consumers = names(result.consumers);
+            expect(std::ranges::is_permutation(consumers, std::vector<std::string>{"close", "describe", "helper"})) << rfl::json::write(consumers);
+            expect(!consumers.empty() && consumers.back() == "helper");
+            inspect.budget.nodes = result.symbols.size() + result.producers.size() + 1;
+            auto limited = view->query(inspect);
+            expect(limited.status == "partial" && limited.producers.size() == 4u && limited.consumers.size() == 1u);
+            expect(std::ranges::contains(limited.coverage.missing, std::string{"consumers budget exhausted"}, &semantic::missing::reason));
+            inspect.budget.nodes = 0;
+            auto empty = view->query(inspect);
+            expect(empty.status == "partial" && empty.symbols.empty() && empty.producers.empty() && empty.consumers.empty());
+            expect(std::ranges::contains(empty.coverage.missing, std::string{"declaration budget exhausted"}, &semantic::missing::reason));
+            inspect.include = {"references", "declarations", "producers", "consumers"};
+            auto referenced = view->query(inspect);
+            expect(!referenced.references.empty() && referenced.symbols.empty() && referenced.producers.empty() && referenced.consumers.empty());
+        };
+        "inspect and scopes return the inferred types written inside a body"_test = [] {
+            ::test::scratch scratch{"typed-bodies"};
+            semantic::shard shard;
+            shard.unit = semantic::make_unit({{"app", "cpp", "clice", "evaluate", semantic::unit_kind::file, "main.cpp"}, "cpp"}, "cpp");
+            shard.unit.direct_inputs = {{semantic::input_kind::file, "main.cpp", "source"}};
+            const semantic::ownership owned{.owner_unit = shard.unit.id, .context = "cpp"};
+            shard.symbols.push_back({.id = "run", .ownership = owned, .name = "run", .kind = std::string{"function"}});
+            shard.occurrences.push_back({.id = "run-definition",
+                                         .ownership = owned,
+                                         .symbol = "run",
+                                         .location = {.source = semantic::place{.path = "main.cpp", .begin = 5, .end = 8}},
+                                         .roles = {std::string{"definition"}},
+                                         .body = semantic::place{.path = "main.cpp", .begin = 10, .end = 40}});
+            shard.scopes.push_back({.id = "later",
+                                    .ownership = owned,
+                                    .location = {.source = semantic::place{.path = "main.cpp", .begin = 45, .end = 60}},
+                                    .kind = std::string{"block"}});
+            shard.types = {{.id = "integer", .domain = "cpp", .kind = std::string{"primitive"}, .name = "int"},
+                           {.id = "text", .domain = "cpp", .kind = std::string{"primitive"}, .name = "char"}};
+            shard.typed_ranges = {{.ownership = owned, .range = {.path = "main.cpp", .begin = 50, .end = 55}, .type = "text"},
+                                  {.ownership = owned, .range = {.path = "main.cpp", .begin = 30, .end = 34}, .type = "integer"},
+                                  {.ownership = owned, .range = {.path = "main.cpp", .begin = 15, .end = 20}, .type = "integer"},
+                                  {.ownership = owned, .range = {.path = "other.cpp", .begin = 15, .end = 20}, .type = "text"}};
+            semantic::store store{scratch.dir};
+            auto view = store.load(store.publish({.snapshots = {{"app", "main", "v1", "source"}}, .configuration = "cpp"}, {shard}));
+            auto starts = [](const semantic::result& result) {
+                return result.typed_ranges | std::views::transform([](const auto& row) { return row.range.begin; }) | std::ranges::to<std::vector>();
+            };
+            const auto inspected = view->query({.action = std::string{"inspect"}, .selector = semantic::selection{.entity = semantic::entity{"run", "cpp"}}});
+            expect(std::ranges::is_permutation(starts(inspected), std::vector<std::uint64_t>{15, 30})) << rfl::json::write(starts(inspected));
+            expect(inspected.types.size() == 1u && inspected.types.front().id == "integer");
+            const auto scoped = view->query({.action = std::string{"scopes"}, .include = {"type"}});
+            expect(starts(scoped) == std::vector<std::uint64_t>{50}) << rfl::json::write(starts(scoped));
+            expect(view->query({.action = std::string{"scopes"}}).typed_ranges.empty());
         };
         "module candidates follow declared inputs across restart"_test = [] {
             ::test::scratch scratch{"semantic-module"};
@@ -1200,6 +1342,56 @@ namespace {
                    available.front().shards == reopened.describe(published).units.at(semantic::unit_identifier(available.front().recipe.unit)) &&
                    available.front().recipe == recipe);
             expect(reopened.candidates("app", "options", {{"app", {{"src/main.kt", "source-two"}}}}).empty());
+        };
+        "identical semantic shards share one content addressed object"_test = [] {
+            ::test::scratch scratch{"semantic-content-address"};
+            auto make = [](const std::string& source) {
+                semantic::shard shard{.unit = semantic::make_unit({{"app", "cpp", "clice", "evaluate", semantic::unit_kind::file, "main.cpp"}, "cpp"}, "cpp")};
+                shard.unit.direct_inputs = {{semantic::input_kind::file, "main.cpp", source}};
+                shard.identities = {{semantic::native_identity{"app", "main", "clice", "source", "main"}, "main", {}}};
+                shard.symbols = {{.id = "main", .ownership = {.owner_unit = shard.unit.id, .context = "cpp"}, .name = "main"},
+                                 {.id = "local", .ownership = {.owner_unit = shard.unit.id, .context = "cpp"}, .name = "local"}};
+                return shard;
+            };
+            auto stored = [&] { return std::ranges::distance(std::filesystem::directory_iterator{scratch.dir / "shards"}); };
+            auto only = [](const semantic::view& view) {
+                expect((view.units.size() == 1u && view.units.begin()->second.size() == 1u) >> fatal);
+                return view.units.begin()->second.front();
+            };
+            std::string shard;
+            {
+                semantic::store store{scratch.dir};
+                auto publish = [&](const std::string& worldline, const std::string& source) {
+                    return store.publish_records({.snapshots = {{"app", worldline, "v1", source}}, .configuration = "cpp"}, {make(source)}, {});
+                };
+                const auto first = publish("main", "one");
+                const auto second = publish("alternative", "one");
+                shard = only(store.describe(first));
+                expect(only(store.describe(second)) == shard) << "another worldline with identical content reuses the shard";
+                expect(shard.starts_with("shard-") && shard.size() == 70u) << shard;
+                expect(stored() == 1);
+                std::ifstream file{scratch.dir / "shards" / shard, std::ios::binary};
+                auto document = rfl::json::read<semantic::shard>(std::string{std::istreambuf_iterator<char>{file}, {}});
+                expect((document.has_value() && document->id == shard) >> fatal);
+                expect(semantic::shard_key(*document) == shard) << "the stored document verifies against its ID";
+                document->symbols.front().name = "forged";
+                expect(semantic::shard_key(*document) != shard);
+                const auto changed = publish("main", "two");
+                expect(only(store.describe(changed)) != shard && stored() == 2);
+                const auto repeated =
+                    store.publish_records({.snapshots = {{"app", "repeat", "v1", "one"}}, .configuration = "cpp"}, {make("one"), make("one")}, {});
+                expect(only(store.describe(repeated)) == shard && stored() == 2) << "a repeated shard in one batch is selected once";
+                store.retire(first);
+                expect(store.load(second)->pieces.front()->id == shard) << "retiring one view keeps a shard another view selects";
+            }
+            semantic::store reopened{scratch.dir};
+            const auto again = reopened.publish_records({.snapshots = {{"app", "later", "v1", "one"}}, .configuration = "cpp"}, {make("one")}, {});
+            expect(only(reopened.describe(again)) == shard && stored() == 2) << "a reopened store recognizes stored content";
+            expect(reopened.load(again)->pieces.front()->symbols().front().name == "main");
+            ::test::scratch elsewhere{"semantic-content-address-elsewhere"};
+            semantic::store other{elsewhere.dir};
+            const auto foreign = other.publish_records({.snapshots = {{"app", "main", "v1", "one"}}, .configuration = "cpp"}, {make("one")}, {});
+            expect(only(other.describe(foreign)) == shard) << "another store derives the same ID for the same records";
         };
         "semantic publications serialize shared types, declaration identities and unit ownership"_test = [] {
             semantic::shard published;
@@ -1270,7 +1462,14 @@ namespace {
             expect(node != native.types.end() && node->declaration == sdk.items.front().symbol_id && !sdk.symbols.front().native_key);
             const auto second = store.publish_records(view, {published}, anchors);
             expect(query(second, "visit").items.front().symbol_id == native.items.front().symbol_id &&
-                   query(second, "node").items.front().symbol_id != sdk.items.front().symbol_id);
+                   query(second, "node").items.front().symbol_id == sdk.items.front().symbol_id)
+                << "identical records keep every symbol ID";
+            auto edited = published;
+            edited.unit.direct_inputs = {{semantic::input_kind::file, "main.cpp", "edited"}};
+            const auto changed = store.publish_records(view, {edited}, anchors);
+            expect(query(changed, "visit").items.front().symbol_id == native.items.front().symbol_id &&
+                   query(changed, "node").items.front().symbol_id != sdk.items.front().symbol_id)
+                << "an unbound declaration does not keep its ID across changed inputs";
             const auto local = query(first, "local").items.front().symbol_id;
             semantic::shard consumer;
             consumer.unit =

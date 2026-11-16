@@ -425,7 +425,6 @@ export namespace semantic {
     };
     struct channel {
         std::string name, value;
-        std::vector<shard_id> shards;
     };
     struct contribution {
         std::vector<std::string> files, occurrences, references, scopes, relations, diagnostics;
@@ -486,6 +485,14 @@ export namespace semantic {
         std::vector<records::diagnostic> diagnostics;
         std::vector<records::typed_range> typed_ranges;
     };
+    // A shard is named by the digest of its own document with the name left
+    // empty, so any holder of the bytes can check them against the ID.
+    inline auto shard_key(semantic::shard& shard) -> shard_id {
+        auto named = std::exchange(shard.id, {});
+        auto key = "shard-" + content::hash_of(rfl::json::write(shard)).str();
+        shard.id = std::move(named);
+        return key;
+    }
     inline auto contributions(const semantic::shard& shard) -> semantic::contribution {
         semantic::contribution out{.files = shard.unit.contributions.files};
         auto collect = [](const auto& rows, auto& ids) {
@@ -547,6 +554,8 @@ export namespace semantic {
         symbol_kind kind;
         std::optional<type_id> type_id;
         std::vector<locator> declarations, definitions;
+        // The text of the definition's body, for inspect and include "source".
+        std::optional<std::string> source;
     };
     struct continuation {
         view_id view;
@@ -616,6 +625,9 @@ export namespace semantic {
         semantic::coverage coverage;
         std::vector<item> items;
         std::vector<records::symbol> symbols;
+        // Callables that produce a selected type, and those taking it as receiver
+        // or first argument.
+        std::vector<records::symbol> producers, consumers;
         std::vector<records::type> types;
         std::vector<records::typed_range> typed_ranges;
         std::vector<records::occurrence> occurrences;
@@ -634,28 +646,32 @@ export namespace semantic {
     inline auto required_facts(query_action action, const std::vector<std::string>& include = {}) -> std::vector<fact_kind> {
         using A = query_action;
         using F = fact_kind;
-        static const std::map<A, std::vector<F>> actions{{A::make<"symbols">(), {F::make<"symbols">()}},
-                                                         {A::make<"definitions">(), {F::make<"definitions">()}},
-                                                         {A::make<"references">(), {F::make<"references">()}},
-                                                         {A::make<"scopes">(), {F::make<"scopes">()}},
-                                                         {A::make<"diagnostics">(), {F::make<"diagnostics">()}},
-                                                         {A::make<"inspect">(), {F::make<"symbols">(), F::make<"definitions">(), F::make<"types">()}},
-                                                         {A::make<"relations">(), {F::make<"relations">()}},
-                                                         {A::make<"impact">(), {F::make<"symbols">(), F::make<"references">(), F::make<"relations">()}}};
-        using projection = rfl::Literal<"type", "scope", "declarations", "definitions", "references", "diagnostics", "relations">;
-        static const std::map<projection, F> projections{{projection::make<"type">(), F::make<"types">()},
-                                                         {projection::make<"scope">(), F::make<"scopes">()},
-                                                         {projection::make<"declarations">(), F::make<"symbols">()},
-                                                         {projection::make<"definitions">(), F::make<"definitions">()},
-                                                         {projection::make<"references">(), F::make<"references">()},
-                                                         {projection::make<"diagnostics">(), F::make<"diagnostics">()},
-                                                         {projection::make<"relations">(), F::make<"relations">()}};
+        static const std::map<A, std::vector<F>> actions{
+            {A::make<"symbols">(), {F::make<"symbols">()}},
+            {A::make<"definitions">(), {F::make<"definitions">()}},
+            {A::make<"references">(), {F::make<"references">()}},
+            {A::make<"scopes">(), {F::make<"scopes">()}},
+            {A::make<"diagnostics">(), {F::make<"diagnostics">()}},
+            {A::make<"inspect">(), {F::make<"symbols">(), F::make<"definitions">(), F::make<"types">(), F::make<"typed_ranges">()}},
+            {A::make<"relations">(), {F::make<"relations">()}},
+            {A::make<"impact">(), {F::make<"symbols">(), F::make<"references">(), F::make<"relations">()}}};
+        using projection =
+            rfl::Literal<"type", "scope", "declarations", "definitions", "references", "diagnostics", "relations", "producers", "consumers", "source">;
+        static const std::map<projection, std::vector<F>> projections{{projection::make<"type">(), {F::make<"types">(), F::make<"typed_ranges">()}},
+                                                                      {projection::make<"scope">(), {F::make<"scopes">()}},
+                                                                      {projection::make<"declarations">(), {F::make<"symbols">()}},
+                                                                      {projection::make<"definitions">(), {F::make<"definitions">()}},
+                                                                      {projection::make<"references">(), {F::make<"references">()}},
+                                                                      {projection::make<"diagnostics">(), {F::make<"diagnostics">()}},
+                                                                      {projection::make<"relations">(), {F::make<"relations">()}},
+                                                                      {projection::make<"producers">(), {F::make<"symbols">()}},
+                                                                      {projection::make<"consumers">(), {F::make<"symbols">()}},
+                                                                      {projection::make<"source">(), {F::make<"definitions">()}}};
         auto facts = actions.at(action);
-        for (const auto& included : include) {
-            const auto next = projections.at(projection{included});
-            if (!std::ranges::contains(facts, next))
-                facts.push_back(next);
-        }
+        for (const auto& included : include)
+            for (const auto& next : projections.at(projection{included}))
+                if (!std::ranges::contains(facts, next))
+                    facts.push_back(next);
         return facts;
     }
 

@@ -34,6 +34,7 @@ namespace {
             own(source.occurrences);
             own(source.references);
             own(source.scopes);
+            own(source.typed_ranges);
             source.unit.channel_definitions = language::server<"fsharp">::channels();
             source.unit.direct_inputs = {{semantic::input_kind::source, "Library.fs", "source-one"}};
             std::map<std::string, semantic::source_anchor> anchors;
@@ -352,6 +353,7 @@ namespace {
             revised_ownership(revised_source.occurrences);
             revised_ownership(revised_source.references);
             revised_ownership(revised_source.scopes);
+            revised_ownership(revised_source.typed_ranges);
             revised_source.unit.channel_definitions = language::server<"fsharp">::channels();
             revised_source.unit.direct_inputs = {{semantic::input_kind::source, "Library.fs", "source-two"}};
             auto revised_view = linked->description;

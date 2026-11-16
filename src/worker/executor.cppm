@@ -862,7 +862,7 @@ export namespace replica {
                         }
                         object = co_await io::blocking(rt_.get_scheduler(home_), pool_, [directory = shard_directory_, id, bytes = std::move(bytes)] {
                             auto value = rfl::json::read<semantic::shard>(bytes);
-                            if (!value || value->id != id)
+                            if (!value || value->id != id || semantic::shard_key(*value) != id)
                                 throw std::invalid_argument("semantic object has another identity");
                             content::checked_name(id);
                             auto object = std::make_shared<semantic::shard_object>();

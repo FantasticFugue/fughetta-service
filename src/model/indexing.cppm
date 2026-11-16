@@ -16,7 +16,9 @@ export namespace semantic {
     };
     struct shard_index {
         std::map<std::string, std::vector<std::size_t>> names, symbols, positions, references, outgoing, incoming, occurrences, occurrence_ids, reference_ids,
-            reference_files, unresolved, types, scopes, scope_owners, diagnostics, typed_overloads;
+            reference_files, unresolved, types, scopes, scope_owners, diagnostics, typed_overloads, members;
+        // Typed ranges by path, ordered by their start offset.
+        std::map<std::string, std::vector<std::size_t>> typed_range_files;
         std::set<symbol_id> identities;
         // Immutable semantic projections are computed with the shard index,
         // persisted and shared by every view and comparison page.
@@ -26,6 +28,9 @@ export namespace semantic {
         std::map<type_id, std::set<std::string>> type_shapes;
         std::map<type_id, std::set<type_id>> type_children;
         std::map<type_id, std::vector<std::size_t>> type_declarations;
+        // Callables keyed by the nominal type they produce, and by the one they
+        // take as receiver or first argument.
+        std::map<symbol_id, std::vector<std::size_t>> type_producers, type_consumers;
     };
     // Return the JSON text of one top-level member of a compact JSON object.
     // Persisted shards are one such object, so a projection reads its own column
@@ -147,6 +152,71 @@ export namespace semantic {
         mutable std::shared_ptr<const std::vector<records::typed_range>> typed_ranges_;
         mutable std::shared_ptr<const semantic::shard> full_;
     };
+    // Providers spell visibility in their own case: clice "public", Kotlin "PUBLIC".
+    inline auto spelled(std::string_view value, std::string_view lower) -> bool {
+        return std::ranges::equal(value, lower, [](char a, char b) { return std::tolower(static_cast<unsigned char>(a)) == b; });
+    }
+    inline auto visibility_rank(std::string_view value) -> std::ptrdiff_t {
+        static constexpr std::array<std::string_view, 4> order{"public", "internal", "protected", "private"};
+        return std::ranges::find_if(order, [&](std::string_view known) { return spelled(value, known); }) - order.begin();
+    }
+    // Strip indirections, aliases and library value wrappers (optional, task, result)
+    // down to the declaration that names the value's type. Providers name
+    // applications fully qualified: "std::optional", "kotlin.Result",
+    // "System.Threading.Tasks.Task<int>" or F#'s postfix "int Microsoft.FSharp.Core.option".
+    template <class Lookup> auto nominal_declaration(type_id id, Lookup&& lookup) -> std::optional<symbol_id> {
+        static const std::set<std::string_view> wrappers{"std::optional",
+                                                         "std::expected",
+                                                         "std::unique_ptr",
+                                                         "std::shared_ptr",
+                                                         "kotlin.Result",
+                                                         "kotlinx.coroutines.Deferred",
+                                                         "System.Nullable",
+                                                         "System.Threading.Tasks.Task",
+                                                         "System.Threading.Tasks.ValueTask",
+                                                         "Microsoft.FSharp.Core.option",
+                                                         "Microsoft.FSharp.Core.Option",
+                                                         "Microsoft.FSharp.Core.voption",
+                                                         "Microsoft.FSharp.Core.ValueOption",
+                                                         "Microsoft.FSharp.Core.Result",
+                                                         "Microsoft.FSharp.Control.Async",
+                                                         "Microsoft.FSharp.Core.byref",
+                                                         "Microsoft.FSharp.Core.inref",
+                                                         "Microsoft.FSharp.Core.outref",
+                                                         "Microsoft.FSharp.NativeInterop.nativeptr"};
+        // F# spells `T option` or `Option<T>`; CLR metadata spells
+        // `[System.Runtime,8.0.0.0]System.Threading.Tasks.Task`1`.
+        auto base = [](std::string_view name) {
+            if (name.ends_with('>'))
+                name = name.substr(0, name.find('<'));
+            else
+                name = name.substr(name.rfind(' ') + 1);
+            if (name.starts_with('['))
+                name = name.substr(name.find(']') + 1);
+            if (const auto tick = name.rfind('`'); tick != std::string_view::npos)
+                name = name.substr(0, tick);
+            return name;
+        };
+        std::set<type_id> seen;
+        while (seen.insert(id).second) {
+            const records::type* type = lookup(id);
+            if (!type)
+                return std::nullopt;
+            if ((type->kind == "pointer" || type->kind == "reference" || type->kind == "nullable" || type->kind == "alias") && !type->arguments.empty())
+                id = type->arguments.front();
+            else if (type->kind == "flexible" && type->lower_bound)
+                id = *type->lower_bound;
+            else if (type->kind == "application" && type->name && (type->arguments.size() == 1 || type->arguments.size() == 2) &&
+                     wrappers.contains(base(*type->name)))
+                id = type->arguments.front();
+            else if (type->kind == "named" || type->kind == "application")
+                return type->declaration;
+            else
+                return std::nullopt;
+        }
+        return std::nullopt;
+    }
+
     inline auto index_shard(const semantic::shard& shard) -> shard_index {
         shard_index out;
         out.comparison_inputs = content::hash_of(rfl::json::write(std::tuple{shard.unit.direct_inputs, shard.unit.observed_dependencies})).str();
@@ -188,7 +258,10 @@ export namespace semantic {
             retain(range.overload);
             if (range.overload)
                 out.typed_overloads[*range.overload].push_back(row);
+            out.typed_range_files[range.range.path].push_back(row);
         }
+        for (auto& [path, rows] : out.typed_range_files)
+            std::ranges::stable_sort(rows, {}, [&](std::size_t row) { return shard.typed_ranges[row].range.begin; });
         if (shard.unit.resolution)
             for (const auto& target : shard.unit.resolution->targets)
                 out.identities.insert(target.symbol_id);
@@ -209,6 +282,8 @@ export namespace semantic {
             compared.inputs = true;
             if (symbol.type)
                 out.type_declarations[*symbol.type].push_back(row);
+            if (symbol.owner)
+                out.members[*symbol.owner].push_back(row);
         }
         for (std::size_t row = 0; row < shard.occurrences.size(); ++row) {
             out.occurrences[shard.occurrences[row].symbol].push_back(row);
@@ -273,6 +348,33 @@ export namespace semantic {
             };
             arguments(type.application_arguments);
         }
+        auto local = [&](const type_id& id) -> const records::type* {
+            const auto found = out.types.find(id);
+            return found == out.types.end() ? nullptr : &shard.types[found->second.front()];
+        };
+        for (std::size_t row = 0; row < shard.symbols.size(); ++row) {
+            const auto& symbol = shard.symbols[row];
+            const auto* signature = symbol.type ? local(*symbol.type) : nullptr;
+            if (!signature || signature->kind != "function" || std::ranges::contains(symbol.modifiers, "local") || spelled(symbol.visibility, "local") ||
+                (symbol.kind.str() != "function" && symbol.kind.str() != "method" && symbol.kind.str() != "constructor"))
+                continue;
+            // C++ constructors return void; every constructor produces its owner.
+            const auto produced = symbol.kind.str() == "constructor" ? symbol.owner
+                                  : signature->return_type           ? nominal_declaration(*signature->return_type, local)
+                                                                     : std::nullopt;
+            if (produced)
+                out.type_producers[*produced].push_back(row);
+            // Instance methods without a receiver (C++ and Kotlin members) take their owner.
+            std::optional<symbol_id> consumed;
+            if (signature->receiver)
+                consumed = nominal_declaration(*signature->receiver, local);
+            else if (symbol.kind.str() == "method" && symbol.owner && !std::ranges::contains(symbol.modifiers, "static"))
+                consumed = symbol.owner;
+            else if (!signature->parameter_groups.empty() && !signature->parameter_groups.front().parameters.empty())
+                consumed = nominal_declaration(signature->parameter_groups.front().parameters.front().type, local);
+            if (consumed)
+                out.type_consumers[*consumed].push_back(row);
+        }
         for (std::size_t row = 0; row < shard.scopes.size(); ++row) {
             const auto& location = shard.scopes[row].location;
             out.scopes[location.source ? location.source->path : ""].push_back(row);
@@ -295,13 +397,14 @@ export namespace semantic {
         std::map<artifact_input, std::string> artifact_inputs;
         std::multimap<std::string, record_address> names, symbols, positions, references;
         std::multimap<std::string, record_address> outgoing, incoming, occurrences, occurrence_ids, reference_ids, reference_files, unresolved, types, scopes,
-            scope_owners, diagnostics, typed_overloads;
+            scope_owners, diagnostics, typed_overloads, typed_range_files, members;
         std::multimap<std::string, std::size_t> resolutions;
         std::multimap<comparison_key, std::size_t> comparison_parts;
         std::map<unit_id, std::vector<std::size_t>> unit_parts;
         std::map<unit_id, std::set<unit_id>> unit_consumers;
         std::map<type_id, std::set<type_id>> type_parents;
         std::multimap<type_id, record_address> type_declarations;
+        std::multimap<symbol_id, record_address> type_producers, type_consumers;
 
         auto symbol(record_address address) const -> const records::symbol& { return pieces.at(address.shard)->symbols().at(address.row); }
         auto type(record_address address) const -> const records::type& { return pieces.at(address.shard)->types().at(address.row); }
@@ -357,7 +460,7 @@ export namespace semantic {
         inline void dispatch(execution&);
         inline void relations(execution&);
         inline void references(execution&);
-        inline void types(execution&);
+        inline void types(execution&, std::vector<type_id> pending = {});
         inline void scopes(execution&);
         inline void diagnostics(execution&);
         inline void declarations(execution&);
@@ -409,6 +512,19 @@ export namespace semantic {
             auto in_files(const locator& location) const -> bool {
                 return (request.scope.projects.empty() || (location.project && std::ranges::contains(request.scope.projects, *location.project))) &&
                        (request.scope.files.empty() || (location.source && std::ranges::contains(request.scope.files, location.source->path)));
+            }
+            auto in_modules(const records::symbol& row) const -> bool {
+                return request.scope.modules.empty() || std::ranges::contains(request.scope.modules, row.module);
+            }
+            auto declared_in_files(const records::symbol& row) const -> bool {
+                if (request.scope.files.empty())
+                    return true;
+                const auto [first, last] = view.occurrences.equal_range(row.id);
+                return std::any_of(first, last, [&](const auto& entry) {
+                    const auto& occurrence = view.occurrence(entry.second);
+                    return occurrence.ownership.context == row.ownership.context && occurrence.location.source &&
+                           std::ranges::contains(request.scope.files, occurrence.location.source->path);
+                });
             }
             auto contains(const symbol_id& id, const context_id& context) const -> bool { return selected.contains({id, context}); }
             void prepare() {
@@ -995,13 +1111,19 @@ export namespace semantic {
                     }
                 }
             }
-            for (const auto& [shard, row] : declarations)
+            const auto budget = self.request.budget.nodes.value_or(1000);
+            for (const auto& [shard, row] : declarations) {
+                if (self.out.symbols.size() >= budget) {
+                    self.out.coverage.missing.push_back(
+                        {.scope = {.facts = {std::string{"symbols"}}}, .reason = "declaration budget exhausted", .phase = std::string{"query"}});
+                    break;
+                }
                 self.out.symbols.push_back(self.view.symbol({shard, row}));
+            }
             if (self.page_references && last < matches.size())
                 self.out.cursor = rfl::json::write(execution::page{self.view.description.id, self.query_key, last});
         }
-        inline void types(execution& self) {
-            std::vector<type_id> pending;
+        inline void types(execution& self, std::vector<type_id> pending) {
             using use_key = std::tuple<symbol_id, context_id, std::string, std::string>;
             std::map<use_key, std::multimap<std::uint64_t, std::uint64_t>> uses;
             std::set<symbol_id> targets;
@@ -1013,6 +1135,18 @@ export namespace semantic {
                 uses[{*reference.target, reference.ownership.context, project, source.path}].emplace(source.begin, source.end);
                 targets.insert(*reference.target);
             }
+            std::set<std::pair<std::size_t, std::size_t>> added;
+            auto add = [&](record_address address) {
+                if (!added.emplace(address.shard, address.row).second)
+                    return;
+                const auto& range = self.view.typed_range(address);
+                self.out.typed_ranges.push_back(range);
+                pending.push_back(range.type);
+                for (const auto& [parameter, argument] : range.substitutions) {
+                    pending.push_back(parameter);
+                    pending.push_back(argument);
+                }
+            };
             for (const auto& target : targets) {
                 const auto [first, last] = self.view.typed_overloads.equal_range(target);
                 for (auto it = first; it != last; ++it) {
@@ -1028,14 +1162,31 @@ export namespace semantic {
                         ++use;
                     if (use == found->second.end() || use->first >= range.range.end)
                         continue;
-                    self.out.typed_ranges.push_back(range);
-                    pending.push_back(range.type);
-                    for (const auto& [parameter, argument] : range.substitutions) {
-                        pending.push_back(parameter);
-                        pending.push_back(argument);
-                    }
+                    add(it->second);
                 }
             }
+            // Inferred types written inside a selected definition's body, or
+            // inside a returned scope.
+            auto within = [&](const context_id& context, const unit_id& unit, const place& region) {
+                const auto& project = self.view.unit_projects.at(unit);
+                const auto [first, last] = self.view.typed_range_files.equal_range(region.path);
+                for (auto it = first; it != last; ++it) {
+                    const auto& range = self.view.typed_range(it->second);
+                    if (range.ownership.context == context && range.range.begin >= region.begin && range.range.end <= region.end &&
+                        self.view.unit_projects.at(range.ownership.owner_unit) == project && self.in_scope(range))
+                        add(it->second);
+                }
+            };
+            if (self.request.action == "inspect")
+                for (const auto& item : self.out.items) {
+                    const auto [first, last] = self.view.occurrences.equal_range(item.symbol_id);
+                    for (auto it = first; it != last; ++it)
+                        if (const auto& occurrence = self.view.occurrence(it->second); occurrence.ownership.context == item.context && occurrence.body)
+                            within(item.context, occurrence.ownership.owner_unit, *occurrence.body);
+                }
+            for (const auto& scope : self.out.scopes)
+                if (scope.location.source)
+                    within(scope.ownership.context, scope.ownership.owner_unit, *scope.location.source);
             for (const auto& item : self.out.items)
                 if (item.type_id)
                     pending.push_back(*item.type_id);
@@ -1051,12 +1202,19 @@ export namespace semantic {
                     ++self.out.coverage.unresolved_count;
                     continue;
                 }
-                if (self.out.types.size() >= budget) {
+                if (self.out.types.size() + self.out.symbols.size() + self.out.producers.size() + self.out.consumers.size() >= budget) {
                     pending.push_back(std::move(id));
                     break;
                 }
                 const auto& type = self.view.type(found->second);
                 self.out.types.push_back(type);
+                // An alias or abbreviation declares the type it stands for.
+                if (type.declaration) {
+                    const auto [first, last] = self.view.symbols.equal_range(*type.declaration);
+                    for (auto at = first; at != last; ++at)
+                        if (const auto& declared = self.view.symbol(at->second).type)
+                            pending.push_back(*declared);
+                }
                 for (const auto* list : {&type.arguments, &type.constraints, &type.elements, &type.type_parameters})
                     pending.insert(pending.end(), list->begin(), list->end());
                 for (const auto* child : {&type.receiver, &type.return_type, &type.lower_bound, &type.upper_bound})
@@ -1122,13 +1280,103 @@ export namespace semantic {
             std::set<std::pair<symbol_id, context_id>> included;
             for (const auto& row : self.out.symbols)
                 included.emplace(row.id, row.ownership.context);
-            for (const auto& [key, row] : self.selected)
-                if (included.insert(key).second)
-                    self.out.symbols.push_back(*row);
+            const auto budget = self.request.budget.nodes.value_or(1000);
+            for (const auto& [key, row] : self.selected) {
+                if (included.contains(key))
+                    continue;
+                if (self.out.symbols.size() >= budget) {
+                    self.out.coverage.missing.push_back(
+                        {.scope = {.facts = {std::string{"symbols"}}}, .reason = "declaration budget exhausted", .phase = std::string{"query"}});
+                    break;
+                }
+                included.insert(key);
+                self.out.symbols.push_back(*row);
+            }
         }
         inline void inspect(execution& self) {
             declarations(self);
-            types(self);
+            // One hop of type surface: the public members of the nominal types a
+            // selected callable's signature names, so a caller sees how to build
+            // its arguments and what its result offers.
+            auto lookup = [&](const type_id& id) -> const records::type* {
+                const auto found = self.view.types.find(id);
+                return found == self.view.types.end() ? nullptr : &self.view.type(found->second);
+            };
+            std::set<symbol_id> owners;
+            for (const auto& item : self.out.items) {
+                const auto* signature = item.type_id ? lookup(*item.type_id) : nullptr;
+                if (!signature || signature->kind != "function")
+                    continue;
+                std::vector<type_id> named;
+                for (const auto& group : signature->parameter_groups)
+                    for (const auto& parameter : group.parameters)
+                        named.push_back(parameter.type);
+                for (const auto* end : {&signature->receiver, &signature->return_type})
+                    if (*end)
+                        named.push_back(**end);
+                for (const auto& id : named)
+                    if (auto declaration = nominal_declaration(id, lookup))
+                        owners.insert(std::move(*declaration));
+            }
+            auto surface = [](const records::symbol& row) {
+                static const std::set<std::string_view> kinds{"constructor", "field", "property", "enum_member", "function", "method"};
+                return kinds.contains(row.kind.str()) && spelled(row.visibility, "public");
+            };
+            std::set<std::pair<symbol_id, context_id>> included;
+            for (const auto& row : self.out.symbols)
+                included.emplace(row.id, row.ownership.context);
+            std::vector<type_id> pending;
+            const auto budget = self.request.budget.nodes.value_or(1000);
+            bool exhausted = false;
+            for (const auto& owner : owners) {
+                const auto [first, last] = self.view.members.equal_range(owner);
+                for (auto at = first; at != last && !exhausted; ++at) {
+                    const auto& row = self.view.symbol(at->second);
+                    if (!self.in_scope(row) || !surface(row) || included.contains({row.id, row.ownership.context}))
+                        continue;
+                    if (self.out.symbols.size() >= budget) {
+                        exhausted = true;
+                        break;
+                    }
+                    included.emplace(row.id, row.ownership.context);
+                    self.out.symbols.push_back(row);
+                    if (row.type)
+                        pending.push_back(*row.type);
+                }
+            }
+            if (exhausted)
+                self.out.coverage.missing.push_back(
+                    {.scope = {.facts = {std::string{"symbols"}}}, .reason = "type surface budget exhausted", .phase = std::string{"query"}});
+            // A selected type lists the callables that produce it and those that
+            // take it, ordered by module and visibility.
+            auto capabilities = [&](std::string_view include, const std::multimap<symbol_id, record_address>& index, std::vector<records::symbol>& into) {
+                if (!std::ranges::contains(self.request.include, include))
+                    return;
+                std::set<std::pair<symbol_id, context_id>> seen;
+                for (const auto& item : self.out.items) {
+                    if (item.kind.str() != "type")
+                        continue;
+                    const auto [first, last] = index.equal_range(item.symbol_id);
+                    for (auto at = first; at != last; ++at)
+                        if (const auto& row = self.view.symbol(at->second);
+                            self.in_scope(row) && self.in_modules(row) && self.declared_in_files(row) && seen.emplace(row.id, row.ownership.context).second)
+                            into.push_back(row);
+                }
+                std::ranges::sort(into, {},
+                                  [](const records::symbol& row) { return std::tuple{row.module, visibility_rank(row.visibility), row.qualified_name}; });
+                const auto used = self.out.symbols.size() + self.out.producers.size() + self.out.consumers.size() - into.size();
+                if (used + into.size() > budget) {
+                    into.resize(budget > used ? budget - used : 0);
+                    self.out.coverage.missing.push_back(
+                        {.scope = {.facts = {std::string{"symbols"}}}, .reason = std::format("{} budget exhausted", include), .phase = std::string{"query"}});
+                }
+                for (const auto& row : into)
+                    if (row.type)
+                        pending.push_back(*row.type);
+            };
+            capabilities("producers", self.view.type_producers, self.out.producers);
+            capabilities("consumers", self.view.type_consumers, self.out.consumers);
+            types(self, std::move(pending));
         }
         enum class paging { symbols, references, relations };
         struct handler {
@@ -1193,8 +1441,9 @@ export namespace semantic {
             for (auto& location : item.definitions)
                 locator(location);
         }
-        for (auto& row : out.symbols)
-            ownership(row.ownership);
+        for (auto* rows : {&out.symbols, &out.producers, &out.consumers})
+            for (auto& row : *rows)
+                ownership(row.ownership);
         for (auto& row : out.typed_ranges)
             ownership(row.ownership);
         for (auto& row : out.occurrences) {

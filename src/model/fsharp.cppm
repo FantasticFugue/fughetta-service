@@ -14,7 +14,8 @@ export namespace language {
         static constexpr std::array<std::pair<std::string_view, std::string_view>, 3> documents{{{"fs", "fsharp"}, {"fsi", "fsharp"}, {"fsx", "fsharp"}}};
         static constexpr std::array<std::string_view, 1> inputs{"project_model"};
         static constexpr std::array<std::string_view, 1> operations{"evaluate"};
-        static constexpr std::array<std::string_view, 7> facts{"symbols", "types", "definitions", "occurrences", "references", "scopes", "diagnostics"};
+        static constexpr std::array<std::string_view, 8> facts{"symbols",    "types",  "definitions", "occurrences",
+                                                               "references", "scopes", "diagnostics", "typed_ranges"};
         static constexpr semantic::unit_kind unit_kind = semantic::unit_kind::module;
         static constexpr bool negotiated = false, dependency_reads = true;
         static constexpr std::string_view update_granularity = "ordered-project";

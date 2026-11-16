@@ -9,6 +9,7 @@ open System.Text.Json.Nodes
 open FSharp.Compiler.Symbols
 open FSharp.Compiler.Text
 open FSharp.Compiler.Diagnostics
+open FSharp.Compiler.Syntax
 open Json
 
 module Records =
@@ -22,6 +23,7 @@ module Records =
         let projectId, provider, unitId, context = field session "project", field session "provider", field template "id", field template "context"
         let identities, symbols = Dictionary<string, JsonNode>(), Dictionary<string, JsonNode>()
         let occurrences, references, diagnostics, scopes = ResizeArray<JsonNode>(), ResizeArray<JsonNode>(), ResizeArray<JsonNode>(), ResizeArray<JsonNode>()
+        let typedRanges = ResizeArray<JsonNode>()
         let files = Dictionary<string, int array * int array * string>()
         let relative path = Path.GetRelativePath(workspace.Root, path).Replace('\\', '/')
         let coordinates (range: range) =
@@ -119,18 +121,27 @@ module Records =
         let bodies = Dictionary<string, range>()
         let bodyKinds = Dictionary<string, string>()
         let parameters = HashSet<string>()
+        let implementations = ResizeArray<FSharpExpr>()
         let fileScope (range: range) = unitId + ":file:" + relative range.FileName
         let bodyScope owner = unitId + ":body:" + owner
+        // A `let` sequence's typed range covers only its first binding, so the
+        // body ends where its furthest subexpression does.
+        let rec furthest (expression: FSharpExpr) =
+            expression.ImmediateSubExpressions
+            |> List.filter (fun child -> child.Range.FileName = expression.Range.FileName)
+            |> List.map furthest
+            |> List.fold (fun last child -> if Position.posGeq last child then last else child) expression.Range.End
         let rec declarations values =
             for declaration in values do
                 match declaration with
                 | FSharpImplementationFileDeclaration.Entity(_, nested) -> declarations nested
                 | FSharpImplementationFileDeclaration.MemberOrFunctionOrValue(value, arguments, expression) ->
+                    if not value.IsCompilerGenerated && selected.Contains(Path.GetFullPath expression.Range.FileName) then implementations.Add expression
                     if value.IsModuleValueOrMember && selected.Contains(Path.GetFullPath expression.Range.FileName) then
                         let start = (value :> FSharpSymbol).ImplementationLocation |> Option.defaultValue value.DeclarationLocation
                         let firstLine = if start.FileName = expression.Range.FileName then min start.StartLine expression.Range.StartLine else expression.Range.StartLine
                         let owner = identify value
-                        let body = Range.mkRange expression.Range.FileName (Position.mkPos firstLine 0) expression.Range.End
+                        let body = Range.mkRange expression.Range.FileName (Position.mkPos firstLine 0) (furthest expression)
                         bodies[owner] <- body
                         if value.IsActivePattern then activeGroups.Add(value, body)
                         bodyKinds[owner] <- if value.IsFunction || value.IsMethod || value.IsConstructor then "function" else "initializer"
@@ -279,6 +290,74 @@ module Records =
                                             "resolution", text "resolved"; "candidates", array []]
                     enclosing range |> Option.iter (fun owner -> reference["from"] <- text owner)
                     references.Add(reference)
+        // A binding states its type inside a typed pattern, `(x: T)` or `let x: T = ...`,
+        // but not through a function's result annotation, `let f x: T = ...`.
+        let annotated (range: range) =
+            match result.ParseTrees.TryFind(Path.GetFullPath range.FileName) with
+            | None -> false
+            | Some tree ->
+                let contains (outer: range) = Range.rangeContainsPos outer range.Start
+                let visitor =
+                    { new SyntaxVisitorBase<unit>() with
+                        member _.VisitExpr(_, _, traverse, expression) = traverse expression
+                        member _.VisitPat(_, traverse, pattern) =
+                            match pattern with
+                            | SynPat.Typed(_, _, whole) when contains whole -> Some ()
+                            | _ -> traverse pattern
+                        member _.VisitSimplePats(_, pattern) =
+                            let rec typedIn pattern =
+                                match pattern with
+                                | SynPat.Typed(_, _, whole) when contains whole -> Some ()
+                                | SynPat.Paren(inner, _) -> typedIn inner
+                                | SynPat.Tuple(elementPats = elements) -> List.tryPick typedIn elements
+                                | _ -> None
+                            typedIn pattern
+                        member _.VisitBinding(_, traverse, binding) =
+                            match binding with
+                            | SynBinding(headPat = SynPat.LongIdent(argPats = SynArgPats.Pats(_ :: _))) -> traverse binding
+                            | SynBinding(headPat = head; returnInfo = Some _) when contains head.Range -> Some ()
+                            | _ -> traverse binding }
+                (SyntaxTraversal.Traverse(range.Start, tree, visitor)).IsSome
+        let typed (range: range) (shown: FSharpType) overload substitutions =
+            let owner = enclosing range |> Option.defaultValue unitId
+            let row = object ["ownership", ownership range; "range", coordinates range; "type", text (typeRecord owner shown)
+                              "substitutions", object (substitutions |> List.map (fun (parameter, argument) -> parameter, text (typeRecord owner argument)))]
+            overload |> Option.iter (fun id -> row["overload"] <- text id)
+            typedRanges.Add(row)
+        let spelled = Dictionary<string, ResizeArray<range>>()
+        for useOf in uses do
+            let range = useOf.Range
+            match useOf.Symbol with
+            | :? FSharpMemberOrFunctionOrValue as value when selected.Contains(Path.GetFullPath range.FileName) ->
+                if useOf.IsFromDefinition then
+                    if isLocal (value :> FSharpSymbol) && not value.IsCompilerGenerated && not value.IsMemberThisValue && not value.IsConstructorThisValue && not (annotated range) then
+                        typed range value.FullType None []
+                else
+                    let id = identify value
+                    if not (spelled.ContainsKey id) then spelled[id] <- ResizeArray()
+                    spelled[id].Add range
+            | _ -> ()
+        // A call whose callee the source names (not one the compiler inserts) and that
+        // is generic, overloaded or virtual; operators such as `a + 1` stay out.
+        let rec calls (expression: FSharpExpr) =
+            let call (callee: FSharpMemberOrFunctionOrValue) (outer: FSharpType list) (own: FSharpType list) =
+                let id = identify callee
+                let overloaded = callee.IsMember && callee.GetOverloads(false) |> Option.exists (fun overloads -> overloads.Count > 1)
+                let named = match spelled.TryGetValue id with | true, ranges -> ranges |> Seq.exists (Range.rangeContainsRange expression.Range) | _ -> false
+                if named && not (callee.CompiledName.StartsWith "op_") && (not own.IsEmpty || overloaded || callee.IsDispatchSlot) then
+                    let parameters = Seq.toList callee.GenericParameters
+                    let arguments = outer @ own
+                    let count = min parameters.Length arguments.Length
+                    let substitutions =
+                        List.zip (List.skip (parameters.Length - count) parameters) (List.skip (arguments.Length - count) arguments)
+                        |> List.map (fun (parameter, argument) -> typeRecords.Parameter(id, parameter), argument)
+                    typed expression.Range expression.Type (Some id) substitutions
+            match expression with
+            | FSharpExprPatterns.Call(_, callee, outer, own, _) -> call callee outer own
+            | FSharpExprPatterns.NewObject(callee, outer, _) -> call callee outer []
+            | _ -> ()
+            for child in expression.ImmediateSubExpressions do calls child
+        for expression in implementations do calls expression
         let rec ensureEntity (entity: FSharpEntity) =
             let ensure (symbol: FSharpSymbol) =
                 match symbol.DeclarationLocation with
@@ -330,9 +409,9 @@ module Records =
         for key, values in rows do contributions[key] <- values |> Seq.map (fun row -> copy row["id"]) |> array
         contributions["relations"] <- array []
         unitValue["contributions"] <- contributions
-        let facts = ["symbols"; "types"; "definitions"; "occurrences"; "references"; "scopes"; "diagnostics"]
+        let facts = ["symbols"; "types"; "definitions"; "occurrences"; "references"; "scopes"; "diagnostics"; "typed_ranges"]
         unitValue["coverage"] <- object ["requested", copy (template["coverage"]["requested"]);
                                           "available", array [object ["files", result.Sources |> Seq.map relative |> strings; "modules", strings [name];
                                                                       "contexts", strings [context]; "projects", strings [projectId]; "facts", strings facts]];
                                           "missing", array []; "unresolved_count", number 0]
-        object (["id", text ""; "unit", unitValue; "identities", array identities.Values; "relations", array []; "typed_ranges", array []] @ (rows |> List.map (fun (key, values) -> key, array values)))
+        object (["id", text ""; "unit", unitValue; "identities", array identities.Values; "relations", array []; "typed_ranges", array typedRanges] @ (rows |> List.map (fun (key, values) -> key, array values)))

@@ -189,11 +189,6 @@ export namespace channels {
 
     inline auto outputs(const std::vector<semantic::channel_definition>& definitions, const std::vector<const semantic::shard*>& shards)
         -> std::vector<semantic::channel> {
-        std::vector<semantic::shard_id> objects;
-        for (const auto* shard : shards)
-            objects.push_back(shard->id);
-        std::ranges::sort(objects);
-        objects.erase(std::unique(objects.begin(), objects.end()), objects.end());
         std::vector<semantic::channel> out;
         for (const auto& definition : definitions) {
             std::vector<std::pair<std::string, std::vector<std::string>>> projections;
@@ -239,7 +234,7 @@ export namespace channels {
                 values.erase(std::unique(values.begin(), values.end()), values.end());
             }
             std::ranges::sort(projections, {}, [](const auto& value) { return value.first; });
-            out.push_back({definition.name, content::hash_of(rfl::json::write(std::pair{definition, projections})).str(), objects});
+            out.push_back({definition.name, content::hash_of(rfl::json::write(std::pair{definition, projections})).str()});
         }
         return out;
     }

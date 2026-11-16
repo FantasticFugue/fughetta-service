@@ -16,6 +16,7 @@ import org.jetbrains.kotlin.analysis.api.resolution.KaImplicitInvokeCall
 import org.jetbrains.kotlin.analysis.api.resolution.KaSingleCall
 import org.jetbrains.kotlin.analysis.api.symbols.*
 import org.jetbrains.kotlin.analysis.api.types.KaClassType
+import org.jetbrains.kotlin.analysis.api.types.KaType
 import org.jetbrains.kotlin.analysis.api.symbols.markers.KaTypeParameterOwnerSymbol
 import org.jetbrains.kotlin.idea.references.mainReference
 import org.jetbrains.kotlin.idea.references.readWriteAccessWithFullExpression
@@ -451,21 +452,47 @@ class Projection(private val root: Path, private val project: String, private va
                 }
             }
         }
-        for (expression in PsiTreeUtil.collectElementsOfType(file, KtExpression::class.java)) {
-            if (expression is KtDeclaration || expression is KtOperationReferenceExpression) continue
-            val type = expression.expressionType ?: continue
-            val call = (expression.resolveToCall() as? KaSuccessCallInfo)?.call as? KaSingleCall<*, *>
-            typedRanges.add(buildJsonObject {
-                put("ownership", ownership(expression)); put("range", place(expression))
-                put("type", types.project(session, type, ::id, ::parameterIdentity))
-                call?.let { put("overload", id(it.signature.symbol)) }
-                putJsonObject("substitutions") {
-                    call?.typeArgumentsMapping?.forEach { (parameter, argument) ->
-                        val (binder, index) = parameterIdentity(parameter)
-                        put(types.parameter(parameter, binder, index), types.project(session, argument, ::id, ::parameterIdentity))
-                    }
+        // Only what the source leaves unwritten: inferred local and lambda parameter
+        // types, implicit `it`, and the instantiation chosen at generic, overloaded or
+        // virtual call sites.
+        fun typed(element: PsiElement, type: KaType, call: KaSingleCall<*, *>? = null) = typedRanges.add(buildJsonObject {
+            put("ownership", ownership(element)); put("range", place(element))
+            put("type", types.project(session, type, ::id, ::parameterIdentity))
+            call?.let { put("overload", id(it.signature.symbol)) }
+            putJsonObject("substitutions") {
+                call?.typeArgumentsMapping?.forEach { (parameter, argument) ->
+                    val (binder, index) = parameterIdentity(parameter)
+                    put(types.parameter(parameter, binder, index), types.project(session, argument, ::id, ::parameterIdentity))
                 }
-            })
+            }
+        })
+        for (declaration in PsiTreeUtil.collectElementsOfType(file, KtCallableDeclaration::class.java)) {
+            val inferred = when (declaration) {
+                is KtProperty -> declaration.isLocal
+                is KtDestructuringDeclarationEntry -> true
+                is KtParameter -> declaration.parent?.parent is KtFunctionLiteral || declaration.parent is KtForExpression
+                else -> false
+            }
+            if (!inferred || declaration.typeReference != null) continue
+            val name = declaration.nameIdentifier ?: continue
+            typed(name, (declaration.symbol as KaCallableSymbol).returnType)
+        }
+        for (expression in PsiTreeUtil.collectElementsOfType(file, KtNameReferenceExpression::class.java)) {
+            val parameter = expression.mainReference.resolveToSymbol() as? KaValueParameterSymbol ?: continue
+            if (parameter.isImplicitLambdaParameter) typed(expression, parameter.returnType)
+        }
+        // Named infix calls such as `key to value` count; arithmetic and comparison operators do not.
+        val calls = PsiTreeUtil.collectElementsOfType(file, KtCallExpression::class.java) +
+            PsiTreeUtil.collectElementsOfType(file, KtBinaryExpression::class.java).filter { it.operationToken == KtTokens.IDENTIFIER } +
+            PsiTreeUtil.collectElementsOfType(file, KtArrayAccessExpression::class.java)
+        for (expression in calls) {
+            val call = (expression.resolveToCall() as? KaSuccessCallInfo)?.call as? KaSingleCall<*, *> ?: continue
+            val symbol = call.signature.symbol
+            val virtual = symbol.location == KaSymbolLocation.CLASS &&
+                (symbol.modality == KaSymbolModality.OPEN || symbol.modality == KaSymbolModality.ABSTRACT)
+            if (call.typeArgumentsMapping.isEmpty() && !virtual && expression.resolveToCallCandidates().size < 2) continue
+            val type = expression.expressionType ?: continue
+            typed(expression, type, call)
         }
         for (array in PsiTreeUtil.collectElementsOfType(file, KtArrayAccessExpression::class.java)) {
             val parent = array.parent

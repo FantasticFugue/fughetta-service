@@ -503,12 +503,10 @@ class EnvironmentTest {
                 assertEquals("resolved", reference.getValue("resolution").jsonPrimitive.content)
                 val consumerText = Files.readString(consumer)
                 val callStart = consumerText.codePointCount(0, consumerText.indexOf("value()"))
-                val callType = projection.typedRanges.single { record ->
+                assertTrue(projection.typedRanges.none { record ->
                     val range = record.getValue("range").jsonObject
-                    range.getValue("path").jsonPrimitive.content == "Consumer.kt" &&
-                        range.getValue("begin").jsonPrimitive.int == callStart && range.getValue("end").jsonPrimitive.int == callStart + 7
-                }
-                assertEquals("kotlin.String", projection.types.records.getValue(callType.getValue("type").jsonPrimitive.content)["name"]?.jsonPrimitive?.content)
+                    range.getValue("path").jsonPrimitive.content == "Consumer.kt" && range.getValue("begin").jsonPrimitive.int == callStart
+                }, "a call that is neither generic, overloaded nor virtual has no typed range")
                 assertEquals(consumerText.codePointCount(0, consumerText.indexOf("value()")),
                     reference.getValue("location").jsonObject.getValue("source").jsonObject.getValue("begin").jsonPrimitive.int)
                 val answer = projection.symbols.values.single { it.getValue("name").jsonPrimitive.content == "answer" }

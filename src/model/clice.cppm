@@ -69,7 +69,8 @@ namespace language {
             {"cu", "cpp"},
         }};
         static constexpr std::array<std::string_view, 1> inputs{"compilation_database"};
-        static constexpr std::array<std::string_view, 7> facts{"symbols", "types", "definitions", "references", "scopes", "diagnostics", "relations"};
+        static constexpr std::array<std::string_view, 8> facts{"symbols", "types",       "definitions", "references",
+                                                               "scopes",  "diagnostics", "relations",   "typed_ranges"};
         static constexpr std::array<std::string_view, 2> operations{"evaluate", "resolve"};
         static constexpr semantic::unit_kind unit_kind = semantic::unit_kind::group;
         static constexpr bool negotiated = false, dependency_reads = true, multiple_inputs = true;
@@ -204,6 +205,12 @@ export namespace language::cpp {
         std::string code, severity, message;
         std::optional<range> location;
     };
+    struct typed_range {
+        range range;
+        std::string type;
+        std::optional<std::string> overload;
+        std::map<std::string, std::string> substitutions;
+    };
     struct configuration_reads {
         std::map<std::string, std::string> commands;
         bool complete = false;
@@ -225,6 +232,7 @@ export namespace language::cpp {
         std::vector<scope> scopes;
         std::vector<relation> relations;
         std::vector<diagnostic> diagnostics;
+        std::vector<typed_range> typed_ranges;
         std::vector<std::string> identities;
     };
     struct contribution_key {
@@ -243,13 +251,16 @@ export namespace language::cpp {
         value = lower(std::move(value));
         if (value == "struct" || value == "class" || value == "enum" || value == "union")
             return "type";
-        if (value == "method" || value == "constructor" || value == "destructor")
-            return "function";
         if (value == "enummember")
             return "enum_member";
         if (value == "invalid" || value.empty())
             return "other";
         return value;
+    }
+    // Scopes have no member kinds: a method body is a function scope.
+    inline auto scope_kind(std::string value) -> std::string {
+        value = kind(std::move(value));
+        return value == "method" || value == "constructor" || value == "destructor" ? "function" : value;
     }
     // The adapter receives the exact text installed in the worker slot. Positions cross
     // the provider boundary once, from UTF-8 bytes to source Unicode scalar offsets.
@@ -442,7 +453,7 @@ export namespace language::cpp {
                                   .location = locate(value.location),
                                   .declared_members = value.declared_members,
                                   .lookup = value.lookup,
-                                  .kind = kind(value.kind)});
+                                  .kind = scope_kind(value.kind)});
         }
         for (const auto& value : input.relations) {
             semantic::records::relation relation{.id = out.unit.id + ":edge:" + std::to_string(out.relations.size()),
@@ -488,6 +499,15 @@ export namespace language::cpp {
                                        .message = value.message,
                                        .ownership = own(),
                                        .location = value.location ? locate(*value.location) : semantic::locator{}});
+        for (const auto& value : input.typed_ranges) {
+            auto location = locate(value.range).source;
+            if (!location)
+                continue;
+            semantic::records::typed_range range{.ownership = own(), .range = std::move(*location), .type = type_id(value.type), .overload = value.overload};
+            for (const auto& [parameter, argument] : value.substitutions)
+                range.substitutions.emplace(type_id(parameter), type_id(argument));
+            out.typed_ranges.push_back(std::move(range));
+        }
         auto artifact_read = [&](const std::string& dependency) {
             const auto name = relative(dependency);
             semantic::dependency read{.kind = semantic::dependency_kind::artifact, .project = project, .key = name};
@@ -533,7 +553,7 @@ export namespace language::cpp {
             out.unit.observed_dependencies.push_back(std::move(read));
         }
         out.unit.coverage.requested.facts = {std::string{"symbols"}, std::string{"types"},       std::string{"definitions"}, std::string{"references"},
-                                             std::string{"scopes"},  std::string{"diagnostics"}, std::string{"relations"}};
+                                             std::string{"scopes"},  std::string{"diagnostics"}, std::string{"relations"},   std::string{"typed_ranges"}};
         out.unit.coverage.requested.contexts = {out.unit.context};
         if (input.complete)
             out.unit.coverage.available.push_back(out.unit.coverage.requested);
@@ -718,6 +738,7 @@ export namespace language {
                 own(shard.scopes);
                 own(shard.relations);
                 own(shard.diagnostics);
+                own(shard.typed_ranges);
                 auto record_id = [&](std::string& id) {
                     if (id.starts_with(parent_id))
                         id = unit.id + id.substr(parent_id.size());

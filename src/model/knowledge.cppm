@@ -305,7 +305,10 @@ export namespace semantic {
                                 symbol.id, anchored_identity{shard.unit.recipe.unit.project, symbol.module, shard.unit.recipe.unit.provider, source->second});
                             inferred.insert(symbol.id);
                         } else
-                            ids.try_emplace(symbol.id, identifier("sym"));
+                            // An unbound symbol is the same only within the same unit inputs.
+                            ids.try_emplace(symbol.id, "sym-" + content::hash_of(rfl::json::write(std::tuple{shard.unit.id, shard.unit.context,
+                                                                                                             shard.unit.direct_inputs, symbol.id}))
+                                                                    .str());
                     }
             const auto unbound = ids.size();
             std::map<std::string, declaration_identity> bound;
@@ -372,7 +375,9 @@ export namespace semantic {
                             throw std::invalid_argument("declaration identities are already bound to different symbols");
                         selected = std::move(previous);
                     }
-                auto id = selected ? *selected : identifier("sym");
+                // A new symbol is named by its declaration, so identical records get the
+                // same ID, and so the same shard ID, in every publication.
+                auto id = selected ? *selected : "sym-" + content::hash_of(rfl::json::write(keys.front())).str();
                 for (const auto& key : keys)
                     if (!known(key))
                         pending.emplace(key, id);
@@ -499,13 +504,40 @@ export namespace semantic {
                 contributions(shard);
                 if (replaced.insert(shard.unit.id).second)
                     selected.units.erase(shard.unit.id);
-                shard.id = identifier("shard");
-                selected.units[shard.unit.id].push_back(shard.id);
             }
-            if (!updates.empty()) {
+            std::map<unit_id, std::vector<const semantic::shard*>> grouped;
+            for (const auto& shard : updates)
+                grouped[shard.unit.id].push_back(&shard);
+            std::map<unit_id, std::vector<semantic::channel>> outputs;
+            std::map<unit_id, std::set<std::string>> modules;
+            for (const auto& [unit, shards] : grouped) {
+                outputs[unit] = channels::outputs(channels::definitions(shards), shards);
+                for (const auto* shard : shards) {
+                    modules[unit].insert(shard->unit.modules.begin(), shard->unit.modules.end());
+                    for (const auto& symbol : shard->symbols)
+                        if (!symbol.module.empty())
+                            modules[unit].insert(symbol.module);
+                }
+            }
+            // An ID names exact content: a shard already stored under it, or repeated
+            // in this batch, is selected again without writing another copy.
+            std::vector<semantic::shard*> fresh;
+            for (auto& shard : updates) {
+                shard.unit.output_channels = outputs.at(shard.unit.id);
+                const auto& names = modules[shard.unit.id];
+                shard.unit.modules.assign(names.begin(), names.end());
+                shard.id = semantic::shard_key(shard);
+                auto& listed = selected.units[shard.unit.id];
+                if (std::ranges::contains(listed, shard.id))
+                    continue;
+                listed.push_back(shard.id);
+                if (!database_->get(persistence::table::shards, shard.id))
+                    fresh.push_back(&shard);
+            }
+            if (!fresh.empty()) {
                 persistence::database::transaction journal{*database_};
-                for (const auto& shard : updates)
-                    database_->rows("INSERT INTO staging VALUES (?1)", {shard.id});
+                for (const auto* shard : fresh)
+                    database_->rows("INSERT INTO staging VALUES (?1)", {shard->id});
                 journal.commit();
             }
             struct pending_files {
@@ -521,26 +553,8 @@ export namespace semantic {
                 }
             } staged{*this};
             persistence::database::transaction transaction{*database_};
-            std::map<unit_id, std::vector<const semantic::shard*>> grouped;
-            for (const auto& shard : updates)
-                grouped[shard.unit.id].push_back(&shard);
-            std::map<unit_id, std::vector<semantic::channel>> outputs;
-            std::map<unit_id, std::set<std::string>> modules;
-            for (const auto& [unit, shards] : grouped) {
-                outputs[unit] = channels::outputs(channels::definitions(shards), shards);
-                for (const auto* shard : shards) {
-                    modules[unit].insert(shard->unit.modules.begin(), shard->unit.modules.end());
-                    for (const auto& symbol : shard->symbols)
-                        if (!symbol.module.empty())
-                            modules[unit].insert(symbol.module);
-                }
-            }
-            for (auto& shard : updates) {
-                shard.unit.output_channels = outputs.at(shard.unit.id);
-                const auto& names = modules[shard.unit.id];
-                shard.unit.modules.assign(names.begin(), names.end());
-                save_shard(std::move(shard));
-            }
+            for (auto* shard : fresh)
+                save_shard(std::move(*shard));
             // Reused shards are selected by unit, never by a workspace-wide union.
             if (collect_coverage) {
                 selected.coverage.available.clear();
@@ -984,8 +998,12 @@ export namespace semantic {
                         for (const auto& child : children)
                             out->type_parents[child].insert(parent);
                     append(out->typed_overloads, piece->index->typed_overloads);
+                    append(out->typed_range_files, piece->index->typed_range_files);
                     append(out->scopes, piece->index->scopes);
                     append(out->scope_owners, piece->index->scope_owners);
+                    append(out->members, piece->index->members);
+                    append(out->type_producers, piece->index->type_producers);
+                    append(out->type_consumers, piece->index->type_consumers);
                     append(out->diagnostics, piece->index->diagnostics);
                     if (piece->unit.resolution) {
                         const auto& resolution = *piece->unit.resolution;

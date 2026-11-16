@@ -77,7 +77,7 @@ export namespace tools {
             std::string status = "complete";
             semantic::coverage coverage;
             std::vector<semantic::item> items;
-            std::vector<semantic::records::symbol> symbols;
+            std::vector<semantic::records::symbol> symbols, producers, consumers;
             std::vector<semantic::records::type> types;
             std::vector<semantic::records::typed_range> typed_ranges;
             std::vector<semantic::records::occurrence> occurrences;
@@ -227,6 +227,8 @@ export namespace tools {
                        .coverage = std::move(result.coverage),
                        .items = std::move(result.items),
                        .symbols = std::move(result.symbols),
+                       .producers = std::move(result.producers),
+                       .consumers = std::move(result.consumers),
                        .types = std::move(result.types),
                        .typed_ranges = std::move(result.typed_ranges),
                        .occurrences = std::move(result.occurrences),
@@ -257,12 +259,30 @@ export namespace tools {
                 std::uint64_t size = 0;
             };
             std::map<std::pair<std::string, std::string>, source_positions> positions;
+            const bool sources = request.action == "inspect" || std::ranges::contains(request.include, "source");
+            std::map<std::pair<std::string, std::string>, std::string> texts;
+            // Semantic offsets count code points.
+            auto slice = [](std::string_view text, const semantic::place& range) {
+                std::size_t byte = 0, begin = text.size();
+                for (std::uint64_t point = 0; byte < text.size() && point < range.end; ++point) {
+                    if (point == range.begin)
+                        begin = byte;
+                    const auto c = static_cast<unsigned char>(text[byte]);
+                    byte += c < 0x80 ? 1 : c >= 0xF0 ? 4 : c >= 0xE0 ? 3 : 2;
+                }
+                return std::string{text.substr(begin, std::min(byte, text.size()) - std::min(begin, byte))};
+            };
             auto enlist = [&](const semantic::locator& at) {
                 if (at.source)
                     positions.try_emplace(std::pair{at.project.value_or(project), at.source->path});
             };
-            for (const auto& row : out.occurrences)
+            for (const auto& row : out.occurrences) {
                 enlist(row.location);
+                if (sources && row.body && std::ranges::contains(out.items, std::pair{row.symbol, row.ownership.context}, [](const auto& item) {
+                        return std::pair{item.symbol_id, item.context};
+                    }))
+                    positions.try_emplace(texts.try_emplace(std::pair{row.location.project.value_or(project), row.body->path}).first->first);
+            }
             for (const auto& row : out.references)
                 enlist(row.location);
             for (const auto& row : out.scopes)
@@ -281,6 +301,8 @@ export namespace tools {
                 if (found == source.files.end())
                     throw tool_error("invalid_semantic_range", "semantic location has no file in its snapshot");
                 const auto text = found->encoding == "hex" ? lines::unhex(found->text) : found->text;
+                if (const auto wanted = texts.find(key); wanted != texts.end())
+                    wanted->second = text;
                 for (std::size_t byte = 0; byte < text.size();) {
                     const auto c = static_cast<unsigned char>(text[byte]);
                     ++index.size;
@@ -323,8 +345,12 @@ export namespace tools {
             for (auto& item : out.items) {
                 std::set<semantic::locator> definitions, declarations;
                 for (const auto* occurrence : occurrences[{item.symbol_id, item.context}]) {
-                    if (std::ranges::contains(occurrence->roles, semantic::role::make<"definition">()))
+                    if (std::ranges::contains(occurrence->roles, semantic::role::make<"definition">())) {
                         definitions.insert(occurrence->location);
+                        const auto text = occurrence->body ? texts.find({occurrence->location.project.value_or(project), occurrence->body->path}) : texts.end();
+                        if (!item.source && text != texts.end())
+                            item.source = slice(text->second, *occurrence->body);
+                    }
                     if (std::ranges::contains(occurrence->roles, semantic::role::make<"declaration">()))
                         declarations.insert(occurrence->location);
                 }

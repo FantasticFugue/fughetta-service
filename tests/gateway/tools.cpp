@@ -1633,7 +1633,7 @@ def publication(path):
         'configurations': {'commands': {}, 'complete': False},
         'symbols': [{'id': 'probe', 'name': 'probe', 'qualified_name': 'probe', 'kind': 'variable',
                      'modifiers': [], 'visibility': 'public', 'parameters': [], 'attributes': []}],
-        'types': [], 'scopes': [], 'relations': [], 'identities': ['probe'],
+        'types': [], 'scopes': [], 'relations': [], 'typed_ranges': [], 'typedRanges': [], 'identities': ['probe'],
         'occurrences': [
             {'symbol': 'probe', 'role': 'Definition', 'location': location, 'candidates': [], 'resolution': 'resolved', 'roles': []},
             {'symbol': 'probe', 'role': 'Reference', 'location': location, 'candidates': [], 'resolution': 'resolved', 'roles': ['read']},
