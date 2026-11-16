@@ -2,6 +2,8 @@ export module constants;
 import std;
 
 export namespace constants {
+    // How many manifest deltas a version chain may carry before a complete manifest snapshot anchors it.
+    inline constexpr std::uint64_t manifest_chain_limit = 32;
     inline constexpr std::uint64_t scope_lease_seconds = 120;
     inline constexpr std::uint64_t scope_max_seconds = 600;
     inline constexpr std::uint64_t scope_reference_limit = 16384;

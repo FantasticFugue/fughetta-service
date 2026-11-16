@@ -463,37 +463,7 @@ export namespace nodes {
         }
     } // namespace codec
 
-    struct key {
-        std::string secret;
-        std::string public_key;
-        static auto generate() -> key;
-        static auto from_secret(std::string bytes) -> key;
-        auto id() const -> std::string { return digest_of(public_key); }
-        auto sign(std::string_view bytes) const -> std::string;
-    };
-    auto verify_signature(std::string_view public_key, std::string_view bytes, std::string_view signature) -> bool;
     auto random_bytes(std::size_t n) -> std::string;
-    inline auto signed_message(const value& body) -> std::string {
-        return "fughetta/node/1/" + body.at("kind").text() + std::string(1, '\0') + codec::encode(body);
-    }
-    inline auto seal(value body, const key& signer) -> value {
-        auto signature = signer.sign(signed_message(body));
-        value::map out;
-        out.reserve(3);
-        out.emplace("body", std::move(body));
-        out.emplace("public_key", bytes{signer.public_key});
-        out.emplace("signature", bytes{std::move(signature)});
-        return out;
-    }
-    inline auto open(const value& object) -> const value& {
-        fields(object, {"body", "public_key", "signature"});
-        auto& body = object.at("body");
-        if (body.at("schema").number() != 1)
-            fail(nodes::code::invalid_record, "unsupported record schema");
-        if (!verify_signature(object.at("public_key").raw(), signed_message(body), object.at("signature").raw()))
-            fail("invalid_signature", "origin signature failed");
-        return body;
-    }
     inline auto object_id(const value& object) -> std::string { return digest_of(codec::encode(object)); }
     inline auto hex(std::string_view bytes) -> std::string {
         constexpr std::string_view digits = "0123456789abcdef";

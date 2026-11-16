@@ -14,6 +14,7 @@ export namespace nodes {
         bool executable = false;
         std::string document;
     };
+    // A byte range of a file, named by the digest of the whole file: reads ask for one, replies carry it.
     struct object_part {
         std::string id;
         std::uint64_t offset = 0;
@@ -60,7 +61,7 @@ export namespace nodes {
         std::optional<reference_input> reference;
         std::uint64_t after = 0;
         std::string worldline = "main";
-        std::string revision, snapshot;
+        std::string revision;
         std::string lease_owner, lease_token;
         std::vector<std::string> leases;
         std::uint64_t lease_seconds = constants::scope_lease_seconds;
@@ -79,12 +80,6 @@ export namespace nodes {
         std::string tool;
         std::vector<std::string> dependencies;
         std::vector<std::string> decisions;
-        std::vector<std::string> authors;
-        std::vector<std::string> nodes;
-        std::vector<std::string> policies;
-        std::vector<std::string> settled;
-        std::vector<std::string> protected_worldlines{"main"};
-        std::vector<std::string> want;
         std::vector<object_part> parts;
         std::string configuration;
         std::string environment;
@@ -111,8 +106,8 @@ export namespace nodes {
         std::optional<file_view> before, after;
     };
     struct history_entry {
-        std::string event, operation, author, actor, executor, tool, intent, result, outcome, policy, line;
-        std::vector<std::string> parents, dependencies, receipts;
+        std::string event, operation, author, actor, tool, intent, result, line;
+        std::vector<std::string> parents, dependencies;
         std::uint64_t lamport = 0;
     };
     struct node_reply {
@@ -120,15 +115,12 @@ export namespace nodes {
         std::string reason;
         std::string project, node, author;
         std::string operation;
-        std::string version, source_digest, receipt, issuer, result, checkpoint;
-        std::string materialized_version;
+        std::string version, source_digest, receipt, issuer, result;
         // The submitted edit on its observed base, before joining concurrent publications.
         std::string written_version;
         std::string base_version;
-        std::string receipt_status;
         std::string worldline;
-        std::vector<std::string> frontier, missing, conflicts, objects, policies;
-        std::vector<std::string> identity_conflicts, refused;
+        std::vector<std::string> frontier, missing, conflicts, objects;
         std::vector<object_part> parts;
         std::vector<file_view> files;
         std::vector<source_difference> changes;

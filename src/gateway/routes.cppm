@@ -368,7 +368,6 @@ namespace front {
             return {.action = file ? "read" : "tree",
                     .worldline = std::string{target.text("worldline").value_or("main")},
                     .revision = std::string{target.text("revision").value_or("")},
-                    .snapshot = std::string{target.text("snapshot").value_or("")},
                     .target = file ? std::string{target.text("path").value_or("")} : std::string{}};
         }
         struct get_node_source : endpoint<"GET", "/api/v1/projects/{project}/node/source", access::member> {

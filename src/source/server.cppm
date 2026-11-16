@@ -291,8 +291,7 @@ export namespace source_server {
                         throw transport::coded_error(checked.code, checked.reason);
                 }
                 // A workspace at its storage limit accepts reversals but no additional source history.
-                static const std::set<std::string, std::less<>> growing{"reference", "mail_send", "apply", "promote", "fork",   "integrate",
-                                                                        "admit",     "resolve",   "redo",  "receive", "restore"};
+                static const std::set<std::string, std::less<>> growing{"reference", "mail_send", "apply", "promote", "fork", "resolve", "redo", "restore"};
                 auto stores = growing.contains(request.request.action) ? request.request.workspace_limit : 0;
                 return repositories_.with(
                     root,

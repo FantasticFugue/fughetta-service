@@ -2,7 +2,6 @@ export module kernel;
 import std;
 import content;
 import codec;
-import index;
 
 export namespace nodes {
     struct element {
@@ -20,19 +19,56 @@ export namespace nodes {
         std::uint64_t first = 0, count = 0;
         auto operator==(const fragment&) const -> bool = default;
     };
-    struct sequence_state {
-        virtual ~sequence_state() = default;
-        virtual auto size() const -> std::uint64_t = 0;
-        virtual auto at(std::uint64_t offset) const -> element = 0;
-        virtual auto position(const element& selected) const -> std::optional<std::uint64_t> = 0;
-        // Where a character is, with how many characters of its run follow it contiguously (itself included), or nothing.
-        virtual auto extent(const element& selected) const -> std::optional<std::pair<std::uint64_t, std::uint64_t>> = 0;
-        virtual auto splice(std::uint64_t offset, std::uint64_t count, std::string run, std::uint64_t inserted) const
-            -> std::shared_ptr<const sequence_state> = 0;
-        virtual auto all() const -> std::vector<fragment> = 0;
-        // The pieces holding the `count` visible characters from `offset`.
-        virtual auto span(std::uint64_t offset, std::uint64_t count) const -> std::vector<fragment> = 0;
-        virtual auto save() const -> value = 0;
+    // Sparse half-open event positions, sorted and disjoint: a version's causal closure.
+    struct causal_set {
+        std::vector<std::pair<std::size_t, std::size_t>> ranges;
+        auto contains(std::size_t n) const -> bool {
+            auto it = std::upper_bound(ranges.begin(), ranges.end(), n, [](auto value, auto& range) { return value < range.first; });
+            return it != ranges.begin() && n < std::prev(it)->second;
+        }
+        void unite(const causal_set& other) {
+            std::vector<std::pair<std::size_t, std::size_t>> next;
+            next.reserve(ranges.size() + other.ranges.size());
+            auto a = ranges.begin();
+            auto b = other.ranges.begin();
+            while (a != ranges.end() || b != other.ranges.end()) {
+                auto item = b == other.ranges.end() || (a != ranges.end() && *a < *b) ? *a++ : *b++;
+                if (!next.empty() && item.first <= next.back().second)
+                    next.back().second = std::max(next.back().second, item.second);
+                else
+                    next.push_back(item);
+            }
+            ranges = std::move(next);
+        }
+        void add(std::size_t n) {
+            causal_set one;
+            one.ranges.emplace_back(n, n + 1);
+            unite(one);
+        }
+        auto without(const causal_set& other) const -> causal_set {
+            causal_set out;
+            std::size_t j = 0;
+            for (auto [first, last] : ranges) {
+                while (j < other.ranges.size() && other.ranges[j].second <= first)
+                    ++j;
+                for (auto k = j; k < other.ranges.size() && other.ranges[k].first < last; ++k) {
+                    auto [lo, hi] = other.ranges[k];
+                    if (first < lo)
+                        out.ranges.emplace_back(first, std::min(lo, last));
+                    first = std::max(first, hi);
+                    if (first >= last)
+                        break;
+                }
+                if (first < last)
+                    out.ranges.emplace_back(first, last);
+            }
+            return out;
+        }
+        template <class F> void each(F f) const {
+            for (auto [first, last] : ranges)
+                for (auto i = first; i < last; ++i)
+                    f(i);
+        }
     };
     struct source_file;
     struct source_state;
@@ -42,29 +78,21 @@ export namespace nodes {
         virtual auto header(std::size_t index) -> value = 0;
         virtual auto locate(const std::string& id) -> std::optional<std::size_t> = 0;
         virtual auto records(const std::string& kind, const std::string& key) -> std::vector<value> = 0;
-        virtual auto text(const std::string& id) -> std::string = 0;
         virtual auto file_text(const source_file& file) -> std::string = 0;
         virtual auto projection(const std::vector<std::string>& heads) -> std::shared_ptr<const source_state> = 0;
-        virtual auto base(const causal_set& wanted) -> std::pair<std::vector<std::string>, std::shared_ptr<const source_state>> = 0;
+        // The newest recorded manifest a version without one was written against, and its frontier.
+        virtual auto base(const std::vector<std::string>& heads) -> std::pair<std::vector<std::string>, std::shared_ptr<const source_state>> = 0;
         virtual auto file_changed(const std::string& file, const causal_set& missing) -> bool = 0;
     };
     struct source_file {
         std::string id, path, kind = "text", digest;
-        mutable std::string text, storage_header, content_object;
+        mutable std::string text;
         bool executable = false, present = true;
         mutable std::vector<fragment> fragments;
         mutable bool fragments_ready = true;
         std::uint64_t stored_bytes = 0, stored_scalars = 0;
-        // Set while the content is still in storage, under `content_object`.
+        // Set while the content is still in storage, under `digest`.
         mutable causal_reader* stored = nullptr;
-        mutable std::shared_ptr<const sequence_state> sequence;
-        void ensure() const {
-            (void)content();
-            if (!fragments_ready && sequence) {
-                fragments = sequence->all();
-                fragments_ready = true;
-            }
-        }
         auto content() const -> const std::string& {
             if (stored) {
                 text = stored->file_text(*this);
@@ -73,12 +101,7 @@ export namespace nodes {
             return text;
         }
         auto bytes() const -> std::uint64_t { return stored ? stored_bytes : text.size(); }
-        auto metadata_digest() const -> std::string {
-            return digest_of(codec::encode(value::map{{"content", digest}, {"executable", executable}, {"file", id}, {"kind", kind}, {"path", path}}));
-        }
         auto at(std::uint64_t offset) const -> element {
-            if (sequence)
-                return sequence->at(offset);
             for (auto& f : fragments) {
                 if (offset < f.count)
                     return {f.run, f.first + offset};
@@ -91,21 +114,18 @@ export namespace nodes {
             if (offset > size() || count > size() - offset)
                 fail(nodes::code::invalid_record, "text range outside visible source");
             std::vector<fragment> pieces;
-            if (sequence)
-                pieces = sequence->span(offset, count);
-            else
-                for (auto& f : fragments) {
-                    if (!count)
-                        break;
-                    if (offset >= f.count) {
-                        offset -= f.count;
-                        continue;
-                    }
-                    auto taken = std::min(count, f.count - offset);
-                    pieces.push_back({f.run, f.first + offset, taken});
-                    count -= taken;
-                    offset = 0;
+            for (auto& f : fragments) {
+                if (!count)
+                    break;
+                if (offset >= f.count) {
+                    offset -= f.count;
+                    continue;
                 }
+                auto taken = std::min(count, f.count - offset);
+                pieces.push_back({f.run, f.first + offset, taken});
+                count -= taken;
+                offset = 0;
+            }
             std::vector<fragment> out;
             for (auto& f : pieces)
                 if (!out.empty() && out.back().run == f.run && out.back().first + out.back().count == f.first)
@@ -115,8 +135,6 @@ export namespace nodes {
             return out;
         }
         auto size() const -> std::uint64_t {
-            if (sequence)
-                return sequence->size();
             std::uint64_t n = 0;
             for (auto& f : fragments)
                 n += f.count;
@@ -124,8 +142,6 @@ export namespace nodes {
         }
         // Where a character is in this file, or nothing when it is not visible here.
         auto position(const element& selected) const -> std::optional<std::uint64_t> {
-            if (sequence)
-                return sequence->position(selected);
             std::uint64_t n = 0;
             for (auto& f : fragments) {
                 if (f.run == selected.run && selected.offset >= f.first && selected.offset - f.first < f.count)
@@ -136,16 +152,15 @@ export namespace nodes {
         }
     };
     struct source_state {
-        persistent_index<std::shared_ptr<const source_file>> files;
-        persistent_index<std::shared_ptr<const source_file>> hidden;
-        persistent_index<std::shared_ptr<const std::set<std::string>>> paths;
-        persistent_index<std::vector<std::string>> file_conflicts, path_conflicts, control_conflicts, identity_conflicts, dependency_conflicts;
-        persistent_index<bool> activation, resolutions;
+        std::map<std::string, std::shared_ptr<const source_file>> files, hidden;
+        std::map<std::string, std::shared_ptr<const std::set<std::string>>> paths;
+        std::map<std::string, std::vector<std::string>> file_conflicts, path_conflicts, control_conflicts, dependency_conflicts;
+        std::map<std::string, bool> activation, resolutions;
         causal_set causal;
         std::vector<std::string> conflicts;
         std::string digest;
         auto path(std::string_view path) const -> const source_file& {
-            auto found = paths.find(path);
+            auto found = paths.find(std::string(path));
             if (found == paths.end() || found->second->empty())
                 fail(nodes::code::invalid_record, "source path not found: " + std::string(path));
             if (found->second->size() != 1)
@@ -153,6 +168,28 @@ export namespace nodes {
             return *files.find(*found->second->begin())->second;
         }
     };
+    // The version's deterministic state root: SHA-256 over the visible files, canonical sorted by (path, file_id).
+    inline auto content_root(const std::map<std::string, std::shared_ptr<const source_file>>& files) -> std::string {
+        std::vector<const source_file*> rows;
+        rows.reserve(files.size());
+        for (auto& [_, file] : files)
+            if (file->present)
+                rows.push_back(file.get());
+        std::ranges::sort(rows, [](const source_file* a, const source_file* b) { return std::tie(a->path, a->id) < std::tie(b->path, b->id); });
+        content::sha256 digest;
+        for (auto* file : rows)
+            digest.update(codec::encode(value::map{{"digest", file->digest},
+                                                   {"executable", file->executable},
+                                                   {"file", file->id},
+                                                   {"kind", file->kind},
+                                                   {"path", file->path},
+                                                   {"size", file->bytes()}}));
+        return content::to_hex(digest.finish()).str();
+    }
+    inline auto state_digest(std::string_view root, const std::vector<std::string>& conflicts) -> std::string {
+        return digest_of(codec::encode(value::map{{"conflicts", strings(conflicts)}, {"files", std::string(root)}}));
+    }
+    inline auto state_digest(const source_state& state) -> std::string { return state_digest(content_root(state.files), state.conflicts); }
 
     class kernel {
         // The `count` characters of one insertion run from offset `first` that an erase removes.
@@ -192,30 +229,8 @@ export namespace nodes {
             std::vector<std::string> selections;
             value property;
             mutable std::u32string scalar_text;
-            // Set while the inserted text is still in storage, under `text_id`.
-            mutable causal_reader* stored = nullptr;
-            std::string text_id;
-            std::uint64_t retained_scalars = 0;
-            void ensure_text() const {
-                if (stored) {
-                    auto decoded = stored->text(text_id);
-                    std::u32string unicode;
-                    for (unsigned char c : std::string_view{decoded})
-                        if (c >= 128) {
-                            unicode = scalars(decoded);
-                            break;
-                        }
-                    if ((unicode.empty() ? decoded.size() : unicode.size()) != retained_scalars)
-                        fail(nodes::code::storage_failure, "insertion scalar proof differs");
-                    auto& self = const_cast<effect&>(*this);
-                    self.text = std::move(decoded);
-                    self.scalar_text = std::move(unicode);
-                    self.stored = nullptr;
-                }
-            }
-            auto scalar_size() const -> std::size_t { return stored ? retained_scalars : scalar_text.empty() ? text.size() : scalar_text.size(); }
+            auto scalar_size() const -> std::size_t { return scalar_text.empty() ? text.size() : scalar_text.size(); }
             auto scalar_at(std::size_t offset) const -> char32_t {
-                ensure_text();
                 return scalar_text.empty() ? static_cast<unsigned char>(text[offset]) : scalar_text[offset];
             }
         };
@@ -239,7 +254,7 @@ export namespace nodes {
         mutable std::map<std::size_t, event> events_;
         std::size_t event_count_ = 0, retained_count_ = 0;
         causal_reader* reader_ = nullptr;
-        mutable std::set<std::string> loaded_files_, loaded_effects_, loaded_controls_, loaded_dependencies_, loaded_identities_;
+        mutable std::set<std::string> loaded_files_, loaded_effects_, loaded_controls_, loaded_dependencies_;
         mutable std::set<std::size_t> loaded_events_;
         mutable std::map<std::string, std::size_t> index_;
         mutable std::map<std::string, std::vector<const effect*>> effects_;
@@ -249,11 +264,9 @@ export namespace nodes {
         mutable std::vector<const effect*> control_effects_;
         mutable std::map<std::string, std::vector<const effect*>> activation_writes_;
         mutable std::map<std::string, std::vector<const effect*>> resolution_writes_;
-        mutable std::map<std::string, std::vector<std::size_t>> dependency_events_, identity_events_;
+        mutable std::map<std::string, std::vector<std::size_t>> dependency_events_;
         mutable std::map<std::string, std::set<std::string>> path_files_;
-        mutable std::map<std::pair<std::string, std::string>, std::pair<std::string, std::string>> operations_;
         mutable std::map<std::string, std::string> blobs_;
-        mutable bool aliases_present_ = false;
         mutable std::uint64_t projected_files_ = 0;
         mutable std::map<std::string, cached_file> cache_;
         mutable std::deque<std::pair<std::vector<std::string>, std::shared_ptr<const source_state>>> projected_;
@@ -288,8 +301,6 @@ export namespace nodes {
             if (!index_.emplace(found->second.id, index).second)
                 fail(nodes::code::invalid_record, "duplicate indexed causal identity");
             auto& retained = found->second;
-            operations_.try_emplace(std::pair{retained.author, retained.operation}, std::pair{retained.request_digest, retained.effect_digest});
-            identity_events_[retained.author + ":" + retained.operation].push_back(index);
             for (auto& dep : retained.dependencies)
                 dependency_events_[dep].push_back(index);
             return retained;
@@ -345,9 +356,12 @@ export namespace nodes {
                 if (x.type == "insert") {
                     x.left = element::decode(input.at("left"));
                     x.right = element::decode(input.at("right"));
-                    x.retained_scalars = input.at("scalars").number();
-                    x.stored = reader_;
-                    x.text_id = input.at("text_id").text();
+                    x.text = input.at("text").text();
+                    for (unsigned char c : std::string_view{x.text})
+                        if (c >= 128) {
+                            x.scalar_text = scalars(x.text);
+                            break;
+                        }
                 } else if (x.type == "erase") {
                     for (auto& target : input.at("targets").list()) {
                         auto run = target.at("run").text();
@@ -382,23 +396,22 @@ export namespace nodes {
             if (!newly_created)
                 load_records("file", file);
             if (auto found = file_effects_.find(file); found != file_effects_.end())
-                for (auto* e : found->second)
-                    e->ensure_text();
-            if (auto found = file_effects_.find(file); found != file_effects_.end())
                 std::ranges::sort(found->second, [](auto* a, auto* b) { return std::tie(a->event, a->ordinal) < std::tie(b->event, b->ordinal); });
             loaded_files_.insert(file);
         }
         void load_presence(const std::string& file) const { load_records("presence", file); }
+        // A record is loaded by its address; the cache names the addresses already read. `effect` and `control` share the
+        // same `<effect id>/<event>/<ordinal>` key space, so a key is marked for the kind it was read as, not for both.
         void load_effect(const std::string& id) const {
-            if (reader_ && !loaded_effects_.contains(id)) {
+            if (reader_ && !loaded_effects_.contains("effect/" + id)) {
                 load_records("effect", id);
-                loaded_effects_.insert(id);
+                loaded_effects_.insert("effect/" + id);
             }
         }
         void load_controls(const std::string& id) const {
-            if (reader_ && !loaded_controls_.contains(id)) {
+            if (reader_ && !loaded_controls_.contains("control/" + id)) {
                 load_records("control", id);
-                loaded_controls_.insert(id);
+                loaded_controls_.insert("control/" + id);
             }
         }
         void load_dependents(const std::string& id) const {
@@ -406,13 +419,6 @@ export namespace nodes {
                 for (auto& v : reader_->records("dependent", id))
                     (void)event_at(v.at("event").number());
                 loaded_dependencies_.insert(id);
-            }
-        }
-        void load_identity(const std::string& id) const {
-            if (reader_ && !loaded_identities_.contains(id)) {
-                for (auto& v : reader_->records("identity", id))
-                    (void)event_at(v.at("event").number());
-                loaded_identities_.insert(id);
             }
         }
         void load_event(std::size_t index) const {
@@ -432,11 +438,6 @@ export namespace nodes {
         void register_event(std::size_t index) {
             auto& event = event_at(index);
             index_.emplace(event.id, index);
-            auto operation = std::pair{event.author, event.operation};
-            if (operations_.contains(operation))
-                aliases_present_ = true;
-            operations_.try_emplace(std::move(operation), std::pair{event.request_digest, event.effect_digest});
-            identity_events_[event.author + ":" + event.operation].push_back(index);
             for (auto& dependency : event.dependencies)
                 dependency_events_[dependency].push_back(index);
             for (auto& file : event.created)
@@ -459,17 +460,7 @@ export namespace nodes {
             }
         }
         auto before(std::size_t a, std::size_t b) const -> bool { return a != b && event_at(b).ancestors.contains(a); }
-        auto before(const effect* a, const effect* b) const -> bool {
-            if (before(a->event, b->event))
-                return true;
-            if (!aliases_present_ || a->id == b->id)
-                return false;
-            auto found = effects_.find(a->id);
-            return found != effects_.end() && std::ranges::any_of(found->second, [&](auto* alias) {
-                       return event_at(alias->event).request_digest == event_at(a->event).request_digest &&
-                              event_at(alias->event).effect_digest == event_at(a->event).effect_digest && before(alias->event, b->event);
-                   });
-        }
+        auto before(const effect* a, const effect* b) const -> bool { return before(a->event, b->event); }
         static auto contains(const causal_set& bits, std::size_t n) -> bool { return bits.contains(n); }
         auto closure(const std::vector<std::string>& heads) const -> causal_set {
             causal_set out;
@@ -535,7 +526,7 @@ export namespace nodes {
         }
         auto extend_text(const cached_file& previous, cached_file& next) const -> bool {
             auto count = previous.effects.size();
-            if (aliases_present_ || !count || count >= next.effects.size() || !previous.conflicts.empty() || previous.file->kind != "text")
+            if (!count || count >= next.effects.size() || !previous.conflicts.empty() || previous.file->kind != "text")
                 return false;
             for (std::size_t i = 0; i < count; ++i)
                 if (previous.effects[i] != next.effects[i] || previous.activation[i] != next.activation[i])
@@ -549,13 +540,9 @@ export namespace nodes {
             for (auto* old : previous.effects)
                 if (old->event != event && !event_at(event).ancestors.contains(old->event))
                     return false;
-            previous.file->ensure();
-            if (previous.file->text.size() != previous.file->size())
+            if (!previous.file->fragments_ready || previous.file->text.size() != previous.file->size())
                 return false;
             next.file = std::make_shared<source_file>(*previous.file);
-            next.file->storage_header.clear();
-            next.file->content_object.clear();
-            next.file->sequence.reset();
             auto& file = *next.file;
             auto position = [&](const element& selected) -> std::optional<std::uint64_t> {
                 std::uint64_t offset = 0;
@@ -634,7 +621,7 @@ export namespace nodes {
             file.digest = digest_of(file.text);
             return true;
         }
-        auto render(const std::string& file_id, const std::vector<const effect*>& list, const persistent_index<bool>& active) const -> const cached_file& {
+        auto render(const std::string& file_id, const std::vector<const effect*>& list, const std::map<std::string, bool>& active) const -> const cached_file& {
             auto is_active = [&](const effect* e) {
                 auto i = active.find(e->id);
                 return i == active.end() || i->second;
@@ -715,9 +702,8 @@ export namespace nodes {
             }
             if (f.path.empty())
                 f.present = false;
-            bool serial = !aliases_present_ && std::adjacent_find(text_effects.begin(), text_effects.end(), [&](auto* a, auto* b) {
-                                                   return a->event != b->event && !before(a->event, b->event);
-                                               }) == text_effects.end();
+            bool serial = std::adjacent_find(text_effects.begin(), text_effects.end(),
+                                             [&](auto* a, auto* b) { return a->event != b->event && !before(a->event, b->event); }) == text_effects.end();
             if (!serial)
                 for (auto* a : text_effects)
                     for (auto* b : text_effects) {
@@ -849,9 +835,7 @@ export namespace nodes {
             for (auto& [_, event] : events_) {
                 if (!event.complete)
                     return false;
-                for (auto& effect : event.effects)
-                    if (effect.stored)
-                        return false;
+                (void)event;
             }
             return true;
         }
@@ -859,40 +843,12 @@ export namespace nodes {
             reader_ = reader;
             retained_count_ = event_count_;
         }
-        void detach_reader() {
-            reader_ = nullptr;
-            discard_projections();
-        }
-        void demand(std::size_t count, bool aliases, causal_reader* reader) {
+        void demand(std::size_t count, causal_reader* reader) {
             if (event_count_ || !events_.empty())
                 fail(nodes::code::invalid_record, "demand kernel must start empty");
             event_count_ = count;
             retained_count_ = count;
-            aliases_present_ = aliases;
             reader_ = reader;
-        }
-        void seed(std::vector<std::string> heads, std::shared_ptr<const source_state> state) {
-            if (closure(heads).ranges != state->causal.ranges)
-                fail(nodes::code::invalid_record, "projection causal proof differs");
-            projected_.emplace_back(std::move(heads), std::move(state));
-        }
-        auto aliases() const -> bool { return aliases_present_; }
-        auto effect_files(const std::string& id) const -> std::set<std::string> {
-            load_effect(id);
-            std::set<std::string> files;
-            if (auto found = effects_.find(id); found != effects_.end())
-                for (auto* effect : found->second)
-                    if (!effect->file.empty())
-                        files.insert(effect->file);
-            return files;
-        }
-        auto identity_events(const std::string& logical) const -> std::vector<std::string> {
-            load_identity(logical);
-            std::vector<std::string> ids;
-            if (auto found = identity_events_.find(logical); found != identity_events_.end())
-                for (auto index : found->second)
-                    ids.push_back(event_at(index).id);
-            return canonical_set(std::move(ids));
         }
         auto loaded_events() const -> std::size_t { return events_.size(); }
         auto loaded_files() const -> std::size_t { return loaded_files_.size() + cache_.size(); }
@@ -917,7 +873,6 @@ export namespace nodes {
             auto& e = event_at(index);
             std::vector<value> out;
             for (auto& x : e.effects) {
-                x.ensure_text();
                 value::map input{{"type", x.type}};
                 if (x.type == "activate" || x.type == "resolve") {
                     input["selections"] = strings(x.selections);
@@ -942,192 +897,6 @@ export namespace nodes {
                                             {"binary", bytes{x.type == "binary" ? blobs_.at(x.property.text()) : std::string{}}}});
             }
             return out;
-        }
-        auto snapshot(std::size_t first = 0, std::size_t count = std::numeric_limits<std::size_t>::max()) const -> std::string {
-            if (first > event_count_)
-                fail(nodes::code::invalid_record, "snapshot event range");
-            auto last = first + std::min(count, event_count_ - first);
-            std::string out{"DCS2"};
-            std::set<std::string> binary;
-            auto integer = [&](std::uint64_t n) { codec::integer(out, n); };
-            auto text = [&](std::string_view s) {
-                integer(s.size());
-                out.append(s);
-            };
-            auto strings = [&](const auto& values) {
-                integer(values.size());
-                for (auto& s : values)
-                    text(s);
-            };
-            integer(first);
-            integer(last - first);
-            for (auto index = first; index < last; ++index) {
-                load_event(index);
-                auto& event = event_at(index);
-                text(event.id);
-                text(event.author);
-                text(event.operation);
-                integer(event.clock);
-                integer(event.ancestors.ranges.size());
-                for (auto [lo, hi] : event.ancestors.ranges) {
-                    integer(lo);
-                    integer(hi);
-                }
-                strings(event.dependencies);
-                strings(event.created);
-                text(event.request_digest);
-                text(event.effect_digest);
-                integer(event.effects.size());
-                std::vector<const effect*> ordered;
-                for (auto& e : event.effects)
-                    ordered.push_back(&e);
-                std::ranges::sort(ordered, [](auto* a, auto* b) { return a->ordinal < b->ordinal; });
-                for (auto* ptr : ordered) {
-                    const auto& e = *ptr;
-                    e.ensure_text();
-                    text(e.id);
-                    text(e.type);
-                    text(e.file);
-                    text(e.text);
-                    integer(e.ordinal);
-                    text(e.left.run);
-                    integer(e.left.offset);
-                    text(e.right.run);
-                    integer(e.right.offset);
-                    integer(e.targets.size());
-                    for (auto& t : e.targets) {
-                        text(*t.run);
-                        integer(t.first);
-                        integer(t.count);
-                    }
-                    strings(e.selections);
-                    codec::encode_value(out, e.property, 0);
-                    if (e.type == "binary")
-                        binary.insert(e.property.text());
-                }
-            }
-            integer(binary.size());
-            for (auto& id : binary) {
-                text(id);
-                text(blobs_.at(id));
-            }
-            return out;
-        }
-        void append_snapshot(std::string_view input) {
-            if (!input.starts_with("DCS2"))
-                fail(nodes::code::invalid_record, "CRDT state snapshot framing");
-            std::size_t offset = 4;
-            auto take = [&](std::size_t size) {
-                if (size > input.size() - offset)
-                    fail(nodes::code::invalid_record, "truncated CRDT state snapshot");
-                auto result = input.substr(offset, size);
-                offset += size;
-                return result;
-            };
-            auto integer = [&]() {
-                auto bytes = take(8);
-                std::uint64_t n = 0;
-                for (int i = 7; i >= 0; --i)
-                    n = (n << 8) | static_cast<unsigned char>(bytes[i]);
-                return n;
-            };
-            auto count = [&]() {
-                auto n = integer();
-                if (n > codec::collection_limit || n > input.size() - offset)
-                    fail(nodes::code::resource_limit, "CRDT snapshot collection limit");
-                return n;
-            };
-            auto text = [&]() {
-                auto size = integer();
-                return std::string(take(size));
-            };
-            auto strings = [&]() {
-                std::vector<std::string> values;
-                auto n = count();
-                values.reserve(n);
-                while (n--)
-                    values.push_back(text());
-                return values;
-            };
-            if (integer() != event_count_)
-                fail(nodes::code::invalid_record, "CRDT snapshot event gap");
-            auto events = count();
-            while (events--) {
-                auto index = event_count_;
-                events_.try_emplace(event_count_++);
-                auto& event = events_.at(index);
-                event.id = text();
-                event.author = text();
-                event.operation = text();
-                event.clock = integer();
-                auto ranges = count();
-                while (ranges--) {
-                    auto lo = integer(), hi = integer();
-                    if (lo >= hi || hi > index || (!event.ancestors.ranges.empty() && lo <= event.ancestors.ranges.back().second))
-                        fail(nodes::code::invalid_record, "snapshot causal intervals");
-                    event.ancestors.ranges.emplace_back(lo, hi);
-                }
-                event.dependencies = strings();
-                event.created = strings();
-                event.request_digest = text();
-                event.effect_digest = text();
-                if (index_.contains(event.id))
-                    fail(nodes::code::invalid_record, "duplicate snapshot event");
-                auto effects = count();
-                for (std::size_t ordinal = 0; ordinal < effects; ++ordinal) {
-                    event.effects.emplace_back();
-                    auto& e = event.effects.back();
-                    e.id = text();
-                    e.type = text();
-                    e.file = text();
-                    e.text = text();
-                    e.ordinal = integer();
-                    e.event = index;
-                    if (e.ordinal != ordinal)
-                        fail(nodes::code::invalid_record, "snapshot effect ordering");
-                    e.left.run = text();
-                    e.left.offset = integer();
-                    e.right.run = text();
-                    e.right.offset = integer();
-                    auto targets = count();
-                    e.targets.reserve(targets);
-                    while (targets--) {
-                        auto run = text();
-                        auto first = integer(), length = integer();
-                        auto found = effects_.find(run);
-                        if (found == effects_.end())
-                            fail(nodes::code::invalid_record, "snapshot deletion anchor is absent");
-                        e.targets.push_back({&found->first, first, length});
-                    }
-                    e.selections = strings();
-                    codec::decoder decoder{input};
-                    decoder.offset = offset;
-                    e.property = decoder.read();
-                    offset = decoder.offset;
-                    for (unsigned char c : std::string_view{e.text})
-                        if (c >= 128) {
-                            e.scalar_text = scalars(e.text);
-                            break;
-                        }
-                    effects_[e.id].push_back(&e);
-                }
-                register_event(index);
-            }
-            auto blobs = count();
-            while (blobs--) {
-                auto id = text();
-                auto data = text();
-                if (digest_of(data) != id)
-                    fail(nodes::code::invalid_record, "snapshot binary digest mismatch");
-                blobs_.try_emplace(std::move(id), std::move(data));
-            }
-            if (offset != input.size())
-                fail(nodes::code::invalid_record, "trailing CRDT state snapshot bytes");
-        }
-        void restore(std::string_view input) {
-            kernel restored;
-            restored.append_snapshot(input);
-            *this = std::move(restored);
         }
         void add_blob(const std::string& digest, std::string bytes) {
             if (digest_of(bytes) != digest)
@@ -1165,31 +934,9 @@ export namespace nodes {
             bits.each([&](auto i) { out.push_back(event_at(i).id); });
             return out;
         }
-        auto event_author(const std::string& id) const -> const std::string& {
-            auto found = locate(id);
-            if (found == index_.end()) {
-                error e{nodes::code::missing_objects, "unknown source batch"};
-                e.missing.push_back(id);
-                throw e;
-            }
-            return event_at(found->second).author;
-        }
-        // One history checked against many events: the closure of heads is built once.
-        auto within(const std::vector<std::string>& heads) const {
-            return [this, bits = closure(heads)](const std::string& event) {
-                auto found = locate(event);
-                return found != index_.end() && contains(bits, found->second);
-            };
-        }
         auto includes(const std::vector<std::string>& heads, const std::string& event) const -> bool {
             auto found = locate(event);
             return found != index_.end() && contains(closure(heads), found->second);
-        }
-        auto uncovered(const std::vector<std::string>& heads, const std::vector<std::string>& admitted) const -> std::vector<std::string> {
-            auto selected = closure(heads), covered = closure(admitted);
-            std::vector<std::string> out;
-            selected.without(covered).each([&](auto i) { out.push_back(event_at(i).id); });
-            return out;
         }
         auto effect_ids(std::string_view event_id) const -> std::vector<std::string> {
             auto i = locate(std::string(event_id));
@@ -1267,11 +1014,6 @@ export namespace nodes {
             next.effect_digest = body.at("effect_digest").text();
             if (!content::is_hash(next.author) || !content::is_hash(next.operation))
                 fail(nodes::code::invalid_record, "invalid operation identity");
-            load_identity(next.author + ":" + next.operation);
-            auto operation_key = std::pair{next.author, next.operation};
-            auto payload = std::pair{body.at("request_digest").text(), body.at("effect_digest").text()};
-            if (operations_.contains(operation_key))
-                aliases_present_ = true;
             next.dependencies = string_list(body.at("dependencies"));
             if (next.dependencies != canonical_set(next.dependencies))
                 fail(nodes::code::invalid_record, "noncanonical dependency set");
@@ -1302,8 +1044,6 @@ export namespace nodes {
                         if (x.type == "resolve") {
                             if (!x.property.boolean())
                                 fail(nodes::code::invalid_record, "resolution must be affirmative");
-                            if (std::ranges::any_of(x.selections, [](auto& selected) { return selected.starts_with("identity:"); }))
-                                fail(nodes::code::identity_conflict, "identity decisions select a coherent worldline frontier");
                             auto observed = project(heads);
                             std::vector<std::string> reversed;
                             for (auto& change : body.at("effects").list())
@@ -1438,129 +1178,6 @@ export namespace nodes {
             });
             return files;
         }
-        auto extend_sequence(const source_file& previous, const std::vector<const effect*>& changes, const causal_set& base) const
-            -> std::shared_ptr<const source_file> {
-            if (!previous.sequence || changes.empty())
-                return {};
-            for (auto* change : changes) {
-                auto& event = event_at(change->event);
-                if ((change->type == "insert" || change->type == "erase") && previous.kind != "text")
-                    return {};
-                if (change->type != "insert" && change->type != "erase" && change->type != "path" && change->type != "mode" && change->type != "presence" &&
-                    change->type != "binary")
-                    return {};
-                auto missing = base.without(event.ancestors);
-                if (!missing.ranges.empty()) {
-                    if (!reader_ || reader_->file_changed(previous.id, missing))
-                        return {};
-                    bool touched = false;
-                    for (auto [first, last] : missing.ranges)
-                        for (auto index = std::max(first, retained_count_); index < last; ++index)
-                            for (auto& effect : event_at(index).effects) {
-                                if (effect.file == previous.id)
-                                    touched = true;
-                                if (effect.type == "activate")
-                                    for (auto& target : effect.selections) {
-                                        load_effect(target);
-                                        for (auto* alias : effects_.at(target))
-                                            if (alias->file == previous.id)
-                                                touched = true;
-                                    }
-                            }
-                    if (touched)
-                        return {};
-                }
-                auto logical = event.author + ":" + event.operation;
-                load_identity(logical);
-                if (std::ranges::any_of(identity_events_.at(logical), [&](auto index) { return index != change->event && base.contains(index); }))
-                    return {};
-            }
-            for (std::size_t i = 1; i < changes.size(); ++i)
-                if (changes[i - 1]->event != changes[i]->event && !event_at(changes[i]->event).ancestors.contains(changes[i - 1]->event))
-                    return {};
-            auto file = std::make_shared<source_file>(previous);
-            std::optional<std::u32string> text;
-            auto edit_text = [&]() -> std::u32string& {
-                if (!text) {
-                    text = scalars(previous.content());
-                    file->stored = nullptr;
-                    file->content_object.clear();
-                    file->fragments.clear();
-                    file->fragments_ready = false;
-                }
-                return *text;
-            };
-            file->storage_header.clear();
-            for (auto* change : changes) {
-                if (change->type == "erase") {
-                    // Visible ranges [first, last) of the erased characters, resolved one sequence piece at a time.
-                    spans ranges;
-                    for (auto& selected : change->targets)
-                        for (auto offset = selected.first, left = selected.count; left;) {
-                            auto at = file->sequence->extent({*selected.run, offset});
-                            if (!at)
-                                return {};
-                            auto taken = std::min(left, at->second);
-                            ranges.emplace_back(at->first, at->first + taken);
-                            offset += taken;
-                            left -= taken;
-                        }
-                    std::ranges::sort(ranges);
-                    spans joined;
-                    for (auto& range : ranges) {
-                        if (!joined.empty() && range.first < joined.back().second)
-                            return {};
-                        if (!joined.empty() && range.first == joined.back().second)
-                            joined.back().second = range.second;
-                        else
-                            joined.push_back(range);
-                    }
-                    for (auto range = joined.rbegin(); range != joined.rend(); ++range)
-                        file->sequence = file->sequence->splice(range->first, range->second - range->first, {}, 0);
-                    auto& old = edit_text();
-                    std::u32string kept;
-                    kept.reserve(old.size());
-                    std::uint64_t from = 0;
-                    for (auto& [first, last] : joined) {
-                        kept.append(old, from, first - from);
-                        from = last;
-                    }
-                    kept.append(old, from);
-                    old = std::move(kept);
-                } else if (change->type == "insert") {
-                    auto left = change->left.run.empty() ? std::optional<std::uint64_t>{0} : file->sequence->position(change->left);
-                    if (left && !change->left.run.empty())
-                        ++*left;
-                    auto right = change->right.run.empty() ? std::optional<std::uint64_t>{file->sequence->size()} : file->sequence->position(change->right);
-                    if (!left || !right || *left != *right)
-                        return {};
-                    change->ensure_text();
-                    auto inserted = scalars(change->text);
-                    file->sequence = file->sequence->splice(*left, 0, change->id, inserted.size());
-                    edit_text().insert(*left, inserted);
-                } else if (change->type == "path")
-                    file->path = change->property.text();
-                else if (change->type == "mode")
-                    file->executable = change->property.boolean();
-                else if (change->type == "presence")
-                    file->present = change->property.boolean();
-                else {
-                    if (file->kind != "binary")
-                        return {};
-                    file->text = blobs_.at(change->property.text());
-                    file->digest = change->property.text();
-                    file->stored = nullptr;
-                    file->content_object.clear();
-                }
-            }
-            if (text) {
-                file->text.clear();
-                for (auto c : *text)
-                    append_scalar(file->text, c);
-                file->digest = digest_of(file->text);
-            }
-            return file;
-        }
         auto compute(const std::vector<std::string>& heads) const -> source_state {
             source_state out;
             if (!projected_.empty())
@@ -1569,11 +1186,10 @@ export namespace nodes {
             auto bits = closure(heads);
             auto delta = changed(out.causal, bits);
             out.causal = bits;
-            std::set<std::string> controls, resolutions, identities, dependencies;
+            std::set<std::string> controls, resolutions, dependencies;
             delta.each([&](auto index) {
                 load_event(index);
                 auto& event = event_at(index);
-                identities.insert(event.author + ":" + event.operation);
                 dependencies.insert(event.dependencies.begin(), event.dependencies.end());
                 for (auto& effect : event.effects)
                     if (effect.type == "activate") {
@@ -1585,10 +1201,8 @@ export namespace nodes {
             auto assign_conflicts = [](auto& index, const std::string& key, std::vector<std::string> values) {
                 if (values.empty())
                     index.erase(key);
-                else {
-                    auto ids = canonical_set(std::move(values));
-                    index.set(key, ids, digest_of(codec::encode(value::map{{"ids", strings(ids)}})));
-                }
+                else
+                    index[key] = canonical_set(std::move(values));
             };
             for (auto& target : controls) {
                 load_controls(target);
@@ -1611,35 +1225,15 @@ export namespace nodes {
                     conflicts.push_back(conflict("activation", std::move(ids)));
                     state = false;
                 }
-                out.activation.set(target, state, digest_of(codec::encode(value::map{{"value", state}})));
+                out.activation[target] = state;
                 assign_conflicts(out.control_conflicts, target, std::move(conflicts));
             }
             for (auto& target : resolutions) {
                 load_controls(target);
                 if (std::ranges::any_of(resolution_writes_.at(target), [&](auto* write) { return contains(bits, write->event); }))
-                    out.resolutions.set(target, true, digest_of(codec::encode(value::map{{"value", true}})));
+                    out.resolutions[target] = true;
                 else
                     out.resolutions.erase(target);
-            }
-            for (auto& identity : identities) {
-                load_identity(identity);
-                std::set<std::string> claims;
-                auto& group = identity_events_.at(identity);
-                if (group.size() > 1)
-                    for (auto index : group)
-                        if (contains(bits, index))
-                            claims.insert(event_at(index).request_digest + event_at(index).effect_digest);
-                std::vector<std::string> conflicts;
-                if (claims.size() > 1) {
-                    std::set<std::string> requests;
-                    for (auto& claim : claims)
-                        requests.insert(claim.substr(0, 64));
-                    auto ids = requests.size() > 1 ? std::vector<std::string>{requests.begin(), requests.end()}
-                                                   : std::vector<std::string>{claims.begin(), claims.end()};
-                    ids.push_back(identity);
-                    conflicts.push_back(conflict("identity", std::move(ids)));
-                }
-                assign_conflicts(out.identity_conflicts, identity, std::move(conflicts));
             }
             auto active = [&](const effect& e) {
                 auto found = out.activation.find(e.id);
@@ -1666,7 +1260,6 @@ export namespace nodes {
                 assign_conflicts(out.dependency_conflicts, target, std::move(conflicts));
             }
             std::set<std::string> changed_paths;
-            std::vector<const effect*> list;
             auto path_owner = [&](const std::string& path, const std::string& id, bool add) {
                 std::set<std::string> owners;
                 if (auto found = out.paths.find(path); found != out.paths.end())
@@ -1678,30 +1271,46 @@ export namespace nodes {
                 if (owners.empty())
                     out.paths.erase(path);
                 else
-                    out.paths.set(path, std::make_shared<const std::set<std::string>>(owners),
-                                  digest_of(codec::encode(value::map{{"ids", strings({owners.begin(), owners.end()})}})));
+                    out.paths[path] = std::make_shared<const std::set<std::string>>(owners);
                 changed_paths.insert(path);
             };
             for (auto& id : affected_files(delta)) {
                 ++projected_files_;
                 auto old = out.files.find(id);
                 auto previous = old == out.files.end() ? std::shared_ptr<const source_file>{} : old->second;
-                list.clear();
+                std::vector<const effect*> list;
                 delta.each([&](auto index) {
-                    for (auto& e : event_at(index).effects)
-                        if (e.file == id)
-                            list.push_back(&e);
+                    for (auto& effect : event_at(index).effects)
+                        if (effect.file == id)
+                            list.push_back(&effect);
                 });
-                std::shared_ptr<const source_file> current, extended;
-                if (previous && controls.empty() && resolutions.empty() && base.causal.without(bits).ranges.empty() && !base.file_conflicts.contains(id) &&
-                    base.identity_conflicts.empty())
-                    extended = extend_sequence(*previous, list, base.causal);
-                if (extended) {
-                    if (extended->present) {
-                        current = extended;
+                bool serial = true;
+                for (std::size_t i = 1; i < list.size(); ++i)
+                    if (list[i - 1]->event != list[i]->event && !event_at(list[i]->event).ancestors.contains(list[i - 1]->event))
+                        serial = false;
+                // A metadata-only change keeps the authenticated content of the file it names; anything that can change
+                // visible characters or their activation replays just this file's effects.
+                bool metadata_only = serial && previous && !previous->fragments_ready && controls.empty() && resolutions.empty() &&
+                                     base.causal.without(bits).ranges.empty() && !base.file_conflicts.contains(id) &&
+                                     std::ranges::all_of(list, [](auto* e) { return e->type == "path" || e->type == "presence" || e->type == "mode"; });
+                std::shared_ptr<const source_file> current;
+                if (metadata_only) {
+                    auto copy = std::make_shared<source_file>(*previous);
+                    for (auto* change : list) {
+                        if (change->type == "path")
+                            copy->path = change->property.text();
+                        else if (change->type == "mode")
+                            copy->executable = change->property.boolean();
+                        else
+                            copy->present = change->property.boolean();
+                    }
+                    if (copy->path.empty())
+                        copy->present = false;
+                    if (copy->present) {
                         out.hidden.erase(id);
+                        current = copy;
                     } else
-                        out.hidden.set(id, extended, extended->metadata_digest());
+                        out.hidden[id] = copy;
                 } else {
                     list.clear();
                     load_file(id);
@@ -1709,16 +1318,13 @@ export namespace nodes {
                         for (auto* effect : found->second)
                             if (contains(bits, effect->event))
                                 list.push_back(effect);
-                    if (aliases_present_)
-                        std::ranges::sort(
-                            list, [&](auto* a, auto* b) { return std::tuple{a->id, event_at(a->event).id} < std::tuple{b->id, event_at(b->event).id}; });
                     if (!list.empty()) {
                         auto& file = render(id, list, out.activation);
                         if (file.file->present) {
                             current = file.file;
                             out.hidden.erase(id);
                         } else
-                            out.hidden.set(id, file.file, file.file->metadata_digest());
+                            out.hidden[id] = file.file;
                         assign_conflicts(out.file_conflicts, id, file.conflicts);
                     } else {
                         out.file_conflicts.erase(id);
@@ -1730,7 +1336,7 @@ export namespace nodes {
                 if (current && (!previous || previous->path != current->path))
                     path_owner(current->path, id, true);
                 if (current)
-                    out.files.set(id, current, current->metadata_digest());
+                    out.files[id] = current;
                 else
                     out.files.erase(id);
             }
@@ -1758,21 +1364,17 @@ export namespace nodes {
                 assign_conflicts(out.path_conflicts, path, std::move(conflicts));
             }
             out.conflicts.clear();
-            for (auto* index : {&out.file_conflicts, &out.path_conflicts, &out.control_conflicts, &out.identity_conflicts, &out.dependency_conflicts})
+            for (auto* index : {&out.file_conflicts, &out.path_conflicts, &out.control_conflicts, &out.dependency_conflicts})
                 for (auto& [_, conflicts] : *index)
                     for (auto& id : conflicts)
                         if (!out.resolutions.contains(id))
                             out.conflicts.push_back(id);
             out.conflicts = canonical_set(std::move(out.conflicts));
-            out.digest = digest_of(codec::encode(value::map{{"conflicts", strings(out.conflicts)}, {"files", out.files.digest()}}));
+            out.digest = state_digest(out);
             return out;
         }
 
     public:
-        void discard_projections() const {
-            projected_.clear();
-            cache_.clear();
-        }
         auto projected_files() const -> std::uint64_t { return projected_files_; }
         auto changed_files(const std::vector<std::string>& before, const std::vector<std::string>& after) const -> std::set<std::string> {
             return affected_files(changed(closure(before), closure(after)));
@@ -1790,9 +1392,10 @@ export namespace nodes {
                     return cached;
                 }
             if (reader_)
-                if (auto state = reader_->projection(ordered)) {
-                    if (closure(ordered).ranges != state->causal.ranges)
-                        fail(nodes::code::invalid_record, "projection causal proof differs");
+                if (auto stored = reader_->projection(ordered)) {
+                    auto state = std::make_shared<source_state>(*stored);
+                    state->causal = closure(ordered);
+                    state->digest = state_digest(*state);
                     projected_.emplace_back(ordered, state);
                     if (projected_.size() > 8)
                         projected_.pop_front();
@@ -1801,18 +1404,19 @@ export namespace nodes {
             auto wanted = closure(ordered);
             if (ordered.empty()) {
                 auto empty = std::make_shared<source_state>();
-                empty->digest = digest_of(codec::encode(value::map{{"conflicts", strings({})}, {"files", ""}}));
+                empty->digest = state_digest(*empty);
                 projected_.emplace_back(ordered, empty);
                 if (projected_.size() > 8)
                     projected_.pop_front();
                 return empty;
             }
             if (projected_.empty() && reader_) {
-                auto [frontier, base] = reader_->base(wanted);
-                if (base) {
-                    if (closure(frontier).ranges != base->causal.ranges)
-                        fail(nodes::code::invalid_record, "base projection causal proof differs");
-                    projected_.emplace_back(std::move(frontier), std::move(base));
+                auto [frontier, stored] = reader_->base(ordered);
+                if (stored) {
+                    auto state = std::make_shared<source_state>(*stored);
+                    state->causal = closure(frontier);
+                    state->digest = state_digest(*state);
+                    projected_.emplace_back(std::move(frontier), std::move(state));
                 }
             }
             if (projected_.size() > 1) {
@@ -1839,9 +1443,46 @@ export namespace nodes {
             return state;
         }
         auto project(const std::vector<std::string>& heads) const -> source_state { return *projection(heads); }
+        // Release older reconstruction states while keeping the newest one for the next publication.
+        void trim_projections(std::size_t keep = 2) const {
+            while (projected_.size() > keep)
+                projected_.pop_front();
+        }
+        // The file as `heads` sees it, with its character runs. A version's manifest names content only; a write
+        // that needs anchors replays just this file's effects.
+        auto materialize(const std::string& file, const std::vector<std::string>& heads) const -> std::shared_ptr<const source_file> {
+            auto state = projection(heads);
+            std::shared_ptr<const source_file> found;
+            if (auto it = state->files.find(file); it != state->files.end())
+                found = it->second;
+            else if (auto it = state->hidden.find(file); it != state->hidden.end())
+                found = it->second;
+            if (!found) {
+                error e{nodes::code::invalid_record, "unknown selected file identity"};
+                throw e;
+            }
+            if (found->fragments_ready)
+                return found;
+            return replay(*found, state->causal, state->activation);
+        }
+        // A file whose version names only content: render its character runs by replaying just this file's effects.
+        auto replay(const source_file& file, const causal_set& bits, const std::map<std::string, bool>& activation) const
+            -> std::shared_ptr<const source_file> {
+            load_file(file.id);
+            std::vector<const effect*> list;
+            if (auto it = file_effects_.find(file.id); it != file_effects_.end())
+                for (auto* effect : it->second)
+                    if (contains(bits, effect->event))
+                        list.push_back(effect);
+            if (list.empty())
+                return std::make_shared<const source_file>(file);
+            return render(file.id, list, activation).file;
+        }
         auto active(const std::vector<std::string>& heads, const std::string& target) const -> bool {
             auto bits = closure(heads);
             std::vector<const effect*> writes;
+            // The effect page and its activation writes name the same `<effect>/<event>/<ordinal>` location under two
+            // indexes; read the effect itself before its controls so both kinds are present.
             load_effect(target);
             load_controls(target);
             if (!effects_.contains(target))

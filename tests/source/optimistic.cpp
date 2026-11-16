@@ -105,6 +105,17 @@ namespace {
             expect(merged.files.front().text == "AbcZ");
             auto own = call({.action = "inspect", .revision = second.written_version});
             expect(own.code == "ok" && own.files.front().text == "abcZ");
+            {
+                // A cold read of the checkout baseline starts from the manifest its writer observed and replays only that
+                // baseline's own effects, never the causal history behind it.
+                nodes::local_node cold{tmp.dir};
+                auto before = cold.statistics();
+                auto again = cold.call({.action = "inspect", .revision = second.written_version});
+                auto after = cold.statistics();
+                expect(again.code == "ok" && again.files.front().text == "abcZ");
+                expect(after.manifest_rows_read - before.manifest_rows_read < 8u);
+                expect(after.causal_effects_read - before.causal_effects_read < 32u);
+            }
             auto replay = call(request);
             expect(replay.replayed && replay.written_version == second.written_version);
             // Bob continued editing before the merged reply could be written locally.

@@ -376,7 +376,7 @@ export namespace tools {
             std::optional<std::string> base_version, created_by;
         };
         struct history_entry {
-            std::string id, operation_id, actor, intent, tool, outcome;
+            std::string id, operation_id, actor, intent, tool;
             std::vector<std::string> parents;
         };
         // One side of a changed file. Text is included up to the project's read limit; binary content never is.
@@ -696,7 +696,7 @@ export namespace tools {
                                             actor, true);
                 std::vector<history_entry> entries;
                 for (auto& h : r.history)
-                    entries.push_back({h.event, h.operation, h.actor, h.intent, h.tool, h.outcome, h.parents});
+                    entries.push_back({h.event, h.operation, h.actor, h.intent, h.tool, h.parents});
                 out.version = r.version;
                 out.entries = std::move(entries);
                 out.truncated = r.truncated;
@@ -753,7 +753,7 @@ export namespace tools {
                         {c.type, c.before ? std::optional{side(*c.before)} : std::nullopt, c.after ? std::optional{side(*c.after)} : std::nullopt});
                 std::vector<history_entry> entries;
                 for (auto& h : r.history)
-                    entries.push_back({h.event, h.operation, h.actor, h.intent, h.tool, h.outcome, h.parents});
+                    entries.push_back({h.event, h.operation, h.actor, h.intent, h.tool, h.parents});
                 std::vector<std::string> lines;
                 for (auto& l : r.lines)
                     lines.push_back(l.name);

@@ -191,13 +191,6 @@ if(TEST_MANAGED_HOSTS AND GRADLE_TOOL AND DOTNET_TOOL AND FUGHETTA_JAVAC)
     "TEST_MSBUILD_MODEL=${FUGHETTA_CLR_EXPORTER}")
 endif()
 
-add_executable(shell source/shell.cpp source/${PLATFORM_FAMILY}/binary.cpp)
-target_link_libraries(shell PRIVATE source)
-
-foreach(SCENARIO IN ITEMS atomicity recovery transfer)
-  add_test(NAME scenario.${SCENARIO} COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/source/scenario.py" "${CMAKE_BINARY_DIR}" "${SCENARIO}")
-  set_tests_properties(scenario.${SCENARIO} PROPERTIES TIMEOUT 180)
-endforeach()
 
 ## Shared environment
 #

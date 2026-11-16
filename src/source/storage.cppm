@@ -306,7 +306,7 @@ export namespace storage {
                         selected->node->initialize();
                 }
                 if (reading && !selected->reader)
-                    selected->reader = std::make_unique<nodes::local_node>(root, std::string{}, false, true);
+                    selected->reader = std::make_unique<nodes::local_node>(root, false, true);
             }
             return f(reading ? *selected->reader : *selected->node);
         }

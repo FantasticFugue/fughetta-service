@@ -55,8 +55,8 @@ add_implementation(gateway gateway exchange routes broadcast backlog pairing)
 
 # source
 add_layer(source)
-add_modules(source source server storage index kernel nodestore engineapi nodestate engine package)
-add_implementation(source source database objects validation projections history coordination worldstate replication)
+add_modules(source source server storage kernel nodestore engineapi nodestate engine package)
+add_implementation(source source database objects history coordination worldstate)
 
 # worker
 add_layer(worker)

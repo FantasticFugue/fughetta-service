@@ -9,7 +9,6 @@ import codec;
 import kernel;
 import durability;
 import archive;
-import index;
 import reflection;
 import nodestore;
 
@@ -174,7 +173,8 @@ namespace nodes {
         auto found = state.files.find(lease.at("file").text());
         if (found == state.files.end() || !found->second->present)
             return {};
-        const auto& file = *found->second;
+        auto held = materialize(state, *found->second);
+        const auto& file = held ? *held : *found->second;
         if (lease.at("kind").text() == "file")
             return semantic::place{file.path, 0, file.kind == "text" ? file.size() : 0};
         auto left = element::decode(lease.at("left")), right = element::decode(lease.at("right"));
@@ -228,7 +228,9 @@ namespace nodes {
         if (in.declaration_ranges.size() > constants::scope_reference_limit)
             fail(nodes::code::resource_limit, "too many declaration anchors in one batch");
         for (const auto& [id, range] : in.declaration_ranges) {
-            const auto& file = state->path(range.path);
+            const auto& stub = state->path(range.path);
+            auto held = materialize(*state, stub);
+            const auto& file = held ? *held : stub;
             if (file.kind != "text" || range.begin >= range.end || range.end > file.size())
                 fail(nodes::code::invalid_record, "analysis returned an invalid declaration range");
             auto element = file.at(range.begin);
@@ -238,7 +240,9 @@ namespace nodes {
             if (!scope.location.source)
                 continue;
             const auto& range = *scope.location.source;
-            const auto& file = state->path(range.path);
+            const auto& stub = state->path(range.path);
+            auto held = materialize(*state, stub);
+            const auto& file = held ? *held : stub;
             if (file.kind != "text" || range.begin >= range.end || range.end > file.size())
                 fail(nodes::code::invalid_record, "analysis returned an invalid scope range");
             scope.reference = hex(random_bytes(32));
@@ -266,7 +270,6 @@ namespace nodes {
             refresh_external();
         }
         ensure_kernel();
-        ensure_status();
         auto root = roots.find(in.worldline);
         if (root == roots.end() && in.worldline != "main")
             fail(nodes::code::invalid_record, "worldline not found");
@@ -352,7 +355,9 @@ namespace nodes {
                     fail(nodes::code::permission_denied, "scope reference belongs to another worldline");
                 if (selected->at("version").text() != out.version)
                     fail("scope_stale", "analyze the current worldline before acquiring scopes");
-                const auto& file = state->path(selected->at("path").text());
+                const auto& stub = state->path(selected->at("path").text());
+                auto held = materialize(*state, stub);
+                const auto& file = held ? *held : stub;
                 auto begin = selected->at("begin").number(), end = selected->at("end").number();
                 if (file.id != selected->at("file").text())
                     fail("scope_stale", "analyzed file identity changed");

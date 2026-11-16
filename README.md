@@ -1364,8 +1364,10 @@ change records. Both page by numeric `after` sequence and `limit`, with
 `truncated` indicating more results. Names are scoped to the selected worldline.
 `inspect`, `read`, `compare`, `fork`, and `history`, plus build/test/run version
 inputs, accept `@name` or a bare name. Execution resolves a channel once before
-scheduling its fixed source input. The existing replication `checkpoint` action
-continues to describe internal source snapshots.
+scheduling its fixed source input. Internal source snapshots are local derived
+state: `identity` reports their digest as `state_snapshot` and their coverage as
+`snapshot_events`, and a node opened with its rebuild flag replays the archive
+instead of trusting them.
 
 ## Concurrency budget
 

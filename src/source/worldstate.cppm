@@ -9,12 +9,79 @@ import codec;
 import kernel;
 import durability;
 import archive;
-import index;
 import reflection;
 import nodestore;
 
 namespace nodes {
     using namespace persistence;
+
+    auto local_node::impl::line_of(const std::string& event) const -> std::string {
+        auto& body = get(event);
+        if (body.at("kind").text() != "batch")
+            fail("worldline_boundary", "selected source is not a source batch");
+        return body.at("line").text();
+    }
+
+    auto local_node::impl::lines() const -> const line_index& {
+        if (!line_names) {
+            line_names.emplace();
+            for (auto& id : object_ids("line"))
+                line_names->names[get(id, "line").at("name").text()].insert(id);
+        }
+        return *line_names;
+    }
+
+    auto local_node::impl::registered_lines(const std::string& name) const -> const std::set<std::string>& {
+        static const std::set<std::string> none;
+        auto found = lines().names.find(name);
+        return found == lines().names.end() ? none : found->second;
+    }
+
+    auto local_node::impl::worldlines() const -> const std::map<std::string, std::vector<std::string>>& { return roots; }
+
+    auto local_node::impl::named_line(const std::string& name) const -> std::string {
+        if (name == "main")
+            return project;
+        auto& found = registered_lines(name);
+        if (found.empty())
+            fail(nodes::code::invalid_record, "worldline not found");
+        return *found.begin();
+    }
+
+    auto local_node::impl::line_name(const std::string& line) const -> std::string {
+        if (line == project)
+            return "main";
+        for (auto& [name, ids] : lines().names)
+            if (ids.contains(line))
+                return name;
+        fail(nodes::code::invalid_record, "source batch names an unregistered worldline");
+    }
+
+    auto local_node::impl::line_base(const std::string& line) const -> std::vector<std::string> {
+        return line == project ? std::vector<std::string>{} : string_list(get(line, "line").at("base"));
+    }
+
+    // An event belongs to a worldline when the line produced it or the line was forked after it.
+    auto local_node::impl::in_line(const std::string& line, const std::string& event) const -> bool {
+        return line_of(event) == line || source.includes(line_base(line), event);
+    }
+
+    void local_node::impl::within_line(const std::string& line, const std::vector<std::string>& heads) const {
+        for (auto& head : heads)
+            if (!in_line(line, head))
+                fail("worldline_boundary", "selected source belongs to another worldline");
+    }
+
+    auto local_node::impl::root_line(const std::string& name) const -> std::string { return named_line(name); }
+
+    // An observation is a state of the line only when it contains the state the line was forked from.
+    void local_node::impl::observes_line(const std::string& line, const std::vector<std::string>& observed) const {
+        within_line(line, observed);
+        for (auto& event : line_base(line))
+            if (!source.includes(observed, event))
+                fail("stale_frontier", "observed source does not contain the worldline base");
+    }
+
     auto local_node::impl::promotion(const node_request& in, bool include_text) -> std::vector<source_difference> {
         if (in.target.empty() || !in.edits.empty())
             fail(nodes::code::invalid_record, "promote requires a source worldline and no edits");
@@ -101,7 +168,7 @@ namespace nodes {
                 if (!change.after)
                     continue;
                 const auto& f = *change.after;
-                auto file = (creating_author.empty() ? author.id() : creating_author) + ":" + in.operation + ":file:" + std::to_string(created++);
+                auto file = (creating_author.empty() ? writer : creating_author) + ":" + in.operation + ":file:" + std::to_string(created++);
                 property(file, "path", f.path);
                 property(file, "presence", true);
                 property(file, "mode", f.executable);
@@ -119,6 +186,7 @@ namespace nodes {
             if (selected.empty())
                 fail(nodes::code::invalid_record, "batch has no reversible effects");
             bool desired = in.action == "redo";
+            // The contribution must be in the state the compensation leaves: a reversal needs it active, a redo inactive.
             for (auto& id : selected)
                 if (source.active(heads, id) == desired)
                     fail(nodes::code::source_conflict, "compensation precondition does not hold");
@@ -177,7 +245,7 @@ namespace nodes {
                 fail(nodes::code::invalid_record, "multiple edits of one path require separate observed batches");
             if (e.kind == "create" || e.kind == "binary_create") {
                 claim(e.path);
-                auto file = (creating_author.empty() ? author.id() : creating_author) + ":" + in.operation + ":file:" + std::to_string(created++);
+                auto file = (creating_author.empty() ? writer : creating_author) + ":" + in.operation + ":file:" + std::to_string(created++);
                 property(file, "path", e.path);
                 property(file, "presence", true);
                 property(file, "mode", e.executable);
@@ -206,6 +274,7 @@ namespace nodes {
                     fail(nodes::code::invalid_record, "directory has no source files");
                 continue;
             }
+            std::shared_ptr<const source_file> held;
             const source_file* selected = nullptr;
             if (!e.document.empty()) {
                 auto it = state.files.find(e.document);
@@ -218,7 +287,19 @@ namespace nodes {
                     selected = hidden->second.get();
                 }
             }
-            auto& file = selected ? *selected : state.path(e.path);
+            const bool needs_runs = e.kind == "edit" || e.kind == "write";
+            if (!selected) {
+                if (needs_runs) {
+                    // A version manifest names content, not character runs: materialize the file this edit anchors into.
+                    held = source.materialize(state.path(e.path).id, heads);
+                    selected = held.get();
+                } else
+                    selected = &state.path(e.path);
+            } else if (needs_runs && !selected->fragments_ready) {
+                held = source.materialize(selected->id, heads);
+                selected = held.get();
+            }
+            auto& file = *selected;
             if (e.kind == "move") {
                 checked_path(e.target);
                 // A move never replaces a file; a concurrent move onto one path stays a recorded path conflict.
@@ -253,18 +334,15 @@ namespace nodes {
         checked_name(in.worldline);
         if (!content::is_hash(in.operation))
             fail(nodes::code::invalid_record, "operation ID must be 32-byte lowercase hex");
-        if (in.reference || in.mail || in.after || !in.genesis_nonce.empty() || !in.authors.empty() || !in.nodes.empty() || !in.policies.empty() ||
-            !in.settled.empty() || !in.want.empty() || !in.parts.empty() || !in.configuration.empty() || !in.environment.empty() || in.force ||
-            !in.revision.empty() || !in.snapshot.empty() || in.protected_worldlines != std::vector<std::string>{"main"} || in.max_bytes != 1024 * 1024 ||
-            in.limit != 100)
+        if (in.reference || in.mail || in.after || !in.genesis_nonce.empty() || !in.parts.empty() || !in.configuration.empty() || !in.environment.empty() ||
+            in.force || !in.revision.empty() || in.max_bytes != 1024 * 1024 || in.limit != 100)
             fail(nodes::code::invalid_record, "source publication contains fields for another operation");
         if (in.activation && in.action != "resolve")
             fail(nodes::code::invalid_record, "activation choices belong to conflict resolution");
-        if (!in.source.empty() && in.action != "promote" && in.action != "fork" && in.action != "integrate" && in.action != "admit")
-            fail(nodes::code::invalid_record, "source selection belongs to fork or integration");
-        if ((in.action == "fork" || in.action == "integrate" || in.action == "admit") &&
-            (!in.edits.empty() || (in.action != "admit" && !in.decisions.empty()) || !in.dependencies.empty() || !in.target.empty()))
-            fail(nodes::code::invalid_record, "selection operations cannot contain source effects");
+        if (!in.source.empty() && in.action != "promote" && in.action != "fork")
+            fail(nodes::code::invalid_record, "source selection belongs to fork or promotion");
+        if (in.action == "fork" && (!in.edits.empty() || !in.decisions.empty() || !in.dependencies.empty() || !in.target.empty()))
+            fail(nodes::code::invalid_record, "a fork cannot contain source effects");
         if (!in.target.empty() && in.action != "promote" && in.action != "reverse" && in.action != "redo" && in.action != "resolve")
             fail(nodes::code::invalid_record, "unexpected compensation target");
         if (in.action == "resolve" && !in.target.empty() && in.decisions.empty())
@@ -273,23 +351,22 @@ namespace nodes {
         if (auto result = retry(in, request_digest))
             return *result;
         if (!content::is_hash(in.owner))
-            fail(nodes::code::invalid_record, "source publication requires an explicit target node identity");
-        if (in.owner != node.id())
-            fail(nodes::code::outcome_unknown, "original target is another node and its verified result is unavailable");
+            fail(nodes::code::invalid_record, "source publication requires an explicit writer identity");
+        if (in.owner != writer)
+            fail(nodes::code::outcome_unknown, "publication names another writer and its result is unavailable");
         interrupt_at("before_transaction");
         transaction tx{*db};
         refresh_external();
         if (auto result = retry(in, request_digest))
             return *result;
         ensure_kernel();
-        ensure_status();
         dirty = true;
         auto found = roots.find(in.worldline);
         if (in.action == "fork" && (found != roots.end() || in.worldline == "main" || !registered_lines(in.worldline).empty()))
             fail(nodes::code::source_conflict, "worldline already exists");
         std::vector<std::string> prior = found == roots.end() ? std::vector<std::string>{} : found->second;
-        // Writers in one worldline may observe an older state of it; selections must observe the current root.
-        if ((selection(in.action) || in.action == "promote")
+        // A fork or a promotion selects the current root of its source; a writer may observe an older state of its own worldline.
+        if (in.action == "fork" || in.action == "promote"
                 ? in.expected != prior
                 : in.expected != source.frontier(in.expected) || std::ranges::any_of(in.expected, [&](auto& event) { return !source.includes(prior, event); }))
             fail("stale_frontier", "expected source frontier is not part of this worldline");
@@ -297,109 +374,65 @@ namespace nodes {
         if (in.action == "promote")
             within_line(root_line(in.target), in.source);
         check_scope_leases(in, prior);
-        auto p = policy(in.worldline);
-        auto& permissions = get(p);
-        bool protected_line = protected_target(permissions, in.worldline);
-        if (protected_line && !allowed(permissions, "nodes", node.id()))
-            fail(nodes::code::policy_denied, "local node cannot accept source");
-        if (protected_line && !allowed(permissions, "authors", author.id()))
-            fail(nodes::code::policy_denied, "local author cannot publish source");
         auto heads = prior;
         std::string line;
         if (in.action == "fork") {
             heads = source.frontier(in.source);
-            std::set<std::string> lines;
+            std::set<std::string> observed_lines;
             for (auto& event : heads)
-                lines.insert(line_of(event));
-            if (lines.size() > 1)
+                observed_lines.insert(line_of(event));
+            if (observed_lines.size() > 1)
                 fail("worldline_boundary", "fork source spans several worldlines");
             auto created = base_body("line", project);
             created["base"] = strings(vector_set(heads));
-            created["creator"] = author.id();
+            created["creator"] = writer;
             created["name"] = in.worldline;
             created["operation"] = in.operation;
-            line = put(std::move(created), author);
-            validate_object(line);
+            line = put(std::move(created));
         } else {
             line = root_line(in.worldline);
-            if (in.action == "integrate" || in.action == "admit") {
-                heads.insert(heads.end(), in.source.begin(), in.source.end());
-                heads = source.frontier(std::move(heads));
-                observes_line(line, heads);
-            } else {
-                if (found == roots.end() && in.worldline != "main")
-                    fail(nodes::code::invalid_record, "join this worldline by integration first");
-                observes_line(line, in.expected);
-                if (in.expected.empty() && !prior.empty())
-                    fail("stale_frontier", "an edit must observe a state of the worldline");
-                heads = in.expected;
-            }
-        }
-        if (in.action == "admit" && !allowed(permissions, "maintainers", author.id()))
-            fail(nodes::code::policy_denied, "explicit admission requires maintainer review");
-        auto conflicts = source.projection(heads)->conflicts;
-        if (std::ranges::any_of(conflicts, [](auto& id) { return id.starts_with("identity:"); }) && in.action != "integrate") {
-            error e{nodes::code::identity_conflict, "select a coherent source frontier before publishing"};
-            e.conflicts = std::move(conflicts);
-            throw e;
+            observes_line(line, in.expected);
+            if (in.expected.empty() && !prior.empty())
+                fail("stale_frontier", "an edit must observe a state of the worldline");
+            heads = in.expected;
         }
         auto result_id = blob(in.result);
-        std::string effect_digest;
-        auto intent = base_body("intent", project);
-        intent["author"] = author.id();
-        intent["parents"] = value::array{};
-        intent["messages"] = value::array{};
-        intent["summary"] = in.intent;
-        auto intent_id = put(std::move(intent), author);
-        auto input_id = blob(codec::encode(request_body(in, project)));
-        auto attempt = base_body("attempt", project);
-        attempt["author"] = author.id();
-        attempt["executor"] = node.id();
-        attempt["intent"] = intent_id;
-        attempt["operation"] = in.operation;
-        attempt["input"] = input_id;
-        attempt["observed"] = strings(heads);
-        attempt["outcome"] = "accepted";
-        attempt["result"] = result_id;
-        attempt["tool"] = declared_tool;
-        auto attempt_id = put(std::move(attempt), author);
-        if (prior.empty() && heads.empty() && in.action != "fork" && lines().active.contains(line))
-            fail("stale_frontier", "this worldline has accepted source; integrate it before editing");
-        if (in.action != "fork" && in.action != "integrate" && in.action != "admit") {
-            std::vector<std::string> required{intent_id, attempt_id, input_id, result_id};
+        std::string event;
+        if (in.action != "fork") {
+            std::vector<std::string> required;
             for (auto& edit : in.edits)
                 if (edit.kind == "binary" || edit.kind == "binary_create")
                     required.push_back(blob(unhex(edit.text)));
-            if (in.action == "promote")
+            if (in.action == "promote") {
                 required.insert(required.end(), in.source.begin(), in.source.end());
-            if (in.action == "promote")
                 for (const auto& change : promotion(in))
                     if (change.after && change.after->kind == "binary")
                         required.push_back(blob(unhex(change.after->text)));
+            }
             auto changes = effects(in, heads);
-            effect_digest = effects_digest(changes);
             auto b = base_body("batch", project);
-            b["author"] = author.id();
-            b["operation"] = in.operation;
-            b["parents"] = strings(heads);
-            b["expected"] = strings(heads);
+            b["actor"] = in.actor;
+            b["author"] = writer;
+            b["caller_operation"] = in.caller_operation;
+            b["dependencies"] = strings(source.dependencies(heads, changes, in.dependencies));
+            b["effect_digest"] = effects_digest(changes);
+            b["effects"] = std::move(changes);
+            b["intent"] = in.intent;
             b["lamport"] = source.clock(heads);
             b["line"] = line;
-            b["policy"] = p;
+            b["operation"] = in.operation;
+            b["parents"] = strings(heads);
             b["request_digest"] = request_digest;
-            b["effect_digest"] = effect_digest;
-            b["intent"] = intent_id;
-            b["attempt"] = attempt_id;
-            b["dependencies"] = strings(source.dependencies(heads, changes, in.dependencies));
-            b["effects"] = std::move(changes);
             b["required"] = strings(vector_set(std::move(required)));
-            auto event = put(std::move(b), author);
-            validate_object(event);
+            b["result"] = result_id;
+            b["tool"] = declared_tool;
+            event = put(std::move(b));
             // A checkout that changes again while sending can advance its local baseline
-            // to its own submitted text without pretending it wrote back concurrent edits.
+            // to its own submitted text without pretending it wrote back concurrent edits. The recorded parent
+            // names the version the writer observed, so a cold read of this baseline starts from that manifest.
             statement own_revision{*db, "INSERT OR IGNORE INTO revisions(id,data) VALUES(?1,?2)"};
             own_revision.text(1, version({event}));
-            own_revision.bind(2, codec::encode(value::map{{"frontier", strings({event})}}));
+            own_revision.bind(2, codec::encode(value::map{{"frontier", strings({event})}, {"parent", version(in.expected)}}));
             own_revision.next();
             heads = prior;
             heads.push_back(event);
@@ -436,14 +469,8 @@ namespace nodes {
                 }
             }
         }
-        // A fork copies a state that exists; an integration or admission joins states, and that may grow the target.
-        if (in.action == "integrate" || in.action == "admit")
-            check_limits(in, *source.projection(prior), *source.projection(heads));
         interrupt_at("after_objects");
-        interrupt_at("before_acceptance");
-        if (effect_digest.empty())
-            effect_digest = digest_of(codec::encode(value::map{{"frontier", strings(heads)}, {"prior", strings(prior)}}));
-        auto out = accept(in, line, request_digest, effect_digest, prior, heads, result_id, attempt_id, in.action == "admit");
+        auto out = commit(in, line, request_digest, prior, heads, event, result_id);
         if (in.action == "fork" && !in.task_id.empty())
             bind_task(in);
         save_snapshot();
@@ -502,7 +529,7 @@ namespace nodes {
             }
             return out;
         }
-        if (!in.reference || in.actor.empty() || !content::is_hash(in.operation) || in.owner != node.id() || in.revision.empty())
+        if (!in.reference || in.actor.empty() || !content::is_hash(in.operation) || in.owner != writer || in.revision.empty())
             fail(nodes::code::invalid_record, "reference requires actor, operation, owner and selected version");
         const auto& requested = *in.reference;
         checked_name(requested.name);
@@ -525,9 +552,6 @@ namespace nodes {
         auto state = source.projection(heads);
         if (!state->conflicts.empty())
             fail(nodes::code::source_conflict, "resolve source conflicts before naming a version");
-        auto permissions = get(policy(in.worldline));
-        if (protected_target(permissions, in.worldline) && (!allowed(permissions, "authors", author.id()) || !allowed(permissions, "nodes", node.id())))
-            fail(nodes::code::policy_denied, "reference author or node is outside project policy");
         std::string previous;
         statement current{*db, "SELECT e.data FROM named_refs r JOIN reference_events e ON e.id=r.event WHERE r.line=?1 AND r.name=?2"};
         current.text(1, in.worldline);
@@ -702,32 +726,4 @@ namespace nodes {
         return out;
     }
 
-    auto local_node::impl::create_policy(const node_request& in) -> node_reply {
-        auto previous = in.policies.empty() ? policies : vector_set(in.policies);
-        if (previous != policies)
-            fail("policy_conflict", "policy change must observe all current policy heads");
-        auto body = base_body("policy", project);
-        body["previous"] = strings(previous);
-        body["authors"] = strings(vector_set(in.authors));
-        body["nodes"] = strings(vector_set(in.nodes));
-        body["maintainers"] = strings({author.id()});
-        body["settled"] = strings(vector_set(in.settled));
-        body["protected"] = strings(vector_set(in.protected_worldlines));
-        std::uint64_t epoch = 0;
-        for (auto& old : previous)
-            if (get(old).at("kind").text() == "policy")
-                epoch = std::max(epoch, get(old).at("epoch").number());
-        body["epoch"] = epoch + 1;
-        transaction tx{*db};
-        dirty = true;
-        auto id = put(std::move(body), author);
-        validate_object(id);
-        refresh_policies();
-        save_snapshot();
-        tx.commit();
-        dirty = false;
-        auto out = identity();
-        out.objects = {id};
-        return out;
-    }
 } // namespace nodes
