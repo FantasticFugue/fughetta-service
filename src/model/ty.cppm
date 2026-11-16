@@ -86,10 +86,13 @@ namespace language {
             return {};
         }
 
+        using emits = std::tuple<>;
+        static auto requirements(const options& o) -> builds::requirements { return builds::tools({o.executable}); }
+        static auto executes_project_code(const options& o) -> bool { return builds::in_project({o.executable}); }
         static void validate(const options& o);
         static auto launch(const options& o, const std::vector<builds::context>& inputs) -> program;
     };
-    static_assert(speaker<server<"ty">>);
+    static_assert(frontend<server<"ty">>);
 } // namespace language
 
 namespace {

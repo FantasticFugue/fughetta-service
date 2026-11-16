@@ -246,15 +246,10 @@ export namespace jobs {
 
     // These labels identify files in one transfer, not semantic units.
     inline auto analysis_exports(const analysis_plan& analysis) -> std::map<std::string, builds::context> {
-        const bool reader = analysis.registration ? std::ranges::contains(analysis.registration->roles, "artifact-reader")
-                                                  : language::providers::dispatch(analysis.provider, []<class Provider>() {
-                                                        if constexpr (requires { Provider::roles; })
-                                                            return std::ranges::contains(Provider::roles, std::string_view{"artifact-reader"});
-                                                        else
-                                                            return false;
-                                                    });
         std::map<std::string, builds::context> out;
-        if (!reader)
+        // Only a domain reader takes its artifacts as files.
+        if (analysis.registration ? !analysis.registration->reads
+                                  : !language::providers::dispatch(analysis.provider, []<class Provider>() { return language::domain_reader<Provider>; }))
             return out;
         for (std::size_t index = 0; index < analysis.artifacts.size(); ++index)
             out.emplace("analysis-artifact-" + std::to_string(index), analysis.artifacts[index]);

@@ -17,12 +17,16 @@ export namespace native_artifact {
 }
 
 export namespace language {
-    template <> struct server<"native-artifact"> {
+    // Object files, shared libraries and executables: ELF, Mach-O and COFF with their C ABI symbol names.
+    template <> struct domain<"native"> {
+        static constexpr std::string_view name = "native", artifact = "native-artifact", linkage = "native.linkage_name";
+    };
+    template <> struct server<"native-artifact"> : reads<domain<"native">, optional_input<"ir", "llvm_ir">> {
         static auto channels() -> std::vector<semantic::channel_definition> {
             return {{.name = "declarations", .projections = {std::string{"symbols"}, std::string{"types"}}},
                     {.name = "exports",
                      .projections = {std::string{"symbols"}},
-                     .symbol_extensions = std::vector<std::string>{"native.linkage_name", "native.jni_registrations"}},
+                     .symbol_extensions = std::vector<std::string>{std::string{domain::linkage}, "native.jni_registrations"}},
                     {.name = "relations", .projections = {std::string{"relations"}}},
                     linkage_channel()};
         }
@@ -35,25 +39,13 @@ export namespace language {
             std::string module;
             builds::environment env;
         };
-        static constexpr std::array<std::pair<std::string_view, std::string_view>, 0> documents{};
-        static constexpr std::array<std::string_view, 3> inputs{"artifact", "ir", "source_facts"};
         static constexpr std::array<std::string_view, 5> facts{"symbols", "definitions", "references", "relations", "diagnostics"};
-        static constexpr std::array<std::string_view, 1> roles{"artifact-reader"};
-        static constexpr semantic::unit_kind unit_kind = semantic::unit_kind::artifact;
         static constexpr std::string_view update_granularity = "artifact";
-        static constexpr std::array<std::string_view, 1> operations{"evaluate"};
-        static constexpr bool negotiated = false, multiple_inputs = true;
-        static auto multiple_input(std::string_view port) -> bool { return port == "source_facts"; }
-        static auto required_inputs(const options&) -> std::vector<std::string> { return {"artifact"}; }
-        static auto input_type(std::string_view port) -> std::string_view {
-            return port == "artifact" ? "native-artifact" : port == "ir" ? "llvm_ir" : "semantic_shard";
-        }
-        static auto consumed_facts(std::string_view port) -> std::vector<semantic::fact_kind> {
-            return port == "source_facts" ? std::vector<semantic::fact_kind>{std::string{"symbols"}, std::string{"definitions"}}
-                                          : std::vector<semantic::fact_kind>{};
-        }
+        static auto tools(const options& o) -> std::vector<std::string> { return {o.executable, o.symbolizer, o.llvm_dis, o.objdump}; }
+        static auto requirements(const options& o) -> builds::requirements { return builds::tools({o.executable, o.symbolizer}); }
+        static auto executes_project_code(const options& o) -> bool { return builds::in_project(tools(o)); }
         static void validate(const options& o) {
-            builds::tools({o.executable, o.symbolizer, o.llvm_dis, o.objdump});
+            builds::tools(tools(o));
             if (o.module.empty())
                 throw std::invalid_argument("native artifact module is required");
             builds::validate_environment(o.env);
@@ -84,6 +76,7 @@ export namespace language {
             return result;
         }
     };
+    static_assert(domain_reader<server<"native-artifact">>);
 } // namespace language
 
 export namespace native_artifact {

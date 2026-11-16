@@ -40,7 +40,7 @@ export namespace language {
 
     // The language servers this program knows; an analysis names one of them or is refused when parsed.
     template <meta::fixed_string... Names> struct catalog {
-        static_assert((speaker<server<Names>> && ...));
+        static_assert(((frontend<server<Names>> + domain_reader<server<Names>> + bridge<server<Names>> == 1) && ...));
         static_assert(meta::distinct(std::array{std::string_view{Names}...}));
         using choice = rfl::TaggedUnion<"provider", with<Names>...>;
         static auto validators() -> const std::vector<input_validator>& {
@@ -74,9 +74,11 @@ export namespace language {
             auto add = [&]<meta::fixed_string Name>() {
                 using implementation = server<Name>;
                 typename implementation::options options;
-                description value{.id = std::string{Name.view()}, .roles = {std::string{"source-analysis"}}};
-                if constexpr (requires { implementation::roles; })
-                    value.roles.assign(implementation::roles.begin(), implementation::roles.end());
+                description value{.id = std::string{Name.view()}, .roles = {std::string{role<implementation>}}};
+                if constexpr (frontend<implementation>)
+                    value.emits = emitted<implementation>();
+                if constexpr (domain_reader<implementation>)
+                    value.reads = std::string{implementation::domain::name};
                 value.configuration_schema = rfl::json::read<rfl::Generic>(rfl::json::to_schema<typename implementation::options>()).value();
                 for (const auto name : implementation::facts)
                     value.facts.emplace_back(std::string{name});
@@ -86,12 +88,8 @@ export namespace language {
                 value.adapter = implementation::adapter::transport;
                 if constexpr (requires { implementation::update_granularity; })
                     value.update_granularity = implementation::update_granularity;
-                if constexpr (requires { implementation::requirements(options); })
-                    value.needs = implementation::requirements(options);
-                else
-                    value.needs = builds::tools({options.executable});
-                if constexpr (requires { options.symbolizer; })
-                    builds::combine(value.needs, builds::tools({options.symbolizer}));
+                value.needs = implementation::requirements(options);
+                value.executes_project_code = implementation::executes_project_code(options);
                 if constexpr (requires { implementation::negotiated; })
                     value.negotiated = implementation::negotiated;
                 if constexpr (requires { implementation::dependency_reads; })
@@ -139,10 +137,13 @@ export namespace language {
     inline auto describe_provider(const provider& configured) -> description {
         return configured.visit([](const auto& value) -> description {
             using implementation = typename std::remove_cvref_t<decltype(value)>::implementation;
-            if constexpr (requires { value.options.registration; }) {
-                auto out = value.options.registration;
+            if constexpr (requires { implementation::registration(value.options); }) {
+                auto out = implementation::registration(value.options);
+                // A registered helper is a frontend unless it names the domain it reads.
+                out.roles = {std::string{out.reads ? roles::reader : roles::frontend}};
                 out.adapter = adapter_kind::helper;
                 out.needs = implementation::requirements(value.options);
+                out.executes_project_code = implementation::executes_project_code(value.options);
                 for (const auto& [_, language] : value.options.documents)
                     if (!std::ranges::contains(out.languages, language))
                         out.languages.push_back(language);
@@ -150,12 +151,8 @@ export namespace language {
             } else {
                 const auto entries = providers::describe();
                 auto out = *std::ranges::find_if(entries, [](const description& entry) { return entry.id == std::remove_cvref_t<decltype(value)>::name; });
-                if constexpr (requires { implementation::requirements(value.options); })
-                    out.needs = implementation::requirements(value.options);
-                else
-                    out.needs = builds::tools({value.options.executable});
-                if constexpr (requires { value.options.symbolizer; })
-                    builds::combine(out.needs, builds::tools({value.options.symbolizer}));
+                out.needs = implementation::requirements(value.options);
+                out.executes_project_code = implementation::executes_project_code(value.options);
                 if constexpr (requires { implementation::required_inputs(value.options); }) {
                     const auto required = implementation::required_inputs(value.options);
                     for (auto& port : out.ports)

@@ -229,6 +229,7 @@ namespace language {
         std::map<std::string, plan> plans;
         std::map<std::string, std::map<std::string, std::string>> produced;
         std::map<std::string, std::map<std::string, std::string>> output_types;
+        std::map<std::string, std::vector<std::string>> emitted;
         for (const auto& [id, stage] : c.stages) {
             name(id);
             auto bound = builds.find(stage.build_configuration);
@@ -238,6 +239,7 @@ namespace language {
             for (const auto& port : descriptor.ports)
                 if (port.direction == "output")
                     output_types[id].emplace(port.name, port.type);
+            emitted.emplace(id, descriptor.emits);
         }
         for (const auto& [id, stage] : c.stages) {
             const auto descriptor = describe_provider(stage.server);
@@ -263,6 +265,9 @@ namespace language {
                         if (owner->second.at(ref->output) != target->type)
                             throw std::invalid_argument("analysis input " + id + "/" + port + " requires " + target->type + "; " + ref->stage + "/" +
                                                         ref->output + " produces " + owner->second.at(ref->output));
+                        if (descriptor.reads && port == "source_facts" && !std::ranges::contains(emitted.at(ref->stage), *descriptor.reads))
+                            throw std::invalid_argument("analysis input " + id + "/" + port + " reads the " + *descriptor.reads + " domain; " + ref->stage +
+                                                        " does not emit into it");
                     }
                 }
             }
@@ -391,7 +396,7 @@ namespace language {
     }
     auto locate(program value, const std::filesystem::path& tree, const builds::toolset& tools, std::uint32_t jobs) -> program {
         if (value.argv.empty()) {
-            if (!providers::dispatch(value.provider, []<class Implementation> { return Implementation::adapter::transport == adapter_kind::reader; }))
+            if (providers::dispatch(value.provider, []<class Implementation> { return frontend<Implementation>; }))
                 throw std::invalid_argument("language server executable is required");
         } else {
             if (!builds::absolute_path(value.argv.front())) {

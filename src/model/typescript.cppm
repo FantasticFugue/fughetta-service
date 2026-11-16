@@ -71,11 +71,15 @@ namespace language {
         static constexpr std::array<std::string_view, 0> inputs{};
         static constexpr std::array<std::string_view, 4> facts{"symbols", "definitions", "scopes", "diagnostics"};
         static constexpr semantic::unit_kind unit_kind = semantic::unit_kind::file;
+        using emits = std::tuple<>;
+        static auto requirements(const options& o) -> builds::requirements { return builds::tools({o.executable}); }
+        // A tsserver inside the project loads the language service plugins installed beside it.
+        static auto executes_project_code(const options& o) -> bool { return builds::in_project({o.executable, o.tsserver_path.value_or("")}); }
 
         static void validate(const options& o);
         static auto launch(const options& o, const std::vector<builds::context>& inputs) -> program;
     };
-    static_assert(speaker<server<"typescript">>);
+    static_assert(frontend<server<"typescript">>);
 } // namespace language
 
 namespace {

@@ -75,6 +75,9 @@ namespace language {
         static constexpr std::array<std::string_view, 2> operations{"evaluate", "resolve"};
         static constexpr semantic::unit_kind unit_kind = semantic::unit_kind::group;
         static constexpr bool negotiated = false, dependency_reads = true, multiple_inputs = true;
+        using emits = std::tuple<domain<"native">>;
+        static auto requirements(const options& o) -> builds::requirements { return builds::tools({o.executable}); }
+        static auto executes_project_code(const options& o) -> bool { return builds::in_project({o.executable}); }
 
         static void configure(program& value, std::uint32_t jobs) {
             if (!value.commands.contains("index"))
@@ -141,7 +144,7 @@ namespace language {
             return out;
         }
     };
-    static_assert(speaker<server<"clice">>);
+    static_assert(frontend<server<"clice">>);
 } // namespace language
 
 export namespace language::cpp {

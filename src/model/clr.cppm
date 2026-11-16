@@ -373,34 +373,25 @@ export namespace clr {
 } // namespace clr
 
 export namespace language {
-    template <> struct server<"clr-artifact"> {
+    // Assemblies and their portable debug symbols.
+    template <> struct domain<"clr"> {
+        static constexpr std::string_view name = "clr", artifact = "clr_artifact";
+    };
+    template <> struct server<"clr-artifact"> : reads<domain<"clr">, optional_input<"symbols", "portable_pdb">> {
         using adapter = clr::reader;
         struct options {
             std::string executable = "dotnet", reader = "fughetta-clr", module;
             builds::environment env;
         };
-        static constexpr std::array<std::pair<std::string_view, std::string_view>, 0> documents{};
-        static constexpr std::array<std::string_view, 3> inputs{"artifact", "symbols", "source_facts"};
         static constexpr std::array<std::string_view, 5> facts{"symbols", "types", "definitions", "references", "relations"};
-        static constexpr std::array<std::string_view, 1> roles{"artifact-reader"}, operations{"evaluate"};
-        static constexpr semantic::unit_kind unit_kind = semantic::unit_kind::artifact;
         static constexpr std::string_view update_granularity = "artifact";
-        static constexpr bool negotiated = false, multiple_inputs = true;
-        static auto multiple_input(std::string_view port) -> bool { return port == "source_facts"; }
-        static auto required_inputs(const options&) -> std::vector<std::string> { return {"artifact"}; }
-        static auto input_type(std::string_view port) -> std::string_view {
-            return port == "artifact" ? "clr_artifact" : port == "symbols" ? "portable_pdb" : "semantic_shard";
-        }
-        static auto consumed_facts(std::string_view port) -> std::vector<semantic::fact_kind> {
-            return port == "source_facts" ? std::vector<semantic::fact_kind>{std::string{"symbols"}, std::string{"definitions"}}
-                                          : std::vector<semantic::fact_kind>{};
-        }
         static auto channels() -> std::vector<semantic::channel_definition> {
             return {{.name = "declarations", .projections = {std::string{"symbols"}, std::string{"types"}}},
                     {.name = "relations", .projections = {std::string{"references"}, std::string{"relations"}}},
                     linkage_channel()};
         }
         static auto requirements(const options& o) -> builds::requirements { return builds::tools({o.executable, o.reader}); }
+        static auto executes_project_code(const options& o) -> bool { return builds::in_project({o.executable, o.reader}); }
         static void validate(const options& o) {
             (void)requirements(o);
             if (o.module.empty())
@@ -429,6 +420,7 @@ export namespace language {
             return out;
         }
     };
+    static_assert(domain_reader<server<"clr-artifact">>);
 } // namespace language
 
 export namespace clr {

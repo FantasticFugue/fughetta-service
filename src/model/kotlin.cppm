@@ -27,7 +27,10 @@ export namespace language {
             out.push_back(linkage_channel());
             return out;
         }
+        using emits = std::tuple<domain<"jvm">>;
         static auto requirements(const options& o) -> builds::requirements { return builds::tools({o.executable, o.host, o.adapter}); }
+        // The adapter loads the compiler plugins the project model declares, and those may be the project's own.
+        static auto executes_project_code(const options&) -> bool { return true; }
         static void validate(const options& o) {
             (void)requirements(o);
             for (const auto& value : {o.executable, o.host, o.adapter}) {
@@ -46,5 +49,5 @@ export namespace language {
                     .executables = {o.host, o.adapter}};
         }
     };
-    static_assert(speaker<server<"kotlin">>);
+    static_assert(frontend<server<"kotlin">>);
 } // namespace language

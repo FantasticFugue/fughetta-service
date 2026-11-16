@@ -45,7 +45,7 @@ add_implementation(io io entropy dns)
 # model
 add_layer(model)
 add_modules(model model allocation content codec archive records objects profiles semantic enumeration reuse channels indexing knowledge world nodes provider report cmake bazel
-  commands clice artifact jvm kmetadata clr pinvoke jni vcpkg typescript bun uv ty ruff gradle msbuild projectmodel build language protocol configuration usage runner replica delivery lsp evaluation helper kotlin fsharp toolchain)
+  commands clice artifact jvm kmetadata clr bridge pinvoke jni vcpkg typescript bun uv ty ruff gradle msbuild projectmodel build language protocol configuration usage runner replica delivery lsp evaluation helper kotlin fsharp toolchain)
 add_implementation(model model crypto planning generator analysis impact comparison reanalysis)
 
 # gateway

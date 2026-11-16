@@ -219,6 +219,10 @@ export namespace language {
         static constexpr std::array<std::string_view, 1> operations{"evaluate"};
         static constexpr semantic::unit_kind unit_kind = semantic::unit_kind::module;
         static constexpr bool negotiated = false;
+        // A registration lists the domains its declarations are built into in its own `emits`.
+        using emits = std::tuple<>;
+        static auto registration(const options& o) -> const description& { return o.registration; }
+        static auto executes_project_code(const options&) -> bool { return true; }
         static auto channels() -> std::vector<semantic::channel_definition> { return {}; }
         static auto requirements(const options& o) -> builds::requirements {
             auto needs = builds::tools(o.tools);
@@ -268,4 +272,5 @@ export namespace language {
                     .documents = o.documents};
         }
     };
+    static_assert(frontend<server<"external">>);
 } // namespace language

@@ -494,28 +494,24 @@ export namespace jvm {
 } // namespace jvm
 
 export namespace language {
-    template <> struct server<"jvm-artifact"> {
+    // Class files and the archives that hold them.
+    template <> struct domain<"jvm"> {
+        static constexpr std::string_view name = "jvm", artifact = "jvm_artifact";
+    };
+    template <> struct server<"jvm-artifact"> : reads<domain<"jvm">, optional_input<"project_model", "project_model">> {
         using adapter = jvm::reader;
         struct options {
             std::string module;
             unsigned java_release = 0;
-            std::string metadata_helper, metadata_executable = "java", source_provider = "kotlin";
+            std::string metadata_helper, metadata_executable = "java";
+            // The frontend whose identities name a library's declarations; omitted, the one whose source facts are installed.
+            std::string source_provider;
         };
-        static constexpr std::array<std::pair<std::string_view, std::string_view>, 0> documents{};
-        static constexpr std::array<std::string_view, 3> inputs{"artifact", "source_facts", "project_model"};
         static constexpr std::array<std::string_view, 5> facts{"symbols", "types", "definitions", "references", "relations"};
-        static constexpr std::array<std::string_view, 1> roles{"artifact-reader"}, operations{"evaluate"};
-        static constexpr semantic::unit_kind unit_kind = semantic::unit_kind::artifact;
         static constexpr std::string_view update_granularity = "class";
-        static constexpr bool negotiated = false, multiple_inputs = true;
-        static auto multiple_input(std::string_view port) -> bool { return port == "source_facts"; }
-        static auto required_inputs(const options&) -> std::vector<std::string> { return {"artifact"}; }
-        static auto input_type(std::string_view port) -> std::string_view {
-            return port == "artifact" ? "jvm_artifact" : port == "project_model" ? "project_model" : "semantic_shard";
-        }
-        static auto consumed_facts(std::string_view port) -> std::vector<semantic::fact_kind> {
-            return port == "source_facts" ? std::vector<semantic::fact_kind>{std::string{"symbols"}, std::string{"definitions"}}
-                                          : std::vector<semantic::fact_kind>{};
+        static auto required_inputs(const options& o) -> std::vector<std::string> {
+            return o.metadata_helper.empty() || !o.source_provider.empty() ? std::vector<std::string>{"artifact"}
+                                                                           : std::vector<std::string>{"artifact", "source_facts"};
         }
         static auto channels() -> std::vector<semantic::channel_definition> {
             return {{.name = "declarations", .projections = {std::string{"symbols"}, std::string{"types"}}},
@@ -542,12 +538,13 @@ export namespace language {
         static auto requirements(const options& o) -> builds::requirements {
             return o.metadata_helper.empty() ? builds::requirements{} : builds::tools({o.metadata_executable, o.metadata_helper});
         }
+        static auto executes_project_code(const options& o) -> bool { return builds::in_project({o.metadata_executable, o.metadata_helper}); }
         static void validate(const options& o) {
             if (o.module.empty())
                 throw std::invalid_argument("JVM artifact module is required");
             if (!o.metadata_helper.empty()) {
-                if (o.metadata_executable.empty() || o.source_provider.empty())
-                    throw std::invalid_argument("Kotlin metadata requires its executable and source provider");
+                if (o.metadata_executable.empty())
+                    throw std::invalid_argument("Kotlin metadata requires its executable");
                 (void)requirements(o);
             }
         }
@@ -576,6 +573,7 @@ export namespace language {
             return out;
         }
     };
+    static_assert(domain_reader<server<"jvm-artifact">>);
 } // namespace language
 
 export namespace jvm {
@@ -1288,20 +1286,23 @@ export namespace jvm {
                             }
                         });
             }
+            // The source facts installed here come from the frontends that emit into this domain.
             std::vector<const semantic::shard*> sources;
+            std::set<std::string> frontends;
             for (const auto& [_, parts] : installed_.source_facts)
-                for (const auto& part : parts)
+                for (const auto& part : parts) {
                     sources.push_back(part->data.get());
+                    frontends.insert(part->data->unit.recipe.unit.provider);
+                }
             std::map<semantic::symbol_id, std::set<semantic::context_id>> declarations;
             for (const auto* source : sources)
                 for (const auto& symbol : source->symbols)
-                    if (symbol.domain == "kotlin")
-                        declarations[symbol.id].insert(symbol.ownership.context);
+                    declarations[symbol.id].insert(symbol.ownership.context);
             std::map<std::string, std::set<std::string>> source_bindings;
             std::map<std::string, std::set<semantic::unit_id>> source_units;
             for (const auto* source : sources)
                 for (const auto& binding : source->identities)
-                    if (const auto* native = std::get_if<semantic::native_identity>(&binding.declaration); native && native->domain == "kotlin") {
+                    if (const auto* native = std::get_if<semantic::native_identity>(&binding.declaration)) {
                         source_bindings[native->native_key].insert(
                             rfl::json::write(std::tuple{*native, binding.symbol, declarations[binding.symbol], source->unit.id}));
                         source_units[native->native_key].insert(source->unit.id);
@@ -1467,9 +1468,13 @@ export namespace jvm {
                     }
                 }
                 if (container.decoded) {
+                    // A library declaration is named as the frontend of the installed sources names it.
+                    if (options_.source_provider.empty() && frontends.size() != 1)
+                        throw std::invalid_argument("Kotlin metadata requires source facts from one frontend, or its source_provider");
+                    const auto& frontend = options_.source_provider.empty() ? *frontends.begin() : options_.source_provider;
                     const auto context = semantic::context_identifier(recipe, logical + ":kotlin");
                     container.projector =
-                        std::make_unique<kotlin_metadata::projector>(*container.decoded, container.module, options_.source_provider, context, targets, sources);
+                        std::make_unique<kotlin_metadata::projector>(*container.decoded, container.module, frontend, context, targets, sources);
                     for (const auto& klass : container.decoded->classes) {
                         const auto found = std::ranges::find(container.classes, klass.owner, &object::name);
                         if (found == container.classes.end())
@@ -1485,7 +1490,8 @@ export namespace jvm {
                             if (const auto units = source_units.find(identity.key); units != source_units.end())
                                 identity_producers_[observation].insert(units->second.begin(), units->second.end());
                         }
-                        values_[{"jvm/identities", observation}] = content::hash_of(rfl::json::write(reads)).str();
+                        // A declaration no source names takes the frontend's identity.
+                        values_[{"jvm/identities", observation}] = content::hash_of(rfl::json::write(std::tuple{reads, frontends})).str();
                     }
                 }
             }

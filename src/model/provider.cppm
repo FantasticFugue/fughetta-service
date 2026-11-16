@@ -229,6 +229,8 @@ export namespace builds {
     void combine(requirements& into, const requirements& from);
     auto tools(const std::vector<std::string>& executables) -> requirements;
     auto tool(const std::string& executable) -> std::string;
+    // Whether any of these executables is a file of the project instead of a mapped tool or a machine path.
+    auto in_project(const std::vector<std::string>& executables) -> bool;
     auto requested(const parameters& p) -> std::set<std::string>;
     void require(const operation_spec& available, const parameters& requested);
     void tool_name(std::string_view name);
@@ -307,6 +309,10 @@ export namespace language {
     struct description {
         std::string id;
         std::vector<std::string> roles, languages;
+        // The link domains this provider's declarations are built into.
+        std::vector<std::string> emits;
+        // The link domain whose artifacts this provider reads.
+        std::optional<std::string> reads;
         rfl::Generic configuration_schema;
         std::vector<port> ports;
         std::vector<semantic::channel_definition> channels;
@@ -318,6 +324,8 @@ export namespace language {
         semantic::unit_kind unit_kind = semantic::unit_kind::file;
         std::string update_granularity = "document";
         bool dependency_reads = false, cancellation = true, exclusive_directory = true;
+        // Whether a session under this configuration runs code the project supplies.
+        bool executes_project_code = false;
         builds::requirements needs;
     };
     struct program {
@@ -338,6 +346,7 @@ export namespace language {
 
     // A language server: `options` is what an analysis configures it with, `documents` maps file extensions to the
     // language IDs it is told, `inputs` names the artifact types it reads, and `launch` starts it on them.
+    // `executes_project_code` says whether a session under these options runs code the project supplies.
     template <meta::fixed_string Name> struct server;
     template <meta::fixed_string Name> using config = typename server<Name>::options;
     template <class T>
@@ -345,11 +354,94 @@ export namespace language {
         typename T::adapter;
         { T::validate(options) } -> std::same_as<void>;
         { T::launch(options, inputs) } -> std::same_as<program>;
+        { T::requirements(options) } -> std::same_as<builds::requirements>;
+        { T::executes_project_code(options) } -> std::same_as<bool>;
         { T::documents.size() } -> std::convertible_to<std::size_t>;
         { T::inputs.size() } -> std::convertible_to<std::size_t>;
         { T::facts.size() } -> std::convertible_to<std::size_t>;
         { T::channels() } -> std::same_as<std::vector<semantic::channel_definition>>;
         { T::unit_kind } -> std::convertible_to<semantic::unit_kind>;
+    };
+
+    // A link domain: the family of built artifacts in which a declaration gets the identity a linker or loader
+    // resolves. `artifact` is the input type a reader of the domain takes. A domain that bindings target also names
+    // `linkage`, the symbol extension holding that identity.
+    template <meta::fixed_string Name> struct domain;
+    template <class T>
+    concept link_domain = requires {
+        { T::name } -> std::convertible_to<std::string_view>;
+        { T::artifact } -> std::convertible_to<std::string_view>;
+    };
+
+    // A provider is exactly one of three things. A frontend gives source-level semantics and lists, as a tuple of
+    // domains, where its declarations are built into. A domain reader gives the symbols of one domain's artifacts. A
+    // bridge resolves the bindings from one domain into another.
+    template <class T>
+    concept frontend = speaker<T> && requires { typename T::emits; } && !requires { typename T::domain; } && !requires { typename T::to; };
+    template <class T>
+    concept domain_reader = speaker<T> && link_domain<typename T::domain> && !requires { typename T::emits; } && !requires { typename T::to; };
+    template <class T>
+    concept bridge = speaker<T> && link_domain<typename T::from> && link_domain<typename T::to> && requires {
+        { T::to::linkage } -> std::convertible_to<std::string_view>;
+    } && !requires { typename T::emits; } && !requires { typename T::domain; };
+    namespace roles {
+        inline constexpr std::string_view frontend = "source-analysis", reader = "artifact-reader", bridge = "relation-resolver";
+    }
+    template <class T>
+        requires frontend<T> || domain_reader<T> || bridge<T>
+    constexpr std::string_view role = frontend<T>        ? roles::frontend
+                                      : domain_reader<T> ? roles::reader
+                                                         : roles::bridge;
+
+    template <class... Domains> auto domain_names(std::tuple<Domains...>*) -> std::vector<std::string> { return {std::string{Domains::name}...}; }
+    template <frontend T> auto emitted() -> std::vector<std::string> { return domain_names(static_cast<typename T::emits*>(nullptr)); }
+
+    // The ports every reader of a domain has: its artifact, the source facts whose definitions it joins to the
+    // artifact's debug locations, and between them the optional inputs a reader lists by name and type.
+    template <meta::fixed_string Name, meta::fixed_string Type> struct optional_input {};
+    template <link_domain Domain, class... Inputs> struct reads;
+    template <link_domain Domain, meta::fixed_string... Names, meta::fixed_string... Types> struct reads<Domain, optional_input<Names, Types>...> {
+        using domain = Domain;
+        static constexpr std::array<std::pair<std::string_view, std::string_view>, 0> documents{};
+        static constexpr std::array<std::string_view, sizeof...(Names) + 2> inputs{"artifact", Names.view()..., "source_facts"};
+        static constexpr std::array<std::string_view, 1> operations{"evaluate"};
+        static constexpr semantic::unit_kind unit_kind = semantic::unit_kind::artifact;
+        static constexpr bool negotiated = false;
+        static auto multiple_input(std::string_view port) -> bool { return port == "source_facts"; }
+        static auto required_inputs(const auto&) -> std::vector<std::string> { return {"artifact"}; }
+        static auto input_type(std::string_view port) -> std::string_view {
+            std::string_view type = port == "artifact" ? std::string_view{Domain::artifact} : "semantic_shard";
+            (void)((port == Names.view() && (type = Types.view(), true)) || ...);
+            return type;
+        }
+        static auto consumed_facts(std::string_view port) -> std::vector<semantic::fact_kind> {
+            return port == "source_facts" ? std::vector<semantic::fact_kind>{std::string{"symbols"}, std::string{"definitions"}}
+                                          : std::vector<semantic::fact_kind>{};
+        }
+    };
+
+    // The ports, facts and channel every bridge has: the declarations of the domain bindings start in, the
+    // definitions of the domain they land in, and the relations between them.
+    template <link_domain From, link_domain To> struct binds {
+        using from = From;
+        using to = To;
+        static constexpr std::array<std::pair<std::string_view, std::string_view>, 0> documents{};
+        static constexpr std::array<std::string_view, 2> inputs{"managed", "native"}, facts{"relations", "diagnostics"};
+        static constexpr std::array<std::string_view, 1> operations{"evaluate"};
+        static constexpr semantic::unit_kind unit_kind = semantic::unit_kind::group;
+        static constexpr bool negotiated = false, multiple_inputs = true;
+        static auto input_type(std::string_view) -> std::string_view { return "semantic_shard"; }
+        static auto consumed_facts(std::string_view port) -> std::vector<semantic::fact_kind> {
+            std::vector<semantic::fact_kind> out{std::string{"symbols"}, std::string{"definitions"}};
+            if (port == "managed")
+                out.push_back(std::string{"types"});
+            return out;
+        }
+        static auto channels() -> std::vector<semantic::channel_definition> {
+            return {{.name = "bindings", .projections = {std::string{"relations"}, std::string{"diagnostics"}}}};
+        }
+        static auto requirements(const auto&) -> builds::requirements { return {}; }
+        static auto executes_project_code(const auto&) -> bool { return false; }
     };
 } // namespace language
 
@@ -433,6 +525,9 @@ namespace builds {
                 out.tools.push_back(executable);
         }
         return out;
+    }
+    auto in_project(const std::vector<std::string>& executables) -> bool {
+        return std::ranges::any_of(executables, [](const std::string& executable) { return !absolute_path(executable) && project_path(executable); });
     }
     auto tool(const std::string& executable) -> std::string {
         if (executable.empty() || executable.contains("${") || project_path(executable))
