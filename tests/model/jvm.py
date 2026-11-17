@@ -97,11 +97,11 @@ JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM* vm, void*) {
         run([compiler, "-shared", "-fPIC", "-g", "-I" + sdk + "/include", "-I" + sdk + "/include/linux", "native.cpp", "-o", "libnative.so"], root)
         run([compiler, "-S", "-emit-llvm", "-fPIC", "-g", "-I" + sdk + "/include", "-I" + sdk + "/include/linux", "native.cpp", "-o", "native.ll"], root)
         run([compiler, "-c", "-fPIC", "-g", "-I" + sdk + "/include", "-I" + sdk + "/include/linux", "native.cpp", "-o", "native.o"], root)
-        readobj = os.environ.get("TEST_LLVM_READOBJ") or shutil.which("llvm-readobj")
-        if not readobj:
-            raise RuntimeError("the Kotlin JNI flow requires llvm-readobj")
-        put(root, "native.json", run([readobj, "--elf-output-style=JSON", "--file-headers", "--symbols", "--dyn-symbols", "libnative.so"], root))
-        put(root, "native-object.json", run([readobj, "--elf-output-style=JSON", "--file-headers", "--symbols", "--dyn-symbols", "native.o"], root))
+        reader = os.environ.get("TEST_NATIVE_HOST") or shutil.which("fughetta-native")
+        if not reader:
+            raise RuntimeError("the Kotlin JNI flow requires fughetta-native")
+        put(root, "native.json", run([reader, "libnative.so", "--ir", "native.ll"], root))
+        put(root, "native-object.json", run([reader, "native.o"], root))
         put(root, "inline.cpp", """__attribute__((always_inline)) inline int inline_leaf(int value) {
     volatile int doubled = value * 2;
     return doubled + 1;
@@ -109,15 +109,7 @@ JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM* vm, void*) {
 extern "C" int optimized(int value) { return inline_leaf(value) + 3; }
 """)
         run([compiler, "-O2", "-g", "-shared", "-fPIC", "inline.cpp", "-o", "inline.so"], root)
-        objdump = os.environ.get("TEST_LLVM_OBJDUMP") or shutil.which("llvm-objdump")
-        symbolizer = os.environ.get("TEST_LLVM_SYMBOLIZER") or shutil.which("llvm-symbolizer")
-        if not objdump or not symbolizer:
-            raise RuntimeError("native inline mapping requires llvm-objdump and llvm-symbolizer")
-        instructions = run([objdump, "--disassemble", "--no-show-raw-insn", "inline.so"], root)
-        put(root, "inline.asm", instructions)
-        addresses = sorted(set(re.findall(r"^\s*([0-9a-fA-F]+):", instructions, re.M)))
-        put(root, "inline-locations.json", run([symbolizer, "--output-style=JSON", "--inlines", "--no-demangle", "--obj=inline.so", *["0x" + at for at in addresses]], root))
-        put(root, "inline.json", run([readobj, "--elf-output-style=JSON", "--file-headers", "--symbols", "--dyn-symbols", "inline.so"], root))
+        put(root, "inline.json", run([reader, "inline.so", "--lines"], root))
         with (root / "helper.log").open("w") as errors:
             process = subprocess.Popen([java, "-jar", host, "--adapter", helper], cwd=root, text=True, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=errors)
             sequence = 0
@@ -164,7 +156,7 @@ extern "C" int optimized(int value) { return inline_leaf(value) + 3; }
         subprocess.run([binary, "--kotlin", str(root / "sample-1.jar"), str(root / "sample-2.jar"),
             str(root / "source-1.json"), str(root / "source-2.json"), str(root / "source-1.kt"), str(root / "source-2.kt"), str(root / "native.json"), str(root / "native.ll"), str(root / "native-object.json"), str(library),
             str(root / "library-metadata.json"), str(root / "model/model.json"), helper,
-            str(root / "inline.json"), str(root / "inline-locations.json"), str(root / "inline.cpp"), str(root / "inline.asm")], check=True)
+            str(root / "inline.json"), str(root / "inline.cpp")], check=True)
     print("Kotlin source analysis, JAR, native JNI execution, binding and edit impact passed")
 
 if len(sys.argv) > 1 and sys.argv[1] == "--kotlin":

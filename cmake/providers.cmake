@@ -86,3 +86,25 @@ if(GRADLE_TOOL)
     VERBATIM)
   add_custom_target(jvm-providers ALL DEPENDS "${JVM_OUTPUT}/built.stamp")
 endif()
+
+## LLVM
+#
+# fughetta-native links LLVM's static libraries. It is a project of its own so
+# it builds against the libstdc++ or libc++ the LLVM package was built with,
+# not this build's toolchain file and flags. Only that project loads LLVM's
+# package. The LLVM beside the compiler is found first; LLVM_DIR names another.
+
+find_path(LLVM_DIR LLVMConfig.cmake HINTS "${CLANG_PREFIX}/lib/cmake/llvm" PATH_SUFFIXES lib/cmake/llvm)
+if(LLVM_DIR)
+  set(NATIVE_OUTPUT "${PROJECT_BINARY_DIR}/native")
+  set(FUGHETTA_PROVIDER_native "${NATIVE_OUTPUT}/bin/fughetta-native${CMAKE_EXECUTABLE_SUFFIX}")
+  list(APPEND FUGHETTA_PROVIDERS native)
+  add_custom_command(OUTPUT "${FUGHETTA_PROVIDER_native}"
+    COMMAND "${CMAKE_COMMAND}" -S "${PROJECT_SOURCE_DIR}/providers/native/host" -B "${NATIVE_OUTPUT}/build"
+      -G "${CMAKE_GENERATOR}" "-DCMAKE_CXX_COMPILER=${CMAKE_CXX_COMPILER}" -DCMAKE_BUILD_TYPE=Release
+      "-DLLVM_DIR=${LLVM_DIR}" "-DCMAKE_RUNTIME_OUTPUT_DIRECTORY=${NATIVE_OUTPUT}/bin"
+    COMMAND "${CMAKE_COMMAND}" --build "${NATIVE_OUTPUT}/build"
+    DEPENDS "${PROJECT_SOURCE_DIR}/providers/native/host/CMakeLists.txt" "${PROJECT_SOURCE_DIR}/providers/native/host/fughetta-native.cpp"
+    VERBATIM)
+  add_custom_target(native-provider ALL DEPENDS "${FUGHETTA_PROVIDER_native}")
+endif()

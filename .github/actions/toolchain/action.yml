@@ -91,7 +91,7 @@ runs:
             echo "deb [signed-by=/usr/share/keyrings/llvm-archive-keyring.gpg] https://apt.llvm.org/$VERSION_CODENAME/ llvm-toolchain-$VERSION_CODENAME-$major main" |
               sudo tee /etc/apt/sources.list.d/llvm.list
             sudo apt-get update
-            sudo apt-get install -y "clang-$major" "clang-tools-$major" "llvm-$major" \
+            sudo apt-get install -y "clang-$major" "clang-tools-$major" "llvm-$major" "llvm-$major-dev" \
               "libc++-$major-dev" "libc++abi-$major-dev" "libclang-rt-$major-dev"
             root="/usr/lib/llvm-$major"
             id="apt-$("$root/bin/clang" -dumpversion)" ;;

@@ -146,7 +146,7 @@ if(GRADLE_TOOL)
   set_tests_properties(helper.kotlin PROPERTIES TIMEOUT 300 ENVIRONMENT
     "FUGHETTA_RECORD_VALIDATOR=$<TARGET_FILE:managed-test>;FUGHETTA_WORKER_TEST=$<TARGET_FILE:executor-test>")
   add_model_test(kotlin "${GRADLE_TOOL}" "${FUGHETTA_JVM_EXPORTER}")
-  if(FUGHETTA_JAVAC AND TEST_MANAGED_HOSTS)
+  if(FUGHETTA_JAVAC AND TEST_MANAGED_HOSTS AND FUGHETTA_PROVIDER_native)
     cmake_path(GET FUGHETTA_JAVAC PARENT_PATH FUGHETTA_JAVA_BIN)
     add_test(NAME model.kotlin-jni COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/model/jvm.py" --kotlin
       "$<TARGET_FILE:jvm-test>" "${GRADLE_TOOL}" "${FUGHETTA_JVM_EXPORTER}" "${FUGHETTA_JAVA_BIN}/java"
@@ -159,7 +159,7 @@ endif()
 if(DOTNET_TOOL)
   add_executable(clr-test model/clr.cpp)
   target_link_libraries(clr-test PRIVATE testing)
-  if(TEST_MANAGED_HOSTS)
+  if(TEST_MANAGED_HOSTS AND FUGHETTA_PROVIDER_native)
     add_test(NAME model.clr COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/model/clr.py"
       "${DOTNET_TOOL}" "${FUGHETTA_PROVIDER_clr}" "${FUGHETTA_PROVIDER_fsharp}" "$<TARGET_FILE:managed-test>"
       "$<TARGET_FILE:clr-test>" "${CMAKE_BINARY_DIR}/clr-tests"
@@ -199,16 +199,23 @@ endif()
 # Every test runs inside the build directory with the same token, so a service
 # started by one driver is reachable by the next.
 
-# The binary tools come from the compiler's own tree.
-file(REAL_PATH "${CMAKE_CXX_COMPILER}" FUGHETTA_COMPILER_BIN)
-cmake_path(GET FUGHETTA_COMPILER_BIN PARENT_PATH FUGHETTA_COMPILER_BIN)
-foreach(TOOL IN ITEMS readobj symbolizer objdump)
-  string(TOUPPER "${TOOL}" VARIABLE)
-  find_program(FUGHETTA_${VARIABLE} NAMES llvm-${TOOL} HINTS "${FUGHETTA_COMPILER_BIN}")
-  if(FUGHETTA_${VARIABLE})
-    list(APPEND TEST_ENVIRONMENT "TEST_LLVM_${VARIABLE}=${FUGHETTA_${VARIABLE}}")
+if(FUGHETTA_PROVIDER_native)
+  list(APPEND TEST_ENVIRONMENT "TEST_NATIVE_HOST=${FUGHETTA_PROVIDER_native}")
+  # The DLL and Rust fixtures need lld-link and rustc.
+  file(REAL_PATH "${CMAKE_CXX_COMPILER}" NATIVE_COMPILER)
+  cmake_path(GET NATIVE_COMPILER PARENT_PATH NATIVE_COMPILER_BIN)
+  find_program(NATIVE_LLD_LINK NAMES lld-link HINTS "${NATIVE_COMPILER_BIN}" NO_DEFAULT_PATH)
+  find_program(NATIVE_RUSTC rustc)
+  set(NATIVE_TEST_OPTIONS)
+  if(NATIVE_LLD_LINK)
+    list(APPEND NATIVE_TEST_OPTIONS --lld-link "${NATIVE_LLD_LINK}")
   endif()
-endforeach()
+  if(NATIVE_RUSTC)
+    list(APPEND NATIVE_TEST_OPTIONS --rustc "${NATIVE_RUSTC}")
+  endif()
+  add_test(NAME model.native COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/model/native.py"
+    "${FUGHETTA_PROVIDER_native}" "${CMAKE_CXX_COMPILER}" "${CMAKE_BINARY_DIR}/native-tests" ${NATIVE_TEST_OPTIONS})
+endif()
 
 get_property(PROJECT_TESTS DIRECTORY PROPERTY TESTS)
 set_property(TEST ${PROJECT_TESTS} APPEND PROPERTY ENVIRONMENT ${TEST_ENVIRONMENT})

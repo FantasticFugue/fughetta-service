@@ -1113,6 +1113,9 @@ Each runs as a platform host that loads one language adapter: map
 or `dotnet`. The worker launches `java -jar fughetta-jvm.jar --adapter
 fughetta-kotlin.jar` and `dotnet fughetta-clr.dll --adapter fughetta-fsharp.dll`.
 CLR artifact stages run the same `fughetta-clr` host without an adapter.
+Native artifact stages run `fughetta-native` from `libexec/fughetta-service/native`;
+it is built when the configure step finds LLVM's CMake package beside the compiler
+(on Debian and Ubuntu, `llvm-23-dev`).
 Explicit worker tool mappings can name readable helper resources as well as
 executables. Only declared artifact inputs
 are installed as provider models; preparation receipts remain separate inputs to
@@ -1154,8 +1157,9 @@ analysis; it does not grant the root task direct access to the other project.
 Cross-project input changes and their configured build/test tasks appear in
 view comparison and impact results.
 
-A `native-artifact` stage reads an ELF executable, shared library or relocatable object with
-`llvm-readobj`. Declare that build output with type `native-artifact`, then bind
+A `native-artifact` stage reads an executable, shared library or relocatable object
+(ELF, Mach-O or COFF) with `fughetta-native`, a host linked against LLVM's object,
+DWARF, PDB and IR libraries. Declare that build output with type `native-artifact`, then bind
 it to the stage's `artifact` port. The optional `source_facts` port accepts stage
 outputs; the gateway exposes their committed shard objects and requests source symbols
 and definitions from their producers. For example, alongside the `cpp` stage:
@@ -1173,12 +1177,11 @@ and definitions from their producers. For example, alongside the `cpp` stage:
 
 Expose `native/facts` through a profile output to request it. Selecting only the
 source output prepares compilation commands without linking. The reader records
-linkage names, imports, exports and artifact locations. `llvm-symbolizer` supplies
-debug positions for `emits` relationships to source definitions; ambiguous positions
-remain unbound. Relationship endpoints carry their own contexts, and the selected
-view retains the source shards needed to inspect either endpoint. Configure worker
-mappings for `llvm-readobj` and `llvm-symbolizer`, or set the stage's `executable`
-and `symbolizer` options. A separate `directory_group` allows the source and artifact
+linkage names, imports, exports and artifact locations. The host reads DWARF, a
+Mach-O `.dSYM` bundle or a PDB for the debug positions of `emits` relationships to
+source definitions; ambiguous positions remain unbound. Relationship endpoints carry their own contexts, and the selected
+view retains the source shards needed to inspect either endpoint. Configure a worker
+mapping for `fughetta-native`, or set the stage's `host` option. A separate `directory_group` allows the source and artifact
 stages to run on different workers. Stage requests carry shard IDs; workers fetch
 objects on demand and share their cached records. Each provider declares its output
 channels. Source providers expose `declarations` and `definition_bodies` across all
@@ -1192,8 +1195,7 @@ reads select named files or recursive directories; additions, removals and renam
 withdraw their cached consumers, while changes outside the selection leave them
 available. Candidates retain these reads in SQLite across gateway restarts.
 Deferred units remain available to continuation.
-The optional `ir` port accepts `llvm_ir`: textual IR is read directly, while
-bitcode uses the mapped `llvm-dis`. Direct calls and available static JNI
+The optional `ir` port accepts `llvm_ir`, either textual IR or bitcode. Direct calls and available static JNI
 registration tables become native relationships and binding evidence.
 
 A `pinvoke` stage consumes CLR facts through `managed` and native artifact facts
@@ -1370,8 +1372,7 @@ Other LSP providers select their launcher, operation programs and configured
 auxiliary executables (including TypeScript tsserver). Their SDK inputs remain at
 installation scope because these providers do not export external read records.
 System packages remain a shared platform input for every provider. Native artifact units select the
-installed reader and, when consuming source mappings, symbolizer identities,
-together with the platform, system packages and effective process environment.
+installed host together with the platform, system packages and effective process environment.
 Changes to unrelated installed tools therefore preserve those units. Selection
 uses the worker's existing installation observations; a tool without an observation
 makes the resulting unit ineligible for reuse.

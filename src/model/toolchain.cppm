@@ -39,10 +39,7 @@ export namespace toolchain {
                 "fughetta-kotlin",
                 "dotnet",
                 "git",
-                "llvm-readobj",
-                "llvm-objdump",
-                "llvm-dis",
-                "llvm-symbolizer"};
+                "fughetta-native"};
     }
 
     struct sdk {

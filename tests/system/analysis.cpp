@@ -114,9 +114,7 @@ namespace {
         worker_config.work_root = (tmp.dir / "worker").string();
         worker_config.parallel = 2;
         worker_config.tools["cxx"] = std::getenv("TEST_CXX");
-        worker_config.tools["llvm-readobj"] = std::getenv("TEST_LLVM_READOBJ");
-        worker_config.tools["llvm-symbolizer"] = std::getenv("TEST_LLVM_SYMBOLIZER");
-        worker_config.tools["llvm-objdump"] = std::getenv("TEST_LLVM_OBJDUMP");
+        worker_config.tools["fughetta-native"] = std::getenv("TEST_NATIVE_HOST");
         worker_config.env["TMPDIR"] = (tmp.dir / "temp").string();
         worker_config.env["JAVA_TOOL_OPTIONS"] =
             "-Djava.io.tmpdir=" + (tmp.dir / "temp").string() + " -Dkotlin.daemon.options=runFilesPath=" + (tmp.dir / "daemon").string();
@@ -592,8 +590,7 @@ namespace {
 
     static constexpr auto cases = [] {
         "Kotlin stage graph defers compilation and connects edits to JNI execution"_test = [] {
-            for (const auto* name :
-                 {"TEST_GRADLE", "TEST_JVM_HOST", "TEST_KOTLIN_ADAPTER", "TEST_CXX", "TEST_JAVA", "TEST_JDK", "TEST_LLVM_READOBJ", "TEST_LLVM_SYMBOLIZER"})
+            for (const auto* name : {"TEST_GRADLE", "TEST_JVM_HOST", "TEST_KOTLIN_ADAPTER", "TEST_CXX", "TEST_JAVA", "TEST_JDK", "TEST_NATIVE_HOST"})
                 if (!std::getenv(name)) {
                     skip / "Kotlin gateway requires the installed JVM toolchain"_test = [] {};
                     return;
@@ -601,7 +598,7 @@ namespace {
             managed_flow(true);
         };
         "FSharp stage graph defers compilation and connects edits to PInvoke execution"_test = [] {
-            for (const auto* name : {"TEST_DOTNET", "TEST_CLR_HOST", "TEST_FSHARP_ADAPTER", "TEST_CXX", "TEST_LLVM_READOBJ", "TEST_LLVM_SYMBOLIZER"})
+            for (const auto* name : {"TEST_DOTNET", "TEST_CLR_HOST", "TEST_FSHARP_ADAPTER", "TEST_CXX", "TEST_NATIVE_HOST"})
                 if (!std::getenv(name)) {
                     skip / "FSharp gateway requires the installed CLR toolchain"_test = [] {};
                     return;
@@ -716,8 +713,9 @@ namespace {
 
         "one MCP connection edits, analyzes, builds, tests and retrieves a local executable"_test = [] {
             auto clice = std::getenv("TEST_CLICE");
-            if (!clice) {
-                skip / "real worker analysis requires TEST_CLICE"_test = [] {};
+            auto native = std::getenv("TEST_NATIVE_HOST");
+            if (!clice || !native) {
+                skip / "real worker analysis requires TEST_CLICE and TEST_NATIVE_HOST"_test = [] {};
                 return;
             }
             test::scratch tmp{"worker-analysis"};
@@ -768,26 +766,23 @@ namespace {
             worker_config.name = "source-reader";
             worker_config.work_root = (tmp.dir / "worker").string();
             worker_config.tools["clice"] = clice;
-            worker_config.tools["llvm-readobj"] = std::getenv("TEST_LLVM_READOBJ") ? std::getenv("TEST_LLVM_READOBJ") : "llvm-readobj";
-            worker_config.tools["llvm-symbolizer"] = std::getenv("TEST_LLVM_SYMBOLIZER") ? std::getenv("TEST_LLVM_SYMBOLIZER") : "llvm-symbolizer";
-            worker_config.tools["llvm-objdump"] = std::getenv("TEST_LLVM_OBJDUMP") ? std::getenv("TEST_LLVM_OBJDUMP") : "llvm-objdump";
+            worker_config.tools["fughetta-native"] = native;
             worker_config.tools["python3"] = std::getenv("TEST_PYTHON") ? std::getenv("TEST_PYTHON") : "/usr/bin/python3";
             test::spit(tmp.dir / "sdk/include/answer.hpp", "#pragma once\ninline constexpr int expected_answer = 42;\n");
             test::spit(tmp.dir / "sdk/manifest.json", R"({"name":"test-sdk","release":"one"})");
             worker_config.sdk_manifests["native-test"] = {.manifest = (tmp.dir / "sdk/manifest.json").string(), .roots = {(tmp.dir / "sdk").string()}};
             const auto artifact_reads = tmp.dir / "artifact-reads";
-            const auto reader = tmp.dir / "readobj";
-            test::spit(reader, "#!/bin/sh\nprintf 'readobj\\n' >> \"$ARTIFACT_READER_LOG\"\nexec \"${TEST_LLVM_READOBJ:-llvm-readobj}\" \"$@\"\n");
+            const auto reader = tmp.dir / "native-reader";
+            test::spit(reader, "#!/bin/sh\nprintf 'native\\n' >> \"$ARTIFACT_READER_LOG\"\nexec \"$TEST_NATIVE_HOST\" \"$@\"\n");
             std::filesystem::permissions(reader, std::filesystem::perms::owner_exec, std::filesystem::perm_options::add);
             auto artifact_config = worker_config;
             artifact_config.name = "artifact-reader";
             artifact_config.work_root = (tmp.dir / "artifact-worker").string();
             artifact_config.tools["clice"] = (tmp.dir / "uninstalled-clice").string();
-            artifact_config.tools["llvm-readobj"] = reader.string();
+            artifact_config.tools["fughetta-native"] = reader.string();
             artifact_config.tools["unused"] = worker_config.tools.at("python3");
             artifact_config.env["ARTIFACT_READER_LOG"] = artifact_reads.string();
-            worker_config.tools["llvm-readobj"] = (tmp.dir / "uninstalled-readobj").string();
-            worker_config.tools["llvm-symbolizer"] = (tmp.dir / "uninstalled-symbolizer").string();
+            worker_config.tools["fughetta-native"] = (tmp.dir / "uninstalled-native").string();
             test::spit(tmp.dir / "artifact-worker.json", rfl::json::write(artifact_config));
             auto artifact_worker = std::make_unique<test::child>(test::worker_command(SERVICE_EXECUTABLE, tmp.dir, {"artifact-worker.json"}));
             test::spit(tmp.dir / "worker.json", rfl::json::write(worker_config));
@@ -986,7 +981,7 @@ namespace {
                 agent("language", "{\"project\":\"app\",\"continuation\":" + rfl::json::write(deferred_artifact.continuation) +
                                       ",\"budget\":{\"units\":" + std::to_string(total_parts + 1) + "}}"));
             expect(reused_artifact.status == "complete" && reused_artifact.reused_units == static_cast<std::uint64_t>(total_parts + 1) &&
-                   reused_artifact.relations.size() == 1u && test::slurp(artifact_reads) == "readobj\n")
+                   reused_artifact.relations.size() == 1u && test::slurp(artifact_reads) == "native\n")
                 << "continuation reuses both source units and the native unit without invoking LLVM again: " << reused_artifact.status
                 << " reused=" << reused_artifact.reused_units << " relations=" << reused_artifact.relations.size() << " reads=" << test::slurp(artifact_reads)
                 << " missing=" << rfl::json::write(reused_artifact.coverage.missing);
@@ -1012,14 +1007,14 @@ namespace {
             restart_artifact_worker();
             const auto after_unrelated_tool = artifact_relations();
             expect(after_unrelated_tool.status == "complete" && after_unrelated_tool.reused_units == static_cast<std::uint64_t>(total_parts + 1) &&
-                   after_unrelated_tool.relations.size() == 1u && test::slurp(artifact_reads) == "readobj\n")
+                   after_unrelated_tool.relations.size() == 1u && test::slurp(artifact_reads) == "native\n")
                 << "an unrelated tool change preserves the native unit across worker restart: " << after_unrelated_tool.status
                 << " reused=" << after_unrelated_tool.reused_units << " reads=" << test::slurp(artifact_reads);
             test::spit(reader, test::slurp(reader) + "# reader installation changed\n");
             restart_artifact_worker();
             const auto after_reader_change = artifact_relations();
             expect(after_reader_change.status == "complete" && after_reader_change.reused_units == static_cast<std::uint64_t>(total_parts) &&
-                   after_reader_change.relations.size() == 1u && test::slurp(artifact_reads) == "readobj\nreadobj\n")
+                   after_reader_change.relations.size() == 1u && test::slurp(artifact_reads) == "native\nnative\n")
                 << "changing the reader reruns native extraction while reusing source units: " << after_reader_change.status
                 << " reused=" << after_reader_change.reused_units << " reads=" << test::slurp(artifact_reads);
             tools::language_query::input reverse_emission{.project = "app",
@@ -1500,7 +1495,7 @@ namespace {
             const auto changed_artifact = test::decode<tools::language_query::output>(agent(
                 "language", R"({"project":"app","configuration":"artifact","action":"relations","selector":{"name":{"text":"twice"}},"relations":["emits"]})"));
             expect(changed_artifact.version == edited.version && changed_artifact.relations.size() == 1u &&
-                   test::slurp(artifact_reads) == "readobj\nreadobj\nreadobj\n")
+                   test::slurp(artifact_reads) == "native\nnative\nnative\n")
                 << "changed artifact and source shards replace the native contribution";
             references.view = updated.view;
             references.cursor.reset();

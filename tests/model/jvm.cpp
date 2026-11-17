@@ -19,7 +19,7 @@ import projectmodel;
 namespace {
     using namespace boost::ut;
     std::filesystem::path class_file, archive, header, changed_archive;
-    std::array<std::filesystem::path, 17> kotlin_files;
+    std::array<std::filesystem::path, 15> kotlin_files;
     auto load(const std::filesystem::path& path) -> std::string {
         std::ifstream input{path, std::ios::binary};
         return {std::istreambuf_iterator<char>{input}, {}};
@@ -27,9 +27,9 @@ namespace {
     const auto kotlin_cases = [] {
         "Kotlin source edits follow real JVM and JNI bindings through native execution"_test = [] {
             test::scratch scratch{"kotlin-jni-records"};
-            auto optimized = native_artifact::records(native_artifact::read(load(kotlin_files[13])), "app", "options", "native", "native", "inline.so", {});
-            const auto locations = rfl::json::read<std::vector<native_artifact::location>>(load(kotlin_files[14])).value();
-            const auto source_text = load(kotlin_files[15]);
+            const auto inline_object = native_artifact::read(load(kotlin_files[13]));
+            auto optimized = native_artifact::records(inline_object, "app", "options", "native", "native", "inline.so", {});
+            const auto source_text = load(kotlin_files[14]);
             const auto split = source_text.find("extern");
             std::vector<channels::definition_body> bodies;
             for (const auto& [name, begin, end] :
@@ -41,9 +41,9 @@ namespace {
                                   {"inline.cpp", begin, end},
                                   std::string{"function"}});
             }
-            const auto addresses = native_artifact::instruction_addresses(load(kotlin_files[16]));
-            expect(addresses.size() == locations.size());
-            native_artifact::associate(optimized, locations, bodies, {{"inline.cpp", source_text}}, kotlin_files[15].parent_path());
+            expect(std::ranges::any_of(inline_object.locations, [](const auto& location) { return location.frames.size() > 1; }))
+                << "an inlined call has an inline frame";
+            native_artifact::associate(optimized, inline_object.locations, bodies, {{"inline.cpp", source_text}}, kotlin_files[14].parent_path());
             expect(std::ranges::any_of(optimized.relations, [](const auto& row) {
                 return row.from == "inline_leaf" && row.detail && row.detail->variant().visit([](const auto& detail) {
                     if constexpr (std::same_as<std::remove_cvref_t<decltype(detail)>, semantic::records::emission_detail>)
@@ -54,8 +54,7 @@ namespace {
             }));
             expect(std::ranges::any_of(optimized.relations, [](const auto& row) { return row.from == "optimized"; }));
             semantic::store store{scratch.dir};
-            auto native_object = native_artifact::read(load(kotlin_files[6]));
-            native_artifact::ir::append(native_object, load(kotlin_files[7]), "native.ll");
+            const auto native_object = native_artifact::read(load(kotlin_files[6]));
             expect(std::ranges::any_of(native_object.symbols, [](const auto& symbol) { return symbol.name == "registered_twice" && !symbol.exported; }));
             expect(native_object.registrations.size() == 1_u && native_object.unresolved.empty());
             const auto relocatable = native_artifact::read(load(kotlin_files[8]));
@@ -546,7 +545,7 @@ namespace {
     };
 } // namespace
 int main(int argc, char** argv) {
-    if (argc == 19 && std::string_view{argv[1]} == "--kotlin") {
+    if (argc == 17 && std::string_view{argv[1]} == "--kotlin") {
         for (std::size_t i = 0; i < kotlin_files.size(); ++i)
             kotlin_files[i] = argv[i + 2];
         boost::ut::suite<"kotlin_jni_flow">{kotlin_cases};

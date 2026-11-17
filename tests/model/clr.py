@@ -16,7 +16,7 @@ parser.add_argument("reader")
 parser.add_argument("work")
 parser.add_argument("--exporter", required=True)
 parser.add_argument("--compiler", default=os.environ.get("CXX", "c++"))
-parser.add_argument("--readobj", default=os.environ.get("TEST_LLVM_READOBJ", "llvm-readobj"))
+parser.add_argument("--native-host", default=os.environ.get("TEST_NATIVE_HOST", "fughetta-native"))
 args = parser.parse_args()
 dotnet, host, adapter, validator, reader, work = args.dotnet, args.host, args.adapter, args.validator, args.reader, args.work
 dotnet, host, adapter, validator, reader = [str(Path(value).resolve()) for value in (dotnet, host, adapter, validator, reader)]
@@ -91,7 +91,7 @@ module Library =
         '}', '']))
     native = root / "libnative.so"
     run([args.compiler, "-shared", "-fPIC", "-g", root / "native.cpp", "-o", native], root)
-    native_report = run([args.readobj, "--elf-output-style=JSON", "--file-headers", "--symbols", "--dyn-symbols", native], root)
+    native_report = run([args.native_host, native], root)
     put(root, "native.json", native_report)
     model = export(root, "msbuild", dotnet, args.exporter, ["Library.fsproj"])
     process = subprocess.Popen([dotnet, host, "--adapter", adapter], cwd=root, text=True, stdin=subprocess.PIPE, stdout=subprocess.PIPE)

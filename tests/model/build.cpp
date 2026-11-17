@@ -202,7 +202,7 @@ namespace {
             const auto artifact_graph = language::expand(artifact_profile, {{"native", native}}, {"native"});
             expect(artifact_graph.stages == std::vector<std::string>{"main", "artifact"});
             expect(std::ranges::contains(artifact_graph.nodes.back().dependencies, "stage/main"));
-            expect(std::ranges::contains(artifact_graph.directory_groups.at("native").tools, "llvm-symbolizer"));
+            expect(std::ranges::contains(artifact_graph.directory_groups.at("native").tools, "fughetta-native"));
             auto cross_project = artifact_profile;
             cross_project.stages.at("artifact").inputs.at("source_facts") = {language::project_input{"library", "release", "cpp", "source", std::nullopt}};
             const auto restored_cross = config::parse_as<language::configuration>(rfl::json::write(cross_project), "analysis");
