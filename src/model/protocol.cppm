@@ -246,6 +246,9 @@ export namespace jobs {
         std::map<semantic::unit_id, std::vector<semantic::shard_id>> retained;
         std::optional<language::description> registration;
         std::map<std::string, std::string> documents;
+        // The provider runs code the project supplies, so its session takes the project's build environment.
+        // A provider that only reads project data runs in the worker's own environment.
+        bool project_code = false;
     };
 
     // These labels identify files in one transfer, not semantic units.

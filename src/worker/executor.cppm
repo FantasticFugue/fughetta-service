@@ -1048,7 +1048,7 @@ export namespace replica {
                                                .registration = analysis->registration,
                                                .documents = analysis->documents},
                                               dir, options_.tools, options_.parallel, cache);
-                auto env = environment(r.env, local.env);
+                auto env = environment(plan.project_code ? r.env : std::map<std::string, std::string>{}, local.env);
                 const auto semantic_environment = env;
                 const auto transport = analysis->registration
                                            ? analysis->registration->adapter

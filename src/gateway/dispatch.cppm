@@ -1098,7 +1098,8 @@ export namespace tools {
                                              .executables = plan.server.executables,
                                              .retained = request.retained,
                                              .registration = plan.server.registration,
-                                             .documents = plan.server.documents};
+                                             .documents = plan.server.documents,
+                                             .project_code = language::describe_provider(request.config.server).executes_project_code};
         auto& registry = zero.files;
         auto& rt = zero.workers.io_context();
         auto& router = zero.workers;
@@ -1154,7 +1155,7 @@ export namespace tools {
                                             .memory_bytes = build.preparation.max_memory_bytes,
                                             .worker = residence ? std::optional{residence->worker} : std::nullopt,
                                             .core = residence ? std::optional{residence->core} : std::nullopt,
-                                            .analysis = !language::describe_provider(request.config.server).executes_project_code};
+                                            .analysis = !build.analysis.project_code};
             auto run_on_worker = [&registry, &rt, &router, &residence, executor, project, files, build, line, version = selected_tree.version, actor, roots,
                                   placed, snapshots = request.snapshots,
                                   sources = request.sources](auto& worker, jobs::progress_log* progress,

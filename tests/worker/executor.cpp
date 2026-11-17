@@ -1029,6 +1029,16 @@ while True:
                                               .analysis = request.analysis};
                 auto named = co_await analysis_call(channel, io, direct, record_checks{.unit = receive});
                 expect(named && named->analyzed && named->steps.empty()) << "an analysis runs on the inputs its preparation reported";
+                const auto writable = std::filesystem::perms::owner_write | std::filesystem::perms::group_write | std::filesystem::perms::others_write;
+                std::vector<std::filesystem::path> prepared_tree{named->tree};
+                for (const auto& entry : std::filesystem::recursive_directory_iterator{named->tree})
+                    prepared_tree.push_back(entry.path());
+                for (const auto& path : prepared_tree)
+                    std::filesystem::permissions(path, writable, std::filesystem::perm_options::remove);
+                auto reading = co_await analysis_call(channel, io, direct, record_checks{.unit = receive});
+                for (const auto& path : prepared_tree)
+                    std::filesystem::permissions(path, std::filesystem::perms::owner_write, std::filesystem::perm_options::add);
+                expect(reading && reading->analyzed && !reading->analysis_error) << "an analysis writes nothing into the tree it reads";
                 expect((co_await channel.call(build))->ok());
                 auto stale = co_await analysis_call(channel, io, direct, record_checks{.unit = receive});
                 expect(!stale && std::get<jobs::failure>(stale.error()).code == "stale_inputs") << "a build since the preparation withdraws its inputs";
