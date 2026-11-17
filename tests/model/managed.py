@@ -182,6 +182,7 @@ def fsharp(root, tool):
     assert not list(root.glob("*/bin/**/*.dll"))
     assert any(r["kind"] == "sdk" for r in app["references"])
     assert "" not in library["extensions"]["defines"]
+    assert library["extensions"]["type_providers"] is False and app["extensions"]["type_providers"] is False
     check_objects(root, model)
     receipt = json.loads((root / "model/assets.json").read_text())
     assert {entry["path"] for entry in receipt["files"]} == {"app/obj/project.assets.json", "library/obj/project.assets.json"}

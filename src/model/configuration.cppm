@@ -101,6 +101,44 @@ export namespace config {
         config::auth auth;
     };
 
+    // Where a Worker's execute role runs. `local` keeps both roles in the Worker process; the other kinds run the execute
+    // role in a container the Worker starts, and the Worker answers analyses as a restricted native process.
+    struct worker_backend {
+        std::string kind = "local";
+        // The runtime command: docker, ctr or container by default, or a compatible one such as podman or nerdctl.
+        std::string program;
+        // An image that supplies the libraries the service executable links.
+        std::string image;
+        // docker: the --runtime name (runsc, kata-runtime); containerd: runsc or kata.
+        std::string runtime;
+        // The address the execute container dials back to; loopback unless the container has a network of its own.
+        std::string host = "127.0.0.1";
+        // Host directories mounted read-only at the same path. The configured tools must lie under one of them or in the image.
+        std::vector<std::string> toolchains;
+        friend auto operator==(const worker_backend&, const worker_backend&) -> bool = default;
+    };
+
+    inline void validate(const worker_backend& b) {
+        static constexpr std::array kinds{"local", "docker", "containerd", "apple"};
+        if (!std::ranges::contains(kinds, std::string_view{b.kind}))
+            throw std::invalid_argument("worker backend is local, docker, containerd or apple");
+        if (b.kind == "local") {
+            if (!b.program.empty() || !b.image.empty() || !b.runtime.empty() || !b.toolchains.empty())
+                throw std::invalid_argument("the local worker backend takes no container settings");
+            return;
+        }
+        if (b.image.empty())
+            throw std::invalid_argument("a container worker backend needs an image");
+        if (b.kind == "containerd" && b.runtime != "runsc" && b.runtime != "kata")
+            throw std::invalid_argument("the containerd worker backend runs with runsc or kata");
+        if (b.kind == "apple" && !b.runtime.empty())
+            throw std::invalid_argument("the apple worker backend has one runtime");
+        io::parse_endpoint(b.host, 0);
+        for (auto& path : b.toolchains)
+            if (path.empty() || !builds::absolute_path(path))
+                throw std::invalid_argument("worker backend toolchains must be absolute paths");
+    }
+
     struct revisions {
         std::uint64_t counter = 0;
         std::uint64_t server = 0;
@@ -114,6 +152,7 @@ export namespace config {
     struct document {
         allocation::budget runtime;
         builds::toolset tools;
+        config::worker_backend worker_backend;
         config::server server;
         config::limits limits;
         std::map<std::string, config::settings, std::less<>> projects;
@@ -397,6 +436,7 @@ export namespace config {
             if (d.server.remote_worker_port == d.server.worker_port || d.server.remote_worker_port == d.server.http_port)
                 throw std::invalid_argument("remote Worker listener needs a separate port");
         }
+        validate(d.worker_backend);
         if (d.server.remote_worker_enrollment && !d.server.remote_worker_port)
             throw std::invalid_argument("remote Worker enrollment needs a private listener");
         io::parse_endpoint(d.server.source);
@@ -467,6 +507,7 @@ export namespace config {
         std::map<std::string, std::string> env;
         bool inherit_env = true;
         builds::toolset tools;
+        config::worker_backend backend;
         std::map<std::string, toolchain::sdk> sdk_manifests;
         std::optional<std::string> dependency_cache;
         std::optional<std::string> dependency_upstream;
@@ -509,6 +550,11 @@ export namespace config {
             throw std::invalid_argument("a dependency publisher takes the execute role");
         if (w.tree_ttl_days == 0)
             throw std::invalid_argument("Worker tree_ttl_days must be positive");
+        validate(w.backend);
+        if (w.backend.kind != "local" && w.roles.size() != 2)
+            throw std::invalid_argument("a container worker backend serves both roles");
+        if (w.backend.kind != "local" && w.dependency_publish)
+            throw std::invalid_argument("a dependency publisher uses the local worker backend");
         if (w.worker_id || w.workspace_id) {
             if (!w.worker_id || !w.workspace_id || !w.token || w.token->size() != 64)
                 throw std::invalid_argument("Registered Worker requires its identity and credentials");

@@ -87,6 +87,7 @@ add_suite(mail source/mail.cpp source unofficial::sqlite3::sqlite3)
 add_suite(optimistic source/optimistic.cpp source unofficial::sqlite3::sqlite3)
 add_suite(storage source/storage.cpp source)
 add_suite(executor worker/executor.cpp worker)
+add_suite(backend worker/backend.cpp worker)
 # The language-server suites drive clice when it is found.
 find_program(CLICE_TOOL clice)
 if(CLICE_TOOL)

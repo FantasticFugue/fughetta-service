@@ -143,6 +143,67 @@ namespace {
         rt.run(std::move(run_core));
     }
 
+    // An execute role in this process, as a container backend's would run beside the Worker.
+    struct execute_beside final : replica::execute_side {
+        std::filesystem::path dir;
+        transport::channel<native::socket>* chan = nullptr;
+        std::size_t opens = 0;
+        bool running = true;
+        auto root() const -> const std::filesystem::path& override { return dir; }
+        auto open() -> coroutine::task<replica::execute_link> override {
+            ++opens;
+            if (!running)
+                throw std::runtime_error("the execute role is stopped");
+            co_return replica::execute_link{*chan, nullptr};
+        }
+    };
+
+    // Runs `work` against a Worker whose execute role is a second service with its own root.
+    template <class F> void beside(F work) {
+        test::scratch tmp{"executor-beside"};
+        cores::io_context<native::context> rt{1};
+        execution::thread_pool disk{2};
+        replica::service execute{rt, {.root = tmp.dir / "execute", .worker = "worker-execute", .inherit_env = false}, disk};
+        replica::service front{rt, {.root = tmp.dir / "cache", .worker = "worker-test", .inherit_env = false}, disk};
+        execute_beside side;
+        side.dir = tmp.dir / "execute";
+        front.set_execute(side);
+        auto run_core = [&](ctx& io, std::size_t) -> coroutine::task<> {
+            auto run_operation = [&]() -> coroutine::task<> {
+                auto to_execute = native::listener{io, {net::ip::address_v4::loopback(), 0}};
+                auto to_front = native::listener{io, {net::ip::address_v4::loopback(), 0}};
+                auto run_tasks = [&](coroutine::scope& tasks) -> coroutine::task<> {
+                    static constexpr auto run_child = [](auto& listener, auto& service) -> coroutine::task<> {
+                        auto [socket, endpoint] = co_await net::async_accept(listener);
+                        transport::channel<native::socket> channel{socket};
+                        transport::dispatcher<native::socket> dispatch;
+                        service.install(dispatch, 0);
+                        auto serve = [&](coroutine::scope& requests) -> coroutine::task<> {
+                            co_await channel.pump([&](const transport::frame& frame) { requests.spawn(dispatch.handle(channel, frame)); });
+                        };
+                        co_await coroutine::with_scope(serve);
+                    };
+                    tasks.spawn(run_child(to_execute, execute));
+                    tasks.spawn(run_child(to_front, front));
+                    auto execute_socket = co_await io::connect(io, {net::ip::address_v4{{127, 0, 0, 1}}, to_execute.local_endpoint().port()});
+                    transport::channel<native::socket> execute_channel{execute_socket};
+                    side.chan = &execute_channel;
+                    auto socket = co_await io::connect(io, {net::ip::address_v4{{127, 0, 0, 1}}, to_front.local_endpoint().port()});
+                    transport::channel<native::socket> channel{socket};
+                    auto run_pump = [&](coroutine::scope& pump) -> coroutine::task<> {
+                        pump.spawn(execute_channel.pump([](const transport::frame&) {}));
+                        pump.spawn(channel.pump([](const transport::frame&) {}));
+                        co_await work(channel, tmp.dir, front, side, io);
+                    };
+                    co_await coroutine::with_scope(std::move(run_pump));
+                };
+                co_await coroutine::with_scope(std::move(run_tasks));
+            };
+            co_await front.run(0, execute.run(0, run_operation()));
+        };
+        rt.run(std::move(run_core));
+    }
+
     auto recipe_script(const std::filesystem::path& root, std::string_view body) -> builds::dependency_recipe {
         auto script = root / "trusted-vcpkg";
         if (host::os == "windows") {
@@ -932,6 +993,85 @@ set(VCPKG_ENV_PASSTHROUGH_UNTRACKED PROBE_LEDGER)
                 expect(timeout.has_value() && timeout->steps[0].timed_out && !timeout->ok());
             };
             exercise(run_operation);
+        };
+
+        "beside a container's execute role, builds run there and analyses that run no project code stay here, offline"_test = [] {
+            static constexpr auto run_operation = [](auto& channel, const auto& root, replica::service& front, execute_beside& side,
+                                                     ctx& io) -> coroutine::task<> {
+                const std::string python = std::getenv("TEST_PYTHON") ? std::getenv("TEST_PYTHON") : "/usr/bin/python3";
+                front.set_runtime(
+                    {.id = "lsp-runtime", .execution = "lsp-runtime-object", .platform = "platform-object", .executables = {{python, "python-object"}}});
+                auto open = native::listener{io, {net::ip::address_v4::loopback(), 0}};
+                auto script = root / "language.py";
+                test::spit(script, std::format(R"python(
+import json, os, socket, sys
+with open(os.path.join(os.path.dirname(__file__), "observed"), "w", newline="\n") as f:
+    try:
+        socket.create_connection(("127.0.0.1", {}), timeout=2).close()
+        f.write("online ")
+    except OSError:
+        f.write("offline ")
+    f.write(os.environ.get("SECRET", "no-secret") + " " + os.getcwd())
+while True:
+    length = 0
+    while True:
+        line = sys.stdin.buffer.readline()
+        if not line: sys.exit(0)
+        if not line.strip(): break
+        if line.lower().startswith(b"content-length:"): length = int(line.split(b":")[1])
+    m = json.loads(sys.stdin.buffer.read(length))
+    if "id" not in m: continue
+    result = None
+    if m.get("method") == "initialize": result = {{"capabilities": {{"diagnosticProvider": True}}}}
+    if m.get("method") == "textDocument/diagnostic":
+        result = {{"kind": "full", "items": [{{"range": {{"start":{{"line":0,"character":0}}, "end":{{"line":0,"character":1}}}}, "message":"seen"}}]}}
+    body = json.dumps({{"jsonrpc":"2.0", "id":m["id"], "result":result}}).encode()
+    sys.stdout.buffer.write(b"Content-Length: %d\r\n\r\n" % len(body) + body)
+    sys.stdout.buffer.flush()
+)python",
+                                               open.local_endpoint().port()));
+                content::manifest tree{{entry("a.py", "x = 1")}};
+                expect((co_await channel.call(jobs::sync_offer{"app", tree})).has_value());
+                expect((co_await channel.call(jobs::source_bytes{{blob("x = 1")}})).has_value());
+                expect(side.opens == 2_u && !std::filesystem::exists(root / "cache/trees/app")) << "sources reach the execute role";
+                jobs::staged_analysis request{.preparation = {.project = "app",
+                                                              .tree = "beside",
+                                                              .snapshot = tree.id(),
+                                                              .steps = {{.name = "prepare", .argv = {test::shell(), "-c", "printf $SECRET > prepared"}}},
+                                                              .preparation_tasks = {{.name = "prepare", .first_step = 0, .step_count = 1}},
+                                                              .timeout_s = 10,
+                                                              .env = {{"SECRET", "project-secret"}}},
+                                              .analysis = jobs::analysis_plan{.provider = "ty",
+                                                                              .argv = {python, script.string()},
+                                                                              .execution = {"language-request", "language-computation", "python"},
+                                                                              .slot_id = "app/beside",
+                                                                              .demand = {.facts = {std::string{"diagnostics"}}}}};
+                std::vector<language::evaluated_unit> received;
+                auto receive = [&](language::evaluated_unit unit) -> void { received.push_back(std::move(unit)); };
+                auto first = co_await analysis_call(channel, io, request, record_checks{.unit = receive});
+                expect((first && first->analyzed && !first->analysis_error) >> fatal)
+                    << (first ? first->analysis_error.value_or("") : std::get<jobs::failure>(first.error()).message);
+                expect(test::slurp(root / "execute/trees" / "app" / "beside" / "prepared") == "project-secret") << "the build ran in the execute role";
+                expect(!std::filesystem::exists(root / "cache/trees/app")) << "this process keeps no tree of its own";
+                expect(test::slurp(root / "observed") == "offline no-secret " + (root / "execute/trees/app/beside").string());
+                expect(!received.empty() && received.back().shards.front().diagnostics.front().message == "seen");
+                const auto opened = side.opens;
+                side.running = false;
+                auto stopped = co_await analysis_call(channel, io, request, record_checks{.unit = receive});
+                expect(stopped && stopped->analyzed && stopped->steps.empty()) << "an unchanged preparation answers while the execute role is stopped";
+                expect(side.opens == opened);
+                auto loading = request;
+                loading.analysis.project_code = true;
+                auto refused = co_await analysis_call(channel, io, loading, record_checks{.unit = receive});
+                expect(!refused && side.opens == opened + 1) << "an analysis that runs project code needs the execute role";
+                side.running = true;
+                auto outside = request;
+                outside.analysis.argv = {test::shell(), "-c", "true"};
+                outside.analysis.execution.stage_id = "outside";
+                auto foreign = co_await analysis_call(channel, io, outside, record_checks{.unit = receive});
+                expect(foreign && foreign->analysis_error) << "an executable outside the startup inventory does not start here";
+            };
+            beside(run_operation);
         };
 
         "a hot directory keeps stage sessions across source changes and retires them together"_test = [] {

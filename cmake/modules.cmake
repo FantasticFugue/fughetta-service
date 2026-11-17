@@ -60,7 +60,7 @@ add_implementation(source source database objects history coordination worldstat
 
 # worker
 add_layer(worker)
-add_modules(worker worker executor dependencies)
+add_modules(worker worker executor dependencies backend sibling)
 
 ## Platform provider
 #

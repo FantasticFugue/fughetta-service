@@ -15,4 +15,7 @@ export namespace host {
     auto detect_tools(const std::map<std::string, std::string>& mapped = {}) -> std::vector<std::string>;
     auto executable() -> std::filesystem::path;
     auto name() -> std::string;
+    // The numeric "user:group" a container runs as so the files it writes stay this account's; empty where accounts are
+    // not numbers.
+    auto account() -> std::string;
 } // namespace host

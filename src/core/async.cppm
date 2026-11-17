@@ -366,6 +366,8 @@ export namespace io {
         std::optional<std::map<std::string, std::string>> env;
         std::optional<std::uint64_t> max_memory_bytes;
         std::optional<std::uint32_t> max_cpu_seconds;
+        // The child reaches no network, loopback included.
+        bool offline = false;
         // A conversation: this process writes the child's standard input, the child's standard output holds only its
         // replies, and its standard error is discarded.
         bool interactive = false;

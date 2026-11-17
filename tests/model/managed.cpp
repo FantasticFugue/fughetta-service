@@ -97,6 +97,29 @@ namespace {
             c.tasks["model"].inputs.clear();
             expect(throws<std::invalid_argument>([&] { builds::validate(c); }));
         };
+        "a model loads project code when a unit names a compiler plugin or type providers"_test = [] {
+            projectmodel::document model{
+                .producer = "test", .producer_version = "current", .units = {{.id = "main", .project = "app", .language = "fsharp", .directory = "."}}};
+            expect(!projectmodel::loads_code(model));
+            model.units[0].extensions["type_providers"] = rfl::Generic{false};
+            expect(!projectmodel::loads_code(model));
+            model.units[0].extensions["type_providers"] = rfl::Generic{true};
+            expect(projectmodel::loads_code(model));
+            model.units[0].extensions.clear();
+            model.units[0].references = {projectmodel::artifact_reference{.object = {std::string(64, 'a'), "Library.dll"}, .role = "classpath"}};
+            expect(!projectmodel::loads_code(model));
+            for (auto name : {"kotlin-scripting-compiler-embeddable-2.3.0.jar", "kotlin-stdlib-2.3.0.jar", "kotlinx-coroutines-core-jvm-1.8.0.jar"})
+                model.units[0].references.push_back(projectmodel::artifact_reference{.object = {std::string(64, 'c'), name}, .role = "plugin"});
+            model.units[0].compiler_arguments = {"-Xplugin=/cache/kotlin-scripting-jvm-2.3.0.jar"};
+            expect(!projectmodel::loads_code(model));
+            model.units[0].compiler_arguments = {"-Xcompiler-plugin=/cache/kotlin-stdlib-2.3.0.jar,/work/tools/rewrite.jar=mode=fast"};
+            expect(projectmodel::loads_code(model));
+            model.units[0].compiler_arguments.clear();
+            model.units[0].references.push_back(projectmodel::artifact_reference{.object = {std::string(64, 'b'), "plugin.jar"}, .role = "plugin"});
+            expect(projectmodel::loads_code(model));
+            model.units[0].references = {projectmodel::tree_reference{.path = "build/libs/kotlin-stdlib-local.jar", .role = "plugin"}};
+            expect(projectmodel::loads_code(model));
+        };
         "model ingestion checks typed references and resolves SDKs on the receiving worker"_test = [] {
             test::scratch temp{"project-model"};
             auto sdk = temp.dir / "sdk";

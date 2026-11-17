@@ -16,6 +16,8 @@ export namespace posix {
     // Measured before fork, so the child calls nothing but the closes.
     auto descriptor_bound() noexcept -> int;
     auto close_inherited(int bound) noexcept -> bool;
+    // In a forked child: leave every network, loopback included, before exec.
+    auto isolate_network() noexcept -> bool;
     // A descriptor that becomes readable when the child exits, or -1 when the
     // exit has to be polled.
     auto exit_handle(int pid) -> int;

@@ -90,6 +90,8 @@ export namespace language {
                     value.update_granularity = implementation::update_granularity;
                 value.needs = implementation::requirements(options);
                 value.executes_project_code = implementation::executes_project_code(options);
+                if constexpr (requires { implementation::model_code; })
+                    value.model_code = implementation::model_code;
                 if constexpr (requires { implementation::negotiated; })
                     value.negotiated = implementation::negotiated;
                 if constexpr (requires { implementation::dependency_reads; })

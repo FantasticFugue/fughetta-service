@@ -249,6 +249,8 @@ export namespace jobs {
         // The provider runs code the project supplies, so its session takes the project's build environment.
         // A provider that only reads project data runs in the worker's own environment.
         bool project_code = false;
+        // The provider loads the plugins its project model names; the worker runs it as project code when the model names any.
+        bool model_code = false;
     };
 
     // These labels identify files in one transfer, not semantic units.

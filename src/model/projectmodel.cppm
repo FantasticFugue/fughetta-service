@@ -136,6 +136,42 @@ export namespace projectmodel {
         }
         return result;
     }
+    // Whether a compiler reading the model loads code the model names: compiler plugins, analyzers or type providers.
+    // KGP puts Kotlin's scripting registrar and the libraries it needs on every compilation's plugin classpath; the
+    // analysis host loads it like the compiler does, so it runs no code the project chose.
+    inline auto builtin_plugin(std::string_view name) -> bool {
+        constexpr std::array<std::string_view, 6> prefixes{"kotlin-scripting-", "kotlin-script-runtime-",  "kotlin-stdlib",
+                                                           "kotlin-reflect-",   "kotlinx-coroutines-core", "annotations-"};
+        return name.ends_with(".jar") && std::ranges::any_of(prefixes, [&](std::string_view prefix) { return name.starts_with(prefix); });
+    }
+    inline auto loads_code(const document& model) -> bool {
+        // `-Xplugin=a.jar,b.jar` and `-Xcompiler-plugin=a.jar,b.jar=option=value`.
+        auto passed = [](std::string_view argument) {
+            for (std::string_view flag : {"-Xplugin=", "-Xcompiler-plugin="})
+                if (argument.starts_with(flag)) {
+                    auto paths = argument.substr(flag.size());
+                    paths = paths.substr(0, paths.find('='));
+                    return std::ranges::any_of(paths | std::views::split(','),
+                                               [](auto path) { return !builtin_plugin(std::filesystem::path{std::string_view{path}}.filename().string()); });
+                }
+            return false;
+        };
+        return std::ranges::any_of(model.units, [&](const unit& unit) {
+            if (const auto found = unit.extensions.find("type_providers"); found != unit.extensions.end() && found->second.to_bool().value_or(false))
+                return true;
+            if (std::ranges::any_of(unit.compiler_arguments, passed))
+                return true;
+            return std::ranges::any_of(unit.references, [](const reference& ref) {
+                return ref.visit([](const auto& value) {
+                    if (value.role != "plugin")
+                        return false;
+                    if constexpr (requires { value.object; })
+                        return !builtin_plugin(value.object.name);
+                    return true;
+                });
+            });
+        });
+    }
     inline auto object_path(const std::filesystem::path& objects, const object_ref& ref) -> std::filesystem::path {
         check(ref);
         return objects / ref.hash;

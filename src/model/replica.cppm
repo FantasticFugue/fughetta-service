@@ -19,17 +19,13 @@ export namespace replica {
         std::chrono::hours partial_ttl{24};
     };
 
-    class store {
+    // What a worker directory holds, read without its lock: the store that owns the directory writes it, and an analysis
+    // process on the same host reads the trees an execute process prepared there.
+    class view {
     public:
-        explicit store(std::filesystem::path root, limits l = {}) : root_(std::move(root)), lock_(root_, "worker directory"), limits_(l) {
-            std::filesystem::create_directories(root_ / "blobs" / "partial");
-            std::filesystem::create_directories(root_ / "trees");
-            discard(root_ / "discarded");
-            index();
-        }
+        explicit view(std::filesystem::path root) : root_(std::move(root)) {}
 
         auto root() const -> const std::filesystem::path& { return root_; }
-        auto cache_bytes() const -> std::uint64_t { return cache_bytes_; }
 
         auto slots() const -> std::vector<jobs::worker_slot> {
             std::vector<std::pair<std::filesystem::file_time_type, std::filesystem::path>> recent;
@@ -56,6 +52,154 @@ export namespace replica {
         auto reports(std::string_view key) const -> std::filesystem::path { return root_ / "reports" / key; }
         // What the analysis sessions of a tree write: their caches live here, so the tree stays the build's alone.
         auto analysis(std::string_view key) const -> std::filesystem::path { return root_ / "analysis" / key; }
+
+        // The files a checkout placed in the tree, in the order of their snapshot.
+        auto placed_files(std::string_view key) const -> std::vector<content::entry> {
+            std::vector<content::entry> out;
+            for (auto& p : read_manifest(key))
+                out.push_back(std::move(p.e));
+            return out;
+        }
+
+        // The digest of a file, read through the store's engine.
+        static auto hash_of(const std::filesystem::path& p) -> content::hash { return hash_file(p); }
+
+        auto generated_inputs(std::string_view project, std::string_view target) const -> std::map<std::string, std::string> {
+            std::map<std::string, std::string> out;
+            for (const auto& [producer, value] : read_generation(tree_key(project, target)).producers)
+                for (const auto& path : value.files)
+                    out.emplace(path, value.object);
+            return out;
+        }
+        auto unfinished_generation(std::string_view project, std::string_view target) const -> bool {
+            return !read_generation(tree_key(project, target)).pending.empty();
+        }
+
+    protected:
+        struct placed {
+            content::entry e;
+            std::int64_t mtime = 0;
+        };
+        static auto stamp(std::filesystem::file_time_type t) -> std::int64_t {
+            return std::chrono::duration_cast<std::chrono::nanoseconds>(t.time_since_epoch()).count();
+        }
+
+        auto manifest_path(std::string_view key) const -> std::filesystem::path { return root_ / "trees" / (std::string{key} + ".manifest"); }
+        auto generation_path(std::string_view key) const -> std::filesystem::path { return root_ / "trees" / (std::string{key} + ".generated"); }
+        struct generated {
+            struct contribution {
+                std::string object;
+                std::set<std::string> files;
+            };
+            std::map<std::string, contribution> producers;
+            std::set<std::string> pending;
+        };
+        auto read_generation(std::string_view key) const -> generated {
+            if (!std::filesystem::exists(generation_path(key)))
+                return {};
+            std::string bytes;
+            for (auto part : durability::read_plain(generation_path(key), constants::generated_manifest_bytes))
+                bytes.append(reinterpret_cast<const char*>(part.data()), part.size());
+            auto value = rfl::json::read<generated>(bytes);
+            if (!value)
+                throw std::runtime_error("invalid generated output ownership: " + value.error().what());
+            return std::move(*value);
+        }
+        auto manifests() const -> std::vector<std::filesystem::path> {
+            std::vector<std::filesystem::path> out;
+            std::error_code ec;
+            for (auto& project : std::filesystem::directory_iterator(root_ / "trees", ec))
+                if (project.is_directory())
+                    for (auto& f : std::filesystem::directory_iterator(project.path(), ec))
+                        if (f.path().extension() == ".manifest")
+                            out.push_back(f.path());
+            return out;
+        }
+        auto key_of(const std::filesystem::path& manifest) const -> std::string {
+            auto rel = std::filesystem::relative(manifest, root_ / "trees");
+            rel.replace_extension();
+            return rel.generic_string();
+        }
+
+        static auto file_clock_to_sys(std::filesystem::file_time_type t) -> std::chrono::system_clock::time_point {
+            return std::chrono::time_point_cast<std::chrono::system_clock::duration>(t - std::filesystem::file_time_type::clock::now() +
+                                                                                     std::chrono::system_clock::now());
+        }
+
+        // Blob and tree files go through the native asynchronous engine, driven from the disk-pool thread that runs the store.
+        static auto engine() -> native::context& {
+            static thread_local native::context resource;
+            return resource;
+        }
+        static constexpr std::size_t piece = 1024 * 1024;
+
+        // Calls `take` with each piece of the file at `p`, in order.
+        template <class Take> static void read_pieces(const std::filesystem::path& p, Take take) {
+            auto size = std::filesystem::file_size(p);
+            auto file = io::open_file(engine().get_scheduler(), p);
+            std::vector<std::byte> buffer(std::min<std::uint64_t>(size, piece));
+            for (std::uint64_t offset = 0; offset < size;) {
+                auto span = std::span{buffer}.first(std::min<std::uint64_t>(piece, size - offset));
+                auto count = cores::run(engine(), io::async_read_at(file, span, offset));
+                if (!count || !*count)
+                    throw std::runtime_error(std::format("short read of {}", p.string()));
+                take(span.first(*count));
+                offset += *count;
+            }
+        }
+
+        static auto read_file(const std::filesystem::path& p) -> std::string {
+            std::string out;
+            read_pieces(p, [&](std::span<const std::byte> bytes) { out.append(reinterpret_cast<const char*>(bytes.data()), bytes.size()); });
+            return out;
+        }
+
+        static auto hash_file(const std::filesystem::path& p) -> content::hash {
+            content::sha256 h;
+            read_pieces(p, [&](std::span<const std::byte> bytes) { h.update(bytes); });
+            return content::to_hex(h.finish());
+        }
+
+        auto read_manifest(std::string_view key) const -> std::vector<placed> {
+            std::vector<placed> out;
+            std::ifstream in{manifest_path(key)};
+            std::string line;
+            while (std::getline(in, line)) {
+                std::istringstream fields{line};
+                placed p;
+                int exec = 0;
+                std::string digest_text;
+                fields >> digest_text >> p.e.size >> exec >> p.mtime;
+                p.e.digest = content::hash{digest_text};
+                fields.get();
+                std::getline(fields, p.e.path);
+                p.e.executable = exec != 0;
+                // The manifest sits where a build can write; a line whose path is not the tree's own is ignored.
+                bool own = !p.e.path.empty();
+                try {
+                    content::checked_path(p.e.path);
+                } catch (const std::invalid_argument&) {
+                    own = false;
+                }
+                if (content::is_hash(p.e.digest) && own)
+                    out.push_back(std::move(p));
+            }
+            return out;
+        }
+
+        std::filesystem::path root_;
+    };
+
+    class store : public view {
+    public:
+        explicit store(std::filesystem::path root, limits l = {}) : view(std::move(root)), lock_(root_, "worker directory"), limits_(l) {
+            std::filesystem::create_directories(root_ / "blobs" / "partial");
+            std::filesystem::create_directories(root_ / "trees");
+            discard(root_ / "discarded");
+            index();
+        }
+
+        auto cache_bytes() const -> std::uint64_t { return cache_bytes_; }
 
         auto offer(const jobs::sync_offer& o) -> jobs::sync_plan {
             checked_project(o.project);
@@ -117,9 +261,6 @@ export namespace replica {
             }
             return ack;
         }
-
-        // The digest of a file, read through the store's engine.
-        static auto hash_of(const std::filesystem::path& p) -> content::hash { return hash_file(p); }
 
         // The files of an offered snapshot.
         auto files(std::string_view project, const content::hash& snapshot) -> std::vector<content::entry> { return find_offer(project, snapshot).files; }
@@ -286,17 +427,6 @@ export namespace replica {
             write_generation(key, state);
         }
 
-        auto generated_inputs(std::string_view project, std::string_view target) const -> std::map<std::string, std::string> {
-            std::map<std::string, std::string> out;
-            for (const auto& [producer, value] : read_generation(tree_key(project, target)).producers)
-                for (const auto& path : value.files)
-                    out.emplace(path, value.object);
-            return out;
-        }
-        auto unfinished_generation(std::string_view project, std::string_view target) const -> bool {
-            return !read_generation(tree_key(project, target)).pending.empty();
-        }
-
         void collect(const std::set<std::string>& busy = {}) {
             auto now = std::chrono::system_clock::now();
             std::error_code ec;
@@ -351,18 +481,9 @@ export namespace replica {
             std::chrono::system_clock::time_point used;
         };
 
-        struct placed {
-            content::entry e;
-            std::int64_t mtime = 0;
-        };
-        static auto stamp(std::filesystem::file_time_type t) -> std::int64_t {
-            return std::chrono::duration_cast<std::chrono::nanoseconds>(t.time_since_epoch()).count();
-        }
-
         auto blob_path(std::string_view h) const -> std::filesystem::path { return root_ / "blobs" / h.substr(0, 2) / h; }
         auto has_blob(std::string_view h) const -> bool { return std::filesystem::exists(blob_path(h)); }
         void touch(const content::hash& h) { used_[h] = std::chrono::system_clock::now(); }
-        auto manifest_path(std::string_view key) const -> std::filesystem::path { return root_ / "trees" / (std::string{key} + ".manifest"); }
         static void withdraw_generated(const std::filesystem::path& dir, const std::set<std::string>& files, const std::set<std::string>& retained) {
             for (const auto& file : files)
                 if (!retained.contains(file)) {
@@ -373,52 +494,11 @@ export namespace replica {
                         std::filesystem::remove(dir / file);
                 }
         }
-        auto generation_path(std::string_view key) const -> std::filesystem::path { return root_ / "trees" / (std::string{key} + ".generated"); }
-        struct generated {
-            struct contribution {
-                std::string object;
-                std::set<std::string> files;
-            };
-            std::map<std::string, contribution> producers;
-            std::set<std::string> pending;
-        };
-        auto read_generation(std::string_view key) const -> generated {
-            if (!std::filesystem::exists(generation_path(key)))
-                return {};
-            std::string bytes;
-            for (auto part : durability::read_plain(generation_path(key), constants::generated_manifest_bytes))
-                bytes.append(reinterpret_cast<const char*>(part.data()), part.size());
-            auto value = rfl::json::read<generated>(bytes);
-            if (!value)
-                throw std::runtime_error("invalid generated output ownership: " + value.error().what());
-            return std::move(*value);
-        }
         void write_generation(std::string_view key, const generated& state) const {
             auto bytes = rfl::json::write(state);
             if (bytes.size() > constants::generated_manifest_bytes)
                 throw std::length_error("generated output ownership exceeds storage limit");
             durability::durable_write(generation_path(key), bytes);
-        }
-
-        auto manifests() const -> std::vector<std::filesystem::path> {
-            std::vector<std::filesystem::path> out;
-            std::error_code ec;
-            for (auto& project : std::filesystem::directory_iterator(root_ / "trees", ec))
-                if (project.is_directory())
-                    for (auto& f : std::filesystem::directory_iterator(project.path(), ec))
-                        if (f.path().extension() == ".manifest")
-                            out.push_back(f.path());
-            return out;
-        }
-        auto key_of(const std::filesystem::path& manifest) const -> std::string {
-            auto rel = std::filesystem::relative(manifest, root_ / "trees");
-            rel.replace_extension();
-            return rel.generic_string();
-        }
-
-        static auto file_clock_to_sys(std::filesystem::file_time_type t) -> std::chrono::system_clock::time_point {
-            return std::chrono::time_point_cast<std::chrono::system_clock::duration>(t - std::filesystem::file_time_type::clock::now() +
-                                                                                     std::chrono::system_clock::now());
         }
 
         void index() {
@@ -444,40 +524,6 @@ export namespace replica {
                         return r.tree;
                     }
             throw std::runtime_error(std::format("unknown snapshot {} of '{}'; offer it first", snapshot, project));
-        }
-
-        // Blob and tree files go through the native asynchronous engine, driven from the disk-pool thread that runs the store.
-        static auto engine() -> native::context& {
-            static thread_local native::context resource;
-            return resource;
-        }
-        static constexpr std::size_t piece = 1024 * 1024;
-
-        // Calls `take` with each piece of the file at `p`, in order.
-        template <class Take> static void read_pieces(const std::filesystem::path& p, Take take) {
-            auto size = std::filesystem::file_size(p);
-            auto file = io::open_file(engine().get_scheduler(), p);
-            std::vector<std::byte> buffer(std::min<std::uint64_t>(size, piece));
-            for (std::uint64_t offset = 0; offset < size;) {
-                auto span = std::span{buffer}.first(std::min<std::uint64_t>(piece, size - offset));
-                auto count = cores::run(engine(), io::async_read_at(file, span, offset));
-                if (!count || !*count)
-                    throw std::runtime_error(std::format("short read of {}", p.string()));
-                take(span.first(*count));
-                offset += *count;
-            }
-        }
-
-        static auto read_file(const std::filesystem::path& p) -> std::string {
-            std::string out;
-            read_pieces(p, [&](std::span<const std::byte> bytes) { out.append(reinterpret_cast<const char*>(bytes.data()), bytes.size()); });
-            return out;
-        }
-
-        static auto hash_file(const std::filesystem::path& p) -> content::hash {
-            content::sha256 h;
-            read_pieces(p, [&](std::span<const std::byte> bytes) { h.update(bytes); });
-            return content::to_hex(h.finish());
         }
 
         // A tree's paths are its own: whatever a build left as a symbolic link on the way to a tracked file is removed, so nothing
@@ -529,33 +575,6 @@ export namespace replica {
             std::filesystem::rename(temp, target);
         }
 
-        auto read_manifest(std::string_view key) const -> std::vector<placed> {
-            std::vector<placed> out;
-            std::ifstream in{manifest_path(key)};
-            std::string line;
-            while (std::getline(in, line)) {
-                std::istringstream fields{line};
-                placed p;
-                int exec = 0;
-                std::string digest_text;
-                fields >> digest_text >> p.e.size >> exec >> p.mtime;
-                p.e.digest = content::hash{digest_text};
-                fields.get();
-                std::getline(fields, p.e.path);
-                p.e.executable = exec != 0;
-                // The manifest sits where a build can write; a line whose path is not the tree's own is ignored.
-                bool own = !p.e.path.empty();
-                try {
-                    content::checked_path(p.e.path);
-                } catch (const std::invalid_argument&) {
-                    own = false;
-                }
-                if (content::is_hash(p.e.digest) && own)
-                    out.push_back(std::move(p));
-            }
-            return out;
-        }
-
         void write_manifest(std::string_view key, const std::vector<placed>& files) const {
             std::string text;
             for (auto& p : files)
@@ -564,7 +583,6 @@ export namespace replica {
             durability::durable_write(manifest_path(key), text);
         }
 
-        std::filesystem::path root_;
         durability::dir_lock lock_;
         limits limits_;
         std::unordered_map<std::string, std::vector<offered>, util::transparent_string_hash, std::equal_to<>> offers_;

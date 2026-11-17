@@ -94,4 +94,5 @@ namespace host {
         ::gethostname(buf.data(), buf.size() - 1);
         return buf.data();
     }
+    auto account() -> std::string { return std::format("{}:{}", ::getuid(), ::getgid()); }
 } // namespace host

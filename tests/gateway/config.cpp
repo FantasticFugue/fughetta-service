@@ -33,6 +33,18 @@ namespace {
                 R"({"dependency_publish":"/published","dependency_recipe":{"executable":"/usr/bin/vcpkg","root":"/opt/vcpkg","triplets":["x64-linux"]}})");
             expect(worker.dependency_publish == "/published" && !worker.dependency_upstream);
         };
+        "a container worker backend serves both roles and publishes no dependencies"_test = [] {
+            for (
+                const auto* text :
+                {R"({"backend":{"kind":"vm","image":"image"}})", R"({"backend":{"kind":"local","image":"image"}})", R"({"backend":{"kind":"docker"}})",
+                 R"({"backend":{"kind":"containerd","image":"image","runtime":"runc"}})", R"({"backend":{"kind":"apple","image":"image","runtime":"kata"}})",
+                 R"({"backend":{"kind":"docker","image":"image","toolchains":["relative"]}})",
+                 R"({"backend":{"kind":"docker","image":"image"},"roles":["execute"]})",
+                 R"({"backend":{"kind":"docker","image":"image"},"dependency_publish":"/published","dependency_recipe":{"executable":"/usr/bin/vcpkg","root":"/opt/vcpkg","triplets":["x64-linux"]}})"})
+                expect(throws<std::invalid_argument>([&] { config::parse_worker(text); })) << text;
+            const auto worker = config::parse_worker(R"({"backend":{"kind":"containerd","image":"image","runtime":"runsc","toolchains":["/opt/toolchains"]}})");
+            expect(worker.backend.kind == "containerd" && worker.backend.host == "127.0.0.1");
+        };
         "source limits and language profiles resolve independently"_test = [] {
             auto d = document();
             config::validate(d);

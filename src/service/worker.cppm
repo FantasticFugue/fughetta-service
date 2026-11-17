@@ -11,6 +11,7 @@ import durability;
 import host;
 import constants;
 import toolchain;
+import sibling;
 
 namespace worker {
     // The Core refused this identity; retrying cannot succeed.
@@ -51,7 +52,19 @@ namespace worker {
                           .dependency_recipe = cfg_.dependency_recipe},
                       compute_) {}
 
-        auto run(native::scheduler& io, std::size_t core) -> coroutine::task<> { co_await builds_.run(core, connected(io, core)); }
+        auto run(native::scheduler& io, std::size_t core) -> coroutine::task<> {
+            if (cfg_.backend.kind == "local") {
+                co_await builds_.run(core, connected(io, core));
+                co_return;
+            }
+            // A container backend runs the execute role in a sibling Worker this one starts on demand.
+            auto beside = [&](coroutine::scope& tasks) -> coroutine::task<> {
+                execute_.emplace(io, tasks, cfg_, builds_.root());
+                builds_.set_execute(*execute_);
+                co_await builds_.run(core, connected(io, core));
+            };
+            co_await coroutine::with_scope(std::move(beside));
+        }
 
         auto connected(native::scheduler& io, std::size_t core) -> coroutine::task<> {
             auto identity = co_await offload(io, [this] {
@@ -248,6 +261,7 @@ namespace worker {
         std::string toolchain_;
         execution::thread_pool compute_;
         replica::service builds_;
+        std::optional<sibling::manager> execute_;
     };
 } // namespace worker
 

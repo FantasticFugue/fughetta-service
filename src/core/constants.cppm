@@ -26,6 +26,12 @@ export namespace constants {
     // What a worker takes. The execute role runs code the project supplies: builds, preparations and the
     // analyses that load it. The analyze role reads the project's data with this program's own code.
     inline constexpr std::string_view execute_role = "execute", analyze_role = "analyze";
+    // A container's execute role must dial back within this, and stops once idle for the other.
+    inline constexpr auto execute_start = std::chrono::seconds{60};
+    inline constexpr auto execute_idle = std::chrono::minutes{10};
+    // What an analysis beside a container's execute role keeps of the host environment.
+    inline constexpr std::array<std::string_view, 9> analysis_environment{"PATH", "HOME",      "LANG",        "LC_ALL",    "TMPDIR",
+                                                                          "USER", "JAVA_HOME", "DOTNET_ROOT", "SystemRoot"};
     inline constexpr std::size_t language_sessions = 16;
     inline constexpr std::size_t semantic_candidates_per_unit = 4;
     inline constexpr auto semantic_view_retention = std::chrono::hours{24};

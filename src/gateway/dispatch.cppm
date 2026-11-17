@@ -1099,7 +1099,8 @@ export namespace tools {
                                              .retained = request.retained,
                                              .registration = plan.server.registration,
                                              .documents = plan.server.documents,
-                                             .project_code = language::describe_provider(request.config.server).executes_project_code};
+                                             .project_code = language::describe_provider(request.config.server).executes_project_code,
+                                             .model_code = language::describe_provider(request.config.server).model_code};
         auto& registry = zero.files;
         auto& rt = zero.workers.io_context();
         auto& router = zero.workers;

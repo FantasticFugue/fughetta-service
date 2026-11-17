@@ -180,6 +180,9 @@ namespace native_process {
     auto child::spawn(native_io::engine<concurrent::queue>& engine, const io::command& cmd) -> child {
         if (cmd.argv.empty() || cmd.argv.front().empty())
             throw std::invalid_argument("spawn: empty command");
+        // Analysis hosts that isolate the network are the POSIX ones; a Windows Worker serves both roles in one process.
+        if (cmd.offline)
+            throw std::invalid_argument("spawn: network isolation is not available on Windows");
         auto s = std::make_unique<state>(engine);
         s->job = winapi::handle{::CreateJobObjectW(nullptr, nullptr)};
         if (!s->job.value)

@@ -115,6 +115,11 @@ namespace native_process {
                     ::_exit(126);
                 }
             }
+            if (cmd.offline && !posix::isolate_network()) {
+                constexpr char message[] = "worker: cannot isolate the network; command not started\n";
+                ::write(2, message, sizeof(message) - 1);
+                ::_exit(126);
+            }
             if (::chdir(dir) != 0)
                 ::_exit(126);
             posix::environment() = envp;

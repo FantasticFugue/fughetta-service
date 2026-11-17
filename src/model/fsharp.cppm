@@ -27,8 +27,9 @@ export namespace language {
         }
         using emits = std::tuple<domain<"clr">>;
         static auto requirements(const options& o) -> builds::requirements { return builds::tools({o.executable, o.host, o.adapter}); }
-        // The compiler service loads the type providers the project references, and those may be the project's own.
-        static auto executes_project_code(const options&) -> bool { return true; }
+        // The compiler service runs only the type providers and analyzers the project model names; a model without them runs no project code.
+        static constexpr bool model_code = true;
+        static auto executes_project_code(const options&) -> bool { return false; }
         static void validate(const options& o) {
             (void)requirements(o);
             for (const auto& value : {o.executable, o.host, o.adapter}) {

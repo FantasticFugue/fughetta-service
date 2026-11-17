@@ -1,5 +1,7 @@
 module;
 #include <errno.h>
+#include <fcntl.h>
+#include <sched.h>
 #include <signal.h>
 #include <sys/prctl.h>
 #include <sys/socket.h>
@@ -87,6 +89,38 @@ namespace posix {
     auto follow_parent(int parent) noexcept -> bool { return ::prctl(PR_SET_PDEATHSIG, SIGKILL) == 0 && ::getppid() == parent; }
     auto descriptor_bound() noexcept -> int { return 0; }
     auto close_inherited(int) noexcept -> bool { return ::syscall(close_range_call, 3u, ~0u, 0) == 0; }
+    // A user namespace that maps only this user lets an unprivileged process own a network namespace, which starts with
+    // loopback down and no other interface. Only async-signal-safe calls run here.
+    auto isolate_network() noexcept -> bool {
+        auto put = [](const char* path, const char* text, std::size_t size) {
+            int fd = ::open(path, O_WRONLY | O_CLOEXEC);
+            if (fd < 0)
+                return false;
+            bool written = ::write(fd, text, size) == static_cast<ssize_t>(size);
+            ::close(fd);
+            return written;
+        };
+        auto map = [&](const char* path, unsigned id) {
+            char digits[10];
+            std::size_t count = 0;
+            do
+                digits[count++] = static_cast<char>('0' + id % 10);
+            while ((id /= 10) != 0);
+            char line[24];
+            std::size_t size = 0;
+            for (int copy = 0; copy < 2; ++copy) {
+                for (auto i = count; i > 0; --i)
+                    line[size++] = digits[i - 1];
+                line[size++] = ' ';
+            }
+            line[size++] = '1';
+            return put(path, line, size);
+        };
+        auto user = ::getuid();
+        auto group = ::getgid();
+        return ::unshare(CLONE_NEWUSER | CLONE_NEWNET) == 0 && put("/proc/self/setgroups", "deny", 4) && map("/proc/self/uid_map", user) &&
+               map("/proc/self/gid_map", group);
+    }
     auto exit_handle(int pid) -> int {
         auto handle = static_cast<int>(::syscall(open_pid_call, pid, 0));
         if (handle < 0)

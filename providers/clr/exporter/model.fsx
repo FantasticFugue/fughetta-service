@@ -2,6 +2,8 @@ open System
 open System.IO
 open System.Diagnostics
 open System.Collections.Generic
+open System.Reflection.Metadata
+open System.Reflection.PortableExecutable
 open System.Security.Cryptography
 open System.Text.Json.Nodes
 open System.Text.RegularExpressions
@@ -32,6 +34,22 @@ let run (tool: string) (cwd: string) (args: seq<string>) =
 let digest path =
     use input = File.OpenRead(path)
     SHA256.HashData(input) |> Convert.ToHexStringLower
+// Whether the compiler would load the assembly at `path` as a type provider. An assembly that cannot be read counts as one.
+let providesTypes (path: string) =
+    File.Exists path &&
+    try
+        use pe = new PEReader(File.OpenRead path)
+        pe.HasMetadata &&
+        let metadata = pe.GetMetadataReader()
+        metadata.GetAssemblyDefinition().GetCustomAttributes() |> Seq.exists (fun handle ->
+            let constructor = metadata.GetCustomAttribute(handle).Constructor
+            constructor.Kind = HandleKind.MemberReference &&
+            let parent = metadata.GetMemberReference(MemberReferenceHandle.op_Explicit constructor).Parent
+            parent.Kind = HandleKind.TypeReference &&
+            let attribute = metadata.GetTypeReference(TypeReferenceHandle.op_Explicit parent)
+            metadata.GetString(attribute.Namespace) = "Microsoft.FSharp.Core.CompilerServices" &&
+            metadata.GetString(attribute.Name) = "TypeProviderAssemblyAttribute")
+    with _ -> true
 let write (path: string) (value: JsonNode) =
     Directory.CreateDirectory(Path.GetDirectoryName(full path)) |> ignore
     let temp = path + "." + Guid.NewGuid().ToString("N") + ".tmp"
@@ -202,6 +220,10 @@ let main () =
                             if automatic || generatedInputs |> Array.exists (fun input -> within input path) then
                                 generated[logical] <- intern path
                         let refs = ResizeArray<JsonNode>()
+                        let mutable typeProviders = false
+                        for item in values items["ReferencePath"] do
+                            let framework = (field item "NuGetPackageId").EndsWith(".Ref", StringComparison.Ordinal) || field item "FrameworkReferenceName" <> ""
+                            if not framework && providesTypes (full (field item "FullPath")) then typeProviders <- true
                         for item in values items["ReferencePath"] |> Seq.filter (fun item ->
                             field item "ReferenceSourceTarget" <> "ProjectReference" && field item "MSBuildSourceProjectFile" = "") do
                             let pack = field item "NuGetPackageId"
@@ -217,7 +239,8 @@ let main () =
                             "compiler_arguments", compilerArguments; "extensions", object ["framework", text target;
                                 "assembly", props["AssemblyName"].DeepClone(); "language_version", props["LangVersion"].DeepClone();
                                 "defines", strings ((field props "DefineConstants").Split(';', StringSplitOptions.RemoveEmptyEntries));
-                                "additional_files", strings (values items["AdditionalFiles"] |> Seq.map (fun item -> relative root (field item "FullPath")))]]
+                                "additional_files", strings (values items["AdditionalFiles"] |> Seq.map (fun item -> relative root (field item "FullPath")));
+                                "type_providers", (JsonValue.Create(typeProviders) :> JsonNode)]]
                         units[id] <- unit
                         for item in values items["_MSBuildProjectReferenceExistent"] do
                             if field item "ReferenceOutputAssembly" <> "false" then

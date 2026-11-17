@@ -326,6 +326,8 @@ export namespace language {
         bool dependency_reads = false, cancellation = true, exclusive_directory = true;
         // Whether a session under this configuration runs code the project supplies.
         bool executes_project_code = false;
+        // Whether a session loads the compiler plugins or type providers its project model names, which may be the project's own.
+        bool model_code = false;
         builds::requirements needs;
     };
     struct program {

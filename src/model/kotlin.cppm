@@ -29,8 +29,9 @@ export namespace language {
         }
         using emits = std::tuple<domain<"jvm">>;
         static auto requirements(const options& o) -> builds::requirements { return builds::tools({o.executable, o.host, o.adapter}); }
-        // The adapter loads the compiler plugins the project model declares, and those may be the project's own.
-        static auto executes_project_code(const options&) -> bool { return true; }
+        // The adapter runs only the compiler plugins the project model declares; a model without them runs no project code.
+        static constexpr bool model_code = true;
+        static auto executes_project_code(const options&) -> bool { return false; }
         static void validate(const options& o) {
             (void)requirements(o);
             for (const auto& value : {o.executable, o.host, o.adapter}) {

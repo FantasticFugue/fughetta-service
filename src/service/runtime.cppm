@@ -115,6 +115,7 @@ export namespace runtime {
                 worker.max_inflight = 1;
                 worker.max_analyses = 1;
                 worker.tools = doc.tools;
+                worker.backend = doc.worker_backend;
                 worker.parallel = plan.workers[i].parallel;
                 worker.memory_bytes = plan.workers[i].memory_bytes;
                 auto file = directory / (worker.name + ".json");

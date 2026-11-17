@@ -128,4 +128,5 @@ namespace host {
             winapi::fail("GetComputerNameEx");
         return winapi::utf8(std::wstring_view{text.data(), count});
     }
+    auto account() -> std::string { return {}; }
 } // namespace host

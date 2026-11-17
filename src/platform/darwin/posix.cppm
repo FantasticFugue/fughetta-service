@@ -1,5 +1,6 @@
 module;
 #include <crt_externs.h>
+#include <sandbox.h>
 #include <mach-o/dyld.h>
 #include <unistd.h>
 #include <libproc.h>
@@ -81,6 +82,15 @@ namespace posix {
         for (int fd = 3; fd < bound; ++fd)
             ::close(fd);
         return true;
+    }
+    // The system profile that denies every socket; the call is deprecated but remains the only one a process can apply
+    // to itself.
+    auto isolate_network() noexcept -> bool {
+        char* error = nullptr;
+        if (::sandbox_init(kSBXProfileNoNetwork, SANDBOX_NAMED, &error) == 0)
+            return true;
+        ::sandbox_free_error(error);
+        return false;
     }
     auto exit_handle(int) -> int { return -1; }
 

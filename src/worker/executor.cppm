@@ -21,6 +21,21 @@ import process;
 import allocation;
 
 export namespace replica {
+    // A call path to the execute role of this Worker when it runs in a process of its own. `hold` keeps the process from
+    // being stopped while the caller uses `chan`.
+    struct execute_link {
+        transport::channel<native::socket>& chan;
+        std::shared_ptr<void> hold;
+    };
+    class execute_side {
+    public:
+        virtual ~execute_side() = default;
+        // The execute role's directory, which this process reads.
+        virtual auto root() const -> const std::filesystem::path& = 0;
+        // Starts the execute role when it is not running.
+        virtual auto open() -> coroutine::task<execute_link> = 0;
+    };
+
     struct options {
         std::filesystem::path root = "work";
         std::string worker;
@@ -35,6 +50,9 @@ export namespace replica {
         std::optional<std::filesystem::path> dependency_publish;
         std::optional<builds::dependency_recipe> dependency_recipe;
         toolchain::identity runtime;
+        // Set when the execute role runs elsewhere: this process then answers analyses that run no project code, and
+        // forwards everything else.
+        execute_side* execute = nullptr;
     };
 
     class service {
@@ -46,6 +64,12 @@ export namespace replica {
             : rt_(rt), store_(o.root, o.limits), options_(std::move(o)), pool_(pool), home_(home) {}
 
         void set_runtime(toolchain::identity identity) { options_.runtime = std::move(identity); }
+        auto root() const -> const std::filesystem::path& { return options_.root; }
+        // From now on the execute role runs behind `side`; this process reads the trees it prepares.
+        void set_execute(execute_side& side) {
+            options_.execute = &side;
+            execute_view_.emplace(side.root());
+        }
 
         // The owner keeps the I/O runtime alive until all context-owned children are gone.
         auto run(std::size_t core, coroutine::task<> work) -> coroutine::task<> {
@@ -100,18 +124,27 @@ export namespace replica {
         template <io::stream S> void install(transport::dispatcher<S>& d, std::size_t core) {
             auto handle_export_read = [this, core](jobs::export_read request, auto&) -> coroutine::task<jobs::source_bytes> {
                 require_consumer();
-                co_return co_await io::blocking(rt_.get_scheduler(core), pool_, [this, root = options_.root, request] {
+                auto execute = execute_view_ ? std::optional{execute_view_->root() / "exports"} : std::nullopt;
+                co_return co_await io::blocking(rt_.get_scheduler(core), pool_, [this, root = options_.root, execute, request] {
                     std::shared_lock guard{exports_lock_};
+                    // What the execute role captured stays in its own directory.
+                    if (execute && !std::filesystem::exists(root / "exports" / request.digest.view()))
+                        return delivery::read(*execute, request);
                     return delivery::read(root / "exports", request);
                 });
             };
             d.template on<jobs::export_read>(std::move(handle_export_read));
-            d.template on<jobs::sync_offer>([this, core](jobs::sync_offer o, auto&) {
+            auto handle_sync_offer = [this, core](jobs::sync_offer o, auto&) -> coroutine::task<jobs::sync_plan> {
                 require_consumer();
-                return at_home(core, [o = std::move(o)](store& s) { return s.offer(o); });
-            });
+                if (options_.execute)
+                    co_return co_await forward(o);
+                co_return co_await at_home(core, [o = std::move(o)](store& s) { return s.offer(o); });
+            };
+            d.template on<jobs::sync_offer>(std::move(handle_sync_offer));
             auto handle_source_bytes = [this, core](jobs::source_bytes p, auto&) -> coroutine::task<jobs::authority_ack> {
                 require_consumer();
+                if (options_.execute)
+                    co_return co_await forward(p);
                 if (core == home_)
                     co_return co_await push(std::move(p));
                 co_return co_await cores::call(rt_.get_scheduler(core), rt_.get_scheduler(home_), [this, p = std::move(p)] { return push(p); });
@@ -124,6 +157,12 @@ export namespace replica {
                 auto execute = [&](coroutine::scope& children) -> coroutine::task<jobs::build_report> {
                     auto close = jobs::analysis_exchange::lifetime{inputs};
                     children.spawn(relay(ex, inputs));
+                    if (options_.execute) {
+                        if (core != home_)
+                            throw std::logic_error("a Worker with an execute role of its own runs on one core");
+                        auto sink = [&ex](jobs::progress p) { return ex.progress(std::move(p)); };
+                        co_return co_await front(std::move(r), inputs, sink);
+                    }
                     if (core == home_)
                         co_return co_await build(std::move(r), inputs);
                     co_return co_await cores::call(rt_.get_scheduler(core), rt_.get_scheduler(home_),
@@ -207,6 +246,119 @@ export namespace replica {
             co_return co_await build(std::move(build_request));
         }
 
+        // Asks the execute role and answers its questions through `inputs`, relaying its progress to `sink`.
+        template <class Req, class Sink> auto forward(const Req& request, jobs::analysis_link inputs, Sink& sink) -> coroutine::task<jobs::reply_t<Req>> {
+            auto link = co_await options_.execute->open();
+            jobs::progress_log log;
+            std::optional<transport::call_result<jobs::reply_t<Req>>> reply;
+            bool done = false;
+            auto ask = [&]() -> coroutine::task<> {
+                struct finish {
+                    bool& done;
+                    ~finish() { done = true; }
+                } finish{done};
+                reply.emplace(co_await link.chan.call(request, &log, inputs));
+            };
+            auto relay_progress = [&]() -> coroutine::task<> {
+                std::size_t seen = 0;
+                for (;;) {
+                    const bool last = done;
+                    for (auto& p : log.since(seen))
+                        co_await sink(std::move(p));
+                    if (last)
+                        co_return;
+                    co_await execution::schedule_after(rt_.get_scheduler(home_), std::chrono::milliseconds{150});
+                }
+            };
+            co_await execution::when_all(ask(), relay_progress());
+            if (!*reply) {
+                if (auto* failure = std::get_if<jobs::failure>(&reply->error()))
+                    throw transport::coded_error(failure->code, std::move(failure->message));
+                transport::raise_call_error(std::move(reply->error()));
+            }
+            co_return std::move(**reply);
+        }
+
+        template <class Req> auto forward(const Req& request) -> coroutine::task<jobs::reply_t<Req>> {
+            auto ignore = [](jobs::progress) -> coroutine::task<> { co_return; };
+            co_return co_await forward(request, jobs::analysis_link{}, ignore);
+        }
+
+        // A build beside a container's execute role runs there. An unchanged preparation the receipt still holds
+        // answers without starting it, so analyses keep working while it is stopped.
+        template <class Sink> auto front(jobs::build_request r, jobs::analysis_link inputs, Sink& sink) -> coroutine::task<jobs::build_report> {
+            const auto started = std::chrono::steady_clock::now();
+            const auto key = store::tree_key(r.project, r.tree);
+            auto turn = co_await lock_tree(key);
+            if (!r.fresh)
+                r.fresh = co_await observed([&](const view& trees) { return trees.unfinished_generation(r.project, r.tree); });
+            // The stage a preparation serves only names its memory reservation.
+            auto same = r;
+            same.timeout_s = 0;
+            same.prepares = same.prepares ? std::optional<std::string>{std::string{}} : std::nullopt;
+            const auto request = content::hash_of(rfl::json::write(same)).str();
+            const auto dir = trees().tree(key);
+            if (auto found = preparations_.find(key); found != preparations_.end()) {
+                if (!r.fresh && r.prepares && r.exports.empty() && found->second.snapshot == r.snapshot && found->second.request == request &&
+                    std::filesystem::is_directory(dir)) {
+                    found->second.used = std::chrono::steady_clock::now();
+                    co_return jobs::build_report{.worker = options_.worker,
+                                                 .tree = dir.string(),
+                                                 .measured = found->second.inputs.outputs,
+                                                 .execution_seconds = 0.0,
+                                                 .inputs = found->second.inputs};
+                }
+                preparations_.erase(found);
+            }
+            if (r.fresh)
+                co_await retire_slot(key);
+            auto report = co_await forward(r, inputs, sink);
+            if (r.prepares && !report.ok())
+                co_await coroutine::under(coroutine::stop_token{}, retire_slot(key));
+            if (r.prepares && report.ok() && report.inputs) {
+                preparation prepared{.snapshot = r.snapshot, .inputs = *report.inputs, .request = request};
+                prepared.files = co_await observed([&](const view& trees) { return trees.placed_files(key); });
+                // An analysis here reads the tree only when it holds exactly the snapshot's files.
+                prepared.forward = content::manifest{prepared.files}.id() != r.snapshot;
+                if (!prepared.forward)
+                    prepared.loads_code = co_await install_models(r.measure, dir, inputs, prepared.models);
+                prepared.used = std::chrono::steady_clock::now();
+                preparations_[key] = std::move(prepared);
+            }
+            report.seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
+            co_return report;
+        }
+
+        // An analysis that runs project code runs beside the build; any other runs here, offline.
+        template <class Sink> auto front(jobs::analysis_request work, jobs::analysis_link inputs, Sink& sink) -> coroutine::task<jobs::build_report> {
+            const auto key = store::tree_key(work.project, work.tree);
+            const auto prepared = preparations_.find(key);
+            const bool remote = prepared != preparations_.end() && prepared->second.snapshot == work.snapshot && prepared->second.inputs.id() == work.inputs &&
+                                (prepared->second.forward || work.analysis.project_code || (work.analysis.model_code && prepared->second.loads_code));
+            if (!remote)
+                co_return co_await build(std::move(work), inputs);
+            auto turn = co_await lock_tree(key);
+            // The receipt stays while the execute role answers analyses of its tree.
+            struct holding {
+                std::map<std::string, int>& active;
+                std::string key;
+                ~holding() {
+                    if (!--active.at(key))
+                        active.erase(key);
+                }
+            } hold{active_, key};
+            ++active_[key];
+            if (auto found = preparations_.find(key); found != preparations_.end())
+                found->second.used = std::chrono::steady_clock::now();
+            try {
+                co_return co_await forward(work, inputs, sink);
+            } catch (const transport::coded_error& error) {
+                if (error.code == jobs::why::stale_inputs)
+                    preparations_.erase(key);
+                throw;
+            }
+        }
+
         template <class Exchange> static auto relay(Exchange& execution, jobs::analysis_link inputs) -> coroutine::task<> {
             while (auto item = co_await inputs->next()) {
                 auto release = jobs::analysis_exchange::completion{item};
@@ -287,6 +439,12 @@ export namespace replica {
             jobs::analysis_inputs inputs;
             delivery::pins models;
             std::chrono::steady_clock::time_point used;
+            // A model the inputs name loads compiler plugins or type providers.
+            bool loads_code = false;
+            // This process cannot read the tree, and the execute role answers every analysis of it.
+            bool forward = false;
+            // The build request that made it, without its deadline.
+            std::string request;
         };
 
         std::uint64_t status_sequence_ = 0;
@@ -417,8 +575,11 @@ export namespace replica {
                 std::rethrow_exception(failed);
         }
 
+        // Beside a container's execute role the tree here is that role's, which no analysis here writes; only its
+        // builds replace the receipt.
         auto retire_slot(const std::string& slot) -> coroutine::task<> {
-            preparations_.erase(slot);
+            if (!options_.execute)
+                preparations_.erase(slot);
             std::vector<session_key> sessions;
             for (const auto& [key, _] : contexts_)
                 if (key.first == slot)
@@ -438,7 +599,7 @@ export namespace replica {
 
         auto status_home() -> coroutine::task<jobs::slot_report> {
             jobs::slot_report out;
-            out.slots = co_await locked([](store& s) { return s.slots(); });
+            out.slots = co_await observed([](const view& trees) { return trees.slots(); });
             for (auto& slot : out.slots) {
                 const auto key = store::tree_key(slot.project, slot.tree);
                 slot.busy = active_.contains(key);
@@ -526,6 +687,36 @@ export namespace replica {
             auto held = co_await store_lock_.lock();
             co_return co_await io::blocking(rt_.get_scheduler(home_), pool_, [this, f = std::move(f)]() mutable { return f(store_); });
         }
+        // The trees builds write: this process's own, or the execute role's, which this one only reads.
+        auto trees() const -> const view& { return execute_view_ ? *execute_view_ : store_; }
+        template <class F> auto observed(F f) -> coroutine::task<std::invoke_result_t<F&, const view&>> {
+            if (!execute_view_)
+                co_return co_await locked(std::move(f));
+            co_return co_await io::blocking(rt_.get_scheduler(home_), pool_, [this, f = std::move(f)]() mutable { return f(*execute_view_); });
+        }
+
+        struct tree_turn {
+            std::unordered_map<std::string, std::weak_ptr<coroutine::mutex>>& locks;
+            std::string key;
+            std::shared_ptr<coroutine::mutex> lock;
+            std::optional<coroutine::mutex::guard> turn;
+            ~tree_turn() {
+                turn.reset();
+                if (lock.use_count() == 1)
+                    locks.erase(key);
+            }
+        };
+        // Builds and analyses of one tree take turns.
+        auto lock_tree(const std::string& key) -> coroutine::task<std::unique_ptr<tree_turn>> {
+            auto lock = tree_locks_[key].lock();
+            if (!lock) {
+                lock = std::make_shared<coroutine::mutex>();
+                tree_locks_[key] = lock;
+            }
+            auto held = std::make_unique<tree_turn>(tree_locks_, key, std::move(lock));
+            held->turn.emplace(co_await held->lock->lock());
+            co_return held;
+        }
 
         auto push(jobs::source_bytes p) -> coroutine::task<jobs::authority_ack> {
             co_await collect_sessions();
@@ -555,6 +746,21 @@ export namespace replica {
             return env;
         }
 
+        // An analysis beside a container's execute role: the host's locations and locale, and the Worker's own settings.
+        auto confined(const std::map<std::string, std::string>& step) const -> std::map<std::string, std::string> {
+            std::map<std::string, std::string> env;
+            const auto host = host::environment();
+            for (const auto name : constants::analysis_environment)
+                if (const auto found = host.find(std::string{name}); found != host.end())
+                    env.insert(*found);
+            for (auto& [k, v] : options_.env)
+                env[k] = v;
+            for (auto& [k, v] : step)
+                env[k] = v;
+            env["OMP_NUM_THREADS"] = std::to_string(options_.parallel);
+            return env;
+        }
+
         void allocate_runtime(std::map<std::string, std::string>& env) const {
             const auto jobs = std::to_string(options_.parallel);
             auto& java = env["JAVA_TOOL_OPTIONS"];
@@ -568,21 +774,7 @@ export namespace replica {
             co_await collect_sessions();
             auto started = std::chrono::steady_clock::now();
             auto key = store::tree_key(r.project, r.tree);
-            auto lock = tree_locks_[key].lock();
-            if (!lock) {
-                lock = std::make_shared<coroutine::mutex>();
-                tree_locks_[key] = lock;
-            }
-            struct tree_lifetime {
-                std::unordered_map<std::string, std::weak_ptr<coroutine::mutex>>& locks;
-                std::string key;
-                std::shared_ptr<coroutine::mutex> lock;
-                ~tree_lifetime() {
-                    if (lock.use_count() == 1)
-                        locks.erase(key);
-                }
-            } lifetime{tree_locks_, key, std::move(lock)};
-            auto turn = co_await lifetime.lock->lock();
+            auto turn = co_await lock_tree(key);
             struct release_resources {
                 service* owner;
                 std::string key;
@@ -663,7 +855,7 @@ export namespace replica {
                 report = co_await coroutine::under(token, run_steps(r, dir, reports, deadline, r.prepares.has_value(), messages, model_pins));
                 if (report && report->ok() && preparation) {
                     auto remaining = std::max(std::chrono::steady_clock::duration::zero(), deadline - std::chrono::steady_clock::now());
-                    co_await install_models(r.measure, dir, messages, model_pins);
+                    prepared.loads_code = co_await install_models(r.measure, dir, messages, model_pins);
                     const auto measuring = std::chrono::steady_clock::now();
                     auto finished = co_await coroutine::under(token, coroutine::deadline(rt_.get_scheduler(home_), remaining, measure(r, dir, files, *report)));
                     *report->execution_seconds += std::chrono::duration<double>(std::chrono::steady_clock::now() - measuring).count();
@@ -734,21 +926,7 @@ export namespace replica {
             auto key = store::tree_key(r.project, r.tree);
             if (analysis->slot_id != key)
                 throw std::invalid_argument("analysis request belongs to another slot");
-            auto lock = tree_locks_[key].lock();
-            if (!lock) {
-                lock = std::make_shared<coroutine::mutex>();
-                tree_locks_[key] = lock;
-            }
-            struct tree_lifetime {
-                std::unordered_map<std::string, std::weak_ptr<coroutine::mutex>>& locks;
-                std::string key;
-                std::shared_ptr<coroutine::mutex> lock;
-                ~tree_lifetime() {
-                    if (lock.use_count() == 1)
-                        locks.erase(key);
-                }
-            } lifetime{tree_locks_, key, std::move(lock)};
-            auto turn = co_await lifetime.lock->lock();
+            auto turn = co_await lock_tree(key);
             struct release_resources {
                 service* owner;
                 std::string key;
@@ -772,7 +950,11 @@ export namespace replica {
             jobs::build_report report{.worker = options_.worker, .measured = prepared->second.inputs.outputs, .preparation_seconds = 0, .execution_seconds = 0};
             auto model_pins = prepared->second.models;
             const auto files = prepared->second.files;
-            const auto dir = store_.tree(key);
+            const auto loads_code = prepared->second.loads_code;
+            // A preparation that finished while this analysis waited for the tree may hand it to the execute role.
+            if (options_.execute && (prepared->second.forward || analysis->project_code || (analysis->model_code && loads_code)))
+                throw transport::coded_error(jobs::why::stale_inputs, "the execute role answers this analysis");
+            const auto dir = trees().tree(key);
             report.tree = dir.string();
             report.analysis_execution = analysis->execution;
             auto parent_token = co_await coroutine::current_token;
@@ -794,8 +976,9 @@ export namespace replica {
             std::exception_ptr failed;
             bool stopped = false, expired = false;
             try {
-                auto finished = co_await coroutine::under(token, coroutine::deadline(rt_.get_scheduler(home_), std::chrono::milliseconds{milliseconds},
-                                                                                     analyze(r, *analysis, dir, files, report, messages, model_pins)));
+                auto finished =
+                    co_await coroutine::under(token, coroutine::deadline(rt_.get_scheduler(home_), std::chrono::milliseconds{milliseconds},
+                                                                         analyze(r, *analysis, dir, files, report, messages, model_pins, loads_code)));
                 stopped = !finished;
                 if (finished && !*finished) {
                     expired = true;
@@ -872,9 +1055,11 @@ export namespace replica {
             });
         }
 
+        // Installs the project models among `inputs` with the objects they name, and tells whether one loads code.
         auto install_models(const std::vector<builds::context>& inputs, const std::filesystem::path& dir, const jobs::analysis_link& fetch,
-                            delivery::pins& held) -> coroutine::task<> {
+                            delivery::pins& held) -> coroutine::task<bool> {
             const auto storage = options_.root / "exports";
+            bool loads_code = false;
             for (const auto& input : inputs) {
                 if (input.type != "project_model")
                     continue;
@@ -889,6 +1074,8 @@ export namespace replica {
                     std::erase_if(objects, [&](const auto& id) { return std::filesystem::is_regular_file(storage / id); });
                     return std::pair{std::move(file), std::move(objects)};
                 });
+                if (execute_view_)
+                    missing = co_await io::blocking(rt_.get_scheduler(home_), pool_, [&] { return copy_objects(storage, std::move(missing)); });
                 for (const auto& id : missing) {
                     if (!fetch)
                         throw std::runtime_error("model object receiver is unavailable");
@@ -925,12 +1112,47 @@ export namespace replica {
                         });
                     } while (offset < total);
                 }
-                co_await io::blocking(rt_.get_scheduler(home_), pool_, [&] {
-                    std::unique_lock guard{exports_lock_};
-                    delivery::retain_model(storage, file.digest);
-                    projectmodel::installed(delivery::model(storage, file.digest), storage, options_.runtime.inputs);
-                });
+                loads_code = co_await io::blocking(rt_.get_scheduler(home_), pool_,
+                                                   [&] {
+                                                       std::unique_lock guard{exports_lock_};
+                                                       delivery::retain_model(storage, file.digest);
+                                                       const auto model = delivery::model(storage, file.digest);
+                                                       projectmodel::installed(model, storage, options_.runtime.inputs);
+                                                       return projectmodel::loads_code(model);
+                                                   }) ||
+                             loads_code;
             }
+            co_return loads_code;
+        }
+
+        // Copies the objects the execute role already holds, checking each against its name; returns the rest.
+        auto copy_objects(const std::filesystem::path& storage, std::set<std::string> wanted) -> std::set<std::string> {
+            const auto from = execute_view_->root() / "exports";
+            const auto receiving = storage / ("pending-model-" + nodes::hex(nodes::random_bytes(16)));
+            struct cleanup {
+                std::filesystem::path path;
+                ~cleanup() {
+                    std::error_code ec;
+                    durability::remove_tree(path, ec);
+                }
+            } cleanup{receiving};
+            std::filesystem::create_directories(receiving / "partial");
+            std::set<std::string> rest;
+            for (const auto& id : wanted) {
+                std::error_code ec;
+                const auto size = std::filesystem::file_size(from / id, ec);
+                if (ec || size > constants::export_bytes || !std::filesystem::copy_file(from / id, receiving / "partial" / id, ec) || ec) {
+                    rest.insert(id);
+                    continue;
+                }
+                delivery::verify(receiving, content::hash{id}, size);
+                std::unique_lock guard{exports_lock_};
+                if (!std::filesystem::exists(storage / id)) {
+                    delivery::readonly(receiving / "partial" / id);
+                    durability::durable_rename(receiving / "partial" / id, storage / id);
+                }
+            }
+            return rest;
         }
 
         auto source_objects(const jobs::analysis_plan& analysis, const jobs::analysis_link& fetch) -> coroutine::task<language::record_inputs> {
@@ -998,7 +1220,7 @@ export namespace replica {
         }
 
         auto analyze(const jobs::build_request& r, const jobs::analysis_plan& plan, const std::filesystem::path& dir, const std::vector<content::entry>& files,
-                     jobs::build_report& report, const jobs::analysis_link& messages, delivery::pins& model_pins) -> coroutine::task<> {
+                     jobs::build_report& report, const jobs::analysis_link& messages, delivery::pins& model_pins, bool loads_code) -> coroutine::task<> {
             const auto* analysis = &plan;
             if (!messages)
                 throw std::logic_error("analysis requires an input exchange");
@@ -1048,7 +1270,12 @@ export namespace replica {
                                                .registration = analysis->registration,
                                                .documents = analysis->documents},
                                               dir, options_.tools, options_.parallel, cache);
-                auto env = environment(plan.project_code ? r.env : std::map<std::string, std::string>{}, local.env);
+                // A session that runs project code sees the project's environment; beside a container's execute role, an
+                // analysis here never does, and sees no credential of the host either.
+                const bool trusted = plan.project_code || (plan.model_code && loads_code);
+                if (options_.execute && trusted)
+                    throw std::logic_error("the execute role answers analyses that run project code");
+                auto env = options_.execute ? confined(local.env) : environment(trusted ? r.env : std::map<std::string, std::string>{}, local.env);
                 const auto semantic_environment = env;
                 const auto transport = analysis->registration
                                            ? analysis->registration->adapter
@@ -1088,12 +1315,16 @@ export namespace replica {
                     // there is no external executable subset to select.
                     if (!executables.empty())
                         runtime.execution = toolchain::select(runtime, executables, semantic_environment);
+                    // Beside a container's execute role, only what the startup inventory hashed may start here.
+                    if (options_.execute && !executables.empty() && runtime.execution.empty())
+                        throw std::invalid_argument("the analysis names an executable outside this Worker's toolchain");
                     allocate_runtime(env);
                     io::command command{.argv = std::move(local.argv),
                                         .cwd = dir,
                                         .env = std::move(env),
                                         .max_memory_bytes = r.max_memory_bytes,
                                         .max_cpu_seconds = r.max_cpu_seconds,
+                                        .offline = options_.execute != nullptr,
                                         .processes = value->processes.group()};
                     value->server = language::make_adapter(rt_.get_scheduler(home_), std::move(command),
                                                            language::session_state{.slot = slot,
@@ -1121,7 +1352,7 @@ export namespace replica {
                 std::map<std::string, std::string> source_files;
                 for (const auto& file : files)
                     source_files.emplace(file.path, file.digest.str());
-                auto generated = co_await locked([&](store& s) { return s.generated_inputs(r.project, r.tree); });
+                auto generated = co_await observed([&](const view& trees) { return trees.generated_inputs(r.project, r.tree); });
                 auto source_facts = co_await source_objects(*analysis, messages);
                 hot.models.insert(hot.models.end(), model_pins.begin(), model_pins.end());
                 const auto installing = std::chrono::steady_clock::now();
@@ -1413,5 +1644,6 @@ export namespace replica {
         std::map<session_key, std::unique_ptr<context>> contexts_;
         std::map<std::string, preparation> preparations_;
         std::chrono::steady_clock::time_point export_collect_{};
+        std::optional<view> execute_view_;
     };
 } // namespace replica
