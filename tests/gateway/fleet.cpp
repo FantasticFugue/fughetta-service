@@ -544,6 +544,8 @@ namespace {
                     } catch (const routing::no_worker& e) {
                         h.out.capacity_err = e.what();
                     }
+                    expect(!h.router.workers(0).holds({}) && h.router.workers(0).holds({.analysis = true}))
+                        << "an analysis has its own place on a worker whose builds are at their limit";
                     h.held.fire();
                 };
                 co_await coroutine::with_scope(std::move(run_children));

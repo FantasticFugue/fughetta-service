@@ -769,7 +769,7 @@ export namespace replica {
             if (prepared == preparations_.end() || prepared->second.snapshot != r.snapshot || prepared->second.inputs.id() != work.inputs)
                 throw transport::coded_error(jobs::why::stale_inputs, "the tree no longer holds the inputs this analysis names");
             prepared->second.used = std::chrono::steady_clock::now();
-            jobs::build_report report{.worker = options_.worker, .measured = prepared->second.inputs.outputs, .execution_seconds = 0};
+            jobs::build_report report{.worker = options_.worker, .measured = prepared->second.inputs.outputs, .preparation_seconds = 0, .execution_seconds = 0};
             auto model_pins = prepared->second.models;
             const auto files = prepared->second.files;
             const auto dir = store_.tree(key);

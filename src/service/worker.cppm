@@ -122,6 +122,8 @@ namespace worker {
                                            .platform = {.os = std::string{host::os}, .arch = std::string{host::arch}},
                                            .compute_threads = compute_.available_parallelism(),
                                            .max_inflight = cfg_.max_inflight,
+                                           .max_analyses = cfg_.max_analyses,
+                                           .roles = cfg_.roles,
                                            .protocol = jobs::protocol_version,
                                            .tools = tools_,
                                            .worker_id = cfg_.worker_id,
@@ -154,7 +156,7 @@ namespace worker {
                 requests.spawn(beat(io, chan));
                 requests.spawn(report_slots(io, chan, core));
                 // The Core picks this Worker by the same limit; enforcing it locally keeps a misbehaving Core from driving unbounded concurrency.
-                auto max_inflight = static_cast<std::size_t>(cfg_.max_inflight);
+                auto max_inflight = static_cast<std::size_t>(cfg_.max_inflight) + cfg_.max_analyses;
                 co_await chan.pump([&](const transport::frame& incoming) -> coroutine::task<> {
                     auto frame = incoming;
                     if (cfg_.worker_id && frame.kind == jobs::code<jobs::admission>) {
@@ -171,7 +173,7 @@ namespace worker {
                         co_return;
                     }
                     if (inflight.load(std::memory_order_relaxed) >= max_inflight) {
-                        co_await chan.fail(frame.corr, "worker is at max_inflight", "worker_overloaded");
+                        co_await chan.fail(frame.corr, "worker is at its dispatch limit", "worker_overloaded");
                         co_return;
                     }
                     inflight.fetch_add(1, std::memory_order_relaxed);

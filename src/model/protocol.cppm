@@ -35,7 +35,10 @@ export namespace jobs {
         std::string auth;
         jobs::platform platform;
         std::uint32_t compute_threads = 0;
+        // Dispatches of the execute role the worker runs at once, and of the analyze role beside them.
         std::uint32_t max_inflight = 1;
+        std::uint32_t max_analyses = 1;
+        std::vector<std::string> roles{std::string{constants::execute_role}, std::string{constants::analyze_role}};
         std::uint32_t protocol = 0;
         std::vector<std::string> tools;
         std::optional<std::string> worker_id;
@@ -309,6 +312,21 @@ export namespace jobs {
         analysis_plan analysis;
     };
 
+    // The analysis of a staged request on the inputs its preparation reported, with the time left since `started`.
+    inline auto analysis_of(const staged_analysis& work, content::hash inputs, std::chrono::steady_clock::time_point started) -> analysis_request {
+        const auto& preparation = work.preparation;
+        const auto spent = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now() - started).count();
+        return {.project = preparation.project,
+                .tree = preparation.tree,
+                .snapshot = preparation.snapshot,
+                .inputs = std::move(inputs),
+                .timeout_s = preparation.timeout_s - std::min<std::uint32_t>(preparation.timeout_s, spent),
+                .env = preparation.env,
+                .max_memory_bytes = preparation.max_memory_bytes,
+                .max_cpu_seconds = preparation.max_cpu_seconds,
+                .analysis = work.analysis};
+    }
+
     struct dependency_fill {
         builds::vcpkg_manifest manifest;
         std::string triplet;
@@ -563,6 +581,19 @@ export namespace jobs {
             return std::ranges::all_of(steps, [](auto& s) { return s.exit_code == 0 && !s.timed_out; });
         }
     };
+
+    // One report over a preparation and the analysis that followed it.
+    inline void merge(build_report& analyzed, build_report prepared) {
+        analyzed.steps.insert(analyzed.steps.begin(), std::make_move_iterator(prepared.steps.begin()), std::make_move_iterator(prepared.steps.end()));
+        analyzed.exports.insert(analyzed.exports.begin(), std::make_move_iterator(prepared.exports.begin()), std::make_move_iterator(prepared.exports.end()));
+        analyzed.models = std::move(prepared.models);
+        analyzed.export_error = std::move(prepared.export_error);
+        analyzed.export_skipped = std::move(prepared.export_skipped);
+        analyzed.inputs = std::move(prepared.inputs);
+        analyzed.preparation_seconds = prepared.preparation_seconds;
+        analyzed.execution_seconds = prepared.execution_seconds.value_or(0) + analyzed.execution_seconds.value_or(0);
+        analyzed.seconds += prepared.seconds;
+    }
 
     template <meta::fixed_string Name> inline constexpr std::uint32_t kind = meta::fnv1a(Name);
 
@@ -1135,42 +1166,22 @@ export namespace transport {
     auto staged(Channel& channel, jobs::staged_analysis work, jobs::progress_log* progress = nullptr, jobs::analysis_link inputs = {})
         -> coroutine::task<call_result<jobs::build_report>> {
         const auto started = std::chrono::steady_clock::now();
-        auto& preparation = work.preparation;
-        preparation.prepares = work.analysis.execution.stage_id;
+        work.preparation.prepares = work.analysis.execution.stage_id;
         for (unsigned attempt = 0;; ++attempt) {
-            auto prepared = co_await channel.call(preparation, progress, inputs);
+            auto prepared = co_await channel.call(work.preparation, progress, inputs);
             if (!prepared || !prepared->inputs) {
                 if (prepared)
                     prepared->analysis_execution = work.analysis.execution;
                 co_return prepared;
             }
-            const auto spent = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now() - started).count();
-            jobs::analysis_request request{.project = preparation.project,
-                                           .tree = preparation.tree,
-                                           .snapshot = preparation.snapshot,
-                                           .inputs = prepared->inputs->id(),
-                                           .timeout_s = preparation.timeout_s - std::min<std::uint32_t>(preparation.timeout_s, spent),
-                                           .env = preparation.env,
-                                           .max_memory_bytes = preparation.max_memory_bytes,
-                                           .max_cpu_seconds = preparation.max_cpu_seconds,
-                                           .analysis = work.analysis};
-            auto analyzed = co_await channel.call(request, progress, inputs);
+            auto analyzed = co_await channel.call(jobs::analysis_of(work, prepared->inputs->id(), started), progress, inputs);
             if (!analyzed) {
                 const auto* refused = std::get_if<jobs::failure>(&analyzed.error());
                 if (refused && refused->code == jobs::why::stale_inputs && attempt < 2)
                     continue;
                 co_return analyzed;
             }
-            auto& report = *analyzed;
-            report.steps.insert(report.steps.begin(), std::make_move_iterator(prepared->steps.begin()), std::make_move_iterator(prepared->steps.end()));
-            report.exports.insert(report.exports.begin(), std::make_move_iterator(prepared->exports.begin()), std::make_move_iterator(prepared->exports.end()));
-            report.models = std::move(prepared->models);
-            report.export_error = std::move(prepared->export_error);
-            report.export_skipped = std::move(prepared->export_skipped);
-            report.inputs = std::move(prepared->inputs);
-            report.preparation_seconds = prepared->preparation_seconds;
-            report.execution_seconds = prepared->execution_seconds.value_or(0) + report.execution_seconds.value_or(0);
-            report.seconds += prepared->seconds;
+            jobs::merge(*analyzed, std::move(*prepared));
             co_return analyzed;
         }
     }

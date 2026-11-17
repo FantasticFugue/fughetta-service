@@ -113,6 +113,7 @@ export namespace runtime {
                 worker.dependency_cache = (root / "dependencies").string();
                 worker.compute_threads = 1;
                 worker.max_inflight = 1;
+                worker.max_analyses = 1;
                 worker.tools = doc.tools;
                 worker.parallel = plan.workers[i].parallel;
                 worker.memory_bytes = plan.workers[i].memory_bytes;

@@ -178,12 +178,9 @@ namespace tools {
                 finish(j, refused(j->what, "cancelled"), "cancelled");
         }
         auto cap = config::resolve_limits(*zero_.snapshot()).concurrent_builds;
-        while (running_ < cap) {
-            auto j = next();
-            if (!j)
-                break;
+        while (auto j = next(running_ < cap, analyzing_ < cap)) {
             j->running = true;
-            ++running_;
+            ++(j->what.operation == "prepare" ? analyzing_ : running_);
             rt_.spawn(0, launch(j));
         }
         std::size_t ahead = 0;
@@ -197,14 +194,14 @@ namespace tools {
     }
 
     // The oldest job of whoever's turn it is that may be tried now; that asker then waits for everyone else's turn.
-    auto backlog::next() -> std::shared_ptr<job> {
+    auto backlog::next(bool builds, bool analyses) -> std::shared_ptr<job> {
         auto now = std::chrono::steady_clock::now();
         for (std::size_t n = 0; n < turns_.size(); ++n) {
             auto actor = turns_.front();
             turns_.pop_front();
             turns_.push_back(actor);
             auto found = std::ranges::find_if(jobs_, [&](auto& j) {
-                return !j->running && j->what.actor == actor && j->retry_at <= now &&
+                return !j->running && (j->what.operation == "prepare" ? analyses : builds) && j->what.actor == actor && j->retry_at <= now &&
                        std::ranges::any_of(j->tickets, [](const auto& held) { return !held->left_.load(std::memory_order_acquire); }) &&
                        std::ranges::all_of(j->predecessors, [](const auto& held) { return held->done(); });
             });
@@ -259,7 +256,7 @@ namespace tools {
         } catch (const std::exception& e) {
             failure = e.what();
         }
-        --running_;
+        --(j->what.operation == "prepare" ? analyzing_ : running_);
         if (!failure.empty()) {
             auto result = refused(j->what, std::move(failure));
             if (!failure_code.empty())

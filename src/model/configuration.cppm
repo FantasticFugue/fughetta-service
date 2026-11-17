@@ -459,6 +459,9 @@ export namespace config {
         std::uint32_t parallel = 1;
         std::optional<std::uint64_t> memory_bytes;
         std::uint32_t max_inflight = 4;
+        // Analyses that read project data run beside the builds, on their own limit.
+        std::uint32_t max_analyses = 4;
+        std::vector<std::string> roles{std::string{constants::execute_role}, std::string{constants::analyze_role}};
         std::uint64_t max_cache_bytes = 20ull << 30;
         std::uint32_t tree_ttl_days = 14;
         std::map<std::string, std::string> env;
@@ -497,8 +500,13 @@ export namespace config {
             throw std::invalid_argument("worker thread and parallel budgets must be positive");
         if (w.memory_bytes && !*w.memory_bytes)
             throw std::invalid_argument("Worker memory_bytes must be positive");
-        if (w.max_inflight == 0)
-            throw std::invalid_argument("Worker max_inflight must be positive");
+        if (w.max_inflight == 0 || w.max_analyses == 0)
+            throw std::invalid_argument("Worker max_inflight and max_analyses must be positive");
+        if (w.roles.empty() ||
+            !std::ranges::all_of(w.roles, [](const auto& role) { return role == constants::execute_role || role == constants::analyze_role; }))
+            throw std::invalid_argument("Worker roles are execute, analyze or both");
+        if (w.dependency_publish && !std::ranges::contains(w.roles, constants::execute_role))
+            throw std::invalid_argument("a dependency publisher takes the execute role");
         if (w.tree_ttl_days == 0)
             throw std::invalid_argument("Worker tree_ttl_days must be positive");
         if (w.worker_id || w.workspace_id) {
@@ -506,7 +514,8 @@ export namespace config {
                 throw std::invalid_argument("Registered Worker requires its identity and credentials");
             check_name("Worker identity", *w.worker_id);
             check_name("Workspace identity", *w.workspace_id);
-            if (!w.heartbeat_seconds || w.heartbeat_seconds > 30 || !w.reconnect_attempts || w.reconnect_attempts > 120 || w.max_inflight > 64)
+            if (!w.heartbeat_seconds || w.heartbeat_seconds > 30 || !w.reconnect_attempts || w.reconnect_attempts > 120 || w.max_inflight > 64 ||
+                w.max_analyses > 64)
                 throw std::invalid_argument("Registered Worker heartbeat, reconnect, or inflight limit is invalid");
         }
         return w;

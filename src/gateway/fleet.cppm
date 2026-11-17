@@ -72,6 +72,8 @@ export namespace routing {
         std::optional<std::uint64_t> memory_bytes;
         std::optional<std::uint64_t> worker;
         std::optional<std::size_t> core;
+        // An analysis that reads project data: it takes the analyze role and its limit. Everything else executes.
+        bool analysis = false;
         friend auto operator==(const selection&, const selection&) -> bool = default;
     };
 
@@ -193,26 +195,32 @@ export namespace routing {
                     continue;
                 if (sel.memory_bytes && m->hello.memory_bytes && *sel.memory_bytes > *m->hello.memory_bytes)
                     continue;
-                if (m->inflight >= m->hello.max_inflight || !memory_available(*m, sel)) {
+                if (!std::ranges::contains(m->hello.roles, sel.analysis ? constants::analyze_role : constants::execute_role))
+                    continue;
+                const auto running = sel.analysis ? m->analyses : m->inflight;
+                const auto limit = sel.analysis ? m->hello.max_analyses : m->hello.max_inflight;
+                if (running >= limit || !memory_available(*m, sel)) {
                     out.busy = true;
                     continue;
                 }
-                placement value{.core = core_, .worker = m->id, .heat = warmth(*m, sel), .inflight = m->inflight, .used = m->last_used};
+                placement value{.core = core_, .worker = m->id, .heat = warmth(*m, sel), .inflight = running, .used = m->last_used};
                 if (const auto observed = m->costs.find(cost_key(sel, value.heat)); observed != m->costs.end())
-                    value.seconds = observed->second.seconds * (1.0 + double(m->inflight) / m->hello.max_inflight);
+                    value.seconds = observed->second.seconds * (1.0 + double(running) / limit);
                 out.candidates.push_back(std::move(value));
             }
             return out;
         }
 
-        template <class Work> auto with(const selection& sel, Work work) -> std::invoke_result_t<Work&, transport::channel<socket>&> {
+        // `observed` is false for work that is only a part of a dispatch held elsewhere: its time and tree are that dispatch's.
+        template <class Work> auto with(const selection& sel, Work work, bool observed = true) -> std::invoke_result_t<Work&, transport::channel<socket>&> {
             auto m = pick(sel);
             if (!m)
                 throw no_worker{diagnose(sel), busy(sel)};
             const auto started = clock::now();
             const auto heat = warmth(*m, sel);
             const auto reserved = memory_reservation(*m, sel);
-            ++m->inflight;
+            auto& running = sel.analysis ? m->analyses : m->inflight;
+            ++running;
             m->memory_reserved += reserved;
             if (changed)
                 changed();
@@ -220,18 +228,20 @@ export namespace routing {
                 std::shared_ptr<member> m;
                 fleet* owner;
                 std::uint64_t reserved;
+                std::size_t& running;
                 ~release() {
-                    --m->inflight;
+                    --running;
                     m->memory_reserved -= reserved;
                     if (owner->changed)
                         owner->changed();
                 }
-            } guard{m, this, reserved};
+            } guard{m, this, reserved, running};
             using yielded = typename std::invoke_result_t<Work&, transport::channel<socket>&>::value_type;
             if constexpr (std::is_void_v<yielded>) {
                 co_await work(m->chan);
                 m->last_used = clock::now();
-                observe(*m, sel, heat, std::chrono::duration<double>(m->last_used - started).count());
+                if (observed)
+                    observe(*m, sel, heat, std::chrono::duration<double>(m->last_used - started).count());
                 co_return;
             } else {
                 auto out = co_await work(m->chan);
@@ -253,7 +263,7 @@ export namespace routing {
                     successful = out.first.ok();
                 else if constexpr (requires { bool(out); })
                     successful = bool(out);
-                if (successful)
+                if (successful && observed)
                     observe(*m, sel, heat, std::chrono::duration<double>(m->last_used - started).count());
                 co_return std::move(out);
             }
@@ -287,8 +297,9 @@ export namespace routing {
                 std::optional<enrollment::record> identity;
                 if (!enabled())
                     rejected = "worker_enrollment_disabled";
-                else if (!pool || !hello.worker_id || !hello.workspace_id || !hello.max_inflight || hello.max_inflight > 64 || !hello.heartbeat_seconds ||
-                         hello.heartbeat_seconds > 30 || hello.tools.size() > 4096)
+                else if (!pool || !hello.worker_id || !hello.workspace_id || !hello.max_inflight || hello.max_inflight > 64 || !hello.max_analyses ||
+                         hello.max_analyses > 64 || hello.roles.empty() || !hello.heartbeat_seconds || hello.heartbeat_seconds > 30 ||
+                         hello.tools.size() > 4096)
                     rejected = "worker_authentication_failed";
                 else {
                     try {
@@ -401,6 +412,35 @@ export namespace routing {
             throw no_worker{"Worker connection is no longer attached"};
         }
 
+        // The inputs a worker's tree last reported for one preparation, so an analysis of unchanged inputs is
+        // sent without asking the preparation again. The worker refuses it when its tree has moved on.
+        auto inputs(const transport::channel<socket>& channel, const std::string& preparation) const -> std::optional<content::hash> {
+            const auto& known = attached(channel).inputs;
+            const auto found = known.find(preparation);
+            return found == known.end() ? std::nullopt : std::optional{found->second};
+        }
+        void remember(const transport::channel<socket>& channel, const std::string& preparation, std::optional<content::hash> reported) {
+            auto& known = attached(channel).inputs;
+            if (!reported) {
+                known.erase(preparation);
+                return;
+            }
+            if (known.size() >= remembered_inputs && !known.contains(preparation))
+                known.clear();
+            known.insert_or_assign(preparation, std::move(*reported));
+        }
+        // Runs work of the execute role on the worker an analysis holds, in a place of its own.
+        template <class Work> auto executing(const transport::channel<socket>& channel, selection sel, Work work) {
+            const auto& held = attached(channel);
+            if (!std::ranges::contains(held.hello.roles, constants::execute_role))
+                throw no_worker{std::format("worker '{}' only analyzes; the preparation needs one that also executes", held.hello.name)};
+            sel.worker = held.id;
+            sel.analysis = false;
+            // The analysis this runs beside already reserved the dispatch's memory.
+            sel.memory_bytes = 0;
+            return with(sel, std::move(work), false);
+        }
+
         auto identity(const transport::channel<socket>& channel) const -> std::pair<std::string, std::optional<std::string>> {
             for (const auto& member : members_)
                 if (&member->chan == &channel)
@@ -448,7 +488,8 @@ export namespace routing {
             jobs::hello hello;
             socket sock;
             transport::channel<socket> chan;
-            std::size_t inflight = 0;
+            std::size_t inflight = 0, analyses = 0;
+            std::map<std::string, content::hash> inputs;
             clock::time_point seen = clock::now();
             clock::time_point last_used = clock::now();
             std::vector<jobs::worker_slot> slots;
@@ -458,6 +499,14 @@ export namespace routing {
             enrollment::store* registry = nullptr;
             bool retiring = false;
         };
+
+        static constexpr std::size_t remembered_inputs = 256;
+        auto attached(const transport::channel<socket>& channel) const -> member& {
+            for (const auto& held : members_)
+                if (&held->chan == &channel)
+                    return *held;
+            throw no_worker{"Worker connection is no longer attached"};
+        }
 
         static auto memory_reservation(const member& m, const selection& sel) -> std::uint64_t {
             if (!m.hello.memory_bytes)

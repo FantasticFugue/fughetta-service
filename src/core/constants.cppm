@@ -23,6 +23,9 @@ export namespace constants {
     inline constexpr auto workspace_event_heartbeat = std::chrono::seconds{15};
     inline constexpr auto workspace_event_lifetime = std::chrono::minutes{5};
     inline constexpr auto language_idle = std::chrono::minutes{10};
+    // What a worker takes. The execute role runs code the project supplies: builds, preparations and the
+    // analyses that load it. The analyze role reads the project's data with this program's own code.
+    inline constexpr std::string_view execute_role = "execute", analyze_role = "analyze";
     inline constexpr std::size_t language_sessions = 16;
     inline constexpr std::size_t semantic_candidates_per_unit = 4;
     inline constexpr auto semantic_view_retention = std::chrono::hours{24};

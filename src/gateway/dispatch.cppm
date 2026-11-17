@@ -150,7 +150,7 @@ export namespace tools {
         auto cancel(std::size_t here, std::uint64_t id, worlds::actor who) -> coroutine::task<std::string>;
         // Core zero's loop: starts what may start and lets go of jobs nobody waits for any more.
         auto serve(native::scheduler& io) -> coroutine::task<>;
-        auto idle() const -> bool { return jobs_.empty() && running_ == 0; }
+        auto idle() const -> bool { return jobs_.empty() && running_ == 0 && analyzing_ == 0; }
 
     private:
         // A reserved directory in a project/layout/runtime pool. Its installed
@@ -184,7 +184,7 @@ export namespace tools {
         auto views() const -> std::vector<view>;
         auto withdraw(std::uint64_t id, const worlds::actor& who) -> std::string;
         void step();
-        auto next() -> std::shared_ptr<job>;
+        auto next(bool builds, bool analyses) -> std::shared_ptr<job>;
         auto launch(std::shared_ptr<job> j) -> coroutine::task<>;
         void finish(const std::shared_ptr<job>& j, outcome r, std::string state);
         static auto refused(const entry& e, std::string why) -> outcome;
@@ -193,7 +193,8 @@ export namespace tools {
         services& zero_;
         std::uint64_t next_id_ = 1;
         std::list<std::shared_ptr<job>> jobs_;
-        std::size_t running_ = 0;
+        // Builds and analyses each run up to the limit, so neither waits behind the other.
+        std::size_t running_ = 0, analyzing_ = 0;
         // Who asked, in the order their turns come.
         std::deque<std::string> turns_;
         std::list<std::pair<std::string, outcome>> cache_;
@@ -335,7 +336,8 @@ export namespace tools {
     auto sync_and_run(native::scheduler& io, storage::registry& files, std::size_t core, transport::channel<native::socket>& worker, std::string project,
                       content::manifest tree, Request work, jobs::progress_log* progress, std::string worldline, std::string version, worlds::actor actor,
                       std::shared_ptr<execution_identity> executor, semantic::retention_roots roots = {}, semantic::snapshot_vector snapshots = {},
-                      semantic::source_vector sources = {}) -> coroutine::task<std::pair<jobs::build_report, sync_stats>> {
+                      semantic::source_vector sources = {}, routing::fleet* beside = nullptr, routing::selection placed = {})
+        -> coroutine::task<std::pair<jobs::build_report, sync_stats>> {
         auto& request = jobs::traits<Request>::preparation(work);
         auto* analysis = jobs::traits<Request>::analysis(work);
         auto report = [&](std::uint64_t done, std::uint64_t total, std::string stage) {
@@ -343,9 +345,7 @@ export namespace tools {
                 progress->push(jobs::progress{done, total, std::move(stage)});
         };
         sync_stats stats;
-        const auto sync_started = std::chrono::steady_clock::now();
-        executor->sync_begin();
-
+        auto expected_snapshot = tree.id();
         std::unordered_map<content::hash, std::uint64_t> sizes;
         std::map<std::string, std::string> source_objects;
         for (auto& e : tree.files) {
@@ -353,64 +353,68 @@ export namespace tools {
             if (analysis)
                 source_objects.emplace(e.path, e.digest.str());
         }
-        auto expected_snapshot = tree.id();
-        auto plan = co_await within(io, offer_deadline, "the offer", worker.call(jobs::sync_offer{project, std::move(tree)}));
-        if (plan.snapshot != expected_snapshot)
-            throw tool_error("invalid_worker_reply", "Worker returned a snapshot different from the offered source");
+        // The worker's cache receives the snapshot's files before anything executes on them.
+        auto synchronize = [&]() -> coroutine::task<> {
+            const auto sync_started = std::chrono::steady_clock::now();
+            executor->sync_begin();
+            auto plan = co_await within(io, offer_deadline, "the offer", worker.call(jobs::sync_offer{project, tree}));
+            if (plan.snapshot != expected_snapshot)
+                throw tool_error("invalid_worker_reply", "Worker returned a snapshot different from the offered source");
 
-        struct piece {
-            content::hash digest;
-            std::uint64_t offset, total, length;
-        };
-        std::vector<std::vector<piece>> pushes(1);
-        std::uint64_t batch = 0, total = 0;
-        for (auto& h : plan.missing) {
-            auto size = sizes.at(h);
-            total += size;
-            std::uint64_t at = 0;
-            do {
-                auto len = std::min(part_size, size - at);
-                if (batch + len > push_batch && !pushes.back().empty()) {
-                    pushes.emplace_back();
-                    batch = 0;
-                }
-                pushes.back().push_back({h, at, size, len});
-                batch += len;
-                at += len;
-            } while (at < size);
-        }
-        for (auto& push : pushes) {
-            if (push.empty())
-                continue;
-            nodes::node_request wanted{.action = "content", .worldline = worldline, .revision = version};
-            for (auto& p : push)
-                wanted.parts.push_back({p.digest.str(), p.offset, p.length, {}});
-            auto reply = co_await files.node(core, project, std::move(wanted), actor, true);
-            if (reply.code != "ok")
-                throw tool_error(reply.code, reply.reason);
-            // A piece is sent compressed when that makes it smaller.
-            std::vector<jobs::source_part> parts;
-            for (auto& p : reply.parts) {
-                auto bytes = lines::unhex(p.data);
-                stats.bytes += bytes.size();
-                auto packed = nodes::archive::pack(bytes);
-                auto& sent = packed.size() < bytes.size() ? packed : bytes;
-                parts.push_back(
-                    {p.id, p.offset, p.total,
-                     std::vector<std::byte>{reinterpret_cast<const std::byte*>(sent.data()), reinterpret_cast<const std::byte*>(sent.data()) + sent.size()},
-                     &sent == &packed});
+            struct piece {
+                content::hash digest;
+                std::uint64_t offset, total, length;
+            };
+            std::vector<std::vector<piece>> pushes(1);
+            std::uint64_t batch = 0, total = 0;
+            for (auto& h : plan.missing) {
+                auto size = sizes.at(h);
+                total += size;
+                std::uint64_t at = 0;
+                do {
+                    auto len = std::min(part_size, size - at);
+                    if (batch + len > push_batch && !pushes.back().empty()) {
+                        pushes.emplace_back();
+                        batch = 0;
+                    }
+                    pushes.back().push_back({h, at, size, len});
+                    batch += len;
+                    at += len;
+                } while (at < size);
             }
-            co_await within(io, push_deadline, "a push", worker.call(jobs::source_bytes{std::move(parts)}));
-            report(stats.bytes, total, "sync");
-        }
-        executor->sync_end();
-        stats.blobs = plan.missing.size();
-        stats.seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - sync_started).count();
+            for (auto& push : pushes) {
+                if (push.empty())
+                    continue;
+                nodes::node_request wanted{.action = "content", .worldline = worldline, .revision = version};
+                for (auto& p : push)
+                    wanted.parts.push_back({p.digest.str(), p.offset, p.length, {}});
+                auto reply = co_await files.node(core, project, std::move(wanted), actor, true);
+                if (reply.code != "ok")
+                    throw tool_error(reply.code, reply.reason);
+                // A piece is sent compressed when that makes it smaller.
+                std::vector<jobs::source_part> parts;
+                for (auto& p : reply.parts) {
+                    auto bytes = lines::unhex(p.data);
+                    stats.bytes += bytes.size();
+                    auto packed = nodes::archive::pack(bytes);
+                    auto& sent = packed.size() < bytes.size() ? packed : bytes;
+                    parts.push_back(
+                        {p.id, p.offset, p.total,
+                         std::vector<std::byte>{reinterpret_cast<const std::byte*>(sent.data()), reinterpret_cast<const std::byte*>(sent.data()) + sent.size()},
+                         &sent == &packed});
+                }
+                co_await within(io, push_deadline, "a push", worker.call(jobs::source_bytes{std::move(parts)}));
+                report(stats.bytes, total, "sync");
+            }
+            executor->sync_end();
+            stats.blobs = plan.missing.size();
+            stats.seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - sync_started).count();
+            report(0, 0, request.steps.empty() ? "run" : request.steps.front().name);
+            executor->begin();
+        };
 
-        report(0, 0, request.steps.empty() ? "run" : request.steps.front().name);
         request.snapshot = expected_snapshot;
         auto limit = std::chrono::seconds{request.timeout_s} + build_overhead;
-        executor->begin();
         publishing::bound publication;
         if (analysis) {
             auto own = std::ranges::find(snapshots, project, &semantic::snapshot::project);
@@ -429,10 +433,52 @@ export namespace tools {
         auto execute = [&](coroutine::scope& children) -> coroutine::task<jobs::build_report> {
             auto close = jobs::analysis_exchange::lifetime{inputs};
             children.spawn(publication.serve(inputs));
-            if constexpr (std::same_as<Request, jobs::staged_analysis>)
-                co_return co_await within(io, limit, "the build", transport::staged(worker, work, progress, inputs));
-            else
+            if constexpr (std::same_as<Request, jobs::staged_analysis>) {
+                const auto started = std::chrono::steady_clock::now();
+                request.prepares = analysis->execution.stage_id;
+                // The same preparation of the same snapshot, whatever time it is given.
+                const auto recipe =
+                    content::hash_of(rfl::json::write(std::tuple{request.project, request.tree, request.snapshot, request.steps, request.preparation_tasks,
+                                                                 request.env, request.measure, request.generation_producers}))
+                        .str();
+                // Inputs a worker already reported for this preparation need no second asking; a tree that has
+                // moved on since refuses the analysis, and the preparation runs after all.
+                auto known = beside ? beside->inputs(worker, recipe) : std::optional<content::hash>{};
+                std::optional<jobs::build_report> prepared;
+                for (unsigned attempt = 0;; ++attempt) {
+                    if (!known) {
+                        auto prepare = [&](transport::channel<native::socket>& executing) -> coroutine::task<jobs::build_report> {
+                            co_await synchronize();
+                            co_return co_await within(io, limit, "the preparation", executing.call(request, progress, inputs));
+                        };
+                        // Beside an analysis, the preparation is execute work with its own place on the worker.
+                        prepared = beside && placed.analysis ? co_await beside->executing(worker, placed, prepare) : co_await prepare(worker);
+                        if (!prepared->inputs) {
+                            prepared->analysis_execution = analysis->execution;
+                            co_return std::move(*prepared);
+                        }
+                        known = prepared->inputs->id();
+                        if (beside)
+                            beside->remember(worker, recipe, known);
+                    } else
+                        executor->begin();
+                    try {
+                        auto analyzed = co_await within(io, limit, "the analysis", worker.call(jobs::analysis_of(work, *known, started), progress, inputs));
+                        if (prepared)
+                            jobs::merge(analyzed, std::move(*prepared));
+                        co_return analyzed;
+                    } catch (const transport::remote_error& refused) {
+                        if (refused.code != jobs::why::stale_inputs || attempt == 2)
+                            throw;
+                        known.reset();
+                        if (beside)
+                            beside->remember(worker, recipe, std::nullopt);
+                    }
+                }
+            } else {
+                co_await synchronize();
                 co_return co_await within(io, limit, "the build", worker.call(work, progress, inputs));
+            }
         };
         auto r = co_await coroutine::with_scope(std::move(execute));
         if (r.ok() && !r.analysis_error &&
@@ -1099,30 +1145,30 @@ export namespace tools {
         bool stopped = false;
         auto token = co_await coroutine::current_token;
         try {
+            // An analysis that loads project code executes; one that only reads project data takes the analyze role.
+            const routing::selection placed{.needs = needs,
+                                            .tree_key = build.preparation.project + "/" + build.preparation.tree,
+                                            .options = build.analysis.options,
+                                            .snapshot = build.preparation.snapshot.str(),
+                                            .stage = build.analysis.execution.stage_id,
+                                            .memory_bytes = build.preparation.max_memory_bytes,
+                                            .worker = residence ? std::optional{residence->worker} : std::nullopt,
+                                            .core = residence ? std::optional{residence->core} : std::nullopt,
+                                            .analysis = !language::describe_provider(request.config.server).executes_project_code};
             auto run_on_worker = [&registry, &rt, &router, &residence, executor, project, files, build, line, version = selected_tree.version, actor, roots,
-                                  snapshots = request.snapshots,
+                                  placed, snapshots = request.snapshots,
                                   sources = request.sources](auto& worker, jobs::progress_log* progress,
                                                              std::size_t core) -> coroutine::task<std::pair<jobs::build_report, sync_stats>> {
                 residence = router.workers(core).locate(worker);
                 auto identity = router.workers(core).identity(worker);
                 executor->select(identity);
                 auto result = co_await sync_and_run(rt.get_scheduler(core), registry, core, worker, project, files, build, progress, line, version, actor,
-                                                    executor, roots, snapshots, sources);
+                                                    executor, roots, snapshots, sources, &router.workers(core), placed);
                 result.first.worker = std::move(identity.first);
                 result.first.worker_id = std::move(identity.second);
                 co_return result;
             };
-            done = co_await coroutine::under(token,
-                                             zero.workers.with_worker(zero.core,
-                                                                      routing::selection{.needs = needs,
-                                                                                         .tree_key = build.preparation.project + "/" + build.preparation.tree,
-                                                                                         .options = build.analysis.options,
-                                                                                         .snapshot = build.preparation.snapshot.str(),
-                                                                                         .stage = build.analysis.execution.stage_id,
-                                                                                         .memory_bytes = build.preparation.max_memory_bytes,
-                                                                                         .worker = residence ? std::optional{residence->worker} : std::nullopt,
-                                                                                         .core = residence ? std::optional{residence->core} : std::nullopt},
-                                                                      std::move(run_on_worker), progress));
+            done = co_await coroutine::under(token, zero.workers.with_worker(zero.core, placed, std::move(run_on_worker), progress));
             stopped = !done;
         } catch (const routing::no_worker& e) {
             if (e.busy) {
