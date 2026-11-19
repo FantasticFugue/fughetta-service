@@ -171,10 +171,16 @@ runs:
         if [[ "$RUNNER_OS" == macOS ]]; then
           runtime=$(find "$root" -name libc++.dylib | sed -n '1p')
           runtime_dir=$(dirname "${runtime:?LLVM archive lacks libc++.dylib}")
-          unwinder="$runtime_dir/libunwind.dylib"
+          # Keep the archive's libc++ symbols and let Darwin unwind every image.
+          for library in "$runtime_dir/libc++.dylib" "$runtime_dir/libc++abi.dylib"; do
+            unwinder=$(otool -L "$library" | awk '$1 ~ /\/libunwind(\.[0-9]+)*\.dylib$/ { print $1; exit }')
+            if [[ -n "$unwinder" ]]; then
+              xcrun install_name_tool -change "$unwinder" /usr/lib/libSystem.B.dylib "$library"
+              codesign --force --sign - "$library"
+            fi
+          done
           echo "CLANG_RUNTIME_DIR=$runtime_dir" >> "$GITHUB_ENV"
-          # Bind app unwind calls to the runtime that libc++abi uses.
-          echo "LDFLAGS=${LDFLAGS:+$LDFLAGS }-L\"$runtime_dir\" -Wl,-rpath,\"$runtime_dir\" -Wl,-needed_library,\"$unwinder\" -lc++abi" >> "$GITHUB_ENV"
+          echo "LDFLAGS=${LDFLAGS:+$LDFLAGS }-L\"$runtime_dir\" -Wl,-rpath,\"$runtime_dir\" -lc++abi" >> "$GITHUB_ENV"
         fi
         echo "CLANG_ROOT=$root" >> "$GITHUB_ENV"
         echo "CLANG_ID=$id" >> "$GITHUB_ENV"

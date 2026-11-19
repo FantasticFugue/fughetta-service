@@ -32,15 +32,18 @@ namespace {
                 auto run = [&](coroutine::scope& tasks) -> coroutine::task<> {
                     tasks.spawn(channel.pump([](const transport::frame&) {}));
                     content::manifest tree;
-                    test::require((co_await channel.call(jobs::sync_offer{"app", tree})).has_value(), "offer failed");
-                    test::require((co_await channel.call(jobs::source_bytes{})).has_value(), "sync failed");
+                    if (auto offered = co_await channel.call(jobs::sync_offer{"app", tree}); !offered)
+                        transport::raise_call_error(std::move(offered.error()));
+                    if (auto synced = co_await channel.call(jobs::source_bytes{}); !synced)
+                        transport::raise_call_error(std::move(synced.error()));
                     const auto python = std::getenv("TEST_PYTHON") ? std::getenv("TEST_PYTHON") : "/usr/bin/python3";
                     jobs::build_request request{.project = "app", .tree = "stdio", .snapshot = tree.id(),
                         .steps = {{.name = "execute", .argv = {python, "-c",
                             "import os, sys; sys.stdout.buffer.write(('execute ' + os.environ.get('FUGHETTA_TEST_SECRET', 'no-secret') + '\\n').encode())"}}},
                         .timeout_s = 10};
                     auto result = co_await channel.call(request);
-                    test::require(result.has_value(), "execute call failed");
+                    if (!result)
+                        transport::raise_call_error(std::move(result.error()));
                     test::require(result->ok(), result->steps.empty() ? "no execute steps" : result->steps.front().output);
                     expect(result->steps.front().output == "execute no-secret\n");
                     expect(std::filesystem::path{result->tree} == tmp.dir / "worker-execute/trees/app/stdio");
