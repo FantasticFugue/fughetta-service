@@ -1122,7 +1122,7 @@ while True:
                     << (first ? first->analysis_error.value_or("") : std::get<jobs::failure>(first.error()).message);
                 expect(test::slurp(root / "execute/trees" / "app" / "beside" / "prepared") == "project-secret") << "the build ran in the execute role";
                 expect(!std::filesystem::exists(root / "cache/trees/app")) << "this process keeps no tree of its own";
-                expect(test::slurp(root / "observed") == "no-secret " + (root / "execute/trees/app/beside").string());
+                expect(test::slurp(root / "observed") == "no-secret " + (root / "execute/trees/app/beside").make_preferred().string());
                 expect(!received.empty() && received.back().shards.front().diagnostics.front().message == "seen");
                 const auto manifest = root / "execute/trees/app/beside.manifest";
                 std::filesystem::last_write_time(manifest, std::filesystem::file_time_type::clock::now() - std::chrono::hours{24 * 30});
@@ -1406,7 +1406,7 @@ def publication(path):
                   "types":[{"id":"int", "kind":"primitive", "name":"int" + "é" * 600000, "arguments":[],
                             "parameters":[], "qualifiers":[], "type_parameters":[], "template_arguments":[]}]}
 if len(sys.argv) > 1:
-    with open(os.path.join(os.path.dirname(__file__), "commands"), "a") as log: log.write(" ".join(sys.argv[1:3]) + "\n")
+    with open(os.path.join(os.path.dirname(__file__), "commands"), "a", newline="\n") as log: log.write(" ".join(sys.argv[1:3]) + "\n")
     if sys.argv[2] == "project-files": result = {"result":{"files":[{"path":"a.cpp","translationUnit":True,"translationUnits":["a.cpp"],"configuration":{"a.cpp":configuration("a.cpp")}},{"path":"b.cpp","translationUnit":False,"translationUnits":[],"configuration":{"b.cpp":configuration("b.cpp")}}]},"stale":[]}
     elif sys.argv[2] == "semantic-contributions": result = {"result":[{"path":"a.cpp","contributions":[{"key":"records","kind":"records","file":"a.cpp","value":"published-a"}]}],"stale":[]}
     else: result = {"result":publication(sys.argv[3]),"stale":[]}
@@ -1425,7 +1425,7 @@ while True:
     result = None
     if m.get("method") == "initialize": result = {"capabilities": {"documentSymbolProvider": True}}
     if m.get("method") == "clice/index":
-        with open(os.path.join(os.path.dirname(__file__), "commands"), "a") as log: log.write("index stdio\n")
+        with open(os.path.join(os.path.dirname(__file__), "commands"), "a", newline="\n") as log: log.write("index stdio\n")
         result = {"failed":[]}
     if m.get("method") == "clice/semanticExport":
         if m["params"]["uri"].endswith("b.cpp") and os.path.exists(os.path.join(os.path.dirname(__file__), "delay")): time.sleep(10)
