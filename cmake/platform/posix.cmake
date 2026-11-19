@@ -2,4 +2,4 @@
 set(PLATFORM_FAMILY posix)
 set(PLATFORM_MODULES posix/descriptor posix/posix)
 set(PLATFORM_IMPLEMENTATION posix/uname posix/sigwait posix/create posix/flush)
-set(GRADLE_LAUNCHER gradle)
+set(GRADLE_LAUNCHERS gradle)

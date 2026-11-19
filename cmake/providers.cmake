@@ -58,10 +58,15 @@ endif()
 # its home, daemon run files and temporary directory. FUGHETTA_GRADLE runs a
 # task of the providers' build that way; the tests run theirs with it too.
 
-find_program(GRADLE_TOOL NAMES "${GRADLE_LAUNCHER}")
+find_program(GRADLE_TOOL NAMES ${GRADLE_LAUNCHERS} NAMES_PER_DIR)
 if(GRADLE_TOOL)
   cmake_path(NATIVE_PATH GRADLE_TOOL GRADLE_NATIVE_TOOL)
-  set(GRADLE_COMMAND ${GRADLE_LAUNCH_PREFIX} "${GRADLE_NATIVE_TOOL}")
+  set(GRADLE_COMMAND "${GRADLE_NATIVE_TOOL}")
+  cmake_path(GET GRADLE_TOOL EXTENSION LAST_ONLY GRADLE_SUFFIX)
+  string(TOLOWER "${GRADLE_SUFFIX}" GRADLE_SUFFIX)
+  if(GRADLE_BATCH_PREFIX AND GRADLE_SUFFIX MATCHES "^\\.(bat|cmd)$")
+    list(PREPEND GRADLE_COMMAND ${GRADLE_BATCH_PREFIX})
+  endif()
   set(JVM_OUTPUT "${PROJECT_BINARY_DIR}/jvm")
   set(FUGHETTA_GRADLE_USER_HOME "${JVM_OUTPUT}/home" CACHE PATH "Gradle user home for the provider build")
   set(GRADLE_ENV
