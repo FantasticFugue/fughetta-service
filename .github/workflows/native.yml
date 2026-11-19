@@ -120,30 +120,6 @@ jobs:
           path: ${{ steps.native.outputs.package-directory }}
           if-no-files-found: error
 
-      - name: Print the failed macOS test backtrace
-        if: failure() && inputs.profile == 'check' && runner.os == 'macOS' && matrix.check.test_pattern != ''
-        env:
-          BUILD_DIR: ${{ steps.native.outputs.build-directory }}
-          TEST_PATTERN: ${{ matrix.check.test_pattern }}
-        run: |
-          python - <<'PYTHON'
-          import json
-          import os
-          import subprocess
-
-          build = os.environ["BUILD_DIR"]
-          listing = subprocess.check_output([
-              "ctest", "--test-dir", build, "-R", os.environ["TEST_PATTERN"], "--show-only=json-v1"
-          ])
-          for test in json.loads(listing)["tests"]:
-              properties = {item["name"]: item["value"] for item in test["properties"]}
-              environment = os.environ.copy()
-              environment.update(entry.split("=", 1) for entry in properties.get("ENVIRONMENT", []))
-              subprocess.run([
-                  "xcrun", "lldb", "--batch", "-o", "run", "-k", "thread backtrace", "--", *test["command"]
-              ], cwd=properties.get("WORKING_DIRECTORY", build), env=environment)
-          PYTHON
-
       - name: Upload logs on failure
         if: failure() && steps.native.outputs.build-directory != ''
         uses: actions/upload-artifact@v7

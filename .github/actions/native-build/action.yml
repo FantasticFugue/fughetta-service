@@ -170,8 +170,9 @@ runs:
         if [[ "$RUNNER_OS" == macOS ]]; then
           runtime=$(find "$root" -name libc++.dylib | sed -n '1p')
           runtime_dir=$(dirname "${runtime:?LLVM archive lacks libc++.dylib}")
+          # Link the unwinder from the same LLVM distribution and keep DWARF unwind tables.
           echo "CLANG_RUNTIME_DIR=$runtime_dir" >> "$GITHUB_ENV"
-          echo "LDFLAGS=${LDFLAGS:+$LDFLAGS }-L\"$runtime_dir\" -Wl,-rpath,\"$runtime_dir\" -lc++abi" >> "$GITHUB_ENV"
+          echo "LDFLAGS=${LDFLAGS:+$LDFLAGS }-L\"$runtime_dir\" -lc++abi -lunwind -Wl,-rpath,\"$runtime_dir\" -Wl,-no_compact_unwind" >> "$GITHUB_ENV"
         fi
         echo "CLANG_ROOT=$root" >> "$GITHUB_ENV"
         echo "CLANG_ID=$id" >> "$GITHUB_ENV"

@@ -161,7 +161,7 @@ namespace {
             auto command = test::worker_command(SERVICE_EXECUTABLE, tmp.dir, {"worker.json"});
             if (kotlin) {
                 command.env = host::environment();
-                command.env.erase("JAVA_HOME");
+                command.env->erase("JAVA_HOME");
             }
             auto process = std::make_unique<test::child>(std::move(command));
             test::eventually(
