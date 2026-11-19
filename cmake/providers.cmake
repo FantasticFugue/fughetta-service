@@ -12,18 +12,25 @@ set(FUGHETTA_PROVIDERS)
 
 ## .NET
 #
-# The SDK must be 11.0 or later, whose F# compiler names CLI events with E:
-# documentation IDs, and the 10.0 reference pack must be installed beside it. Building the F# plugin builds the
-# fughetta-clr host it references.
+# Install the selected target framework's reference pack beside the build SDK.
+# Building the F# plugin also builds the fughetta-clr host it references.
 
 find_program(DOTNET_TOOL dotnet)
 if(DOTNET_TOOL)
+  set(CLR_SETTINGS "${FUGHETTA_CLR_PROVIDERS}/Directory.Build.props")
+  set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${CLR_SETTINGS}")
+  file(STRINGS "${CLR_SETTINGS}" CLR_SDK_SETTING REGEX "<FughettaMinimumSdkVersion>")
+  string(REGEX MATCH "<FughettaMinimumSdkVersion>([0-9]+\\.[0-9]+)</FughettaMinimumSdkVersion>" CLR_SDK_MATCH "${CLR_SDK_SETTING}")
+  if(NOT CLR_SDK_MATCH)
+    message(FATAL_ERROR "Set FughettaMinimumSdkVersion in ${CLR_SETTINGS}")
+  endif()
+  set(CLR_MINIMUM_SDK "${CMAKE_MATCH_1}")
   execute_process(COMMAND "${DOTNET_TOOL}" --version
     WORKING_DIRECTORY "${FUGHETTA_CLR_PROVIDERS}"
     OUTPUT_VARIABLE DOTNET_VERSION OUTPUT_STRIP_TRAILING_WHITESPACE
     RESULT_VARIABLE DOTNET_VERSION_STATUS ERROR_VARIABLE DOTNET_VERSION_ERROR)
-  if(NOT DOTNET_VERSION_STATUS EQUAL 0 OR NOT DOTNET_VERSION MATCHES "^[0-9]+\\.[0-9]+\\.[0-9]+" OR DOTNET_VERSION VERSION_LESS 11.0)
-    message(FATAL_ERROR "clr-providers require .NET SDK 11.0 or later; ${DOTNET_TOOL} reported '${DOTNET_VERSION}': ${DOTNET_VERSION_ERROR}")
+  if(NOT DOTNET_VERSION_STATUS EQUAL 0 OR NOT DOTNET_VERSION MATCHES "^[0-9]+\\.[0-9]+\\.[0-9]+" OR DOTNET_VERSION VERSION_LESS CLR_MINIMUM_SDK)
+    message(FATAL_ERROR "clr-providers require .NET SDK ${CLR_MINIMUM_SDK} or later; ${DOTNET_TOOL} reported '${DOTNET_VERSION}': ${DOTNET_VERSION_ERROR}")
   endif()
   set(CLR_OUTPUT "${PROJECT_BINARY_DIR}/clr")
   set(FUGHETTA_PROVIDER_clr "${CLR_OUTPUT}/fughetta-clr/fughetta-clr.dll")
@@ -42,7 +49,7 @@ if(DOTNET_TOOL)
       "${DOTNET_TOOL}" build "${FUGHETTA_CLR_PROVIDERS}/exporter/fughetta-msbuild-model.fsproj"
       --nologo "-p:FughettaOutput=${CLR_OUTPUT}"
     COMMAND "${CMAKE_COMMAND}" -E touch "${CLR_OUTPUT}/built.stamp"
-    DEPENDS ${CLR_PROVIDER_SOURCES} "${FUGHETTA_CLR_PROVIDERS}/Directory.Build.props" "${DOTNET_TOOL}"
+    DEPENDS ${CLR_PROVIDER_SOURCES} "${CLR_SETTINGS}" "${DOTNET_TOOL}"
     VERBATIM)
   add_custom_target(clr-providers ALL DEPENDS "${CLR_OUTPUT}/built.stamp")
 endif()
@@ -94,7 +101,8 @@ if(GRADLE_TOOL)
     BYPRODUCTS "${FUGHETTA_PROVIDER_jvm}" "${FUGHETTA_PROVIDER_kotlin}"
     COMMAND ${FUGHETTA_GRADLE} installDist
     COMMAND "${CMAKE_COMMAND}" -E touch "${JVM_OUTPUT}/built.stamp"
-    DEPENDS ${JVM_PROVIDER_SOURCES} "${FUGHETTA_JVM_PROVIDERS}/build.gradle.kts" "${FUGHETTA_JVM_PROVIDERS}/settings.gradle.kts" "${GRADLE_TOOL}"
+    DEPENDS ${JVM_PROVIDER_SOURCES} "${FUGHETTA_JVM_PROVIDERS}/build.gradle.kts" "${FUGHETTA_JVM_PROVIDERS}/settings.gradle.kts"
+      "${FUGHETTA_JVM_PROVIDERS}/gradle.properties" "${GRADLE_TOOL}"
     VERBATIM)
   add_custom_target(jvm-providers ALL DEPENDS "${JVM_OUTPUT}/built.stamp")
 endif()

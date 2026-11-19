@@ -40,10 +40,9 @@ def worker_executables(stage, system):
             stage / f"libexec/fughetta-service/llvm/fughetta-llvm{suffix}"]
 
 
-def worker_assets(stage, args, system, machine):
-    arch = {"x86_64": "x64", "amd64": "x64"}.get(machine, machine)
+def worker_assets(stage, args, system):
     for binary in worker_executables(stage, system):
-        target = args.output / f"{binary.stem}-{sys.platform}-{arch}{binary.suffix}"
+        target = args.output / f"{binary.stem}-{sys.platform}-{args.arch}{binary.suffix}"
         shutil.copy2(binary, target)
         if system != "Windows":
             clang = os.environ.get("CLANG_ROOT")
@@ -153,14 +152,14 @@ def deb(stage, scratch, args):
 
 def msi(stage, scratch, args):
     shutil.copy2(HERE / "windows/initialize.ps1", stage / "share/fughetta-service/initialize.ps1")
-    run("wix", "build", HERE / "windows/package.wxs", "-arch", "x64",
+    run("wix", "build", HERE / "windows/package.wxs", "-arch", args.arch,
         "-d", f"Stage={stage.as_posix()}", "-d", f"Version={args.version}",
         "-ext", "WixToolset.Util.wixext", "-intermediateFolder", scratch / "wix", "-pdbtype", "none",
-        "-out", args.output / f"fughetta-service-{args.version}-x64.msi")
+        "-out", args.output / f"fughetta-service-{args.version}-{args.arch}.msi")
 
 
 def homebrew(stage, scratch, args):
-    archive = args.output / f"fughetta-service-{args.version}-darwin-arm64.tar.gz"
+    archive = args.output / f"fughetta-service-{args.version}-{sys.platform}-{args.arch}.tar.gz"
     with tarfile.open(archive, "w:gz") as package:
         for child in sorted(stage.iterdir()):
             package.add(child, arcname=child.name)
@@ -197,6 +196,7 @@ def main():
     machine = platform.machine().lower()
     if (system, machine) not in {("Linux", "x86_64"), ("Windows", "amd64"), ("Darwin", "arm64")}:
         parser.error("packages are built on Linux x64, Windows x64, or macOS arm64")
+    args.arch = {"x86_64": "x64", "amd64": "x64"}.get(machine, machine)
     if system == "Darwin" and not args.release_url:
         parser.error("--release-url is required for the Homebrew formula")
     args.build = args.build.resolve()
@@ -224,7 +224,7 @@ def main():
         elif clang := os.environ.get("CLANG_ROOT"):
             runtime_search = [*runtime_search, (Path(clang) / "lib").as_posix()]
         if args.worker_assets:
-            worker_assets(stage, args, system, machine)
+            worker_assets(stage, args, system)
         runtime(stage, scratch, system, runtime_search)
         {"Linux": deb, "Windows": msi, "Darwin": homebrew}[system](stage, scratch, args)
 

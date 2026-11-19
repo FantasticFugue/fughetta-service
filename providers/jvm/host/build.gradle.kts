@@ -13,7 +13,7 @@ dependencies {
 }
 
 kotlin {
-    jvmToolchain(25)
+    jvmToolchain(providers.gradleProperty("fughetta.javaVersion").get().toInt())
 }
 
 application { mainClass.set("fughetta.jvm.MainKt") }

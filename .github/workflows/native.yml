@@ -36,11 +36,18 @@ jobs:
           settings=$(python3 - <<'PY'
           import json
           from pathlib import Path
+          from xml.etree import ElementTree
 
           config = json.loads(Path(".github/ci.json").read_text())
           minimum = json.loads(Path("CMakePresets.json").read_text())["cmakeMinimumRequired"]
           config["toolchain"]["cmake"] = ".".join(str(minimum[part]) for part in ("major", "minor", "patch"))
-          config["toolchain"]["dotnet"] = "\n".join(config["toolchain"]["dotnet"])
+          clr = ElementTree.parse("providers/clr/Directory.Build.props")
+          framework = clr.findtext(".//TargetFramework").removeprefix("net")
+          sdk = clr.findtext(".//FughettaMinimumSdkVersion")
+          config["toolchain"]["dotnet"] = "\n".join(f"{version}.x" for version in dict.fromkeys((framework, sdk)))
+          jvm = dict(line.split("=", 1) for line in Path("providers/jvm/gradle.properties").read_text().splitlines()
+                     if "=" in line and not line.lstrip().startswith(("#", "!")))
+          config["toolchain"]["java"]["version"] = jvm["fughetta.javaVersion"]
           print(json.dumps(config, separators=(",", ":")))
           PY
           )

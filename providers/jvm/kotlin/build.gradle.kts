@@ -41,7 +41,7 @@ dependencies {
 }
 
 kotlin {
-    jvmToolchain(25)
+    jvmToolchain(providers.gradleProperty("fughetta.javaVersion").get().toInt())
     compilerOptions {
         optIn.add("org.jetbrains.kotlin.analysis.api.KaExperimentalApi")
         optIn.add("org.jetbrains.kotlin.analysis.api.KaImplementationDetail")
