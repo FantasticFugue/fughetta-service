@@ -104,7 +104,10 @@ runs:
             curl -fsSL --retry 3 "https://github.com/llvm/llvm-project/releases/download/llvmorg-$LLVM_VERSION/$name.tar.xz" -o "$temporary/$name.tar.xz"
             tar -xf "$temporary/$name.tar.xz" -C "$temporary"
             root="$temporary/$name"
-            id="llvm-$LLVM_VERSION" ;;
+            # Autotools invokes upstream clang directly, so it needs the SDK
+            # in the environment as well as CMake's compiler configuration.
+            echo "SDKROOT=$(xcrun --sdk macosx --show-sdk-path)" >> "$GITHUB_ENV"
+            id="llvm-$LLVM_VERSION-sdk-$(xcrun --sdk macosx --show-sdk-version)" ;;
           Windows)
             case "$RUNNER_ARCH" in X64) arch=x86_64 ;; ARM64) arch=aarch64 ;; esac
             name="clang+llvm-$LLVM_VERSION-$arch-pc-windows-msvc"
