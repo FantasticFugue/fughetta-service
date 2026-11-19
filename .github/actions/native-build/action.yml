@@ -25,6 +25,23 @@ runs:
       with:
         python-version: "3.x"
 
+    - name: Set dependency cache paths
+      shell: bash
+      env:
+        PRESET: ${{ inputs.preset }}
+      run: |
+        workspace="$GITHUB_WORKSPACE"
+        if [[ "$RUNNER_OS" == Windows ]]; then workspace=$(cygpath -m "$workspace"); fi
+        vcpkg_cache="$workspace/build/ci/vcpkg"
+        mkdir -p "$vcpkg_cache/downloads" "$vcpkg_cache/archives"
+        {
+          echo "CI_IMAGE_VERSION=${ImageVersion:-$RUNNER_OS}"
+          echo "VCPKG_DOWNLOADS=$vcpkg_cache/downloads"
+          echo "VCPKG_BINARY_SOURCES=clear;files,$vcpkg_cache/archives,readwrite"
+          echo "NUGET_PACKAGES=$workspace/build/ci/nuget"
+          echo "GRADLE_USER_HOME=$workspace/build/$PRESET/jvm/home"
+        } >> "$GITHUB_ENV"
+
     # The CLR providers build with the newest SDK and target net10.0, whose
     # reference pack the 10.0 SDK installs.
     - uses: actions/setup-dotnet@v5
@@ -41,6 +58,14 @@ runs:
     - uses: gradle/actions/setup-gradle@v5
       with:
         gradle-version: current
+        cache-read-only: ${{ github.event_name == 'pull_request' }}
+
+    - name: Restore toolchain downloads
+      id: tools-cache
+      uses: actions/cache/restore@v6
+      with:
+        path: ${{ runner.temp }}/native-toolchain
+        key: native-toolchain-${{ runner.os }}-${{ runner.arch }}-${{ inputs.cmake-version }}-${{ inputs.llvm-version }}
 
     # PyPI lags the CMake release, so CMake comes from Kitware's release.
     - name: Install build tools
@@ -57,9 +82,12 @@ runs:
           Windows-X64) package=windows-x86_64.zip bin=bin ;;
           Windows-ARM64) package=windows-arm64.zip bin=bin ;;
         esac
-        archive="$RUNNER_TEMP/cmake-$CMAKE_VERSION-$package"
-        curl -fsSL --retry 3 -o "$archive" \
-          "https://github.com/Kitware/CMake/releases/download/v$CMAKE_VERSION/cmake-$CMAKE_VERSION-$package"
+        archive="$RUNNER_TEMP/native-toolchain/cmake-$CMAKE_VERSION-$package"
+        mkdir -p "$(dirname "$archive")"
+        if [[ ! -f "$archive" ]]; then
+          curl -fsSL --retry 3 -o "$archive" \
+            "https://github.com/Kitware/CMake/releases/download/v$CMAKE_VERSION/cmake-$CMAKE_VERSION-$package"
+        fi
         case "$package" in
           *.zip) 7z x -y -o"$RUNNER_TEMP" "$archive" >/dev/null ;;
           *) tar -xzf "$archive" -C "$RUNNER_TEMP" ;;
@@ -101,8 +129,6 @@ runs:
           macOS)
             case "$RUNNER_ARCH" in ARM64) arch=ARM64 ;; esac
             name="LLVM-$LLVM_VERSION-macOS-$arch"
-            curl -fsSL --retry 3 "https://github.com/llvm/llvm-project/releases/download/llvmorg-$LLVM_VERSION/$name.tar.xz" -o "$temporary/$name.tar.xz"
-            tar -xf "$temporary/$name.tar.xz" -C "$temporary"
             root="$temporary/$name"
             # Autotools invokes upstream clang directly, so it needs the SDK
             # in the environment as well as CMake's compiler configuration.
@@ -114,13 +140,26 @@ runs:
             case "$RUNNER_ARCH" in X64) arch=x86_64 ;; ARM64) arch=aarch64 ;; esac
             name="clang+llvm-$LLVM_VERSION-$arch-pc-windows-msvc"
             temporary="$(cygpath -u "$temporary")"
-            curl -fsSL --retry 3 "https://github.com/llvm/llvm-project/releases/download/llvmorg-$LLVM_VERSION/$name.tar.xz" -o "$temporary/$name.tar.xz"
-            tar -xf "$temporary/$name.tar.xz" -C "$temporary"
             root="$(cygpath -m "$temporary/$name")"
             id="llvm-$LLVM_VERSION" ;;
         esac
+        if [[ "$RUNNER_OS" != Linux ]]; then
+          archive="$temporary/native-toolchain/$name.tar.xz"
+          if [[ ! -f "$archive" ]]; then
+            curl -fsSL --retry 3 -o "$archive" \
+              "https://github.com/llvm/llvm-project/releases/download/llvmorg-$LLVM_VERSION/$name.tar.xz"
+          fi
+          tar -xf "$archive" -C "$temporary"
+        fi
         echo "CLANG_ROOT=$root" >> "$GITHUB_ENV"
         echo "CLANG_ID=$id" >> "$GITHUB_ENV"
+
+    - name: Save toolchain downloads
+      if: steps.tools-cache.outputs.cache-hit != 'true'
+      uses: actions/cache/save@v6
+      with:
+        path: ${{ runner.temp }}/native-toolchain
+        key: ${{ steps.tools-cache.outputs.cache-primary-key }}
 
     # Port versions can refer to Git trees from earlier commits, so the
     # registry needs the history reachable from the manifest's baseline.
@@ -143,20 +182,13 @@ runs:
         fi
         echo "VCPKG_ROOT=$root" >> "$GITHUB_ENV"
 
-    - name: Cache vcpkg downloads
-      uses: actions/cache@v6
-      with:
-        path: build/${{ inputs.preset }}/vcpkg-downloads
-        key: vcpkg-downloads-${{ runner.os }}-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json') }}
-        restore-keys: vcpkg-downloads-${{ runner.os }}-
-
-    - name: Restore installed vcpkg dependencies
-      id: installed
+    - name: Restore vcpkg downloads and binary packages
+      id: vcpkg-cache
       uses: actions/cache/restore@v6
       with:
-        path: build/${{ inputs.preset }}/vcpkg_installed
-        key: vcpkg-installed-${{ runner.os }}-${{ runner.arch }}-${{ inputs.preset }}-${{ env.CLANG_ID }}-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json', 'cmake/toolchain.cmake') }}
-        restore-keys: vcpkg-installed-${{ runner.os }}-${{ runner.arch }}-${{ inputs.preset }}-${{ env.CLANG_ID }}-
+        path: build/ci/vcpkg
+        key: vcpkg-packages-${{ runner.os }}-${{ runner.arch }}-${{ inputs.preset }}-${{ env.CLANG_ID }}-${{ env.CI_IMAGE_VERSION }}-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json', 'cmake/toolchain.cmake') }}
+        restore-keys: vcpkg-packages-${{ runner.os }}-${{ runner.arch }}-${{ inputs.preset }}-${{ env.CLANG_ID }}-
 
     - name: Configure
       shell: bash
@@ -167,15 +199,24 @@ runs:
         read -r -a arguments <<< "$CONFIGURE_ARGS"
         cmake --preset "$PRESET" "${arguments[@]}"
 
-    # After configure, the dependency cache is usable even if compilation fails.
-    - name: Cache installed vcpkg dependencies
-      if: steps.installed.outputs.cache-hit != 'true'
+    # vcpkg selects binary archives by its own package ABI at install time.
+    - name: Save vcpkg downloads and binary packages
+      if: steps.vcpkg-cache.outputs.cache-hit != 'true'
       uses: actions/cache/save@v6
       with:
-        path: build/${{ inputs.preset }}/vcpkg_installed
-        key: ${{ steps.installed.outputs.cache-primary-key }}
+        path: build/ci/vcpkg
+        key: ${{ steps.vcpkg-cache.outputs.cache-primary-key }}
+
+    - name: Restore NuGet packages
+      id: nuget-cache
+      uses: actions/cache/restore@v6
+      with:
+        path: build/ci/nuget
+        key: nuget-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('providers/clr/**/*.fsproj', 'providers/clr/**/*.csproj', 'providers/clr/Directory.Build.props') }}
+        restore-keys: nuget-${{ runner.os }}-${{ runner.arch }}-
 
     - name: Build
+      id: build
       shell: bash
       env:
         PRESET: ${{ inputs.preset }}
@@ -198,3 +239,10 @@ runs:
           fi
           echo "Clang crashed; resuming the Ninja build."
         done
+
+    - name: Save NuGet packages
+      if: ${{ !cancelled() && steps.build.outcome != 'skipped' && steps.nuget-cache.outputs.cache-hit != 'true' }}
+      uses: actions/cache/save@v6
+      with:
+        path: build/ci/nuget
+        key: ${{ steps.nuget-cache.outputs.cache-primary-key }}
