@@ -1,24 +1,22 @@
-name: toolchain
-description: Install CMake, Ninja, clang for this runner and vcpkg at the baseline in vcpkg-configuration.json, and restore the vcpkg caches of a preset's build directory.
+name: native-build
+description: Set up the native and managed toolchains, then configure and build a CMake preset.
 
 inputs:
   preset:
-    description: Configure preset whose build directory holds the vcpkg caches
+    description: CMake configure and build preset
     required: true
+  configure-args:
+    description: Additional CMake configure arguments
+    default: ''
+  targets:
+    description: Space-separated CMake targets, or empty to build the default targets
+    default: ''
   llvm-version:
     description: LLVM release (Linux takes its major from apt.llvm.org)
     default: 23.1.5
   cmake-version:
     description: CMake release
     default: 4.5.0
-
-outputs:
-  installed-key:
-    description: Cache key for the installed vcpkg dependencies
-    value: ${{ steps.installed.outputs.cache-primary-key }}
-  installed-hit:
-    description: Whether the installed dependencies matched that key
-    value: ${{ steps.installed.outputs.cache-hit }}
 
 runs:
   using: composite
@@ -34,6 +32,15 @@ runs:
         dotnet-version: |
           10.0.x
           11.0.x
+
+    - uses: actions/setup-java@v5
+      with:
+        distribution: temurin
+        java-version: '25'
+
+    - uses: gradle/actions/setup-gradle@v5
+      with:
+        gradle-version: current
 
     # PyPI lags the CMake release, so CMake comes from Kitware's release.
     - name: Install build tools
@@ -110,7 +117,8 @@ runs:
         echo "CLANG_ROOT=$root" >> "$GITHUB_ENV"
         echo "CLANG_ID=$id" >> "$GITHUB_ENV"
 
-    # vcpkg is checked out at the builtin baseline the manifest names.
+    # Port versions can refer to Git trees from earlier commits, so the
+    # registry needs the history reachable from the manifest's baseline.
     - name: Install vcpkg
       shell: bash
       run: |
@@ -121,7 +129,7 @@ runs:
         fi
         baseline="$(python -c "import json; print(json.load(open('vcpkg-configuration.json'))['default-registry']['baseline'])")"
         git init -q "$root"
-        git -C "$root" fetch -q --depth 1 https://github.com/microsoft/vcpkg.git "$baseline"
+        git -C "$root" fetch -q --no-tags https://github.com/microsoft/vcpkg.git "$baseline"
         git -C "$root" checkout -q FETCH_HEAD
         if [ "$RUNNER_OS" = Windows ]; then
           cmd //c "$(cygpath -w "$root/bootstrap-vcpkg.bat")" -disableMetrics
@@ -137,8 +145,6 @@ runs:
         key: vcpkg-downloads-${{ runner.os }}-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json') }}
         restore-keys: vcpkg-downloads-${{ runner.os }}-
 
-    # Restored here and saved by the workflow after configuring, so a failing
-    # build keeps the installed dependencies.
     - name: Restore installed vcpkg dependencies
       id: installed
       uses: actions/cache/restore@v6
@@ -146,3 +152,33 @@ runs:
         path: build/${{ inputs.preset }}/vcpkg_installed
         key: vcpkg-installed-${{ runner.os }}-${{ runner.arch }}-${{ inputs.preset }}-${{ env.CLANG_ID }}-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json', 'cmake/toolchain.cmake') }}
         restore-keys: vcpkg-installed-${{ runner.os }}-${{ runner.arch }}-${{ inputs.preset }}-${{ env.CLANG_ID }}-
+
+    - name: Configure
+      shell: bash
+      env:
+        PRESET: ${{ inputs.preset }}
+        CONFIGURE_ARGS: ${{ inputs.configure-args }}
+      run: |
+        read -r -a arguments <<< "$CONFIGURE_ARGS"
+        cmake --preset "$PRESET" "${arguments[@]}"
+
+    # After configure, the dependency cache is usable even if compilation fails.
+    - name: Cache installed vcpkg dependencies
+      if: steps.installed.outputs.cache-hit != 'true'
+      uses: actions/cache/save@v6
+      with:
+        path: build/${{ inputs.preset }}/vcpkg_installed
+        key: ${{ steps.installed.outputs.cache-primary-key }}
+
+    - name: Build
+      shell: bash
+      env:
+        PRESET: ${{ inputs.preset }}
+        BUILD_TARGETS: ${{ inputs.targets }}
+      run: |
+        read -r -a targets <<< "$BUILD_TARGETS"
+        arguments=()
+        if ((${#targets[@]})); then
+          arguments=(--target "${targets[@]}")
+        fi
+        cmake --build --preset "$PRESET" --parallel 2 "${arguments[@]}"

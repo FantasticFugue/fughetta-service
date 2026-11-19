@@ -44,19 +44,10 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - id: toolchain
-        uses: ./.github/actions/toolchain
+      - uses: ./.github/actions/native-build
         with:
           preset: release
-
-      - uses: actions/setup-java@v5
-        with:
-          distribution: temurin
-          java-version: '25'
-
-      - uses: gradle/actions/setup-gradle@v5
-        with:
-          gradle-version: current
+          targets: fughetta-service llvm-provider clr-providers jvm-providers
 
       - name: Install packaging tools
         run: |
@@ -68,27 +59,7 @@ jobs:
               "$RUNNER_TEMP/wix/wix" extension add WixToolset.Util.wixext ;;
           esac
 
-      - name: Configure
-        run: cmake --preset release
-
-      - name: Cache installed vcpkg dependencies
-        if: steps.toolchain.outputs.installed-hit != 'true'
-        uses: actions/cache/save@v6
-        with:
-          path: build/release/vcpkg_installed
-          key: ${{ steps.toolchain.outputs.installed-key }}
-
-      - name: Build
-        # The compiler occasionally segfaults on a unit that compiles on
-        # the next attempt; ninja retries only what failed, and ten failures
-        # fail the step.
-        run: |
-          for attempt in $(seq 10); do
-            cmake --build --preset release --target fughetta-service llvm-provider clr-providers jvm-providers --parallel 2 && exit 0
-          done
-          exit 1
-
-      - name: Package
+      - name: Stage worker binaries
         run: |
           set -euo pipefail
           cmake --install build/release --prefix dist-root --component runtime

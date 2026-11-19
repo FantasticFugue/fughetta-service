@@ -11,6 +11,9 @@ concurrency:
   group: build-${{ github.head_ref || github.ref_name }}
   cancel-in-progress: true
 
+permissions:
+  contents: read
+
 jobs:
   build:
     name: ${{ matrix.name }}
@@ -27,7 +30,7 @@ jobs:
           - name: macos-arm64
             os: macos-15
             configure: -DCLANG_SANITIZER=
-            targets: --target executor-test
+            targets: executor-test
             test: -R '^executor$'
           - name: windows-x64
             os: windows-2025
@@ -35,30 +38,11 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - id: toolchain
-        uses: ./.github/actions/toolchain
+      - uses: ./.github/actions/native-build
         with:
           preset: debug
-
-      - name: Configure
-        run: cmake --preset debug ${{ matrix.configure }}
-
-      - name: Cache installed vcpkg dependencies
-        if: steps.toolchain.outputs.installed-hit != 'true'
-        uses: actions/cache/save@v6
-        with:
-          path: build/debug/vcpkg_installed
-          key: ${{ steps.toolchain.outputs.installed-key }}
-
-      - name: Build
-        # The compiler occasionally segfaults on a unit that compiles on
-        # the next attempt; ninja retries only what failed, and ten failures
-        # fail the step.
-        run: |
-          for attempt in $(seq 10); do
-            cmake --build --preset debug --parallel 2 ${{ matrix.targets }} && exit 0
-          done
-          exit 1
+          configure-args: ${{ matrix.configure }}
+          targets: ${{ matrix.targets }}
 
       - name: Test
         run: ctest --preset debug ${{ matrix.test }}
