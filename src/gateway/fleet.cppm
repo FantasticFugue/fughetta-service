@@ -232,7 +232,7 @@ export namespace routing {
         }
 
         // `observed` is false for work that is only a part of a dispatch held elsewhere: its time and tree are that dispatch's.
-        template <class Work> auto with(const selection& sel, Work work, bool observed = true) -> std::invoke_result_t<Work&, transport::channel<socket>&> {
+        template <class Work> auto with(selection sel, Work work, bool observed = true) -> std::invoke_result_t<Work&, transport::channel<socket>&> {
             auto m = pick(sel);
             if (!m)
                 throw no_worker{diagnose(sel), busy(sel)};
@@ -474,7 +474,7 @@ export namespace routing {
             sel.analysis = false;
             // The analysis this runs beside already reserved the dispatch's memory.
             sel.memory_bytes = 0;
-            return with(sel, std::move(work), false);
+            return with(std::move(sel), std::move(work), false);
         }
 
         auto receipt_identity(const transport::channel<socket>& channel) const {
