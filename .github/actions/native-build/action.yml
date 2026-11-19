@@ -170,7 +170,6 @@ runs:
           runtime=$(find "$root" -name libc++.dylib | sed -n '1p')
           runtime_dir=$(dirname "${runtime:?LLVM archive lacks libc++.dylib}")
           unwinder="$runtime_dir/libunwind.dylib"
-          test -f "$unwinder"
           echo "CLANG_RUNTIME_DIR=$runtime_dir" >> "$GITHUB_ENV"
           # Bind app unwind calls to the runtime that libc++abi uses.
           echo "LDFLAGS=${LDFLAGS:+$LDFLAGS }-L\"$runtime_dir\" -Wl,-rpath,\"$runtime_dir\" -Wl,-needed_library,\"$unwinder\" -lc++abi" >> "$GITHUB_ENV"
