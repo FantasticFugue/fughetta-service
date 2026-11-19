@@ -245,7 +245,10 @@ namespace {
         test::tool(port, "task", R"({"project":"app","action":"create","task":"managed","worldline":"main","operation_id":"bind-managed"})");
         const auto run = test::decode<tools::task::output>(
             test::tool(port, "task", R"({"project":"app","action":"start","task":"managed","operation_id":"start-managed"})"));
-        auto agent = [&](const std::string& name, const std::string& args) { return test::tool(port, name, args, false, *run.credential); };
+        const auto analysis_timeout = std::chrono::seconds{language::timeout(profile.defaults.execution.limits)};
+        auto agent = [&](const std::string& name, const std::string& args) {
+            return test::tool(port, name, args, false, *run.credential, analysis_timeout);
+        };
         auto query = [&](std::string output) {
             return test::decode<tools::language_query::output>(
                 agent("language", json::write(tools::language_query::input{.project = "app",
