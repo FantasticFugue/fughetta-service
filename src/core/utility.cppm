@@ -3,6 +3,11 @@ export module utility;
 import std;
 
 export namespace util {
+#ifdef _WIN32
+    auto capture_current_exception() noexcept -> std::exception_ptr;
+#else
+    inline auto capture_current_exception() noexcept -> std::exception_ptr { return std::current_exception(); }
+#endif
     // A move-only, type-erased callable with a small buffer, for the places the
     // scheduler and the service layers hand a callback to somebody and forget
     // the concrete type (a post to a worker, a notification sink, a gate
@@ -227,3 +232,31 @@ export namespace util {
         auto operator()(const std::string& s) const noexcept -> std::size_t { return std::hash<std::string_view>{}(s); }
     };
 } // namespace util
+
+#ifdef _WIN32
+namespace util {
+    namespace {
+        // Clang can omit the copy callback in the throw metadata of an imported
+        // filesystem_error. Capture a typed copy whose metadata is emitted here.
+        struct captured_filesystem_error final : std::filesystem::filesystem_error {
+            explicit captured_filesystem_error(const std::filesystem::filesystem_error& error) : std::filesystem::filesystem_error(error) {}
+        };
+    }
+
+    auto capture_current_exception() noexcept -> std::exception_ptr {
+        try {
+            throw;
+        } catch (const std::filesystem::filesystem_error& error) {
+            if (typeid(error) != typeid(std::filesystem::filesystem_error))
+                return std::current_exception();
+            try {
+                throw captured_filesystem_error{error};
+            } catch (...) {
+                return std::current_exception();
+            }
+        } catch (...) {
+            return std::current_exception();
+        }
+    }
+}
+#endif

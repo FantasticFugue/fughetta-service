@@ -15,7 +15,7 @@
   },
   "runners": [
     {"id": "linux-x64", "label": "ubuntu-24.04"},
-    {"id": "macos-arm64", "label": "macos-15", "check": {"configure": "-DCLANG_SANITIZER=", "targets": "executor-test", "test_pattern": "^executor$", "retain_test_log": true}},
+    {"id": "macos-arm64", "label": "macos-15", "check": {"configure": "-DCLANG_SANITIZER=", "retain_test_log": true}},
     {"id": "windows-x64", "label": "windows-2025", "check": {"configure": "-DCLANG_SANITIZER="}}
   ]
 }

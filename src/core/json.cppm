@@ -102,13 +102,10 @@ namespace json::detail {
         });
     }
 
-    class parse_error : public std::runtime_error { using std::runtime_error::runtime_error; };
-    [[noreturn]] inline void invalid(std::string_view message) { throw parse_error{std::string{message}}; }
-
     struct dom_input {
         simdjson::dom::element item;
         auto null() const -> bool { return item.is_null(); }
-        template <class T> auto scalar() const -> T {
+        template <class T> auto scalar() const -> result<T> {
             if constexpr (std::same_as<T, std::string> || std::same_as<T, std::string_view>) {
                 std::string_view text;
                 if (!item.get_string().get(text))
@@ -130,7 +127,7 @@ namespace json::detail {
                 if (!item.get_int64().get(out) && std::in_range<T>(out))
                     return static_cast<T>(out);
             }
-            invalid("unexpected JSON scalar");
+            return json::unexpected("unexpected JSON scalar");
         }
         auto at(std::string_view key) const -> std::optional<dom_input> {
             simdjson::dom::element out;
@@ -138,44 +135,66 @@ namespace json::detail {
                 return dom_input{out};
             return {};
         }
-        template <class F> void object(F&& f) const {
+        template <class F> auto object(F&& f) const -> result<void> {
             simdjson::dom::object object;
             if (item.get_object().get(object))
-                invalid("expected JSON object");
-            for (auto [name, child] : object)
-                f(name, dom_input{child});
+                return json::unexpected("expected JSON object");
+            for (auto [name, child] : object) {
+                if (auto status = f(name, dom_input{child}); !status)
+                    return status;
+            }
+            return {};
         }
-        template <class F> void array(F&& f) const {
+        template <class F> auto array(F&& f) const -> result<void> {
             simdjson::dom::array array;
             if (item.get_array().get(array))
-                invalid("expected JSON array");
-            f(array.size(), [&](auto&& visit) {
-                for (auto child : array)
-                    visit(dom_input{child});
+                return json::unexpected("expected JSON array");
+            return f(array.size(), [&](auto&& visit) -> result<void> {
+                for (auto child : array) {
+                    if (auto status = visit(dom_input{child}); !status)
+                        return status;
+                }
+                return {};
             });
         }
-        auto dynamic() const -> value {
+        auto dynamic() const -> result<value> {
             using kind = simdjson::dom::element_type;
             switch (item.type()) {
-            case kind::NULL_VALUE: return {};
-            case kind::BOOL: return scalar<bool>();
-            case kind::INT64: return scalar<std::int64_t>();
-            case kind::UINT64: return scalar<std::uint64_t>();
-            case kind::DOUBLE: return scalar<double>();
-            case kind::STRING: return scalar<std::string>();
-            case kind::BIGINT: invalid("JSON integer is outside the 64-bit range");
+            case kind::NULL_VALUE: return value{};
+            case kind::BOOL: return value{*scalar<bool>()};
+            case kind::INT64: return value{*scalar<std::int64_t>()};
+            case kind::UINT64: return value{*scalar<std::uint64_t>()};
+            case kind::DOUBLE: return value{*scalar<double>()};
+            case kind::STRING: return value{*scalar<std::string>()};
+            case kind::BIGINT: return json::unexpected("JSON integer is outside the 64-bit range");
             case kind::ARRAY: {
                 json::array out;
-                array([&](auto size, auto visit) {
+                auto status = array([&](auto size, auto visit) {
                     out.reserve(size);
-                    visit([&](auto child) { out.push_back(child.dynamic()); });
+                    return visit([&](auto child) -> result<void> {
+                        auto decoded = child.dynamic();
+                        if (!decoded)
+                            return std::unexpected(std::move(decoded.error()));
+                        out.push_back(std::move(*decoded));
+                        return {};
+                    });
                 });
-                return out;
+                if (!status)
+                    return std::unexpected(std::move(status.error()));
+                return value{std::move(out)};
             }
             case kind::OBJECT: {
                 json::object out;
-                object([&](auto name, auto child) { out.insert(std::string{name}, child.dynamic()); });
-                return out;
+                auto status = object([&](auto name, auto child) -> result<void> {
+                    auto decoded = child.dynamic();
+                    if (!decoded)
+                        return std::unexpected(std::move(decoded.error()));
+                    out.insert(std::string{name}, std::move(*decoded));
+                    return {};
+                });
+                if (!status)
+                    return std::unexpected(std::move(status.error()));
+                return value{std::move(out)};
             }
             }
             std::unreachable();
@@ -185,7 +204,7 @@ namespace json::detail {
     struct value_input {
         const value& item;
         auto null() const -> bool { return std::holds_alternative<std::monostate>(item.data); }
-        template <class T> auto scalar() const -> T {
+        template <class T> auto scalar() const -> result<T> {
             if constexpr (std::same_as<T, std::string> || std::same_as<T, std::string_view>) {
                 if (const auto* text = std::get_if<std::string>(&item.data))
                     return T{*text};
@@ -209,7 +228,7 @@ namespace json::detail {
                     if (const auto* number = std::get_if<double>(&item.data))
                         return static_cast<T>(*number);
             }
-            invalid("unexpected JSON scalar");
+            return json::unexpected("unexpected JSON scalar");
         }
         auto at(std::string_view key) const -> std::optional<value_input> {
             if (const auto* object = std::get_if<json::object>(&item.data))
@@ -217,26 +236,40 @@ namespace json::detail {
                     return value_input{field->second};
             return {};
         }
-        template <class F> void object(F&& f) const {
+        template <class F> auto object(F&& f) const -> result<void> {
             const auto* object = std::get_if<json::object>(&item.data);
             if (!object)
-                invalid("expected JSON object");
-            for (const auto& [name, child] : *object)
-                f(name, value_input{child});
+                return json::unexpected("expected JSON object");
+            for (const auto& [name, child] : *object) {
+                if (auto status = f(name, value_input{child}); !status)
+                    return status;
+            }
+            return {};
         }
-        template <class F> void array(F&& f) const {
+        template <class F> auto array(F&& f) const -> result<void> {
             const auto* array = std::get_if<json::array>(&item.data);
             if (!array)
-                invalid("expected JSON array");
-            f(array->size(), [&](auto&& visit) {
-                for (const auto& child : *array)
-                    visit(value_input{child});
+                return json::unexpected("expected JSON array");
+            return f(array->size(), [&](auto&& visit) -> result<void> {
+                for (const auto& child : *array) {
+                    if (auto status = visit(value_input{child}); !status)
+                        return status;
+                }
+                return {};
             });
         }
-        auto dynamic() const -> value { return item; }
+        auto dynamic() const -> result<value> { return item; }
     };
 
-    template <class T, class Policy, class Input> auto decode(Input input) -> T;
+    template <class T, class Policy, class Input> auto decode(Input input) -> result<T>;
+
+    template <class Policy, class T, class Input> auto decode_into(T& target, Input input) -> result<void> {
+        auto decoded = decode<T, Policy>(input);
+        if (!decoded)
+            return std::unexpected(std::move(decoded.error()));
+        target = std::move(*decoded);
+        return {};
+    }
 
     template <class T> using member_tuple = decltype(meta::members(std::declval<T&>()));
     template <class T, std::size_t I> using member_type = bare<std::tuple_element_t<I, member_tuple<T>>>;
@@ -245,7 +278,7 @@ namespace json::detail {
     template <class T, class Policy, class Input> struct member_setter {
         std::string_view name;
         std::uint32_t hash;
-        void (*assign)(T&, Input);
+        result<void> (*assign)(T&, Input);
         bool mandatory;
 
         template <std::size_t I> static consteval auto make() -> member_setter {
@@ -255,7 +288,7 @@ namespace json::detail {
             } else {
                 const std::string_view name = spelling<I>.view();
                 return {name, meta::fnv1a(name), [](T& record, Input child) {
-                    std::get<I>(meta::members(record)) = decode<field, Policy>(child);
+                    return decode_into<Policy>(std::get<I>(meta::members(record)), child);
                 }, required<field>()};
             }
         }
@@ -263,14 +296,14 @@ namespace json::detail {
         template <std::size_t I> static constexpr auto spelling = key<T, I, member_type<T, I>, Policy>();
     };
 
-    template <class T, class Policy, class Input, std::size_t... I> auto read_record(Input input, std::index_sequence<I...>) -> T {
+    template <class T, class Policy, class Input, std::size_t... I> auto read_record(Input input, std::index_sequence<I...>) -> result<T> {
         using setter = member_setter<T, Policy, Input>;
         static constexpr std::array<setter, sizeof...(I)> setters{setter::template make<I>()...};
         static constexpr auto mandatory = ((setter::template make<I>().mandatory ? (std::uint64_t{1} << I) : 0) | ... | 0);
         T out{};
         std::uint64_t seen = 0;
         std::size_t next = 0;
-        input.object([&](std::string_view name, Input child) {
+        auto status = input.object([&](std::string_view name, Input child) -> result<void> {
             auto match = setters.begin() + next;
             if (match == setters.end() || match->name != name || !match->assign) {
                 if constexpr (sizeof...(I) > 8) {
@@ -286,52 +319,63 @@ namespace json::detail {
                 const auto index = static_cast<std::size_t>(match - setters.begin());
                 const auto bit = std::uint64_t{1} << index;
                 if ((seen & bit) == 0) {
-                    match->assign(out, child);
+                    if (auto assigned = match->assign(out, child); !assigned)
+                        return assigned;
                     seen |= bit;
                     next = index + 1;
                 }
             } else if constexpr (Policy::strict) {
-                invalid("unexpected JSON field " + std::string{name});
+                return json::unexpected("unexpected JSON field " + std::string{name});
             }
+            return {};
         });
+        if (!status)
+            return std::unexpected(std::move(status.error()));
         if constexpr (!Policy::defaults && mandatory != 0) {
             if (const auto missing = mandatory & ~seen)
-                invalid("missing JSON field " + std::string{setters[std::countr_zero(missing)].name});
+                return json::unexpected("missing JSON field " + std::string{setters[std::countr_zero(missing)].name});
         }
         return out;
     }
 
-    template <class T, class Policy, class Input> auto record(Input input) -> T {
+    template <class T, class Policy, class Input> auto record(Input input) -> result<T> {
         using indices = std::make_index_sequence<std::tuple_size_v<member_tuple<T>>>;
         if constexpr (flat<T>(indices{})) {
             return read_record<T, Policy>(input, indices{});
         } else {
             T out{};
             std::bitset<128> seen;
-            input.object([&](std::string_view name, Input child) {
+            auto status = input.object([&](std::string_view name, Input child) -> result<void> {
                 std::size_t index = 0;
                 bool found = false;
+                result<void> assigned;
                 fields<Policy>(out, [&](std::string_view key, auto& field) {
                     if (!found && name == key) {
                         found = true;
                         if (!seen[index]) {
-                            field = decode<bare<decltype(field)>, Policy>(child);
+                            assigned = decode_into<Policy>(field, child);
                             seen.set(index);
                         }
                     }
                     ++index;
                 });
                 if (Policy::strict && !found)
-                    invalid("unexpected JSON field " + std::string{name});
+                    return json::unexpected("unexpected JSON field " + std::string{name});
+                return assigned;
             });
+            if (!status)
+                return std::unexpected(std::move(status.error()));
             if constexpr (!Policy::defaults) {
                 std::size_t index = 0;
+                std::optional<std::string_view> missing;
                 fields<Policy>(out, [&](std::string_view name, auto& field) {
                     if constexpr (required<bare<decltype(field)>>())
-                        if (!seen[index])
-                            invalid("missing JSON field " + std::string{name});
+                        if (!seen[index] && !missing)
+                            missing = name;
                     ++index;
                 });
+                if (missing)
+                    return json::unexpected("missing JSON field " + std::string{*missing});
             }
             return out;
         }
@@ -358,15 +402,13 @@ namespace json::detail {
         return names<E>[index];
     }
 
-    template <class T, class Policy, std::size_t I = 0, class Input> auto union_value(Input input) -> T {
+    template <class T, class Policy, std::size_t I = 0, class Input> auto union_value(Input input) -> result<T> {
         if constexpr (I == std::variant_size_v<T>) {
-            invalid("JSON value does not match any alternative");
+            return json::unexpected("JSON value does not match any alternative");
         } else {
-            try {
-                return T{std::in_place_index<I>, decode<std::variant_alternative_t<I, T>, Policy>(input)};
-            } catch (const parse_error&) {
-                return union_value<T, Policy, I + 1>(input);
-            }
+            if (auto decoded = decode<std::variant_alternative_t<I, T>, Policy>(input))
+                return T{std::in_place_index<I>, std::move(*decoded)};
+            return union_value<T, Policy, I + 1>(input);
         }
     }
 
@@ -394,106 +436,131 @@ namespace json::detail {
         return result;
     }
 
-    template <class T, class Policy, std::size_t I = 0, class Input> auto tagged_value(std::string_view tag, Input input) -> T {
+    template <class T, class Policy, std::size_t I = 0, class Input> auto tagged_value(std::string_view tag, Input input) -> result<T> {
         if constexpr (I == std::tuple_size_v<typename T::alternatives>) {
-            invalid("unknown JSON discriminator " + std::string{tag});
+            return json::unexpected("unknown JSON discriminator " + std::string{tag});
         } else {
             using choice = std::tuple_element_t<I, typename T::alternatives>;
             constexpr auto names = discriminator_names<choice, Policy, T::discriminator>();
             if (std::ranges::find(names, tag) != names.end())
-                return T{decode<choice, Policy>(input)};
+                return decode<choice, Policy>(input).transform([](choice&& decoded) { return T{std::move(decoded)}; });
             return tagged_value<T, Policy, I + 1>(tag, input);
         }
     }
 
-    template <class T, class Policy, class Input> auto decode(Input input) -> T {
+    template <class T, class Policy, class Input> auto decode(Input input) -> result<T> {
         if constexpr (std::same_as<T, value>) {
             return input.dynamic();
         } else if constexpr (std::same_as<T, json::object> || std::same_as<T, json::array>) {
             auto data = input.dynamic();
-            if (auto* result = std::get_if<T>(&data.data))
-                return std::move(*result);
-            invalid("unexpected JSON container");
+            if (!data)
+                return std::unexpected(std::move(data.error()));
+            if (auto* decoded = std::get_if<T>(&data->data))
+                return std::move(*decoded);
+            return json::unexpected("unexpected JSON container");
         } else if constexpr (annotation<T>) {
-            return T{decode<typename T::underlying_type, Policy>(input)};
+            return decode<typename T::underlying_type, Policy>(input).transform([](auto&& decoded) { return T{std::move(decoded)}; });
         } else if constexpr (std::same_as<T, std::string> || std::same_as<T, std::string_view> || std::integral<T> || std::floating_point<T>) {
             return input.template scalar<T>();
         } else if constexpr (requires { typename T::wire_type; }) {
-            return T{decode<typename T::wire_type, Policy>(input)};
+            return decode<typename T::wire_type, Policy>(input).transform([](auto&& decoded) { return T{std::move(decoded)}; });
         } else if constexpr (std::same_as<T, std::monostate> || std::same_as<T, std::nullptr_t>) {
             if (!input.null())
-                invalid("expected JSON null");
+                return json::unexpected("expected JSON null");
             return {};
         } else if constexpr (optional<T>) {
             if (input.null())
-                return {};
-            return T{decode<typename T::value_type, Policy>(input)};
+                return T{};
+            return decode<typename T::value_type, Policy>(input).transform([](auto&& decoded) { return T{std::move(decoded)}; });
         } else if constexpr (unique<T> || shared<T>) {
             if (input.null())
-                return {};
+                return T{};
             using item = typename T::element_type;
-            return T{new item(decode<item, Policy>(input))};
+            return decode<item, Policy>(input).transform([](item&& decoded) { return T{new item(std::move(decoded))}; });
         } else if constexpr (is_literal<T>) {
             const auto name = input.template scalar<std::string_view>();
-            if (std::ranges::find(T::names, name) == T::names.end())
-                invalid("unknown JSON literal " + std::string{name});
-            return T{name};
+            if (!name)
+                return std::unexpected(name.error());
+            if (std::ranges::find(T::names, *name) == T::names.end())
+                return json::unexpected("unknown JSON literal " + std::string{*name});
+            return T{*name};
         } else if constexpr (is_tagged<T>) {
             const auto tag = input.at(T::discriminator.view());
             if (!tag)
-                invalid("missing JSON discriminator " + std::string{T::discriminator.view()});
-            return tagged_value<T, Policy>(tag->template scalar<std::string_view>(), input);
+                return json::unexpected("missing JSON discriminator " + std::string{T::discriminator.view()});
+            return tag->template scalar<std::string_view>().and_then([&](std::string_view name) { return tagged_value<T, Policy>(name, input); });
         } else if constexpr (variant<T>) {
             return union_value<T, Policy>(input);
         } else if constexpr (std::is_enum_v<T>) {
             const auto name = input.template scalar<std::string_view>();
-            const auto match = std::ranges::find(names<T>, name);
-            if (name.empty() || match == names<T>.end())
-                invalid("unknown JSON enum " + std::string{name});
+            if (!name)
+                return std::unexpected(name.error());
+            const auto match = std::ranges::find(names<T>, *name);
+            if (name->empty() || match == names<T>.end())
+                return json::unexpected("unknown JSON enum " + std::string{*name});
             return static_cast<T>(match - names<T>.begin());
         } else if constexpr (mapping<T>) {
             T out;
+            result<void> status;
             if constexpr (std::constructible_from<typename T::key_type, std::string_view>) {
-                input.object([&](auto name, auto child) {
-                    out.emplace(typename T::key_type{name}, decode<typename T::mapped_type, Policy>(child));
+                status = input.object([&](auto name, auto child) -> result<void> {
+                    auto decoded = decode<typename T::mapped_type, Policy>(child);
+                    if (!decoded)
+                        return std::unexpected(std::move(decoded.error()));
+                    out.emplace(typename T::key_type{name}, std::move(*decoded));
+                    return {};
                 });
             } else {
-                input.array([&](auto, auto visit) {
-                    visit([&](auto child) {
+                status = input.array([&](auto, auto visit) {
+                    return visit([&](auto child) -> result<void> {
                         auto pair = decode<std::pair<typename T::key_type, typename T::mapped_type>, Policy>(child);
-                        out.emplace(std::move(pair.first), std::move(pair.second));
+                        if (!pair)
+                            return std::unexpected(std::move(pair.error()));
+                        out.emplace(std::move(pair->first), std::move(pair->second));
+                        return {};
                     });
                 });
             }
+            if (!status)
+                return std::unexpected(std::move(status.error()));
             return out;
         } else if constexpr (tuple<T>) {
             T out{};
-            input.array([&](std::size_t size, auto visit) {
+            auto status = input.array([&](std::size_t size, auto visit) -> result<void> {
                 if (size != std::tuple_size_v<T>)
-                    invalid("unexpected JSON tuple length");
+                    return json::unexpected("unexpected JSON tuple length");
                 std::size_t index = 0;
-                visit([&](auto child) {
+                return visit([&](auto child) {
                     std::size_t position = 0;
+                    result<void> assigned;
                     std::apply([&](auto&... item) {
-                        ((index == position++ ? static_cast<void>(item = decode<bare<decltype(item)>, Policy>(child)) : void()), ...);
+                        ((index == position++ ? static_cast<void>(assigned = decode_into<Policy>(item, child)) : void()), ...);
                     }, out);
                     ++index;
+                    return assigned;
                 });
             });
+            if (!status)
+                return std::unexpected(std::move(status.error()));
             return out;
         } else if constexpr (sequence<T>) {
             T out;
-            input.array([&](std::size_t size, auto visit) {
+            auto status = input.array([&](std::size_t size, auto visit) {
                 if constexpr (requires { out.reserve(size); })
                     out.reserve(size);
-                visit([&](auto child) {
+                return visit([&](auto child) -> result<void> {
                     auto item = decode<typename T::value_type, Policy>(child);
-                    if constexpr (requires { out.push_back(std::move(item)); })
-                        out.push_back(std::move(item));
+                    if (!item)
+                        return std::unexpected(std::move(item.error()));
+                    if constexpr (requires { out.push_back(std::move(*item)); })
+                        out.push_back(std::move(*item));
                     else
-                        out.insert(std::move(item));
+                        out.insert(std::move(*item));
+                    return {};
                 });
             });
+            if (!status)
+                return std::unexpected(std::move(status.error()));
             return out;
         } else {
             return record<T, Policy>(input);
@@ -636,13 +703,7 @@ namespace json::detail {
         return instance;
     }
 
-    template <class T, class Policy, class Input> auto try_decode(Input input) -> result<T> {
-        try {
-            return decode<T, Policy>(input);
-        } catch (const parse_error& error) {
-            return json::unexpected(error.what());
-        }
-    }
+
 }
 
 export namespace json {
@@ -650,11 +711,11 @@ export namespace json {
         simdjson::dom::element root;
         if (const auto error = detail::parser().parse(text.data(), text.size()).get(root))
             return json::unexpected(std::string{"could not parse JSON: "} + simdjson::error_message(error));
-        return detail::try_decode<T, detail::policy<Options...>>(detail::dom_input{root});
+        return detail::decode<T, detail::policy<Options...>>(detail::dom_input{root});
     }
 
     template <class T, class... Options> auto from_value(const value& input) -> result<T> {
-        return detail::try_decode<T, detail::policy<Options...>>(detail::value_input{input});
+        return detail::decode<T, detail::policy<Options...>>(detail::value_input{input});
     }
 
     template <class... Options, class T> auto write(const T& item) -> std::string {

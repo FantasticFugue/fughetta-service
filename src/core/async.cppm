@@ -469,7 +469,7 @@ export namespace io {
                             auto result = std::move(*owner->socket);
                             execution::set_value(std::move(owner->receiver), std::move(result));
                         } catch (...) {
-                            execution::set_error(std::move(owner->receiver), std::current_exception());
+                            execution::set_error(std::move(owner->receiver), util::capture_current_exception());
                         }
                     }
                     template <class E> void set_error(E&& error) noexcept { execution::set_error(std::move(owner->receiver), std::forward<E>(error)); }
@@ -491,7 +491,7 @@ export namespace io {
                         };
                         inner.emplace(connecting{this});
                     } catch (...) {
-                        execution::set_error(std::move(receiver), std::current_exception());
+                        execution::set_error(std::move(receiver), util::capture_current_exception());
                         return;
                     }
                     execution::start(*inner);
@@ -595,7 +595,7 @@ export namespace io {
                     } else
                         value.emplace(work());
                 } catch (...) {
-                    fail(std::current_exception());
+                    fail(util::capture_current_exception());
                 }
                 execution::start(back);
             }
@@ -657,7 +657,7 @@ export namespace cores {
                 else
                     return std::make_exception_ptr(std::forward<E>(e));
             } catch (...) {
-                return std::current_exception();
+                return util::capture_current_exception();
             }
         }
 
@@ -709,7 +709,7 @@ export namespace cores {
                     try {
                         action();
                     } catch (...) {
-                        control_error{}(std::current_exception());
+                        control_error{}(util::capture_current_exception());
                     }
                     execution::set_value(std::move(out));
                 }
@@ -777,7 +777,7 @@ export namespace cores {
                 try {
                     state->value.emplace(std::forward<Values>(values)...);
                 } catch (...) {
-                    state->error = std::current_exception();
+                    state->error = util::capture_current_exception();
                 }
                 state->context->stop();
             }
@@ -827,7 +827,7 @@ export namespace cores {
                     try {
                         self->result_.template emplace<1>(std::in_place_type<std::tuple<std::decay_t<Values>...>>, std::forward<Values>(value)...);
                     } catch (...) {
-                        self->result_.template emplace<2>(std::current_exception());
+                        self->result_.template emplace<2>(util::capture_current_exception());
                     }
                     self->inner_done();
                 }
@@ -885,7 +885,7 @@ export namespace cores {
                     };
                     inner_.emplace(connecting{this});
                 } catch (...) {
-                    result_.template emplace<2>(std::current_exception());
+                    result_.template emplace<2>(util::capture_current_exception());
                     inner_done();
                     return;
                 }
@@ -1150,7 +1150,7 @@ export namespace cores {
             auto remember = [&] {
                 std::lock_guard lock(errors);
                 if (!startup_error)
-                    startup_error = std::current_exception();
+                    startup_error = util::capture_current_exception();
             };
             {
                 std::vector<std::jthread> threads;
