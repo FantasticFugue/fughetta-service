@@ -1,4 +1,5 @@
 export module provider;
+import utility;
 import std;
 import meta;
 import json;
@@ -237,9 +238,11 @@ export namespace builds {
 } // namespace builds
 
 export namespace language {
-    struct resolution_error : std::invalid_argument {
+    struct resolution_error : std::invalid_argument, util::retained_exception {
         using std::invalid_argument::invalid_argument;
+        auto retain() const noexcept -> std::exception_ptr override;
     };
+    auto resolution_error::retain() const noexcept -> std::exception_ptr { return util::copy_current_exception(*this); }
 
     struct document {
         std::string path, language, text;

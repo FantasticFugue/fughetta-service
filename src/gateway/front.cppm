@@ -176,12 +176,14 @@ export namespace front {
         bool remote_listener = false;
     };
 
-    struct coded_error : std::runtime_error {
+    struct coded_error : std::runtime_error, util::retained_exception {
         http::status status;
         std::string code;
         std::vector<std::string> missing, conflicts, frontier;
         coded_error(http::status status, std::string_view code, std::string message) : std::runtime_error(std::move(message)), status(status), code(code) {}
+        auto retain() const noexcept -> std::exception_ptr override;
     };
+    auto coded_error::retain() const noexcept -> std::exception_ptr { return util::copy_current_exception(*this); }
 
     namespace api {
         template <class T> struct section_view {
@@ -568,7 +570,7 @@ export namespace front {
             try {
                 r = co_await coroutine::under(source.get_token(), handle(rpc, out, who, configuration));
             } catch (...) {
-                failure = std::current_exception();
+                failure = util::capture_current_exception();
             }
             if (failure)
                 std::rethrow_exception(failure);

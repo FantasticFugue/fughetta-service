@@ -373,7 +373,7 @@ export namespace tools {
         try {
             co_return co_await fresh();
         } catch (const tool_error&) {
-            failed = std::current_exception();
+            failed = util::capture_current_exception();
         }
         // When even the receipt cannot be read, the caller hears the first answer, which may be outcome_unknown.
         std::optional<std::pair<nodes::node_reply, record>> done;

@@ -20,9 +20,11 @@ export namespace durability {
                        std::string_view temp_suffix = constants::temporary_suffix);
     void durable_private_write(const std::filesystem::path& target, std::string_view text);
     // Why a file could not be read: not a regular file within the limit, not owner-only where required, unreadable, or resized while read.
-    struct unreadable : std::runtime_error {
+    struct unreadable : std::runtime_error, util::retained_exception {
         using std::runtime_error::runtime_error;
+        auto retain() const noexcept -> std::exception_ptr override;
     };
+    auto unreadable::retain() const noexcept -> std::exception_ptr { return util::copy_current_exception(*this); }
     // Yields `path` in pieces if it is a regular file, not a link, of at most `limit` bytes, checked on the opened file itself; a FIFO is
     // never waited on. Throws `unreadable` when it is anything else, or changes size while read.
     auto read_plain(const std::filesystem::path& path, std::uint64_t limit) -> util::generator<std::span<const std::byte>>;
@@ -90,9 +92,11 @@ export namespace durability {
     void durable_rename(const std::filesystem::path& from, const std::filesystem::path& to);
     void durable_directories(const std::filesystem::path& dir);
 
-    struct lock_busy : std::runtime_error {
+    struct lock_busy : std::runtime_error, util::retained_exception {
         using std::runtime_error::runtime_error;
+        auto retain() const noexcept -> std::exception_ptr override;
     };
+    auto lock_busy::retain() const noexcept -> std::exception_ptr { return util::copy_current_exception(*this); }
 
     class dir_lock {
     public:

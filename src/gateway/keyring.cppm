@@ -1,6 +1,7 @@
 module;
 #include <sodium.h>
 export module keyring;
+import utility;
 import std;
 import content;
 import configuration;
@@ -8,9 +9,11 @@ import world;
 
 // Who sends a request to this core: the holder of a bearer token, or the caller a front on the private network names.
 export namespace keyring {
-    struct unauthorized : std::runtime_error {
+    struct unauthorized : std::runtime_error, util::retained_exception {
         using std::runtime_error::runtime_error;
+        auto retain() const noexcept -> std::exception_ptr override;
     };
+    auto unauthorized::retain() const noexcept -> std::exception_ptr { return util::copy_current_exception(*this); }
 
     inline auto hash(std::string_view token) -> std::string { return content::hash_of(token).str(); }
 

@@ -3,6 +3,31 @@ export module utility;
 import std;
 
 export namespace util {
+    struct retained_exception {
+        virtual ~retained_exception() = default;
+        virtual auto retain() const noexcept -> std::exception_ptr = 0;
+    };
+
+    template <class Error> auto copy_current_exception(const Error& error) noexcept -> std::exception_ptr {
+#ifdef _WIN32
+        if (typeid(error) != typeid(Error))
+            return std::current_exception();
+        // Use this from an out-of-line definition in the error's own module.
+        // This throw emits a copy callback even when the original came from an importer.
+        struct captured final : Error {
+            explicit captured(const Error& original) : Error(original) {}
+        };
+        try {
+            throw captured{error};
+        } catch (...) {
+            return std::current_exception();
+        }
+#else
+        static_cast<void>(error);
+        return std::current_exception();
+#endif
+    }
+
 #ifdef _WIN32
     auto capture_current_exception() noexcept -> std::exception_ptr;
 #else
@@ -235,25 +260,37 @@ export namespace util {
 
 #ifdef _WIN32
 namespace util {
-    namespace {
-        // Clang can omit the copy callback in the throw metadata of an imported
-        // filesystem_error. Capture a typed copy whose metadata is emitted here.
-        struct captured_filesystem_error final : std::filesystem::filesystem_error {
-            explicit captured_filesystem_error(const std::filesystem::filesystem_error& error) : std::filesystem::filesystem_error(error) {}
-        };
-    }
-
     auto capture_current_exception() noexcept -> std::exception_ptr {
         try {
             throw;
+        } catch (const retained_exception& error) {
+            return error.retain();
         } catch (const std::filesystem::filesystem_error& error) {
-            if (typeid(error) != typeid(std::filesystem::filesystem_error))
-                return std::current_exception();
-            try {
-                throw captured_filesystem_error{error};
-            } catch (...) {
-                return std::current_exception();
-            }
+            return copy_current_exception(error);
+        } catch (const std::ios_base::failure& error) {
+            return copy_current_exception(error);
+        } catch (const std::system_error& error) {
+            return copy_current_exception(error);
+        } catch (const std::format_error& error) {
+            return copy_current_exception(error);
+        } catch (const std::invalid_argument& error) {
+            return copy_current_exception(error);
+        } catch (const std::domain_error& error) {
+            return copy_current_exception(error);
+        } catch (const std::length_error& error) {
+            return copy_current_exception(error);
+        } catch (const std::out_of_range& error) {
+            return copy_current_exception(error);
+        } catch (const std::logic_error& error) {
+            return copy_current_exception(error);
+        } catch (const std::range_error& error) {
+            return copy_current_exception(error);
+        } catch (const std::overflow_error& error) {
+            return copy_current_exception(error);
+        } catch (const std::underflow_error& error) {
+            return copy_current_exception(error);
+        } catch (const std::runtime_error& error) {
+            return copy_current_exception(error);
         } catch (...) {
             return std::current_exception();
         }

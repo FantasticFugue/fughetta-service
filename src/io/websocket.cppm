@@ -1,4 +1,5 @@
 export module websocket;
+import utility;
 import std;
 import coroutine;
 import http;
@@ -37,7 +38,7 @@ export namespace web::ws {
                     frame = state_->decoder_.next();
                 } catch (const http::websocket::failure& e) {
                     status = e.status;
-                    failed = std::current_exception();
+                    failed = util::capture_current_exception();
                 }
                 if (failed) {
                     std::array reason{std::byte(status >> 8), std::byte(status & 255)};

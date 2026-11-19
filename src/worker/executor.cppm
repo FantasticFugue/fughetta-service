@@ -1,4 +1,5 @@
 export module executor;
+import utility;
 import std;
 import native;
 import coroutine;
@@ -80,7 +81,7 @@ export namespace replica {
             try {
                 stopped = !(co_await coroutine::under(token, std::move(work)));
             } catch (...) {
-                failed = std::current_exception();
+                failed = util::capture_current_exception();
             }
             auto finish = [this]() -> coroutine::task<> {
                 std::exception_ptr failed;
@@ -90,7 +91,7 @@ export namespace replica {
                         co_await retire(key);
                     } catch (...) {
                         if (!failed)
-                            failed = std::current_exception();
+                            failed = util::capture_current_exception();
                     }
                 }
                 if (failed)
@@ -417,7 +418,7 @@ export namespace replica {
                         item->answer(std::move(*reply));
                     }
                 } catch (...) {
-                    item->fail(std::current_exception());
+                    item->fail(util::capture_current_exception());
                 }
             }
         }
@@ -630,7 +631,7 @@ export namespace replica {
             try {
                 co_await old->server->close();
             } catch (...) {
-                failed = std::current_exception();
+                failed = util::capture_current_exception();
             }
             old->server.reset();
             if (failed)
@@ -651,7 +652,7 @@ export namespace replica {
                     co_await retire(key);
                 } catch (...) {
                     if (!failed)
-                        failed = std::current_exception();
+                        failed = util::capture_current_exception();
                 }
             }
             if (failed)
@@ -997,7 +998,7 @@ export namespace replica {
                         report->steps.push_back({.name = "analysis", .timed_out = true, .output = "time budget exhausted while measuring build outputs"});
                 }
             } catch (...) {
-                failed = std::current_exception();
+                failed = util::capture_current_exception();
             }
             auto discard_captured_tree = [&]() -> coroutine::task<> {
                 auto discarded = co_await locked([&](store& s) { return s.detach(r.project, r.tree); });
@@ -1148,7 +1149,7 @@ export namespace replica {
                     }
                 }
             } catch (...) {
-                failed = std::current_exception();
+                failed = util::capture_current_exception();
             }
             if (resource->exceeded || failed || stopped || expired)
                 co_await coroutine::under(coroutine::stop_token{}, retire_slot(key));

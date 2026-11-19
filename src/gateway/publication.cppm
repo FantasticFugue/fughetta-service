@@ -1,4 +1,5 @@
 export module publication;
+import utility;
 import std;
 import coroutine;
 import registry;
@@ -317,7 +318,7 @@ export namespace publishing {
                     item->answer(co_await files->read_model(core, project, std::move(std::get<jobs::model_read>(item->data))));
                 }
             } catch (...) {
-                item->fail(std::current_exception());
+                item->fail(util::capture_current_exception());
             }
         }
     }

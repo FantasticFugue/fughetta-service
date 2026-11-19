@@ -1,4 +1,5 @@
 export module usage;
+import utility;
 import std;
 import json;
 import configuration;
@@ -68,9 +69,11 @@ export namespace usage {
         std::uint64_t oldest = 0;
     };
 
-    struct quota_exceeded : std::runtime_error {
+    struct quota_exceeded : std::runtime_error, util::retained_exception {
         using std::runtime_error::runtime_error;
+        auto retain() const noexcept -> std::exception_ptr override;
     };
+    auto quota_exceeded::retain() const noexcept -> std::exception_ptr { return util::copy_current_exception(*this); }
 
     struct day {
         std::string date;

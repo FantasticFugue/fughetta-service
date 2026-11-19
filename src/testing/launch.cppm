@@ -53,7 +53,7 @@ export namespace test {
                         throw std::runtime_error("child wait was stopped");
                     promise_.set_value(*result);
                 } catch (...) {
-                    promise_.set_exception(std::current_exception());
+                    promise_.set_exception(util::capture_current_exception());
                 }
             });
         }

@@ -1,4 +1,5 @@
 export module configuration;
+import utility;
 import constants;
 import std;
 import json;
@@ -10,16 +11,20 @@ export import language;
 export import allocation;
 
 export namespace config {
-    struct not_found : std::invalid_argument {
+    struct not_found : std::invalid_argument, util::retained_exception {
         using std::invalid_argument::invalid_argument;
+        auto retain() const noexcept -> std::exception_ptr override;
     };
+    auto not_found::retain() const noexcept -> std::exception_ptr { return util::copy_current_exception(*this); }
 
-    struct revision_conflict : std::runtime_error {
+    struct revision_conflict : std::runtime_error, util::retained_exception {
         std::uint64_t revision;
         std::string value;
         revision_conflict(std::uint64_t r, std::string v)
             : std::runtime_error("configuration changed underneath; rebase onto the current revision"), revision(r), value(std::move(v)) {}
+        auto retain() const noexcept -> std::exception_ptr override;
     };
+    auto revision_conflict::retain() const noexcept -> std::exception_ptr { return util::copy_current_exception(*this); }
 
     inline auto valid_name(std::string_view n) -> bool {
         if (n.empty() || n.size() > 64 || !std::isalnum(static_cast<unsigned char>(n.front())))

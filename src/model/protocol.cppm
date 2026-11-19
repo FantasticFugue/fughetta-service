@@ -911,10 +911,12 @@ export namespace transport {
 
     template <class T> auto decode(const frame& f) -> T { return codec<T>::decode(f.payload); }
 
-    struct remote_error : std::runtime_error {
+    struct remote_error : std::runtime_error, util::retained_exception {
         remote_error(std::string message, std::string_view code) : std::runtime_error(std::move(message)), code(code) {}
         std::string code;
+        auto retain() const noexcept -> std::exception_ptr override;
     };
+    auto remote_error::retain() const noexcept -> std::exception_ptr { return util::copy_current_exception(*this); }
 
     using call_error = std::variant<jobs::failure, std::exception_ptr>;
     template <class T> using call_result = std::expected<T, call_error>;
@@ -931,10 +933,12 @@ export namespace transport {
         std::unreachable();
     }
 
-    struct coded_error : std::runtime_error {
+    struct coded_error : std::runtime_error, util::retained_exception {
         coded_error(std::string_view code, std::string message) : std::runtime_error(std::move(message)), code(code) {}
         std::string code;
+        auto retain() const noexcept -> std::exception_ptr override;
     };
+    auto coded_error::retain() const noexcept -> std::exception_ptr { return util::copy_current_exception(*this); }
 
     template <io::stream S> class channel {
     public:
@@ -1090,7 +1094,7 @@ export namespace transport {
                     }
                 }
             } catch (...) {
-                why = std::current_exception();
+                why = util::capture_current_exception();
             }
             if (!why && !stopped)
                 why = std::make_exception_ptr(io::closed{});

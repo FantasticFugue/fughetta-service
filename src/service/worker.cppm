@@ -1,6 +1,7 @@
 module;
 #include <argparse/argparse.hpp>
 export module worker;
+import utility;
 import std;
 import runtime;
 import coroutine;
@@ -18,10 +19,12 @@ import sibling;
 
 namespace worker {
     // The Core refused this identity; retrying cannot succeed.
-    struct refused : std::runtime_error {
+    struct refused : std::runtime_error, util::retained_exception {
         explicit refused(std::string_view code)
             : std::runtime_error(code == "worker_revoked" ? "Worker identity was revoked" : "Worker credentials or endpoint were refused") {}
+        auto retain() const noexcept -> std::exception_ptr override;
     };
+    auto refused::retain() const noexcept -> std::exception_ptr { return util::copy_current_exception(*this); }
     // Refusals that leave the identity valid are retried like a lost connection.
     [[noreturn]] void reject(std::string_view code) {
         if (code == "worker_protocol_mismatch")

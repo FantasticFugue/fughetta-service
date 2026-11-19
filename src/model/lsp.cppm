@@ -1,6 +1,7 @@
 module;
 #include <ada.h>
 export module lsp;
+import utility;
 import std;
 import host;
 import http;
@@ -620,7 +621,7 @@ export namespace lsp {
                 if (auto finished = co_await coroutine::deadline(io_, std::chrono::seconds{5}, run_until_deadline(*this)))
                     code = static_cast<int>(*finished);
             } catch (...) {
-                failed = std::current_exception();
+                failed = util::capture_current_exception();
             }
             co_await abort();
             if (failed)
@@ -656,7 +657,7 @@ export namespace lsp {
                 }
                 ended_ = std::make_exception_ptr(std::runtime_error("language reader stopped"));
             } catch (...) {
-                ended_ = std::current_exception();
+                ended_ = util::capture_current_exception();
             }
             if (pending_) {
                 pending_->error = ended_;

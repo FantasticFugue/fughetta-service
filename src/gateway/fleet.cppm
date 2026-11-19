@@ -1,4 +1,5 @@
 export module fleet;
+import utility;
 import std;
 import constants;
 import enrollment;
@@ -111,10 +112,12 @@ export namespace routing {
     }
 
     // No worker takes a dispatch now. `busy` when one could but is at its dispatch limit, so the dispatch may wait for it.
-    struct no_worker : std::runtime_error {
+    struct no_worker : std::runtime_error, util::retained_exception {
         explicit no_worker(std::string why, bool busy = false) : std::runtime_error(std::move(why)), busy(busy) {}
         bool busy;
+        auto retain() const noexcept -> std::exception_ptr override;
     };
+    auto no_worker::retain() const noexcept -> std::exception_ptr { return util::copy_current_exception(*this); }
 
     // A worker's first frame, or nothing when it does not arrive in time or is not
     // a hello. Kept out of the `admit` template so the deadline race is compiled

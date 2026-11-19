@@ -1,6 +1,7 @@
 module;
 #include <sqlite3.h>
 export module knowledge;
+import utility;
 import std;
 import json;
 import constants;
@@ -179,13 +180,17 @@ export namespace semantic {
         bool cacheable = true;
     };
 
-    struct expired_view : std::runtime_error {
+    struct expired_view : std::runtime_error, util::retained_exception {
         using std::runtime_error::runtime_error;
+        auto retain() const noexcept -> std::exception_ptr override;
     };
+    auto expired_view::retain() const noexcept -> std::exception_ptr { return util::copy_current_exception(*this); }
 
-    struct expired_symbol : std::runtime_error {
+    struct expired_symbol : std::runtime_error, util::retained_exception {
         using std::runtime_error::runtime_error;
+        auto retain() const noexcept -> std::exception_ptr override;
     };
+    auto expired_symbol::retain() const noexcept -> std::exception_ptr { return util::copy_current_exception(*this); }
 
     struct retention {
         std::chrono::milliseconds lifetime = constants::semantic_view_retention;
