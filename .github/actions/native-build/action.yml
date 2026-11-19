@@ -184,4 +184,15 @@ runs:
         if ((${#targets[@]})); then
           arguments=(--target "${targets[@]}")
         fi
-        cmake --build --preset "$PRESET" --parallel 2 "${arguments[@]}"
+        build_log="$RUNNER_TEMP/native-build-$PRESET.log"
+        for attempt in 1 2 3; do
+          if cmake --build --preset "$PRESET" --parallel 2 "${arguments[@]}" 2>&1 | tee "$build_log"; then
+            exit 0
+          else
+            status=$?
+          fi
+          if [[ "$attempt" == 3 ]] || ! grep -Fq 'PLEASE submit a bug report to https://github.com/llvm/llvm-project/issues/' "$build_log"; then
+            exit "$status"
+          fi
+          echo "Clang crashed; resuming the Ninja build."
+        done
