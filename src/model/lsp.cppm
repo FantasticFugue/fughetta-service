@@ -655,7 +655,7 @@ export namespace lsp {
                         pending_->wake();
                     }
                 }
-                ended_ = std::make_exception_ptr(std::runtime_error("language reader stopped"));
+                ended_ = util::make_exception_ptr(std::runtime_error("language reader stopped"));
             } catch (...) {
                 ended_ = util::capture_current_exception();
             }

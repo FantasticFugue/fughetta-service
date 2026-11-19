@@ -585,7 +585,7 @@ export namespace io {
                 else if constexpr (std::same_as<E, std::exception_ptr>)
                     error.template emplace<2>(std::move(e));
                 else
-                    error.template emplace<2>(std::make_exception_ptr(std::move(e)));
+                    error.template emplace<2>(util::make_exception_ptr(std::move(e)));
             }
             void run() noexcept {
                 try {
@@ -653,9 +653,9 @@ export namespace cores {
                 if constexpr (std::same_as<std::decay_t<E>, std::exception_ptr>)
                     return std::forward<E>(e);
                 else if constexpr (std::same_as<std::decay_t<E>, std::error_code>)
-                    return std::make_exception_ptr(std::system_error(e));
+                    return util::make_exception_ptr(std::system_error(e));
                 else
-                    return std::make_exception_ptr(std::forward<E>(e));
+                    return util::make_exception_ptr(std::forward<E>(e));
             } catch (...) {
                 return util::capture_current_exception();
             }

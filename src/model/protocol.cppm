@@ -490,7 +490,7 @@ export namespace jobs {
         using response = std::variant<std::monostate, reuse_reply, shard_piece, source_bytes>;
         struct message {
             request data;
-            explicit message(request data) : data(std::move(data)), unanswered_(std::make_exception_ptr(std::runtime_error("analysis input task stopped"))) {}
+            explicit message(request data) : data(std::move(data)), unanswered_(util::make_exception_ptr(std::runtime_error("analysis input task stopped"))) {}
             template <class T> void answer(T value) {
                 {
                     std::lock_guard held{mutex};
@@ -1097,8 +1097,8 @@ export namespace transport {
                 why = util::capture_current_exception();
             }
             if (!why && !stopped)
-                why = std::make_exception_ptr(io::closed{});
-            ended_ = why ? why : std::make_exception_ptr(io::closed{});
+                why = util::make_exception_ptr(io::closed{});
+            ended_ = why ? why : util::make_exception_ptr(io::closed{});
             std::vector<std::shared_ptr<pending>> waiting;
             for (auto& [corr, slot] : pending_)
                 waiting.push_back(slot);

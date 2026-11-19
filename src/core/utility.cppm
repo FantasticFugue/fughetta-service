@@ -1,6 +1,9 @@
 export module utility;
 
 import std;
+#ifdef _WIN32
+import httpant.io;
+#endif
 
 export namespace util {
     struct retained_exception {
@@ -33,6 +36,18 @@ export namespace util {
 #else
     inline auto capture_current_exception() noexcept -> std::exception_ptr { return std::current_exception(); }
 #endif
+
+    template <class Error> auto make_exception_ptr(Error&& error) noexcept -> std::exception_ptr {
+#ifdef _WIN32
+        try {
+            throw std::forward<Error>(error);
+        } catch (...) {
+            return capture_current_exception();
+        }
+#else
+        return std::make_exception_ptr(std::forward<Error>(error));
+#endif
+    }
     // A move-only, type-erased callable with a small buffer, for the places the
     // scheduler and the service layers hand a callback to somebody and forget
     // the concrete type (a post to a worker, a notification sink, a gate
@@ -268,6 +283,8 @@ namespace util {
         } catch (const std::filesystem::filesystem_error& error) {
             return copy_current_exception(error);
         } catch (const std::ios_base::failure& error) {
+            return copy_current_exception(error);
+        } catch (const http::io::net::closed& error) {
             return copy_current_exception(error);
         } catch (const std::system_error& error) {
             return copy_current_exception(error);
