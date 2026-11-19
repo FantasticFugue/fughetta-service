@@ -7,8 +7,9 @@
     "gradle": "current"
   },
   "compile_jobs": 2,
-  "compiler_attempts": 3,
+  "build_attempts": 3,
   "download_retries": 3,
+  "rate_limit_wait_seconds": 30,
   "profiles": {
     "check": {"preset": "debug", "timeout": 360},
     "package": {"preset": "release", "timeout": 150, "targets": "fughetta-service llvm-provider clr-providers jvm-providers"}

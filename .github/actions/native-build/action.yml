@@ -245,7 +245,8 @@ runs:
         PRESET: ${{ inputs.preset }}
         BUILD_TARGETS: ${{ inputs.targets }}
         BUILD_JOBS: ${{ fromJSON(inputs.settings).compile_jobs }}
-        COMPILER_ATTEMPTS: ${{ fromJSON(inputs.settings).compiler_attempts }}
+        BUILD_ATTEMPTS: ${{ fromJSON(inputs.settings).build_attempts }}
+        RATE_LIMIT_WAIT: ${{ fromJSON(inputs.settings).rate_limit_wait_seconds }}
       run: |
         read -r -a targets <<< "$BUILD_TARGETS"
         arguments=()
@@ -253,16 +254,23 @@ runs:
           arguments=(--target "${targets[@]}")
         fi
         build_log="$RUNNER_TEMP/native-build-$PRESET.log"
-        for ((attempt = 1; attempt <= COMPILER_ATTEMPTS; ++attempt)); do
+        for ((attempt = 1; ; ++attempt)); do
           if cmake --build "$CI_BUILD_DIR" --parallel "$BUILD_JOBS" "${arguments[@]}" 2>&1 | tee "$build_log"; then
             exit 0
           else
             status=$?
           fi
-          if [[ "$attempt" == "$COMPILER_ATTEMPTS" ]] || ! grep -Fq 'PLEASE submit a bug report to https://github.com/llvm/llvm-project/issues/' "$build_log"; then
+          if ((attempt >= BUILD_ATTEMPTS)); then
             exit "$status"
           fi
-          echo "Clang crashed; resuming the Ninja build."
+          if grep -Fq 'PLEASE submit a bug report to https://github.com/llvm/llvm-project/issues/' "$build_log"; then
+            echo "Clang crashed; resuming the Ninja build."
+          elif grep -Fq 'Received status code 429 from server: Too Many Requests' "$build_log"; then
+            echo "The dependency repository rate-limited Gradle; waiting before resuming the Ninja build."
+            sleep "$RATE_LIMIT_WAIT"
+          else
+            exit "$status"
+          fi
         done
 
     - name: Save NuGet packages
