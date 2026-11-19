@@ -1,5 +1,6 @@
 cmake_minimum_required(VERSION 3.28)
-project(fughetta-llvm LANGUAGES CXX)
+# LLVM's package can run C feature checks while finding its dependencies.
+project(fughetta-llvm LANGUAGES C CXX)
 
 # The Windows package's PDB library names the DIA SDK of a Visual Studio
 # installation, which LLVM's package finds only inside a developer prompt. The
