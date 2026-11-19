@@ -169,8 +169,10 @@ runs:
         if [[ "$RUNNER_OS" == macOS ]]; then
           runtime=$(find "$root" -name libc++.dylib | sed -n '1p')
           runtime_dir=$(dirname "${runtime:?LLVM archive lacks libc++.dylib}")
-          # Link the unwinder from the same LLVM distribution and keep DWARF unwind tables.
+          # Darwin arm64 normally emits only compact unwind for some frames.
+          # Emit DWARF in the objects before asking the linker to keep it.
           echo "CLANG_RUNTIME_DIR=$runtime_dir" >> "$GITHUB_ENV"
+          echo "CXXFLAGS=${CXXFLAGS:+$CXXFLAGS }-femit-dwarf-unwind=always" >> "$GITHUB_ENV"
           echo "LDFLAGS=${LDFLAGS:+$LDFLAGS }-L\"$runtime_dir\" -lc++abi -lunwind -Wl,-rpath,\"$runtime_dir\" -Wl,-no_compact_unwind" >> "$GITHUB_ENV"
         fi
         echo "CLANG_ROOT=$root" >> "$GITHUB_ENV"
