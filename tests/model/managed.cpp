@@ -153,10 +153,10 @@ namespace {
     }
     // Each line holds one helper exchange; both sides must read as the published wire types.
     auto conforming_transcript(const std::filesystem::path& path) -> std::size_t {
-        namespace json = language::helper;
+        namespace helper = language::helper;
         struct exchange {
-            json::message<json::value> message;
-            json::response<json::value> response;
+            helper::message<json::value> message;
+            helper::response<json::value> response;
         };
         std::ifstream file{path};
         std::size_t count = 0;
@@ -167,15 +167,15 @@ namespace {
             const auto& params = message.params;
             const auto& result = *response.result;
             if (message.operation == "open")
-                conforms<json::opening, json::value>(params, result);
+                conforms<helper::opening, json::value>(params, result);
             else if (message.operation == "update")
-                conforms<json::installation, json::value>(params, result);
+                conforms<helper::installation, json::value>(params, result);
             else if (message.operation == "units")
-                conforms<json::selection, std::vector<semantic::unit_key>>(params, result);
+                conforms<helper::selection, std::vector<semantic::unit_key>>(params, result);
             else if (message.operation == "evaluate")
-                conforms<json::evaluation, json::evaluation_result>(params, result);
+                conforms<helper::evaluation, helper::evaluation_result>(params, result);
             else if (message.operation == "observe")
-                conforms<json::observation, std::vector<semantic::input_object>>(params, result);
+                conforms<helper::observation, std::vector<semantic::input_object>>(params, result);
             // Graceful shutdown is a host convenience outside the worker contract.
             else if (message.operation != "close")
                 throw std::runtime_error("helper transcript names unknown operation " + message.operation);
