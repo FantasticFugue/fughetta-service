@@ -223,10 +223,10 @@ runs:
         CMAKE_VERSION: ${{ fromJSON(inputs.settings).toolchain.cmake }}
         JAVA_VERSION: ${{ steps.java.outputs.version }}
         GRADLE_VERSION: ${{ steps.gradle.outputs.gradle-version }}
+        CONFIGURE_ARGS: ${{ inputs.configure-args }}
       run: |
-        config=$(git log -1 --format=%H -- .github/actions/native-build .github/ci.json \
-          CMakePresets.json cmake/toolchain.cmake vcpkg.json vcpkg-configuration.json)
-        prefix="native-build-$RUNNER_OS-$RUNNER_ARCH-$CI_IMAGE_VERSION-$PRESET-$CMAKE_VERSION-$CLANG_ID-$JAVA_VERSION-$GRADLE_VERSION-$(dotnet --version)-$config-"
+        config=$(git log -1 --format=%H -- CMakePresets.json cmake/toolchain.cmake vcpkg.json vcpkg-configuration.json)
+        prefix="native-build-$RUNNER_OS-$RUNNER_ARCH-$CI_IMAGE_VERSION-$PRESET-$CMAKE_VERSION-$CLANG_ID-$JAVA_VERSION-$GRADLE_VERSION-$(dotnet --version)-$CONFIGURE_ARGS-$config-"
         {
           echo "prefix=$prefix"
           echo "paths<<NATIVE_BUILD_PATHS"
@@ -258,6 +258,9 @@ runs:
         CONFIGURE_ARGS: ${{ inputs.configure-args }}
       run: |
         read -r -a arguments <<< "$CONFIGURE_ARGS"
+        if [[ "$RUNNER_OS" == macOS ]]; then
+          arguments+=("-DCMAKE_EXE_LINKER_FLAGS=$LDFLAGS")
+        fi
         cmake --preset "$PRESET" -B "$CI_BUILD_DIR" "${arguments[@]}" \
           -DFUGHETTA_GRADLE_USER_HOME="$GRADLE_USER_HOME"
 
