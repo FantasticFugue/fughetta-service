@@ -23,6 +23,11 @@ def put(root, name, text):
     path.write_text(text, encoding="utf-8")
 
 
+def use_java_home(root):
+    put(root, "gradle.properties", "org.gradle.java.installations.fromEnv=JAVA_HOME\n"
+        "org.gradle.java.installations.auto-detect=false\norg.gradle.java.installations.auto-download=false\n")
+
+
 def export(root, kind, tool, exporter, projects=(), generated=(), prepare=True):
     shutil.rmtree(os.environ["FUGHETTA_STAGING"], ignore_errors=True)
     if kind == "gradle":
@@ -214,7 +219,13 @@ if __name__ == "__main__":
     with tempfile.TemporaryDirectory(dir=args.work, prefix=args.kind + "-") as directory:
         root = Path(directory).resolve()
         objects = root.parent / (root.name + "-objects")
-        sdk = Path(shutil.which("java")).resolve().parent.parent if args.kind == "kotlin" else Path(args.tool).resolve().parent
+        if args.kind == "kotlin":
+            java_home = os.environ.get("JAVA_HOME")
+            sdk = Path(java_home).resolve() if java_home else Path(shutil.which("java")).resolve().parent.parent
+            os.environ["JAVA_HOME"] = str(sdk)
+            use_java_home(root)
+        else:
+            sdk = Path(args.tool).resolve().parent
         os.environ["FUGHETTA_STAGING"] = str(objects)
         os.environ["FUGHETTA_SDKS"] = json.dumps([{"name": "sdk/java" if args.kind == "kotlin" else "sdk/dotnet", "object": "installed-sdk", "roots": [str(sdk)]}])
         if args.kind == "kotlin":

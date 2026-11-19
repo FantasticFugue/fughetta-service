@@ -10,6 +10,7 @@ import platform
 import re
 import shutil
 import subprocess
+import sys
 import tarfile
 import tempfile
 
@@ -33,10 +34,28 @@ def render(source, destination, **values):
     destination.write_text(text, encoding="utf-8")
 
 
+def worker_executables(stage, system):
+    suffix = ".exe" if system == "Windows" else ""
+    return [stage / f"bin/fughetta-service{suffix}",
+            stage / f"libexec/fughetta-service/llvm/fughetta-llvm{suffix}"]
+
+
+def worker_assets(stage, args, system, machine):
+    arch = {"x86_64": "x64", "amd64": "x64"}.get(machine, machine)
+    for binary in worker_executables(stage, system):
+        target = args.output / f"{binary.stem}-{sys.platform}-{arch}{binary.suffix}"
+        shutil.copy2(binary, target)
+        if system != "Windows":
+            clang = os.environ.get("CLANG_ROOT")
+            strip = Path(clang) / "bin/llvm-strip" if clang else "llvm-strip"
+            run(strip, target)
+        if system == "Darwin":
+            run("codesign", "--force", "--sign", "-", target)
+
+
 def runtime(stage, scratch, system, search):
     suffix = ".exe" if system == "Windows" else ""
-    executables = [stage / f"bin/fughetta-service{suffix}",
-                   stage / f"libexec/fughetta-service/llvm/fughetta-llvm{suffix}"]
+    executables = worker_executables(stage, system)
     dependencies = scratch / "runtime.txt"
     run("cmake", f"-DSTAGE={stage.as_posix()}", f"-DSUFFIX={suffix}",
         f"-DSEARCH={';'.join(search)}", f"-DOUTPUT={dependencies.as_posix()}",
@@ -156,10 +175,19 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--build", type=Path, required=True)
     parser.add_argument("--output", type=Path, default=Path("dist"))
-    parser.add_argument("--version", required=True)
+    version = parser.add_mutually_exclusive_group(required=True)
+    version.add_argument("--version")
+    version.add_argument("--build-number", help="Patch number for the configured CMake project version")
+    parser.add_argument("--worker-assets", action="store_true", help="Also emit the standalone worker binaries")
     parser.add_argument("--release-url", help="Download directory of the release; required on macOS")
     parser.add_argument("--runtime-search", action="append", default=[], help="Native library search directory")
     args = parser.parse_args()
+    if args.build_number is not None:
+        cache = (args.build / "CMakeCache.txt").read_text(encoding="utf-8")
+        project_version = re.search(r"^CMAKE_PROJECT_VERSION:STATIC=(\d+\.\d+)\.\d+$", cache, re.MULTILINE)
+        if not project_version:
+            parser.error("the CMake build directory must contain a configured project version")
+        args.version = f"{project_version[1]}.{args.build_number}"
     if not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", args.version):
         parser.error("--version must have three numeric components")
     major, minor, patch = map(int, args.version.split("."))
@@ -190,7 +218,14 @@ def main():
             path = path.replace("@PREFIX@", str(stage)).replace("@EXE@", ".exe" if system == "Windows" else "")
             if not Path(path).is_file():
                 raise FileNotFoundError(f"Build all language providers before packaging: {path}")
-        runtime(stage, scratch, system, args.runtime_search)
+        runtime_search = args.runtime_search
+        if compiler_runtime := os.environ.get("CLANG_RUNTIME_DIR"):
+            runtime_search = [*runtime_search, compiler_runtime]
+        elif clang := os.environ.get("CLANG_ROOT"):
+            runtime_search = [*runtime_search, (Path(clang) / "lib").as_posix()]
+        if args.worker_assets:
+            worker_assets(stage, args, system, machine)
+        runtime(stage, scratch, system, runtime_search)
         {"Linux": deb, "Windows": msi, "Darwin": homebrew}[system](stage, scratch, args)
 
 

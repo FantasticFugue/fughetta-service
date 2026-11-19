@@ -138,6 +138,7 @@ namespace {
         test::spit(tmp.dir / "sdk.json", kotlin ? "{\"sdk\":\"jdk\"}" : "{\"sdk\":\"dotnet\"}");
         worker_config.sdk_manifests[kotlin ? "sdk/java" : "sdk/dotnet"] = {.manifest = (tmp.dir / "sdk.json").string(), .roots = {sdk.string()}};
         if (kotlin) {
+            worker_config.env["JAVA_HOME"] = sdk.string();
             worker_config.tools["java"] = std::getenv("TEST_JAVA");
             worker_config.tools["gradle"] = std::getenv("TEST_GRADLE");
             worker_config.tools["fughetta-jvm"] = std::getenv("TEST_JVM_HOST");
@@ -172,6 +173,8 @@ namespace {
         const std::string path = kotlin ? "src/main/kotlin/Main.kt" : "Library.fs";
         if (kotlin) {
             files["settings.gradle"] = "rootProject.name = 'managed-e2e'\ninclude 'library'\n";
+            files["gradle.properties"] = "org.gradle.java.installations.fromEnv=JAVA_HOME\n"
+                                         "org.gradle.java.installations.auto-detect=false\norg.gradle.java.installations.auto-download=false\n";
             files["build.gradle"] = "plugins { id 'org.jetbrains.kotlin.jvm' version '2.4.21'; id 'application' }\n"
                                     "repositories { mavenCentral() }\nkotlin { jvmToolchain(25) }\n"
                                     "subprojects { apply plugin: 'org.jetbrains.kotlin.jvm'; repositories { mavenCentral() }; kotlin { jvmToolchain(25) } }\n"

@@ -1,0 +1,21 @@
+{
+  "toolchain": {
+    "llvm": "23.1.5",
+    "python": "3.x",
+    "dotnet": ["10.0.x", "11.0.x"],
+    "java": {"distribution": "temurin", "version": "25"},
+    "gradle": "current"
+  },
+  "compile_jobs": 2,
+  "compiler_attempts": 3,
+  "download_retries": 3,
+  "profiles": {
+    "check": {"preset": "debug", "timeout": 360},
+    "package": {"preset": "release", "timeout": 150, "targets": "fughetta-service llvm-provider clr-providers jvm-providers"}
+  },
+  "runners": [
+    {"id": "linux-x64", "label": "ubuntu-24.04"},
+    {"id": "macos-arm64", "label": "macos-15", "check": {"configure": "-DCLANG_SANITIZER=", "targets": "executor-test", "test_pattern": "^executor$", "retain_test_log": true}},
+    {"id": "windows-x64", "label": "windows-2025", "check": {"configure": "-DCLANG_SANITIZER="}}
+  ]
+}

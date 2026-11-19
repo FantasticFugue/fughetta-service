@@ -132,7 +132,8 @@ function(add_model_test PROVIDER TOOL EXPORTER)
   set_tests_properties(model.${PROVIDER} PROPERTIES TIMEOUT 300)
 endfunction()
 
-find_program(FUGHETTA_JAVAC javac)
+find_package(Java COMPONENTS Development QUIET)
+set(FUGHETTA_JAVAC "${Java_JAVAC_EXECUTABLE}")
 if(FUGHETTA_JAVAC)
   add_executable(jvm-test model/jvm.cpp)
   target_link_libraries(jvm-test PRIVATE testing)
@@ -147,9 +148,8 @@ if(GRADLE_TOOL)
     "FUGHETTA_RECORD_VALIDATOR=$<TARGET_FILE:managed-test>;FUGHETTA_WORKER_TEST=$<TARGET_FILE:executor-test>")
   add_model_test(kotlin "${GRADLE_TOOL}" "${FUGHETTA_JVM_EXPORTER}")
   if(FUGHETTA_JAVAC AND TEST_MANAGED_HOSTS AND FUGHETTA_PROVIDER_llvm)
-    cmake_path(GET FUGHETTA_JAVAC PARENT_PATH FUGHETTA_JAVA_BIN)
     add_test(NAME model.kotlin-jni COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/model/jvm.py" --kotlin
-      "$<TARGET_FILE:jvm-test>" "${GRADLE_TOOL}" "${FUGHETTA_JVM_EXPORTER}" "${FUGHETTA_JAVA_BIN}/java"
+      "$<TARGET_FILE:jvm-test>" "${GRADLE_TOOL}" "${FUGHETTA_JVM_EXPORTER}" "${Java_JAVA_EXECUTABLE}"
       "${FUGHETTA_PROVIDER_jvm}" "${FUGHETTA_PROVIDER_kotlin}"
       "$<TARGET_FILE:managed-test>" "${CMAKE_CXX_COMPILER}" "${CMAKE_BINARY_DIR}/jvm-tests")
     set_tests_properties(model.kotlin-jni PROPERTIES TIMEOUT 600)
@@ -176,14 +176,14 @@ endif()
 # The analysis suite runs the whole managed flow when both providers and a JDK
 # are present.
 if(TEST_MANAGED_HOSTS AND GRADLE_TOOL AND DOTNET_TOOL AND FUGHETTA_JAVAC)
-  file(REAL_PATH "${FUGHETTA_JAVAC}" FUGHETTA_JDK_BIN)
+  file(REAL_PATH "${Java_JAVA_EXECUTABLE}" FUGHETTA_JDK_BIN)
   cmake_path(GET FUGHETTA_JDK_BIN PARENT_PATH FUGHETTA_JDK_BIN)
   cmake_path(GET FUGHETTA_JDK_BIN PARENT_PATH FUGHETTA_JDK)
   set_property(TEST analysis APPEND PROPERTY ENVIRONMENT
     "TEST_GRADLE=${GRADLE_TOOL}"
-    "TEST_GRADLE_MODULES=${JVM_OUTPUT}/home/caches/modules-2"
+    "TEST_GRADLE_MODULES=${FUGHETTA_GRADLE_USER_HOME}/caches/modules-2"
     "TEST_DOTNET=${DOTNET_TOOL}"
-    "TEST_JAVA=${FUGHETTA_JDK_BIN}/java"
+    "TEST_JAVA=${Java_JAVA_EXECUTABLE}"
     "TEST_JDK=${FUGHETTA_JDK}"
     "TEST_CXX=${CMAKE_CXX_COMPILER}"
     "TEST_JVM_HOST=${FUGHETTA_PROVIDER_jvm}"

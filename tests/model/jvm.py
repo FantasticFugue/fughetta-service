@@ -10,7 +10,7 @@ import zipfile
 import re
 
 def kotlin_flow(binary, gradle, exporter, java, host, helper, validator, compiler, work):
-    from managed import export, put, run
+    from managed import export, put, run, use_java_home
     binary, java, host, helper, validator = [str(Path(value).resolve()) for value in (binary, java, host, helper, validator)]
     # The compiler may be an argv[0]-selected LLVM driver symlink.
     compiler = str(Path(compiler).absolute())
@@ -21,10 +21,12 @@ def kotlin_flow(binary, gradle, exporter, java, host, helper, validator, compile
         sdk = str(Path(java).parent.parent)
         objects = root / "objects"
         # Gradle keeps its home, the Kotlin daemon its run files, under the step's own root.
-        os.environ.update(TMPDIR=str(root), TEST_JAVA=java, FUGHETTA_STAGING=str(objects),
+        os.environ.update(TMPDIR=str(root), JAVA_HOME=sdk, TEST_JAVA=java, FUGHETTA_STAGING=str(objects),
             JAVA_TOOL_OPTIONS="-Djava.io.tmpdir=" + str(root) + " -Dkotlin.daemon.options=runFilesPath=" + str(root / "daemon"),
             GRADLE_USER_HOME=str(root / "gradle-home"),
             FUGHETTA_SDKS=json.dumps([dict(name="sdk/java", object="jdk", roots=[sdk])]))
+        use_java_home(root)
+        use_java_home(library_root)
         put(root, "settings.gradle", "rootProject.name = 'sample'\n")
         put(root, "build.gradle", """
 plugins { id 'org.jetbrains.kotlin.jvm' version '2.4.21' }
