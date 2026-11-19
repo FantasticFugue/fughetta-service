@@ -35,7 +35,7 @@ namespace {
             auto group = std::make_shared<io::process_group>();
             io::command command{.argv = {"sh", "-c", "sleep 60 & echo ready; read line; kill $!; wait"},
                                 .cwd = std::filesystem::current_path(),
-                                .interactive = true,
+                                .stdio = io::process_stdio::blocking,
                                 .processes = group};
             auto child = io::spawn_process(context.get_scheduler(), command);
             auto inspect = [&]() -> coroutine::task<> {
@@ -72,7 +72,8 @@ namespace {
         "an interactive child reads its input and keeps stdout for replies"_test = [] {
             native::context context;
             io::command command{
-                .argv = {"sh", "-c", "read line; echo \"got $line\"; echo noise >&2; cat"}, .cwd = std::filesystem::current_path(), .interactive = true};
+                .argv = {"sh", "-c", "read line; echo \"got $line\"; echo noise >&2; cat"}, .cwd = std::filesystem::current_path(),
+                .stdio = io::process_stdio::blocking};
             auto child = io::spawn_process(context.get_scheduler(), command);
             auto talk = [](native::process& child) -> coroutine::task<> {
                 std::string message = "hello\nrest\n";

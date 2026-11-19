@@ -360,15 +360,16 @@ export namespace io {
         std::map<int, std::shared_ptr<process_record>> children;
     };
 
+    enum class process_stdio { captured, blocking, asynchronous };
+
     struct command {
         std::vector<std::string> argv;
         std::filesystem::path cwd;
         std::optional<std::map<std::string, std::string>> env;
         std::optional<std::uint64_t> max_memory_bytes;
         std::optional<std::uint32_t> max_cpu_seconds;
-        // A conversation: this process writes the child's standard input, the child's standard output holds only its
-        // replies, and its standard error is discarded.
-        bool interactive = false;
+        // Both duplex modes reserve stdout for replies. Select asynchronous when the child drives stdio with its I/O scheduler.
+        process_stdio stdio = process_stdio::captured;
         // A file, created or truncated, that receives the child's standard output; its standard error alone is then what this
         // process reads. Not for a conversation.
         std::optional<std::filesystem::path> standard_output;

@@ -359,7 +359,7 @@ export namespace lsp {
     class session {
     public:
         session(native::scheduler io, io::command server) : io_(io) {
-            server.interactive = true;
+            server.stdio = io::process_stdio::blocking;
             child_.emplace(io::spawn_process(io, server));
         }
 

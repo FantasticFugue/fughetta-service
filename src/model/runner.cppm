@@ -88,7 +88,7 @@ export namespace runner {
         std::uint64_t log_size = 0;
         bool log_truncated = false;
         auto proc = io::spawn_process(io, cmd);
-        if (cmd.interactive)
+        if (cmd.stdio != io::process_stdio::captured)
             proc.close_input();
         tail out{output_limit};
         bool timed_out = false;

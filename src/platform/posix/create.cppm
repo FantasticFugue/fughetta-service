@@ -98,7 +98,7 @@ namespace native_process {
             ::dup2(in, 0);
             ::dup2(file >= 0 ? file : out, 1);
             // A conversation keeps stdout for replies and discards its diagnostics, as on Windows.
-            if (cmd.interactive) {
+            if (cmd.stdio != io::process_stdio::captured) {
                 int null = ::open("/dev/null", O_WRONLY);
                 if (null < 0 || ::dup2(null, 2) < 0)
                     ::_exit(126);
@@ -151,8 +151,9 @@ namespace native_process {
         char** envp = cmd.env ? env.data() : posix::environment();
         auto dir = cmd.cwd.string();
 
+        const bool interactive = cmd.stdio != io::process_stdio::captured;
         int out[2];
-        if (cmd.interactive ? ::socketpair(AF_UNIX, SOCK_STREAM, 0, out) < 0 : ::pipe(out) < 0)
+        if (interactive ? ::socketpair(AF_UNIX, SOCK_STREAM, 0, out) < 0 : ::pipe(out) < 0)
             throw std::system_error(errno, std::system_category(), "child output");
         ::fcntl(out[0], F_SETFD, FD_CLOEXEC);
         ::fcntl(out[1], F_SETFD, FD_CLOEXEC);
@@ -164,7 +165,7 @@ namespace native_process {
             ::close(out[1]);
             throw std::system_error(error, std::system_category(), "nonblocking child output");
         }
-        int in = cmd.interactive ? out[1] : ::open("/dev/null", O_RDONLY | O_CLOEXEC);
+        int in = interactive ? out[1] : ::open("/dev/null", O_RDONLY | O_CLOEXEC);
         if (in < 0) {
             auto err = errno;
             ::close(out[0]);
@@ -178,7 +179,7 @@ namespace native_process {
                 auto err = errno;
                 ::close(out[0]);
                 ::close(out[1]);
-                if (!cmd.interactive)
+                if (!interactive)
                     ::close(in);
                 throw std::system_error(err, std::system_category(), "open child standard output");
             }
@@ -190,7 +191,7 @@ namespace native_process {
             auto err = errno;
             ::close(out[0]);
             ::close(out[1]);
-            if (!cmd.interactive)
+            if (!interactive)
                 ::close(in);
             if (file >= 0)
                 ::close(file);
@@ -200,7 +201,7 @@ namespace native_process {
             exec_child(args.data(), envp, dir.c_str(), out[1], in, file, cmd, parent, bound);
         ::setpgid(pid, pid);
         ::close(out[1]);
-        if (!cmd.interactive)
+        if (!interactive)
             ::close(in);
         if (file >= 0)
             ::close(file);
@@ -213,7 +214,7 @@ namespace native_process {
             ::close(out[0]);
             throw;
         }
-        auto state = std::make_unique<child::state>(&engine, pid, out[0], cmd.interactive, pidfd);
+        auto state = std::make_unique<child::state>(&engine, pid, out[0], interactive, pidfd);
         if (cmd.processes) {
             state->observed = std::make_shared<observation>();
             state->observed->pid = pid;

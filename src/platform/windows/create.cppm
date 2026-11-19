@@ -194,17 +194,21 @@ namespace native_process {
         if (s->out.value == INVALID_HANDLE_VALUE)
             winapi::fail("CreateNamedPipe output");
         SECURITY_ATTRIBUTES security{sizeof security, nullptr, TRUE};
-        winapi::handle write{::CreateFileW(name.c_str(), GENERIC_WRITE, 0, &security, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr)};
+        const bool interactive = cmd.stdio != io::process_stdio::captured;
+        // IOCP can only associate the child's inherited handles if they were opened for overlapped I/O.
+        const DWORD child_pipe_flags =
+            cmd.stdio == io::process_stdio::asynchronous ? FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OVERLAPPED : FILE_ATTRIBUTE_NORMAL;
+        winapi::handle write{::CreateFileW(name.c_str(), GENERIC_WRITE, 0, &security, OPEN_EXISTING, child_pipe_flags, nullptr)};
         if (write.value == INVALID_HANDLE_VALUE)
             winapi::fail("open child output");
         winapi::handle input, errors;
-        if (cmd.interactive) {
+        if (interactive) {
             auto inbound = std::format(L"\\\\.\\pipe\\child-input-{}-{}", ::GetCurrentProcessId(), serial.fetch_add(1));
             s->in = winapi::handle{::CreateNamedPipeW(inbound.c_str(), PIPE_ACCESS_OUTBOUND | FILE_FLAG_OVERLAPPED | FILE_FLAG_FIRST_PIPE_INSTANCE,
                                                       PIPE_TYPE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS, 1, 65536, 65536, 0, nullptr)};
             if (s->in.value == INVALID_HANDLE_VALUE)
                 winapi::fail("CreateNamedPipe input");
-            input = winapi::handle{::CreateFileW(inbound.c_str(), GENERIC_READ, 0, &security, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr)};
+            input = winapi::handle{::CreateFileW(inbound.c_str(), GENERIC_READ, 0, &security, OPEN_EXISTING, child_pipe_flags, nullptr)};
             // A conversation keeps stdout for replies; its diagnostics are discarded.
             errors = winapi::handle{::CreateFileW(L"NUL", GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, &security, OPEN_EXISTING, 0, nullptr)};
             if (errors.value == INVALID_HANDLE_VALUE)
@@ -220,14 +224,14 @@ namespace native_process {
             if (file.value == INVALID_HANDLE_VALUE)
                 winapi::fail("open child standard output");
         }
-        HANDLE inherited[]{input.value, write.value, cmd.interactive ? errors.value : file.value};
-        attributes attr{inherited, cmd.interactive || cmd.standard_output ? 3u : 2u};
+        HANDLE inherited[]{input.value, write.value, interactive ? errors.value : file.value};
+        attributes attr{inherited, interactive || cmd.standard_output ? 3u : 2u};
         STARTUPINFOEXW start{};
         start.StartupInfo.cb = sizeof start;
         start.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
         start.StartupInfo.hStdInput = input.value;
         start.StartupInfo.hStdOutput = cmd.standard_output ? file.value : write.value;
-        start.StartupInfo.hStdError = cmd.interactive ? errors.value : write.value;
+        start.StartupInfo.hStdError = interactive ? errors.value : write.value;
         start.lpAttributeList = attr.list;
         std::wstring command;
         for (auto& arg : cmd.argv) {

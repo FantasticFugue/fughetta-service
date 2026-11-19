@@ -357,7 +357,7 @@ export namespace language {
         auto run(std::vector<std::string> argv) -> coroutine::task<std::string> {
             auto command = command_;
             command.argv = std::move(argv);
-            command.interactive = true;
+            command.stdio = io::process_stdio::blocking;
             auto result = co_await runner::run_step(io_, std::move(command), std::nullopt, constants::semantic_object_bytes, state_.provider);
             if (result.truncated || result.timed_out)
                 throw std::length_error("artifact reader exhausted its output or time budget");

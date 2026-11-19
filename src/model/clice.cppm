@@ -797,7 +797,7 @@ export namespace language {
             command.argv = commands_.at(name);
             command.argv.insert(command.argv.end(), arguments.begin(), arguments.end());
             command.argv.insert(command.argv.end(), {"--workspace", root_.string(), "--config-overlay", overlay_});
-            command.interactive = true;
+            command.stdio = io::process_stdio::blocking;
             auto report = co_await runner::run_step(io_, std::move(command), std::nullopt, constants::semantic_object_bytes, name);
             if (report.truncated)
                 throw std::length_error("clice " + name + " exceeds the semantic object limit");

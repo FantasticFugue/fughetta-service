@@ -99,7 +99,7 @@ export namespace language {
                 host.sdks.emplace(sdk.name, sdk.roots.front());
             }
             auto command = command_;
-            command.interactive = true;
+            command.stdio = io::process_stdio::blocking;
             child_.emplace(io::spawn_process(io_, command));
             (void)co_await call<json::value>("open", helper::opening{state_, std::move(initialization), std::move(host)});
         }
