@@ -63,11 +63,13 @@ runs:
         dotnet-version: ${{ fromJSON(inputs.settings).toolchain.dotnet }}
 
     - uses: actions/setup-java@v5
+      id: java
       with:
         distribution: ${{ fromJSON(inputs.settings).toolchain.java.distribution }}
         java-version: ${{ fromJSON(inputs.settings).toolchain.java.version }}
 
     - uses: gradle/actions/setup-gradle@v5
+      id: gradle
       with:
         gradle-version: ${{ fromJSON(inputs.settings).toolchain.gradle }}
         cache-read-only: ${{ github.event_name == 'pull_request' }}
@@ -213,6 +215,42 @@ runs:
         key: vcpkg-packages-${{ runner.os }}-${{ runner.arch }}-${{ inputs.preset }}-${{ env.CLANG_ID }}-${{ env.CI_IMAGE_VERSION }}-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json', 'cmake/toolchain.cmake') }}
         restore-keys: vcpkg-packages-${{ runner.os }}-${{ runner.arch }}-${{ inputs.preset }}-${{ env.CLANG_ID }}-
 
+    - name: Identify the native build cache
+      id: build-cache-key
+      shell: bash
+      env:
+        PRESET: ${{ inputs.preset }}
+        CMAKE_VERSION: ${{ fromJSON(inputs.settings).toolchain.cmake }}
+        JAVA_VERSION: ${{ steps.java.outputs.version }}
+        GRADLE_VERSION: ${{ steps.gradle.outputs.gradle-version }}
+      run: |
+        config=$(git log -1 --format=%H -- .github/actions/native-build .github/ci.json \
+          CMakePresets.json cmake/toolchain.cmake vcpkg.json vcpkg-configuration.json)
+        prefix="native-build-$RUNNER_OS-$RUNNER_ARCH-$CI_IMAGE_VERSION-$PRESET-$CMAKE_VERSION-$CLANG_ID-$JAVA_VERSION-$GRADLE_VERSION-$(dotnet --version)-$config-"
+        {
+          echo "prefix=$prefix"
+          echo "paths<<NATIVE_BUILD_PATHS"
+          for path in .ninja_deps .ninja_log build.ninja CMakeCache.txt CMakeFiles '*.cmake' \
+              '*.a' '*.exe' '*.lib' '*.pdb' '*-test' fughetta-service _deps clr jvm llvm tests \
+              vcpkg_installed vcpkg-triplets source-times.json; do
+            printf '%s/%s\n' "$CI_BUILD_DIR" "$path"
+          done
+          echo NATIVE_BUILD_PATHS
+        } >> "$GITHUB_OUTPUT"
+
+    - name: Restore Ninja build outputs
+      id: build-cache
+      uses: actions/cache/restore@v6
+      with:
+        key: ${{ steps.build-cache-key.outputs.prefix }}${{ github.sha }}
+        restore-keys: ${{ steps.build-cache-key.outputs.prefix }}
+        path: ${{ steps.build-cache-key.outputs.paths }}
+
+    - name: Restore unchanged source timestamps
+      if: steps.build-cache.outputs.cache-matched-key != ''
+      shell: bash
+      run: python .github/actions/native-build/source-times.py restore "$CI_BUILD_DIR"
+
     - name: Configure
       shell: bash
       env:
@@ -280,3 +318,15 @@ runs:
       with:
         path: ${{ env.NUGET_PACKAGES }}
         key: ${{ steps.nuget-cache.outputs.cache-primary-key }}
+
+    - name: Record source timestamps
+      if: steps.build.outcome == 'success' && steps.build-cache.outputs.cache-hit != 'true'
+      shell: bash
+      run: python .github/actions/native-build/source-times.py save "$CI_BUILD_DIR"
+
+    - name: Save Ninja build outputs
+      if: steps.build.outcome == 'success' && steps.build-cache.outputs.cache-hit != 'true'
+      uses: actions/cache/save@v6
+      with:
+        key: ${{ steps.build-cache.outputs.cache-primary-key }}
+        path: ${{ steps.build-cache-key.outputs.paths }}

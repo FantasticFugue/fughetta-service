@@ -75,6 +75,8 @@ jobs:
         include: ${{ fromJSON(needs.plan.outputs.settings).runners }}
     steps:
       - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
 
       - id: native
         uses: ./.github/actions/native-build
