@@ -107,14 +107,8 @@ runs:
             # Autotools invokes upstream clang directly, so it needs the SDK
             # in the environment as well as CMake's compiler configuration.
             echo "SDKROOT=$(xcrun --sdk macosx --show-sdk-path)" >> "$GITHUB_ENV"
-            # The SDK's libc++ lacks symbols used by the upstream headers.
-            runtime=$(find "$root/lib" -name libc++.dylib | sed -n '1p')
-            if [[ -z "$runtime" ]]; then
-              echo "LLVM $LLVM_VERSION did not include its libc++ runtime" >&2
-              exit 1
-            fi
-            runtime_dir=$(dirname "$runtime")
-            echo "LDFLAGS=${LDFLAGS:+$LDFLAGS }-L\"$runtime_dir\" -Wl,-rpath,\"$runtime_dir\"" >> "$GITHUB_ENV"
+            # Use the archive's libc++ together with its separate ABI library.
+            echo "LDFLAGS=${LDFLAGS:+$LDFLAGS }-L\"$root/lib\" -Wl,-rpath,\"$root/lib\" -lc++abi" >> "$GITHUB_ENV"
             id="llvm-$LLVM_VERSION-sdk-$(xcrun --sdk macosx --show-sdk-version)" ;;
           Windows)
             case "$RUNNER_ARCH" in X64) arch=x86_64 ;; ARM64) arch=aarch64 ;; esac
