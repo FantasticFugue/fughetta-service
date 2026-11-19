@@ -1,3 +1,5 @@
+module;
+#include <sodium.h>
 export module codec;
 import std;
 import content;
@@ -466,28 +468,16 @@ export namespace nodes {
     auto random_bytes(std::size_t n) -> std::string;
     inline auto object_id(const value& object) -> std::string { return digest_of(codec::encode(object)); }
     inline auto hex(std::string_view bytes) -> std::string {
-        constexpr std::string_view digits = "0123456789abcdef";
-        std::string out;
-        out.reserve(bytes.size() * 2);
-        for (unsigned char b : bytes) {
-            out += digits[b >> 4];
-            out += digits[b & 15];
-        }
-        return out;
+        return content::hex_encode({reinterpret_cast<const unsigned char*>(bytes.data()), bytes.size()});
     }
     inline auto unhex(std::string_view text) -> std::string {
         if (text.size() % 2)
             fail(nodes::code::invalid_record, "invalid hex length");
-        std::string out;
-        auto digit = [](char c) -> int {
-            if (c >= '0' && c <= '9')
-                return c - '0';
-            if (c >= 'a' && c <= 'f')
-                return c - 'a' + 10;
+        if (text.find_first_of("ABCDEF") != std::string_view::npos)
             fail(nodes::code::invalid_record, "invalid hex digit");
-        };
-        for (std::size_t i = 0; i < text.size(); i += 2)
-            out += static_cast<char>((digit(text[i]) << 4) | digit(text[i + 1]));
+        std::string out(text.size() / 2, '\0');
+        if (sodium_hex2bin(reinterpret_cast<unsigned char*>(out.data()), out.size(), text.data(), text.size(), nullptr, nullptr, nullptr) != 0)
+            fail(nodes::code::invalid_record, "invalid hex digit");
         return out;
     }
 } // namespace nodes

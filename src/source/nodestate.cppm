@@ -39,12 +39,13 @@ export namespace nodes {
 
     auto vector_set(std::vector<std::string> ids) -> std::vector<std::string>;
     auto base_body(std::string kind, std::string project) -> value::map;
+    auto chunked_payload(std::string_view data) -> bool;
     auto effects_digest(const value::array& effects) -> std::string;
     auto request_body(const node_request& in, const std::string& project) -> value;
     auto tool_name(std::string_view declared, std::string_view action) -> std::string;
     // `events.ancestors_blob`: the half-open event ranges of a causal closure, compact and ordered.
     auto encode_causal(const causal_set& ancestors) -> std::string;
-    auto decode_causal(std::string_view bytes) -> causal_set;
+    auto decode_causal(std::string_view bytes, std::size_t event) -> causal_set;
 
     struct local_node::impl {
         struct body_view {
@@ -83,7 +84,7 @@ export namespace nodes {
         std::uint64_t state_bytes_read = 0, state_bytes_written = 0, state_bytes_decoded = 0;
         std::set<std::string> cached_payload_files;
         std::uint64_t cached_payload_bytes = 0, cache_evictions = 0;
-        std::uint64_t object_count = 0, object_watermark = 0, archive_bytes = 0;
+        std::uint64_t object_count = 0, object_watermark = 0;
 
         static auto checked_root(std::filesystem::path path) -> std::filesystem::path;
         impl(std::filesystem::path path, bool rebuild, bool reading);
@@ -92,6 +93,7 @@ export namespace nodes {
         void trim_objects();
         auto put(value body) -> std::string;
         auto retain(value object) -> std::string;
+        void load_batch(const std::string& id, const value& body);
         void persist(value object, const std::string& id, std::string_view data);
         auto blob(std::string bytes_value) -> std::string;
         auto get(const std::string& id, std::string_view kind = {}) const -> const value&;
@@ -101,6 +103,8 @@ export namespace nodes {
         void check_schema(const value& b) const;
         void write_blob(const std::string& digest, std::string_view kind, std::uint64_t raw_bytes, std::uint64_t scalars, std::string_view data);
         auto read_blob(const std::string& digest) -> std::string;
+        auto read_chunked_blob(const std::string& digest) -> std::string;
+        auto retain_chunked_blob(const std::string& digest, std::string_view data) -> std::uint64_t;
         // A version's manifest names content only: a caller that needs character runs replays this file's effects.
         auto materialize(const source_state& state, const source_file& file) -> std::shared_ptr<const source_file>;
         auto line_of(const std::string& event) const -> std::string;

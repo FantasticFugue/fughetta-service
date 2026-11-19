@@ -2,12 +2,12 @@ export module jni;
 import std;
 import evaluation;
 import coroutine;
-import reflection;
+import json;
 import records;
 import channels;
 import objects;
 import jvm;
-import artifact;
+import llvm;
 export import bridge;
 
 export namespace jni {
@@ -156,7 +156,7 @@ export namespace jni {
         binding::endpoints<to> ends{inputs, source_definition, [&](const target& defined) {
                                         if (const auto found = defined.symbol->extensions.find("native.jni_registrations");
                                             found != defined.symbol->extensions.end())
-                                            for (const auto& method : rfl::from_generic<std::vector<registration>>(found->second).value())
+                                            for (const auto& method : json::from_value<std::vector<registration>>(found->second).value())
                                                 registrations[{defined.symbol->module, method.klass, method.name, method.descriptor}].push_back(
                                                     {defined.shard, defined.symbol, defined.location, true});
                                     }};
@@ -340,7 +340,7 @@ export namespace language {
             }
         }
         static auto launch(const options& value, const std::vector<builds::context>&) -> program {
-            return {.provider = "jni", .initialization = rfl::to_generic(value)};
+            return {.provider = "jni", .initialization = json::to_value(value)};
         }
     };
     static_assert(bridge<server<"jni">>);

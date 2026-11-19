@@ -14,6 +14,12 @@ export namespace allocation {
         std::optional<std::uint64_t> worker_memory_bytes;
         friend auto operator==(const budget&, const budget&) -> bool = default;
     };
+    inline auto self_hosted(unsigned cpus) -> budget {
+        const auto workers = std::clamp(cpus / 2u, 1u, budget{}.workers);
+        return {.threads = 6u + 2u * workers,
+                .jobs = std::max(workers, cpus > workers ? cpus - workers : 1u),
+                .workers = workers};
+    }
     struct worker {
         std::uint32_t parallel;
         std::optional<std::uint64_t> memory_bytes;

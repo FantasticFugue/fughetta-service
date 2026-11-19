@@ -1,7 +1,7 @@
 export module toolchain;
 import std;
 import content;
-import reflection;
+import json;
 import host;
 
 export namespace toolchain {
@@ -39,7 +39,7 @@ export namespace toolchain {
                 "fughetta-kotlin",
                 "dotnet",
                 "git",
-                "fughetta-native"};
+                "fughetta-llvm"};
     }
 
     struct sdk {
@@ -88,7 +88,7 @@ export namespace toolchain {
             // choosing different drivers. Parent directories only locate tools.
             selected.emplace(selected_tool{role, std::filesystem::path{path}.filename().generic_string()}, found->second);
         }
-        return content::hash_of(rfl::json::write(std::tuple{runtime.platform, selected, environment})).str();
+        return content::hash_of(json::write(std::tuple{runtime.platform, selected, environment})).str();
     }
 
     // Roots are normalized once when a worker installs its immutable SDKs.
@@ -207,11 +207,11 @@ export namespace toolchain {
             }
             // Package manifests contribute to the enclosing SDK's identity.
             if (!manifests.empty())
-                install_sdk(name, content::hash_of(rfl::json::write(manifests)).str(), roots);
+                install_sdk(name, content::hash_of(json::write(manifests)).str(), roots);
         }
-        out.platform = content::hash_of(rfl::json::write(std::tuple{std::string{host::os}, std::string{host::arch}, system})).str();
-        out.execution = content::hash_of(rfl::json::write(std::tuple{out.platform, binaries, environment})).str();
-        out.id = content::hash_of(rfl::json::write(std::tuple{out.execution, out.inputs})).str();
+        out.platform = content::hash_of(json::write(std::tuple{std::string{host::os}, std::string{host::arch}, system})).str();
+        out.execution = content::hash_of(json::write(std::tuple{out.platform, binaries, environment})).str();
+        out.id = content::hash_of(json::write(std::tuple{out.execution, out.inputs})).str();
         return out;
     }
 } // namespace toolchain

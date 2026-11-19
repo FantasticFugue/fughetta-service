@@ -4,13 +4,13 @@ import boost.ut;
 import meta;
 import language;
 import build;
-import reflection;
+import json;
 
 namespace {
     using namespace boost::ut;
 
     template <meta::fixed_string Name> auto options(builds::configuration& c, const std::string& builder) -> builds::config<Name>& {
-        return rfl::get<builds::with<Name>>(c.builders.at(builder).variant()).options;
+        return std::get<builds::with<Name>>(c.builders.at(builder).variant()).options;
     }
     void add(builds::configuration& c, const std::string& task, const std::string& builder, const std::string& operation) {
         c.tasks[task] = {.builder = builder, .operation = operation};
@@ -131,12 +131,12 @@ namespace {
             typescript.locale = "en";
             typescript.max_tsserver_memory = 4096;
             typescript.disable_automatic_typing_acquisition = true;
-            typescript.preferences["includeInlayParameterNameHints"] = rfl::Generic{"all"};
-            typescript.implicit_project_configuration["checkJs"] = rfl::Generic{true};
+            typescript.preferences["includeInlayParameterNameHints"] = json::value{"all"};
+            typescript.implicit_project_configuration["checkJs"] = json::value{true};
             auto plan = language::prepare({.server = language::with<"typescript">{.options = std::move(typescript)}, .build_configuration = "native"},
                                           {{"native", {}}});
             expect(plan.server.argv == std::vector<std::string>{"typescript-language-server", "--stdio", "--tsserver-path", "${tool:tsserver}"});
-            auto json = rfl::json::write(plan.server.initialization);
+            auto json = json::write(plan.server.initialization);
             expect(json.contains(R"("hostInfo":"fughetta")") && json.contains(R"("maxTsServerMemory":4096)"));
             expect(json.contains(R"("includeInlayParameterNameHints":"all")") && json.contains(R"("checkJs":true)"));
             auto local = language::locate(
@@ -154,7 +154,7 @@ namespace {
             expect(throws<std::invalid_argument>(
                 [&] { language::prepare({.server = language::with<"typescript">{.options = invalid}, .build_configuration = "native"}, {{"native", {}}}); }));
             invalid.max_tsserver_memory.reset();
-            invalid.preferences[""] = rfl::Generic{true};
+            invalid.preferences[""] = json::value{true};
             expect(throws<std::invalid_argument>(
                 [&] { language::prepare({.server = language::with<"typescript">{.options = invalid}, .build_configuration = "native"}, {{"native", {}}}); }));
         };
@@ -162,7 +162,7 @@ namespace {
         "TypeScript and Bun are in the published adapter schemas"_test = [] {
             auto& schemas = builds::schemas();
             expect(schemas.contains("tsc") && schemas.contains("bun"));
-            auto text = rfl::json::write(schemas.at("bun"));
+            auto text = json::write(schemas.at("bun"));
             expect(!text.contains("run_command") && !text.contains("append_args"));
         };
     };

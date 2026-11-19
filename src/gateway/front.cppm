@@ -3,7 +3,7 @@ import std;
 import enrollment;
 import constants;
 import native;
-import reflection;
+import json;
 import coroutine;
 import http;
 import mcp;
@@ -72,7 +72,7 @@ export namespace front {
 
     private:
         auto message(unsigned changes, std::string_view event) const -> std::string {
-            return std::format("event: {}\ndata: {{\"workspace_id\":{},\"changes\":{}}}\n\n", event, rfl::json::write(workspace_), changes);
+            return std::format("event: {}\ndata: {{\"workspace_id\":{},\"changes\":{}}}\n\n", event, json::write(workspace_), changes);
         }
         cores::context<native::scheduler>& rt_;
         std::string workspace_;
@@ -213,13 +213,13 @@ export namespace front {
 
     inline auto conflict_reply(const config::revision_conflict& e) -> web::reply {
         return web::json_reply(409, std::format(R"({{"code":"revision_conflict","message":{},"revision":{},"value":{}}})",
-                                                rfl::json::write(std::string{e.what()}), e.revision, e.value));
+                                                json::write(std::string{e.what()}), e.revision, e.value));
     }
 
     inline auto coded_reply(const coded_error& e) -> web::reply {
-        return web::json_reply(e.status, std::format(R"({{"code":{},"message":{},"missing":{},"conflicts":{},"frontier":{}}})", rfl::json::write(e.code),
-                                                     rfl::json::write(std::string{e.what()}), rfl::json::write(e.missing), rfl::json::write(e.conflicts),
-                                                     rfl::json::write(e.frontier)));
+        return web::json_reply(e.status, std::format(R"({{"code":{},"message":{},"missing":{},"conflicts":{},"frontier":{}}})", json::write(e.code),
+                                                     json::write(std::string{e.what()}), json::write(e.missing), json::write(e.conflicts),
+                                                     json::write(e.frontier)));
     }
 
     // Answers one REST request; the configuration MCP answers through it too.
@@ -249,7 +249,7 @@ export namespace front {
             tools_.insert(tools_.end(), configuration.begin(), configuration.end());
         }
         auto list() const -> const std::vector<mcp::tool>& { return tools_; }
-        auto call(std::string_view name, rfl::Generic args, mcp::notifier& note, const worlds::actor& who, mcp::call_context call = {})
+        auto call(std::string_view name, json::value args, mcp::notifier& note, const worlds::actor& who, mcp::call_context call = {})
             -> coroutine::task<mcp::tool_outcome> {
             if (std::ranges::any_of(settings_.list(), [name](const auto& tool) { return tool.name == name; })) {
                 if (!who.run.empty())
@@ -328,7 +328,8 @@ export namespace front {
                     }
                     std::optional<allocation::control::lease> admitted;
                     bool control_read = method == "OPTIONS" || (method == "GET" && (t.path == "/healthz" || t.path == "/api/v1/config/runtime" ||
-                                                                                    t.path == "/api/v1/builds" || t.path == "/api/v1/events"));
+                                                                                    t.path == "/api/v1/builds" || t.path == "/api/v1/events" ||
+                                                                                    t.path == "/api/v1/hosting/activity"));
                     // Status polling must not prevent a drained instance from rebuilding its processes.
                     if (!refused && c.runtime && !control_read) {
                         if (auto held = c.runtime->enter(t.path == "/api/v1/config/runtime"))
@@ -425,7 +426,7 @@ export namespace front {
         }
 
         static auto draining_cancel(std::string_view body) -> bool {
-            auto rpc = rfl::json::read<mcp::request>(std::string{body});
+            auto rpc = json::read<mcp::request>(std::string{body});
             return rpc && mcp::cancelled_request(*rpc).has_value();
         }
 
@@ -458,9 +459,9 @@ export namespace front {
             if (auto v = web::header(in.head, "mcp-protocol-version"); v && !mcp::supported(*v)) {
                 co_return error(400, std::format("unsupported MCP-Protocol-Version '{}'", *v));
             }
-            auto rpc = rfl::json::read<mcp::request>(body);
+            auto rpc = json::read<mcp::request>(body);
             if (!rpc) {
-                co_return web::json_reply(400, rfl::json::write(mcp::response{.error = mcp::error{mcp::code::parse_error, rpc.error().what()}}));
+                co_return web::json_reply(400, json::write(mcp::response{.error = {mcp::error{{mcp::code::parse_error}, {rpc.error().what()}}}}));
             }
             if (auto cancelled = mcp::cancelled_request(*rpc)) {
                 if (ctx_.requests && who)
@@ -476,7 +477,7 @@ export namespace front {
             if (accept.find("text/event-stream") == std::string_view::npos || !mcp::progress_token(*rpc)) {
                 mcp::notifier drop;
                 auto out = co_await cancellable(*rpc, drop, *who, configuration);
-                co_return web::json_reply(200, rfl::json::write(out ? **out : cancelled(*rpc)));
+                co_return web::json_reply(200, json::write(out ? **out : cancelled(*rpc)));
             }
 
             web::event_stream events;
@@ -519,9 +520,9 @@ export namespace front {
                 if (disconnected.stop_requested()) {
                     // The request ticket has been released; no response can reach this peer.
                 } else if (!out)
-                    events.push(web::event_stream::message(rfl::json::write(cancelled(*rpc))));
+                    events.push(web::event_stream::message(json::write(cancelled(*rpc))));
                 else if (*out)
-                    events.push(web::event_stream::message(rfl::json::write(**out)));
+                    events.push(web::event_stream::message(json::write(**out)));
                 heartbeat_stop.request_stop();
                 events.close();
                 co_await children.join();
@@ -580,7 +581,7 @@ export namespace front {
         }
 
         static auto cancelled(const mcp::request& rpc) -> mcp::response {
-            return {.id = rpc.id, .error = mcp::error{mcp::code::request_cancelled, "the request was cancelled"}};
+            return {.id = {rpc.id}, .error = {mcp::error{{mcp::code::request_cancelled}, {"the request was cancelled"}}}};
         }
 
         context ctx_;

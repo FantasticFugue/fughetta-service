@@ -3,7 +3,7 @@ import utility;
 import constants;
 import std;
 import knowledge;
-import reflection;
+import json;
 import coroutine;
 import meta;
 import protocol;
@@ -186,7 +186,7 @@ export namespace tools {
         auto reply = co_await node_call(s, project, {.action = "task_lookup", .execution_token = token}, worlds::service_actor("execution"));
         if (!reply.execution)
             throw tool_error("unauthenticated", "execution not found");
-        auto identity = rfl::json::read<worlds::actor>(reply.execution->identity);
+        auto identity = json::read<worlds::actor>(reply.execution->identity);
         if (!identity)
             throw tool_error("unauthenticated", "invalid execution identity");
         auto who = *identity;
@@ -221,19 +221,19 @@ export namespace tools {
     }
 
     struct change {
-        rfl::Description<"edit, replace, write, create, remove, move or mode", std::string> kind;
-        rfl::Description<"Path relative to the project root", std::string> path;
-        rfl::Description<"edit: first Unicode scalar to replace, in the observed version; replace: first scalar of the search window",
+        json::described<"edit, replace, write, create, remove, move or mode", std::string> kind;
+        json::described<"Path relative to the project root", std::string> path;
+        json::described<"edit: first Unicode scalar to replace, in the observed version; replace: first scalar of the search window",
                          std::optional<std::uint64_t>>
             offset;
-        rfl::Description<"edit: number of Unicode scalars to replace (0 inserts); replace: length of the search window", std::optional<std::uint64_t>> count;
-        rfl::Description<"replace: text that occurs exactly once in the window", std::optional<std::string>> old_text;
-        rfl::Description<"replace: its replacement", std::optional<std::string>> new_text;
-        rfl::Description<"replace: a scope reference from language; the window is that structure in the observed version", std::optional<std::string>> scope;
-        rfl::Description<"edit/write/create: new text", std::optional<std::string>> text;
-        rfl::Description<"write/create: new bytes, base64", std::optional<std::string>> data_base64;
-        rfl::Description<"create/mode: executable flag", std::optional<bool>> executable;
-        rfl::Description<"move: new path", std::optional<std::string>> destination;
+        json::described<"edit: number of Unicode scalars to replace (0 inserts); replace: length of the search window", std::optional<std::uint64_t>> count;
+        json::described<"replace: text that occurs exactly once in the window", std::optional<std::string>> old_text;
+        json::described<"replace: its replacement", std::optional<std::string>> new_text;
+        json::described<"replace: a scope reference from language; the window is that structure in the observed version", std::optional<std::string>> scope;
+        json::described<"edit/write/create: new text", std::optional<std::string>> text;
+        json::described<"write/create: new bytes, base64", std::optional<std::string>> data_base64;
+        json::described<"create/mode: executable flag", std::optional<bool>> executable;
+        json::described<"move: new path", std::optional<std::string>> destination;
     };
 
     // The byte where a text's scalar at `scalar` begins, or its size past the end.
@@ -341,6 +341,7 @@ export namespace tools {
     struct record {
         std::string input;
         std::uint64_t replacements = 0;
+        std::optional<std::string> observed;
     };
     auto recorded(services& s, const std::string& project, const worlds::actor& actor, const std::optional<std::string>& operation_id, const std::string& input,
                   std::string worldline = "main") -> coroutine::task<std::optional<std::pair<nodes::node_reply, record>>> {
@@ -356,7 +357,7 @@ export namespace tools {
             co_return std::nullopt;
         if (r.code != "ok")
             throw tool_error(r.code, r.reason);
-        auto kept = rfl::json::read<record>(r.result);
+        auto kept = json::read<record>(r.result);
         if (!kept || kept->input != input)
             throw tool_error(nodes::code::identity_conflict, "operation ID reused with different input");
         co_return std::pair{std::move(r), *kept};
@@ -393,36 +394,36 @@ export namespace tools {
                             "(else the edited text) for the caller and reports reach: body_only or declaration_touched. "
                             "Repeat an operation_id with identical input to recover its recorded result."> {
         struct input {
-            rfl::Description<"Project; supplied by the execution context when absent", std::optional<std::string>> project;
-            rfl::Description<"list, inspect, read, compare, diff, promote, fork, apply, receipt, history, contribution, reference, references, "
+            json::described<"Project; supplied by the execution context when absent", std::optional<std::string>> project;
+            json::described<"list, inspect, read, compare, diff, promote, fork, apply, receipt, history, contribution, reference, references, "
                              "reference_history, reverse, redo, export or restore",
                              std::string>
                 action;
-            rfl::Description<"Worldline name; task binding when absent; explicit selection required without a task", std::optional<std::string>> worldline;
-            rfl::Description<"Selected version or @tag/channel; diff/promote: source version (required for promote)", std::optional<std::string>> version;
-            rfl::Description<"apply/reverse/redo/compare: observed version; diff/promote: target version (required for promote)", std::optional<std::string>>
+            json::described<"Worldline name; task binding when absent; explicit selection required without a task", std::optional<std::string>> worldline;
+            json::described<"Selected version or @tag/channel; diff/promote: source version (required for promote)", std::optional<std::string>> version;
+            json::described<"apply/reverse/redo/compare: observed version; diff/promote: target version (required for promote)", std::optional<std::string>>
                 observed;
-            rfl::Description<"read: first Unicode scalar to return in a text file", std::optional<std::uint64_t>> offset;
-            rfl::Description<"read: Unicode scalars to return; bounded by the project read_max_bytes", std::optional<std::uint64_t>> count;
-            rfl::Description<"read: omit content when this digest is unchanged", std::optional<std::string>> known_digest;
-            rfl::Description<"apply/promote/reverse/redo: explicit scope lease tokens that must cover the edits; omit them to lock implicitly",
+            json::described<"read: first Unicode scalar to return in a text file", std::optional<std::uint64_t>> offset;
+            json::described<"read: Unicode scalars to return; bounded by the project read_max_bytes", std::optional<std::uint64_t>> count;
+            json::described<"read: omit content when this digest is unchanged", std::optional<std::string>> known_digest;
+            json::described<"apply/promote/reverse/redo: explicit scope lease tokens that must cover the edits; omit them to lock implicitly",
                              std::optional<std::vector<std::string>>>
                 leases;
-            rfl::Description<"read: file path", std::optional<std::string>> path;
-            rfl::Description<"fork/restore: name of the new worldline", std::optional<std::string>> name;
-            rfl::Description<"fork/diff/promote: source worldline; diff/promote compare or copy into worldline", std::optional<std::string>> from;
-            rfl::Description<"apply/promote/fork/reverse/redo/restore: caller-chosen ID of this operation", std::optional<std::string>> operation_id;
-            rfl::Description<"apply/promote/fork/reverse/redo: what this change is for", std::optional<std::string>> intent;
-            rfl::Description<"apply: one atomic batch", std::optional<std::vector<change>>> changes;
-            rfl::Description<"export: replace a package of that name", std::optional<bool>> force;
-            rfl::Description<"export/restore: package name, shared by the workspace's projects", std::optional<std::string>> package;
-            rfl::Description<"reverse/redo/contribution: the history entry to undo, restore or describe", std::optional<std::string>> target;
-            rfl::Description<"history: page size", std::optional<std::uint64_t>> limit;
-            rfl::Description<"history: the last entry of the previous page", std::optional<std::string>> cursor;
-            rfl::Description<"reference: name, tag/channel kind, expected prior receipt and build/test/review attestations",
+            json::described<"read: file path", std::optional<std::string>> path;
+            json::described<"fork/restore: name of the new worldline", std::optional<std::string>> name;
+            json::described<"fork/diff/promote: source worldline; diff/promote compare or copy into worldline", std::optional<std::string>> from;
+            json::described<"apply/promote/fork/reverse/redo/restore: caller-chosen ID of this operation", std::optional<std::string>> operation_id;
+            json::described<"apply/promote/fork/reverse/redo: what this change is for", std::optional<std::string>> intent;
+            json::described<"apply: one atomic batch", std::optional<std::vector<change>>> changes;
+            json::described<"export: replace a package of that name", std::optional<bool>> force;
+            json::described<"export/restore: package name, shared by the workspace's projects", std::optional<std::string>> package;
+            json::described<"reverse/redo/contribution: the history entry to undo, restore or describe", std::optional<std::string>> target;
+            json::described<"history: page size", std::optional<std::uint64_t>> limit;
+            json::described<"history: the last entry of the previous page", std::optional<std::string>> cursor;
+            json::described<"reference: name, tag/channel kind, expected prior receipt and build/test/review attestations",
                              std::optional<nodes::reference_input>>
                 reference;
-            rfl::Description<"references/reference_history: last sequence of the previous page", std::optional<std::uint64_t>> after;
+            json::described<"references/reference_history: last sequence of the previous page", std::optional<std::uint64_t>> after;
         };
         struct line_entry {
             std::string name, version;
@@ -667,7 +668,7 @@ export namespace tools {
                 // A retry answers from the receipt: the source worldline may have moved on since the original resolved its version.
                 auto name = *in.name.value();
                 auto id = *in.operation_id.value();
-                std::string input = content::hash_of(rfl::json::write(std::array{name, in.from.value().value_or(line), in.version.value().value_or(""),
+                std::string input = content::hash_of(json::write(std::array{name, in.from.value().value_or(line), in.version.value().value_or(""),
                                                                                  in.intent.value().value_or("")}))
                                         .str();
                 auto apply_once = [&]() -> coroutine::task<nodes::node_reply> {
@@ -679,7 +680,7 @@ export namespace tools {
                                                   .caller_operation = id,
                                                   .source = base.frontier,
                                                   .intent = in.intent.value().value_or(""),
-                                                  .result = rfl::json::write(record{input})},
+                                                  .result = json::write(record{input})},
                                                  actor);
                 };
                 auto r = co_await once<nodes::node_reply>(

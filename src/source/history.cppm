@@ -9,7 +9,7 @@ import codec;
 import kernel;
 import durability;
 import archive;
-import reflection;
+import json;
 import nodestore;
 
 namespace nodes {
@@ -341,7 +341,7 @@ namespace nodes {
         q.text(2, version_id);
         q.text(3, base_version);
         q.text(4, creator);
-        q.text(5, rfl::json::write(frontier));
+        q.text(5, json::write(frontier));
         q.next();
     }
 
@@ -597,7 +597,7 @@ namespace nodes {
             row.text(1, id.substr(10));
             if (!row.next())
                 fail(nodes::code::outcome_unknown, "reference receipt not found");
-            auto record = rfl::json::read<reference_record>(row.data(0));
+            auto record = json::read<reference_record>(row.data(0));
             if (!record)
                 fail(nodes::code::storage_failure, "reference receipt is unreadable");
             auto out = identity();

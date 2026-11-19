@@ -27,7 +27,7 @@ namespace source {
         }
 
         template <jobs::request Req> auto invoke(net::ip::tcp::endpoint endpoint, Req request, coroutine::stop_token stop) -> jobs::reply_t<Req> {
-            native::context resource;
+            static thread_local native::context resource;
             auto io = resource.get_scheduler();
             bool issued = false;
             // A node write whose answer is lost may have committed: the caller learns that as outcome_unknown and asks for its receipt.

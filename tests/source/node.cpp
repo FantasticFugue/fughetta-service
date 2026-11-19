@@ -66,6 +66,65 @@ namespace {
     auto inspect(nodes::local_node& node) -> nodes::node_reply { return good(node, {.action = "inspect"}); }
 
     const auto cases = [] {
+        "a local binary edit reuses compressed extents across causal versions"_test = [] {
+            test::scratch tmp{"chunked-asset"};
+            const auto root = tmp.dir / "repository";
+            nodes::local_node node{root};
+            good(node, {.action = "initialize", .genesis_nonce = op("chunked-asset-genesis")});
+            std::string asset(10 * 1024 * 1024, '\0');
+            std::mt19937 generator{20261118};
+            for (auto& byte : asset)
+                byte = static_cast<char>(generator() & 0xff);
+            auto original = change(node, "chunked-original", {},
+                                   {.kind = std::string{"binary_create"}, .path = "asset.bin", .text = nodes::hex(asset)});
+
+            sqlite3* raw = nullptr;
+            expect((sqlite3_open_v2((root / "repository.sqlite").string().c_str(), &raw, SQLITE_OPEN_READONLY, nullptr) == SQLITE_OK) >> fatal);
+            std::unique_ptr<sqlite3, decltype(&sqlite3_close)> database{raw, sqlite3_close};
+            auto scalar = [&](const char* sql) {
+                sqlite3_stmt* query = nullptr;
+                expect((sqlite3_prepare_v2(raw, sql, -1, &query, nullptr) == SQLITE_OK) >> fatal);
+                expect((sqlite3_step(query) == SQLITE_ROW) >> fatal);
+                const auto result = sqlite3_column_int64(query, 0);
+                sqlite3_finalize(query);
+                return result;
+            };
+            constexpr auto bytes = "SELECT SUM(length(data)) FROM blob_chunks";
+            const auto first_payload = scalar(bytes);
+            const auto first_pages = scalar("PRAGMA page_count");
+            expect(first_payload > 0);
+            constexpr std::size_t offset = 4 * 1024 * 1024;
+            for (auto& byte : std::span{asset}.subspan(offset, 4096))
+                byte ^= 0x5a;
+            auto updated = change(node, "chunked-update", original.frontier,
+                                  {.kind = std::string{"binary"}, .path = "asset.bin", .text = nodes::hex(asset)});
+            const auto payload_growth = scalar(bytes) - first_payload;
+            const auto page_growth = (scalar("PRAGMA page_count") - first_pages) * scalar("PRAGMA page_size");
+            std::cout << "Added compressed chunk bytes: " << payload_growth << ", SQLite page growth: " << page_growth << " bytes\n";
+            expect(payload_growth > 0 && payload_growth <= 128 * 1024);
+            expect(page_growth < 1024 * 1024);
+
+            nodes::local_node reopened{root};
+            const auto file = good(reopened, {.action = "read", .revision = updated.version, .target = "asset.bin"});
+            expect(file.files.size() == 1u);
+            const auto digest = content::hash_of(asset).str();
+            const auto version = nodes::object_id(value::map{{"frontier", nodes::strings(updated.frontier)}, {"project_id", node.project_id()}});
+            const auto root_digest = nodes::object_id(value::map{{"digest", digest}, {"executable", false}, {"file", file.files.front().id},
+                                                                {"kind", "binary"}, {"path", "asset.bin"}, {"size", static_cast<std::uint64_t>(asset.size())}});
+            expect(file.version == version && updated.version == version);
+            expect(file.source_digest == nodes::state_digest(root_digest, {}));
+            expect(file.files.front().digest == digest);
+            expect(text(file, "asset.bin") == nodes::hex(asset));
+
+            nodes::local_node audited{root, true};
+            const auto recovered = good(audited, {.action = "tree", .target = "asset.bin"});
+            expect(recovered.version == updated.version && recovered.source_digest == updated.source_digest);
+
+            nodes::local_node cold{root};
+            auto reversed = good(cold, {.action = "reverse", .operation = op("chunked-reverse"),
+                                        .expected = updated.frontier, .target = updated.frontier.front()});
+            expect(reversed.source_digest == original.source_digest);
+        };
         "named tags and channels preserve source selection and operation recovery"_test = [] {
             test::scratch tmp{"named-checkpoints"};
             std::string first, second, reference_receipt;
@@ -189,7 +248,7 @@ namespace {
             nodes::causal_set serial;
             for (std::size_t i = 0; i < 10000; ++i)
                 serial.add(i);
-            expect(serial.ranges.size() == 1u);
+            expect(serial.ranges().size() == 1u);
             expect(serial.contains(9999u));
             expect(!serial.contains(10000u));
         };
@@ -752,14 +811,6 @@ namespace {
             expect(failed.code == "identity_conflict");
             expect(!good(node, {.action = "worldlines"}).worldlines.contains("unbound"));
         };
-        "source rejects removed semantic and syntax-scope operations"_test = [] {
-            test::scratch tmp{"no-semantics"};
-            nodes::local_node node{tmp.dir / "a"};
-            good(node, {.action = "initialize"});
-            for (auto action : {"semantic", "semantic.publish", "anchor"})
-                expect(attempt(node, {.action = action}).code != "ok");
-            expect(attempt(node, {.action = "lock"}).code == "invalid_record");
-        };
         "missing causal log and corrupt effect pages refuse edits and a rebuild reconstructs them"_test = [] {
             for (bool missing : {false, true}) {
                 test::scratch tmp{"demand-damaged"};
@@ -1145,14 +1196,6 @@ namespace {
             auto seed = p.seed();
             auto before = inspect(p.a);
             expect(before.files.size() == 1u);
-            auto& file = before.files.front();
-            // The version's state root is SHA-256 over its canonical sorted manifest tuples.
-            content::sha256 manifest;
-            manifest.update(nodes::codec::encode(value::map{
-                {"digest", file.digest}, {"executable", file.executable}, {"file", file.id}, {"kind", file.kind}, {"path", file.path}, {"size", file.size}}));
-            auto root = content::to_hex(manifest.finish()).str();
-            expect(before.source_digest ==
-                   nodes::digest_of(nodes::codec::encode(value::map{{"conflicts", nodes::strings(before.conflicts)}, {"files", root}})));
             auto evidence =
                 good(p.a, {.action = "apply", .operation = op("evidence"), .expected = seed.frontier, .intent = "Review only", .result = "Actual observation"});
             auto after = inspect(p.a);

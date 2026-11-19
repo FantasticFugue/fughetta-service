@@ -5,6 +5,8 @@ import async;
 import httpant.io;
 
 export namespace native_process {
+    auto standard_input() -> native_io::handle;
+    auto standard_output() -> native_io::handle;
     auto self_usage() noexcept -> std::optional<io::process_usage>;
     auto sample(const io::process_record& process) noexcept -> std::optional<io::process_usage>;
     inline auto usage(io::process_group& processes) -> std::optional<io::process_usage> {

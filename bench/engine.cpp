@@ -1,6 +1,6 @@
 #include <sys/resource.h>
 import std;
-import reflection;
+import json;
 import content;
 import codec;
 import engine;
@@ -113,7 +113,7 @@ namespace {
         std::vector<std::string> head;
         std::vector<std::string> paths;
         if (mode == "w1") {
-            auto parsed = rfl::json::read<input_manifest>(read(inputs / "node-evaluation-project.json"));
+            auto parsed = json::read<input_manifest>(read(inputs / "node-evaluation-project.json"));
             if (!parsed)
                 throw std::runtime_error(parsed.error().what());
             std::vector<nodes::edit> initial;
@@ -174,7 +174,7 @@ namespace {
             }
         }
         std::ofstream raw_timings(root / "latencies-ms.json");
-        raw_timings << rfl::json::write(timings);
+        raw_timings << json::write(timings);
         raw_timings.close();
         summarize(output, a);
         output.seconds = elapsed(start);
@@ -205,7 +205,7 @@ int main(int argc, char** argv) {
             output.peak_rss_kib = peak();
         } else
             throw std::invalid_argument("unknown benchmark mode");
-        std::cout << rfl::json::write(output) << '\n';
+        std::cout << json::write(output) << '\n';
         return 0;
     } catch (const std::exception& e) {
         std::cerr << "node-benchmark: " << e.what() << '\n';

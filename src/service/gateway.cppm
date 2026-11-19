@@ -1,3 +1,5 @@
+module;
+#include <argparse/argparse.hpp>
 export module gateway;
 import std;
 import environment;
@@ -12,7 +14,7 @@ import front;
 import keyring;
 import usage;
 import protocol;
-import reflection;
+import json;
 import runtime;
 import host;
 import enrollment;
@@ -114,7 +116,7 @@ namespace gateway {
                     }
                 } else {
                     auto workers = router_.workers(0).describe(0);
-                    if (std::ranges::count_if(workers, [](const auto& w) { return w.online; }) == doc_.runtime.workers) {
+                    if (std::ranges::count_if(workers, [](const auto& w) { return w.online && !w.worker_id && w.name.starts_with("local-"); }) == doc_.runtime.workers) {
                         control_.ready(current->revisions.runtime);
                         lifecycle::publish(lifecycle::phase::ready);
                     }
@@ -168,16 +170,20 @@ namespace gateway {
 } // namespace gateway
 
 // `gateway token NAME ROLE [config.json]` adds a bearer token to the configuration and prints it once; only its hash is kept.
-auto add_token(std::span<char*> args) -> int {
-    if (args.size() < 2 || args.size() > 3)
-        throw std::invalid_argument("usage: fughetta-service token NAME owner|member [config.json]");
-    std::string role = args[1];
-    std::filesystem::path file = args.size() > 2 ? args[2] : "config.json";
-    config::store store{std::filesystem::exists(file) ? config::load(file) : config::document{}, file};
+auto add_token(int argc, char** argv) -> int {
+    argparse::ArgumentParser arguments{"fughetta-service token", "", argparse::default_arguments::help};
+    arguments.add_argument("name");
+    arguments.add_argument("role").choices("owner", "member");
+    arguments.add_argument("config").nargs(argparse::nargs_pattern::optional).default_value(std::string{"config.json"});
+    arguments.parse_args(argc, argv);
+    const auto role = arguments.get<std::string>("role");
+    const auto file = std::filesystem::path{arguments.get<std::string>("config")};
+    const auto budget = allocation::self_hosted(host::available_cpus());
+    config::store store{std::filesystem::exists(file) ? config::load(file, budget) : config::document{.runtime = budget}, file};
     auto doc = store.current();
     auto token = keyring::mint();
     auto server = doc->server;
-    server.auth.tokens.push_back({.name = args[0], .hash = keyring::hash(token), .role = role});
+    server.auth.tokens.push_back({.name = arguments.get<std::string>("name"), .hash = keyring::hash(token), .role = role});
     store.put_server(server, doc->revisions.server);
     std::println("{}", token);
     return 0;
@@ -186,7 +192,7 @@ auto add_token(std::span<char*> args) -> int {
 export int run_gateway(int argc, char** argv, bool managed) {
     try {
         if (argc > 1 && std::string_view{argv[1]} == "token")
-            return add_token(std::span{argv + 2, argv + argc});
+            return add_token(argc - 1, argv + 1);
         if (argc > 2)
             throw std::invalid_argument("usage: fughetta-service [config.json] | fughetta-service token NAME owner|member [config.json]");
         std::filesystem::path file = argc > 1 ? argv[1] : "config.json";
@@ -195,10 +201,16 @@ export int run_gateway(int argc, char** argv, bool managed) {
         for (;;) {
             lifecycle::publish(lifecycle::phase::starting);
             config::document doc;
+            const auto budget = managed ? std::optional{allocation::self_hosted(host::available_cpus())} : std::nullopt;
             if (argc > 1 || std::filesystem::exists(file))
-                doc = config::load(file);
+                doc = config::load(file, budget);
+            else if (budget)
+                doc.runtime = *budget;
             if (managed) {
-                doc.worker_token = keyring::mint();
+                // A hosted backend provisions a shared credential for overflow Workers.
+                // The embedded supervisor still rotates its private credential on restart.
+                if (!doc.server.overflow_wait_seconds)
+                    doc.worker_token = keyring::mint();
                 host::set_environment_if_absent("SOURCE_TOKEN", keyring::mint());
             }
             cores::io_context<runtime::context> context{1};

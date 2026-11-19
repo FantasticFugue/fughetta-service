@@ -22,6 +22,9 @@ jobs:
     defaults:
       run:
         shell: bash
+    env:
+      PACKAGE_VERSION: 0.1.${{ github.run_number }}
+      RELEASE_URL: https://github.com/${{ github.repository }}/releases/download/nightly-${{ github.run_id }}-${{ github.run_attempt }}
     strategy:
       fail-fast: false
       matrix:
@@ -29,12 +32,15 @@ jobs:
           - name: linux-x64
             os: ubuntu-24.04
             asset: fughetta-service-linux-x64
+            llvm: fughetta-llvm-linux-x64
           - name: macos-arm64
             os: macos-15
             asset: fughetta-service-darwin-arm64
+            llvm: fughetta-llvm-darwin-arm64
           - name: windows-x64
             os: windows-2025
             asset: fughetta-service-win32-x64.exe
+            llvm: fughetta-llvm-win32-x64.exe
     steps:
       - uses: actions/checkout@v7
 
@@ -42,6 +48,25 @@ jobs:
         uses: ./.github/actions/toolchain
         with:
           preset: release
+
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '25'
+
+      - uses: gradle/actions/setup-gradle@v5
+        with:
+          gradle-version: current
+
+      - name: Install packaging tools
+        run: |
+          case "$RUNNER_OS" in
+            Linux) sudo apt-get install -y patchelf ;;
+            Windows)
+              dotnet tool install wix --tool-path "$RUNNER_TEMP/wix"
+              echo "$RUNNER_TEMP/wix" >> "$GITHUB_PATH"
+              "$RUNNER_TEMP/wix/wix" extension add WixToolset.Util.wixext ;;
+          esac
 
       - name: Configure
         run: cmake --preset release
@@ -59,28 +84,46 @@ jobs:
         # fail the step.
         run: |
           for attempt in $(seq 10); do
-            cmake --build --preset release --target fughetta-service --parallel 2 && exit 0
+            cmake --build --preset release --target fughetta-service llvm-provider clr-providers jvm-providers --parallel 2 && exit 0
           done
           exit 1
 
       - name: Package
         run: |
           set -euo pipefail
-          cmake --install build/release --prefix dist-root
+          cmake --install build/release --prefix dist-root --component runtime
+          cmake --install build/release --prefix dist-root --component llvm
+          # The worker finds fughetta-llvm through the tool mapping fug writes.
           binary="$(ls dist-root/bin/fughetta-service*)"
-          if [ "$RUNNER_OS" != Windows ]; then
-            "$CLANG_ROOT/bin/llvm-strip" "$binary"
-          fi
-          if [ "$RUNNER_OS" = macOS ]; then
-            codesign --force --sign - "$binary"
-          fi
+          llvm="$(ls dist-root/libexec/fughetta-service/llvm/fughetta-llvm*)"
+          for file in "$binary" "$llvm"; do
+            if [ "$RUNNER_OS" != Windows ]; then
+              "$CLANG_ROOT/bin/llvm-strip" "$file"
+            fi
+            if [ "$RUNNER_OS" = macOS ]; then
+              codesign --force --sign - "$file"
+            fi
+          done
           mkdir -p dist
           cp "$binary" "dist/${{ matrix.asset }}"
+          cp "$llvm" "dist/${{ matrix.llvm }}"
+
+      - name: Package native service installation
+        run: |
+          python cmake/packaging/package.py --build build/release --output dist \
+            --version "$PACKAGE_VERSION" --release-url "$RELEASE_URL" \
+            --runtime-search "$CLANG_ROOT/lib"
 
       - uses: actions/upload-artifact@v7
         with:
           name: nightly-${{ matrix.name }}
-          path: dist/${{ matrix.asset }}
+          path: |
+            dist/${{ matrix.asset }}
+            dist/${{ matrix.llvm }}
+            dist/*.deb
+            dist/*.msi
+            dist/*.tar.gz
+            dist/*.rb
           if-no-files-found: error
 
       - name: Upload logs on failure
@@ -115,8 +158,11 @@ jobs:
           cat > notes.md <<EOF
           Nightly build from main at $GITHUB_SHA.
 
-          Includes Linux x64, Windows x64, and macOS arm64 binaries.
-          Run \`fug worker\` to download the binary for your machine automatically.
+          Includes Linux x64, Windows x64, and macOS arm64 binaries of the service
+          and of fughetta-llvm, the native artifact reader.
+          Run \`fug worker\` to download both for your machine automatically.
+          Native service installations are available as a Debian package, an MSI,
+          and a macOS archive with its Homebrew formula. These include all provider hosts.
 
           This nightly is published as Latest so fughetta-cli's default
           releases/latest endpoint can find it. It is a development build.

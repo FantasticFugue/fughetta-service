@@ -118,7 +118,7 @@ class ProtocolTest {
             val template = buildJsonObject {
                 put("id", "unit"); put("context", "context")
                 putJsonObject("recipe") { put("unit", key); put("options", "options") }
-                listOf("direct_inputs", "observed_dependencies", "channel_definitions", "output_channels", "modules").forEach { put(it, empty) }
+                listOf("direct_inputs", "observed_dependencies", "channel_definitions", "conventions", "output_channels", "modules").forEach { put(it, empty) }
                 putJsonObject("contributions") {
                     listOf("files", "occurrences", "references", "scopes", "relations", "diagnostics", "symbols", "types").forEach { put(it, empty) }
                 }
@@ -135,6 +135,7 @@ class ProtocolTest {
                         put("inputs", empty); put("demand", demand); putJsonObject("budget") {}; put("retained_only", false)
                     }
                 }).jsonObject
+                assertEquals(JsonArray(emptyList()), result.getValue("receipts"))
                 val shard = result.getValue("shards").jsonArray.single().jsonObject
                 assertTrue(shard.getValue("identities").jsonArray.all {
                     it.jsonObject.getValue("declaration").jsonObject.getValue("provider").jsonPrimitive.content == "workspace-kotlin"

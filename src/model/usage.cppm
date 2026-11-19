@@ -1,8 +1,9 @@
 export module usage;
 import std;
-import reflection;
+import json;
 import configuration;
 import durability;
+import records;
 
 export namespace usage {
     inline auto now() -> std::int64_t { return std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count(); }
@@ -32,6 +33,7 @@ export namespace usage {
         std::string error;
         std::string workspace_id, worldline, version, snapshot, operation, actor;
         std::string error_code;
+        std::vector<semantic::artifact_receipt> artifact_receipts;
     };
 
     struct tool_event {
@@ -251,7 +253,7 @@ export namespace usage {
                 std::string line;
                 if (!std::getline(in, line))
                     throw std::runtime_error("cannot read usage event");
-                auto e = rfl::json::read<event, rfl::DefaultIfMissing>(line);
+                auto e = json::read<event, json::defaults>(line);
                 if (!e)
                     throw std::runtime_error("unreadable usage event");
                 out.next = e->seq;
@@ -289,7 +291,7 @@ export namespace usage {
                         m.segment = segment;
                 segments_[segment] = active_latest_;
                 // Keep the sequence even if every archived event expires.
-                auto marker = rfl::json::write(event{.seq = segment}) + '\n';
+                auto marker = json::write(event{.seq = segment}) + '\n';
                 durability::durable_write(log_path(), marker);
                 size_ = marker.size();
                 active_latest_ = 0;
@@ -297,7 +299,7 @@ export namespace usage {
                 writer_ = std::make_unique<durability::append_file>(log_path());
                 compact();
             }
-            auto line = rfl::json::write(e) + '\n';
+            auto line = json::write(e) + '\n';
             pending_ += line;
             if (!batching_)
                 flush();
@@ -356,7 +358,7 @@ export namespace usage {
                     original += line;
                     if (complete)
                         original += '\n';
-                    auto e = rfl::json::read<event, rfl::DefaultIfMissing>(line);
+                    auto e = json::read<event, json::defaults>(line);
                     if (!complete || !e) {
                         (complete ? bad : torn)++;
                         continue;
@@ -399,7 +401,7 @@ export namespace usage {
             active_day_ = active_latest_ ? day_of(active_latest_) : day_of(now());
             // Write the sequence before removing expired archives after a restart.
             if (!size_ && next_seq_ > 1) {
-                auto marker = rfl::json::write(event{.seq = next_seq_ - 1}) + '\n';
+                auto marker = json::write(event{.seq = next_seq_ - 1}) + '\n';
                 durability::durable_write(log_path(), marker);
                 size_ = marker.size();
             }

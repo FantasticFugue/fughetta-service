@@ -1,6 +1,6 @@
 export module projectmodel;
 import std;
-import reflection;
+import json;
 import content;
 import toolchain;
 export import provider;
@@ -10,25 +10,25 @@ export namespace projectmodel {
         std::string hash, name;
     };
     struct project_reference {
-        rfl::Literal<"project"> kind;
+        json::literal<"project"> kind;
         std::string project, unit, path;
         std::string role;
         std::map<std::string, std::string> attributes;
     };
     struct artifact_reference {
-        rfl::Literal<"artifact"> kind;
+        json::literal<"artifact"> kind;
         object_ref object;
         std::string role;
     };
     struct sdk_reference {
-        rfl::Literal<"sdk"> kind;
+        json::literal<"sdk"> kind;
         std::string name, path, role;
     };
     struct tree_reference {
-        rfl::Literal<"tree"> kind;
+        json::literal<"tree"> kind;
         std::string path, role;
     };
-    using reference = rfl::TaggedUnion<"kind", project_reference, artifact_reference, sdk_reference, tree_reference>;
+    using reference = json::tagged<"kind", project_reference, artifact_reference, sdk_reference, tree_reference>;
     struct unit {
         std::string id, project, language, directory;
         // Source order is significant for F#. Generated text is a content object,
@@ -38,7 +38,7 @@ export namespace projectmodel {
         std::vector<reference> references;
         std::vector<std::string> outputs, compiler_arguments;
         std::vector<std::map<std::string, std::string>> variants;
-        std::map<std::string, rfl::Generic> extensions;
+        std::map<std::string, json::value> extensions;
     };
     struct document {
         std::uint32_t schema = 1;
@@ -66,7 +66,7 @@ export namespace projectmodel {
         return *selected;
     }
     inline auto read(std::string_view text) -> document {
-        auto model = rfl::json::read<document>(text).value();
+        auto model = json::read<document>(text).value();
         if (model.schema != 1)
             throw std::invalid_argument("unknown project model schema");
         if (model.producer.empty() || model.producer_version.empty() || model.units.empty())

@@ -4,12 +4,12 @@ namespace builds {
     auto adapter_of(const builder& b) -> std::string_view {
         return b.visit([](const auto& w) { return std::remove_cvref_t<decltype(w)>::name; });
     }
-    auto schemas() -> const std::map<std::string, rfl::Generic>& {
+    auto schemas() -> const std::map<std::string, json::value>& {
         static const auto out = [] {
-            std::map<std::string, rfl::Generic> out;
-            [&]<class... W>(std::type_identity<rfl::TaggedUnion<"adapter", W...>>) {
+            std::map<std::string, json::value> out;
+            [&]<class... W>(std::type_identity<json::tagged<"adapter", W...>>) {
                 ((out[std::string{W::name}] =
-                      *rfl::json::read<rfl::Generic>(rfl::json::to_schema<typename W::implementation::options, rfl::DefaultIfMissing, rfl::NoExtraFields>())),
+                      json::schema<typename W::implementation::options, json::defaults, json::strict>()),
                  ...);
             }(std::type_identity<builder>{});
             return out;
@@ -303,6 +303,8 @@ namespace builds {
         }
     } // namespace
     void validate(const configuration& c) {
+        for (const auto& path : c.relocatable_build_dirs)
+            relative(path, false);
         auto d = describe(c);
         check(c, d);
         for (auto& [op, _] : c.operations)

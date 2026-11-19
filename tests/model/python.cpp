@@ -4,13 +4,13 @@ import boost.ut;
 import meta;
 import language;
 import build;
-import reflection;
+import json;
 
 namespace {
     using namespace boost::ut;
 
     template <meta::fixed_string Name> auto options(builds::configuration& c, const std::string& builder) -> builds::config<Name>& {
-        return rfl::get<builds::with<Name>>(c.builders.at(builder).variant()).options;
+        return std::get<builds::with<Name>>(c.builders.at(builder).variant()).options;
     }
     void add(builds::configuration& c, const std::string& task, const std::string& builder, const std::string& operation, std::vector<std::string> after = {}) {
         c.tasks[task] = {.builder = builder, .operation = operation, .after = std::move(after)};
@@ -130,7 +130,7 @@ namespace {
         "the ty and ruff servers get their own settings as initializationOptions.settings"_test = [] {
             language::config<"ty"> ty{.python = "build/venv"};
             ty.server.diagnostic_mode = "workspace";
-            ty.server.configuration["rules"] = rfl::json::read<rfl::Generic>(R"({"unresolved-import":"warn"})").value();
+            ty.server.configuration["rules"] = json::read<json::value>(R"({"unresolved-import":"warn"})").value();
             auto environments = project();
             environments.builders["other"] = builds::with<"uv">{.options = {.env_dir = "build/other", .build_dir = "build/other-dist"}};
             environments.tasks["other"] = {.builder = "other", .operation = "sync"};
@@ -140,7 +140,7 @@ namespace {
                                           {{"native", environments}});
             expect(plan.server.argv == std::vector<std::string>{"ty", "server"});
             expect(plan.build.steps.size() == 1u && plan.inputs.size() == 1u && plan.inputs.front().type == "python_environment");
-            expect(rfl::json::write(plan.server.initialization) ==
+            expect(json::write(plan.server.initialization) ==
                    R"({"settings":{"configuration":{"rules":{"unresolved-import":"warn"}},"diagnosticMode":"workspace"}})");
             expect(plan.server.env.at("VIRTUAL_ENV") == "${tree}/build/venv") << "ty finds the uv environment by its variable";
             auto local = language::locate(plan.server, ::test::absolute("/work/project"), {{"ty", ::test::absolute("/opt/ty/bin/ty")}}, 1, {});
@@ -160,7 +160,7 @@ namespace {
             auto launched =
                 language::prepare({.server = language::with<"ruff">{.options = std::move(ruff)}, .build_configuration = "native"}, {{"native", {}}}).server;
             expect(launched.argv == std::vector<std::string>{"ruff", "server"});
-            expect(rfl::json::write(launched.initialization) == R"({"settings":{"lineLength":100,"exclude":["build/**"],"lint":{"select":["ANN","I"]},)"
+            expect(json::write(launched.initialization) == R"({"settings":{"lineLength":100,"exclude":["build/**"],"lint":{"select":["ANN","I"]},)"
                                                                 R"("format":{"backend":"uv"},"codeAction":{"fixViolation":{"enable":false}}}})");
 
             auto reject = [](auto provider) {

@@ -4,8 +4,12 @@ import coroutine;
 import native;
 import http;
 import protocol;
+import publication;
+import enrollment;
+import knowledge;
+import support;
 import provider;
-import reflection;
+import json;
 
 namespace {
     using namespace boost::ut;
@@ -137,6 +141,10 @@ namespace {
         auto [peer, remote] = co_await net::async_accept(listener);
         transport::channel<socket> channel{client}, server{peer};
         std::size_t delivered = 0;
+        test::scratch scratch{"signed-unit"};
+        enrollment::store registry{scratch.dir, "workspace"};
+        const auto credential = registry.add("analysis Worker", "owner");
+        const content::receipt_key key{credential.secret};
         auto send = [&]() -> coroutine::task<> {
             for (unsigned pass = 0; pass < 3; ++pass) {
                 auto frame = co_await server.recv();
@@ -148,7 +156,8 @@ namespace {
                 auto request = transport::decode<jobs::analysis_request>(frame);
                 language::evaluated_unit unit{
                     .session =
-                        {.id = "session", .slot = request.analysis.slot_id, .project = "app", .snapshot = "source", .epoch = 1, .phase = std::string{"ready"}},
+                        {.id = "session", .slot = request.analysis.slot_id, .project = "app", .stage = "python", .provider = "ty", .options = "options",
+                         .snapshot = "source", .epoch = 1, .phase = std::string{"ready"}},
                     .request = {.execution = request.analysis.execution,
                                 .slot_id = request.analysis.slot_id,
                                 .unit = {"app", "python", "ty", "evaluate", semantic::unit_kind::file, "a.py"},
@@ -158,7 +167,10 @@ namespace {
                 unit.shards.front().unit = semantic::make_unit(recipe, semantic::context_identifier(recipe));
                 unit.shards.front().diagnostics.front().ownership = {
                     unit.shards.front().unit.id, unit.shards.front().unit.context, {.provider = "ty", .kind = std::string{"source"}}};
-                auto data = rfl::json::write(unit);
+                auto receipt = jobs::shard_claim(unit, unit.shards.front(), credential.workspace_id, credential.worker_id);
+                receipt.signature = key.sign(receipt.payload());
+                unit.receipts.push_back(std::move(receipt));
+                auto data = json::write(unit);
                 auto bytes = std::as_bytes(std::span{data});
                 co_await server.post(jobs::facts_batch{0, {bytes.begin(), bytes.end()}}, frame.corr);
                 jobs::build_report report{.analysis_execution = request.analysis.execution};
@@ -186,7 +198,29 @@ namespace {
             auto close = jobs::analysis_exchange::lifetime{inputs};
             auto receive = [&]() -> coroutine::task<> {
                 while (auto item = co_await inputs->next()) {
-                    const auto& unit = std::get<language::evaluated_unit>(item->data);
+                    auto unit = std::get<language::evaluated_unit>(item->data);
+                    publishing::bound publication{.project = "app", .plan = request.analysis, .expected_snapshot = "source",
+                                                  .signer = {&registry, credential.worker_id}};
+                    publication.plan.options = "options";
+                    publication.plan.registration.emplace();
+                    publication.plan.registration->operations = {"evaluate"};
+                    auto altered = unit;
+                    altered.shards.front().diagnostics.front().message = "tampered";
+                    expect(throws<tools::tool_error>([&] { publication.receive(std::move(altered)); }));
+                    publication.receive(unit);
+                    expect(publication.units->receipts.size() == 1_u);
+                    const auto root = scratch.dir / "semantic";
+                    semantic::view_id view;
+                    {
+                        semantic::store store{root};
+                        view = store.publish_records({.snapshots = {{"app", "main", "v1", "source"}}, .configuration = "python"},
+                                                     std::move(publication.units->shards), {}, {}, std::move(publication.units->receipts));
+                    }
+                    semantic::store restored{root};
+                    const auto published = restored.describe(view);
+                    expect((published.receipts.size() == 1_u) >> fatal);
+                    expect(published.receipts.front().submitted.signature == unit.receipts.front().signature);
+                    expect(published.receipts.front().published == published.units.begin()->second.front());
                     ++delivered;
                     expect(unit.shards.front().diagnostics.front().message == "staged diagnostic");
                     item->answer(std::monostate{});

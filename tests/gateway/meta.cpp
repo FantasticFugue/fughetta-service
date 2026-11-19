@@ -12,7 +12,7 @@ import support;
 import tools;
 import fleet;
 import world;
-import reflection;
+import json;
 
 namespace {
     using namespace boost::ut;
@@ -26,7 +26,7 @@ namespace {
         for (std::size_t at = 0; (at = text.find(lead, at)) != std::string::npos;) {
             at += lead.size();
             auto end = text.find("\n\n", at);
-            out.push_back(rfl::json::read<mcp::notification>(text.substr(at, end - at)).value());
+            out.push_back(json::read<mcp::notification>(text.substr(at, end - at)).value());
             at = end;
         }
         return out;
@@ -44,8 +44,6 @@ namespace {
     static_assert(std::same_as<meta::find_t<is_long, meta::list<int, long, char>>, long>);
     static_assert(std::same_as<meta::find_t<is_long, meta::list<int, char>>, void>);
 
-    static_assert(jobs::code<jobs::node_call> == meta::fnv1a("node.call"));
-    static_assert(std::same_as<jobs::reply_t<jobs::node_usage>, jobs::node_usage_reply>);
     static_assert(jobs::request<jobs::node_call> && !jobs::request<jobs::hello>);
     static_assert(jobs::one_way<jobs::progress>);
 
@@ -82,14 +80,13 @@ namespace {
         };
         static auto run(tools::services& s, mcp::call_context context, input in, mcp::notifier& note, const worlds::actor&) -> coroutine::task<output> {
             for (std::int64_t i = 1; i <= 2; ++i)
-                note({.method = "notifications/progress", .params = mcp::object({{"progress", i}, {"total", std::int64_t{2}}})});
+                note({.method = "notifications/progress", .params = json::object({{"progress", i}, {"total", std::int64_t{2}}})});
             co_return output{2, in.fail.value_or(false), context.client_sync_seconds};
         }
     };
 
     using box = tools::toolbox<echo, shout, tick>;
     static_assert(tools::valid_name("build") && !tools::valid_name("has space") && !tools::valid_name(""));
-    static_assert(echo::name == "echo");
 
     struct gateway_parts {
         cores::io_context<native::context> rt{1};
@@ -102,7 +99,7 @@ namespace {
         tools::services services{config.slot(0), router, files, 0};
     };
 
-    auto request(std::string_view json) -> mcp::request { return rfl::json::read<mcp::request>(json).value(); }
+    auto request(std::string_view json) -> mcp::request { return json::read<mcp::request>(json).value(); }
 
     static constexpr auto meta_suite = [] {
         "an MCP server lists and calls the toolbox's tools"_test = [] {
@@ -118,13 +115,13 @@ namespace {
             auto io = context.get_scheduler();
             mcp::notifier drop;
             const worlds::actor someone{.issuer = "token", .user = "tester", .caller = "test-suite", .role = "owner"};
-            auto said = *cores::run(context, server.tools.call("shout", mcp::object({{"text", std::string{"hey"}}}), drop, someone));
+            auto said = *cores::run(context, server.tools.call("shout", json::object({{"text", std::string{"hey"}}}), drop, someone));
             expect(said.text == R"({"said":"HEY"})" && !said.error && said.structured.has_value());
-            auto unknown = *cores::run(context, server.tools.call("whisper", mcp::object({}), drop, someone));
+            auto unknown = *cores::run(context, server.tools.call("whisper", json::object{}, drop, someone));
             expect(unknown.error && unknown.text == "unknown tool: whisper");
-            auto bad = *cores::run(context, server.tools.call("echo", mcp::object({}), drop, someone));
+            auto bad = *cores::run(context, server.tools.call("echo", json::object{}, drop, someone));
             expect(bad.error && bad.text.contains(R"("code":"invalid_record")") && bad.text.contains("echo: bad arguments")) << bad.text;
-            auto failed = *cores::run(context, server.tools.call("tick", mcp::object({{"fail", true}}), drop, someone));
+            auto failed = *cores::run(context, server.tools.call("tick", json::object({{"fail", true}}), drop, someone));
             expect(failed.error) << "an output that says failed()";
         };
 
@@ -141,14 +138,14 @@ namespace {
                 R"({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"tick","arguments":{},"_meta":{"fughetta/client_sync_seconds":0.25}}})");
             auto r = *cores::run(context, server.handle(plain, keep, someone));
             expect(notifications(stream).empty()) << "no token, no progress";
-            expect(!r->error.has_value());
-            auto result = rfl::from_generic<mcp::tool_result>(*r->result).value();
-            expect(rfl::from_generic<tick::output>(*result.structuredContent)->client_sync_seconds == 0.25);
+            expect(!r->error.get().has_value());
+            auto result = json::from_value<mcp::tool_result>(*r->result.get()).value();
+            expect(json::from_value<tick::output>(*result.structuredContent)->client_sync_seconds == 0.25);
 
             auto asked = request(R"({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"tick","arguments":{},"_meta":{"progressToken":"t-7"}}})");
             auto next = *cores::run(context, server.handle(asked, keep, someone));
-            auto next_result = rfl::from_generic<mcp::tool_result>(*next->result).value();
-            expect(!rfl::from_generic<tick::output>(*next_result.structuredContent)->client_sync_seconds.has_value());
+            auto next_result = json::from_value<mcp::tool_result>(*next->result.get()).value();
+            expect(!json::from_value<tick::output>(*next_result.structuredContent)->client_sync_seconds.has_value());
             auto sent = notifications(stream);
             expect((sent.size() == 2u) >> fatal);
             auto params = sent[1].params.to_object().value();
@@ -158,12 +155,12 @@ namespace {
             auto excessive = request(
                 R"({"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"tick","arguments":{},"_meta":{"fughetta/client_sync_seconds":86401}}})");
             auto ignored = *cores::run(context, server.handle(excessive, keep, someone));
-            auto ignored_result = rfl::from_generic<mcp::tool_result>(*ignored->result).value();
-            expect(!rfl::from_generic<tick::output>(*ignored_result.structuredContent)->client_sync_seconds.has_value());
+            auto ignored_result = json::from_value<mcp::tool_result>(*ignored->result.get()).value();
+            expect(!json::from_value<tick::output>(*ignored_result.structuredContent)->client_sync_seconds.has_value());
 
             auto hello = request(R"({"jsonrpc":"2.0","id":3,"method":"initialize","params":{"protocolVersion":"2025-03-26"}})");
             auto init = *cores::run(context, server.handle(hello, keep, someone));
-            auto version = init->result->to_object().value().get("protocolVersion").value().to_string().value();
+            auto version = init->result.get()->to_object().value().get("protocolVersion").value().to_string().value();
             expect(version == "2025-03-26") << "a version both speak is agreed on";
         };
     };

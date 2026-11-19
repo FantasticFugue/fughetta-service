@@ -5,7 +5,7 @@ import delivery;
 import protocol;
 import build;
 import projectmodel;
-import reflection;
+import json;
 import durability;
 import registry;
 import configuration;
@@ -52,7 +52,7 @@ namespace {
                            .language = "kotlin",
                            .directory = ".",
                            .references = {projectmodel::artifact_reference{.object = {hash.str(), "library.jar"}, .role = "classpath"}}}}};
-            test::spit(tree / "model.json", rfl::json::write(model));
+            test::spit(tree / "model.json", json::write(model));
             test::spit(tree / "library.jar", "library");
             test::spit(tree / "later", "later");
             const auto file = delivery::capture(tree, {{"model", "model.json"}}, storage).at(0);

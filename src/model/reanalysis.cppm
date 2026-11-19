@@ -1,6 +1,6 @@
 module indexing;
 import std;
-import reflection;
+import json;
 import profiles;
 import content;
 
@@ -155,7 +155,7 @@ namespace semantic {
                     }
                     values.clear();
                     if (!unavailable)
-                        values.insert(content::hash_of(rfl::json::write(channels)).str());
+                        values.insert(content::hash_of(json::write(channels)).str());
                 }
                 if (old_read.values == values && old_read.producers == new_read.producers && !unavailable)
                     continue;

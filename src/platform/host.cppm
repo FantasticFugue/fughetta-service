@@ -13,9 +13,7 @@ export namespace host {
     auto resolve_tools(const std::map<std::string, std::string>& mapped = {}, const std::vector<std::string>& wanted = {})
         -> std::map<std::string, std::string>;
     auto detect_tools(const std::map<std::string, std::string>& mapped = {}) -> std::vector<std::string>;
+    auto available_cpus() noexcept -> unsigned;
     auto executable() -> std::filesystem::path;
     auto name() -> std::string;
-    // The numeric "user:group" a container runs as so the files it writes stay this account's; empty where accounts are
-    // not numbers.
-    auto account() -> std::string;
 } // namespace host

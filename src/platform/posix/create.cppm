@@ -16,6 +16,16 @@ import posix;
 
 namespace native_process {
     namespace {
+        auto standard_stream(int fd) -> native_io::handle {
+            const auto flags = ::fcntl(fd, F_GETFL);
+            if (flags < 0 || ::fcntl(fd, F_SETFL, flags | O_NONBLOCK) < 0)
+                throw std::system_error(errno, std::system_category(), "nonblocking worker stdio");
+            return fd;
+        }
+    } // namespace
+    auto standard_input() -> native_io::handle { return standard_stream(STDIN_FILENO); }
+    auto standard_output() -> native_io::handle { return standard_stream(STDOUT_FILENO); }
+    namespace {
         struct observation : io::process_record {};
     } // namespace
     auto sample(const io::process_record& process) noexcept -> std::optional<io::process_usage> { return posix::process_usage(process.pid, true); }
@@ -114,11 +124,6 @@ namespace native_process {
                     ::write(2, message, sizeof(message) - 1);
                     ::_exit(126);
                 }
-            }
-            if (cmd.offline && !posix::isolate_network()) {
-                constexpr char message[] = "worker: cannot isolate the network; command not started\n";
-                ::write(2, message, sizeof(message) - 1);
-                ::_exit(126);
             }
             if (::chdir(dir) != 0)
                 ::_exit(126);

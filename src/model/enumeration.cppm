@@ -1,6 +1,6 @@
 export module enumeration;
 import std;
-import reflection;
+import json;
 import content;
 import records;
 
@@ -20,7 +20,7 @@ export namespace enumeration {
     }
 
     inline auto value(const std::map<std::string, std::string>& sources, const semantic::file_set& selection) -> std::string {
-        return content::hash_of(rfl::json::write(members(sources, selection))).str();
+        return content::hash_of(json::write(members(sources, selection))).str();
     }
 
     inline auto read(std::string project, std::string key, const std::map<std::string, std::string>& sources, semantic::file_set selection)

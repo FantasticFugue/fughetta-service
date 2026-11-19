@@ -2,7 +2,7 @@ import std;
 import support;
 import boost.ut;
 import language;
-import reflection;
+import json;
 import fixture;
 import semantic;
 import knowledge;
@@ -10,6 +10,10 @@ import reuse;
 import channels;
 import kotlin;
 import enumeration;
+import native;
+import objects;
+import coroutine;
+import evaluation;
 
 namespace {
     using namespace boost::ut;
@@ -37,6 +41,193 @@ namespace {
         return {store.load(view)->pieces.front()->symbols().front().id, view};
     }
     static constexpr auto cases = [] {
+        "Python test observations augment static declarations and nominal capabilities"_test = [] {
+            ::test::scratch scratch{"python-observations"};
+            semantic::shard source;
+            source.unit = semantic::make_unit({{"app", "python", "ty", "evaluate", semantic::unit_kind::file, "sample.py"}, "ty"}, "static-context");
+            const semantic::ownership owner{source.unit.id, source.unit.context};
+            source.identities = {{semantic::native_identity{"app", "sample", "ty", "source", "convert"}, "convert"}};
+            source.symbols = {{.id = "convert", .ownership = owner, .language = "python", .domain = "source", .module = "sample",
+                              .name = "convert", .qualified_name = "sample.convert", .kind = "function"}};
+            source.occurrences = {{.id = "definition", .ownership = owner, .symbol = "convert",
+                                   .location = {.source = semantic::place{"sample.py", 0, 36}}, .roles = {std::string{"definition"}},
+                                   .selection = semantic::place{"sample.py", 4, 11}}};
+            source.unit.channel_definitions = language::server<"ty">::channels();
+            source.unit.output_channels = channels::outputs(source.unit.channel_definitions, {&source});
+            std::ofstream{scratch.dir / "report"} << R"json({"domain":"python","module":"sample","symbols":[],"observations":[
+{"path":"sample.py","function":"convert","declaration":4,"role":"first_parameter","slot":"value","begin":12,"end":17,"type_module":"builtins","type_name":"int"},
+{"path":"sample.py","function":"convert","declaration":4,"role":"return","slot":"return","begin":28,"end":35,"type_module":"builtins","type_name":"str"}],
+"observed_surfaces":{"builtins.str":{"members":["join"]}}})json";
+            auto input = std::make_shared<semantic::shard_object>();
+            input->data = std::make_shared<const semantic::shard>(source);
+            cores::io_context<native::context> runtime{1};
+            std::vector<semantic::shard> observations;
+            runtime.run([&](auto& io, std::size_t) -> coroutine::task<> {
+                using provider = language::server<"python-runtime">;
+                provider::adapter reader{io, {.cwd = scratch.dir}, {.project = "app", .stage = "observe", .provider = "python-runtime", .options = "observe"}};
+                reader.objects({scratch.dir, {"report"}});
+                auto program = provider::launch({}, {{"artifact", "python-runtime", "samples.json", "file"}});
+                auto session = co_await reader.open(program.initialization);
+                session = co_await reader.update(session.epoch, {.snapshot = "snapshot", .source_files = {{"sample.py", "text"}},
+                    .model = {{"samples.json", "report"}}, .source_facts = {{"source_facts", {input}}}});
+                const semantic::extent demand{};
+                const auto units = co_await reader.units(session.epoch, demand);
+                auto result = co_await reader.evaluate({.execution = {.request_id = "request", .computation_id = "compute", .stage_id = "observe"},
+                    .slot_id = session.slot, .unit = units.front(), .epoch = session.epoch, .inputs = session.inputs});
+                observations = std::move(result.shards);
+                co_await reader.close();
+            });
+            expect((observations.size() == 1u && observations.front().typed_ranges.size() == 2u) >> fatal);
+            observations.push_back(std::move(source));
+            semantic::store store{scratch.dir / "views"};
+            const auto view = store.load(store.publish_records({.snapshots = {{"app", "main", "v1", "snapshot"}}}, std::move(observations), {}));
+            const auto function = view->query({.action = std::string{"inspect"}, .selector = semantic::selection{.name = semantic::named{"convert"}},
+                                               .include = {std::string{"type"}}});
+            expect(function.typed_ranges.size() == 2u && std::ranges::all_of(function.typed_ranges, [](const auto& sample) {
+                return sample.confidence == "runtime_observed" && sample.observation && sample.observation->context == "static-context";
+            }));
+            const auto string_type = view->query({.action = std::string{"inspect"}, .selector = semantic::selection{.name = semantic::named{"str"}},
+                                             .include = {std::string{"type"}, std::string{"producers"}}});
+            const auto input_type = view->query({.action = std::string{"inspect"}, .selector = semantic::selection{.name = semantic::named{"int"}},
+                                                 .include = {std::string{"consumers"}}});
+            expect(string_type.producers.size() == 1u && input_type.consumers.size() == 1u &&
+                   std::ranges::any_of(string_type.types, [](const auto& type) { return type.extensions.contains("python.surface"); }));
+        };
+        "impact comparison reports new dependency loops fan-out and unsafe type changes"_test = [] {
+            ::test::scratch scratch{"quality-critic"};
+            semantic::store store{scratch.dir};
+            auto contribution = [](bool changed) {
+                semantic::shard out;
+                out.unit = semantic::make_unit({{"app", "cpp", "clice", "evaluate", semantic::unit_kind::group, "quality"}, "cpp"}, "cpp");
+                out.unit.conventions = language::server<"clice">::conventions();
+                const semantic::ownership owner{out.unit.id, out.unit.context};
+                for (const auto name : {"A", "B", "C", "D", "E"})
+                    out.symbols.push_back({.id = name, .ownership = owner, .language = "cpp", .module = name,
+                                           .name = name, .kind = "function"});
+                out.symbols[0].type = "signature";
+                out.symbols.push_back({.id = "stable", .ownership = owner, .language = "cpp", .module = "A", .name = "stable", .kind = "function"});
+                out.types = {{.id = "int", .domain = "cpp", .kind = "primitive", .name = "int"},
+                             {.id = "void", .domain = "cpp", .kind = "primitive", .name = "void"},
+                             {.id = "erased", .domain = "cpp", .kind = "pointer", .arguments = {"void"}},
+                             {.id = "any", .domain = "cpp", .kind = "named", .name = "std::any"},
+                             {.id = "signature", .domain = "cpp", .kind = "function", .return_type = changed ? "erased" : "int",
+                              .parameter_groups = {{{{changed ? "any" : "int"}}}}}};
+                auto edge = [&](std::string from, std::string to, std::string kind = "calls") {
+                    out.relations.push_back({.id = from + ":" + to, .kind = std::move(kind), .ownership = owner,
+                                             .from = std::move(from), .to = std::move(to), .resolution = std::string{"resolved"}});
+                };
+                auto cast = [&](std::string finger, std::uint64_t at) {
+                    auto where = owner;
+                    where.origin.location = semantic::locator{.source = semantic::place{"main.cpp", at, at + 6}};
+                    out.relations.push_back({.id = finger, .kind = "cpp:reinterpret_cast", .ownership = std::move(where),
+                                             .from = "A", .to = "A", .resolution = std::string{"resolved"}, .fingerprint = finger});
+                };
+                edge("A", "B");
+                edge("C", "D", "imports");
+                edge("D", "C", "inherits");
+                if (!changed) {
+                    edge("C", "E");
+                    edge("E", "C");
+                }
+                cast("existing", changed ? 20 : 10);
+                if (changed) {
+                    edge("B", "A");
+                    edge("A", "C");
+                    edge("A", "D");
+                    edge("A", "E");
+                    cast("introduced", 40);
+                }
+                return out;
+            };
+            const auto first = store.publish({.snapshots = {{"app", "main", "v1", "base"}}}, {contribution(false)});
+            auto next = store.describe(first);
+            next.snapshots = {{"app", "feature", "v2", "changed"}};
+            const auto second = store.publish(next, {contribution(true)});
+            auto before = store.load(first), after = store.load(second);
+            const auto result = semantic::compare_views(*before, *after, {.action = std::string{"impact"}});
+            const auto& report = *result.comparison;
+            expect((report.topology.size() == 2u && report.degraded_types.size() == 3u) >> fatal);
+            expect(report.topology[0].kind == "cycle" && report.topology[0].modules.size() == 2u &&
+                   report.topology[0].modules[0].name == "A" && report.topology[0].modules[1].name == "B");
+            expect(report.topology[1].kind == "fan_out" && report.topology[1].before == 1u && report.topology[1].after == 4u);
+            expect(report.degraded_types[0].kind == "return_value" && report.degraded_types[0].after == "void*");
+            expect(report.degraded_types[1].kind == "parameter" && report.degraded_types[1].after == "std::any");
+            expect(report.degraded_types[2].kind == "unsafe_cast" && report.degraded_types[2].location->source->begin == 40u);
+            const auto scoped = semantic::compare_views(*before, *after, {.action = std::string{"impact"},
+                .selector = semantic::selection{.name = semantic::named{"stable"}}});
+            expect(scoped.comparison->topology.size() == 2u && scoped.comparison->degraded_types.empty());
+        };
+        "view comparison suggests surviving public records with the same field shape"_test = [] {
+            ::test::scratch scratch{"duplicate-types"};
+            auto declaration = [](std::string name, std::vector<std::string> field_types, bool split = false, bool last_static = false) {
+                auto part = [&](std::string suffix) {
+                    semantic::shard out;
+                    out.unit = semantic::make_unit(
+                        {{"app", "cpp", "clice", "evaluate", semantic::unit_kind::file, name + suffix}, "cpp"}, "cpp");
+                    return out;
+                };
+                auto type = part(".hpp"), members = part(".cpp");
+                type.symbols.push_back({.id = name, .ownership = {type.unit.id, type.unit.context}, .language = "cpp",
+                                        .name = name, .kind = "type", .visibility = "public"});
+                auto& fields = split ? members : type;
+                const auto owner = semantic::ownership{fields.unit.id, fields.unit.context};
+                const auto id = [&](const std::string& type) { return name + ":" + type; };
+                fields.types = {{.id = id("int"), .domain = "cpp", .kind = "primitive", .name = "int"},
+                                {.id = id("const_int"), .domain = "cpp", .kind = "primitive", .name = "int", .qualifiers = {"const"}},
+                                {.id = id("double"), .domain = "cpp", .kind = "primitive", .name = "double"},
+                                {.id = id("Width"), .domain = "cpp", .kind = "alias", .name = "Width", .arguments = {id("int")},
+                                 .qualifiers = {"const"}},
+                                {.id = id("pointer"), .domain = "cpp", .kind = "pointer", .arguments = {id("int")}}};
+                for (std::size_t i = 0; i < field_types.size(); ++i) {
+                    const auto member = name + "_field_" + std::to_string(i);
+                    fields.symbols.push_back({.id = member, .ownership = owner, .language = "cpp", .name = member, .kind = "field",
+                                              .owner = name, .type = id(field_types[i]), .visibility = "public"});
+                }
+                if (last_static)
+                    fields.symbols.back().modifiers.push_back("static");
+                std::vector<semantic::shard> out;
+                out.push_back(std::move(type));
+                if (split)
+                    out.push_back(std::move(members));
+                return out;
+            };
+            semantic::view_id first, second;
+            {
+                semantic::store store{scratch.dir};
+                auto old = declaration("Existing", {"const_int", "double", "pointer"});
+                auto another = declaration("Another", {"pointer", "double", "const_int"});
+                std::ranges::move(another, std::back_inserter(old));
+                first = store.publish({.snapshots = {{"app", "main", "v1", "base"}}}, std::move(old));
+                auto fresh = declaration("Replacement", {"pointer", "Width", "double"}, true);
+                for (auto distinct : {declaration("ValueInstead", {"int", "Width", "double"}),
+                                      declaration("StaticOnly", {"pointer", "double", "Width"}, false, true)})
+                    std::ranges::move(distinct, std::back_inserter(fresh));
+                auto next = store.describe(first);
+                next.snapshots = {{"app", "feature", "v2", "changed"}};
+                second = store.publish(next, std::move(fresh));
+            }
+            semantic::store store{scratch.dir};
+            auto before = store.load(first), after = store.load(second);
+            expect(std::ranges::any_of(before->pieces, [](const auto& piece) {
+                return piece->index->record_shapes && piece->index->record_shapes->contains("Existing");
+            }));
+            const auto result = semantic::compare_views(*before, *after, {.action = std::string{"impact"}});
+            expect((result.comparison->duplicate_types.size() == 2u) >> fatal);
+            for (const auto& match : result.comparison->duplicate_types)
+                expect(match.subject.symbol_id == "Replacement" && match.field_count == 3u);
+            expect(result.comparison->duplicate_types.front().existing.symbol_id == "Another");
+            expect(result.comparison->duplicate_types.back().existing.symbol_id == "Existing");
+            expect(result.comparison->duplicate_types.front().structural_shape_hash == result.comparison->duplicate_types.back().structural_shape_hash);
+
+            semantic::request request{.action = std::string{"impact"},
+                                      .selector = semantic::selection{.name = semantic::named{"Replacement"}}, .limit = 1};
+            const auto page = semantic::compare_views(*before, *after, request);
+            expect((page.cursor.has_value() && page.comparison->duplicate_types.size() == 1u) >> fatal);
+            request.cursor = page.cursor;
+            const auto resumed = semantic::compare_views(*before, *after, request);
+            expect(resumed.comparison->duplicate_types.size() == 1u && !resumed.cursor);
+            expect(resumed.comparison->duplicate_types.front().existing.symbol_id == "Existing");
+        };
         "semantic views replace unit contributions and retain shared shards across restart"_test = [] {
             ::test::scratch scratch{"semantic-views"};
             semantic::native_identity declaration{"app", "main", "clice", "source", "c:@F@read#"};
@@ -280,8 +471,10 @@ namespace {
             alternative.ownership.owner_unit = library.unit.id;
             alternative.name = "alternative-b";
             library.symbols.push_back(alternative);
+            library.unit.conventions = language::server<"clice">::conventions();
+            library.unit.conventions.front().relation_traits = {{"direct_call", "calls"}};
             library.relations.push_back({.id = "shared-call",
-                                         .kind = std::string{"calls"},
+                                         .kind = "direct_call",
                                          .ownership = {library.unit.id, "cpp"},
                                          .from = "library-0",
                                          .to = "b",
@@ -319,7 +512,7 @@ namespace {
             expect(early.comparison->reanalysis.size() == 1_u);
             expect(early.comparison->reanalysis.front().id == declaration.unit.id) << "unchanged declaration channels stop propagation to consumers";
             declaration.symbols.front().visibility = "private";
-            declaration.symbols.front().extensions["annotation"] = rfl::to_generic(std::string{"changed"});
+            declaration.symbols.front().extensions["annotation"] = json::to_value(std::string{"changed"});
             caller.unit.direct_inputs.front().object = "new";
             caller.references.front().roles.push_back(std::string{"type"});
             auto view = store.describe(first);
@@ -327,6 +520,10 @@ namespace {
             const auto second = store.publish(view, {declaration, caller});
             semantic::store reopened{scratch.dir};
             const auto before = reopened.load(first), after = reopened.load(second);
+            const auto calls = after->query({.action = std::string{"relations"},
+                                             .selector = semantic::selection{.entity = semantic::entity{"library-0", "cpp"}},
+                                             .relations = {"direct_call"}});
+            expect(calls.relations.size() == 1_u && calls.relations.front().kind == "direct_call");
             const auto library_shard = before->description.units.at(library.unit.id).front();
             const auto shared_before = std::ranges::find_if(before->pieces, [&](const auto& part) { return part->id == library_shard; });
             const auto shared_after = std::ranges::find_if(after->pieces, [&](const auto& part) { return part->id == library_shard; });
@@ -790,7 +987,7 @@ namespace {
                 task.reset();
                 result.roots.value().reset();
                 store.sweep();
-                auto decoded = rfl::json::read<language::result>(rfl::json::write(joined));
+                auto decoded = json::read<language::result>(json::write(joined));
                 expect(std::filesystem::exists(scratch.dir / "shards" / offered.front().shards.front()) && decoded && !decoded->roots.value())
                     << "shared computation results own their internal views without exporting runtime roots";
             }
@@ -1138,6 +1335,31 @@ namespace {
             expect(replaced.types.front().name == "short");
             expect(original->query(inspect).types.front().name == "long");
             expect(store.load(second)->query({.action = std::string{"symbols"}}).status == "complete");
+
+            auto diagnostics = language::cpp::translate(
+                {.column_encoding = "utf8",
+                 .diagnostics = {{.code = "err_unknown_typename",
+                                  .severity = "Error",
+                                  .message = "unknown type name 'handle'",
+                                  .location = language::cpp::range{"b.cpp", 0, 1}},
+                                 {.code = "err_pp_file_not_found",
+                                  .severity = "Error",
+                                  .message = "'sdk.hpp' file not found",
+                                  .location = language::cpp::range{"b.cpp", 2, 3}}}},
+                scratch.dir, {{"b.cpp", "text"}}, "app", "cpp", "cpp", "b.cpp", {}, {{"b.cpp", "input"}});
+            const auto third = store.publish_records(view, {a, unit("b.cpp", "int"), std::move(diagnostics)}, {});
+            auto recovering = store.load(third);
+            inspect.scope.files = {"shared.hpp"};
+            auto tentative = recovering->query(inspect);
+            expect(tentative.status == "partial");
+            expect((tentative.items.size() == 1u && tentative.diagnostics.size() == 1u) >> fatal);
+            expect(tentative.items.front().type_confidence == "tentative");
+            expect(tentative.diagnostics.front().code == "err_pp_file_not_found");
+            inspect.selector->entity->context = a.unit.context;
+            auto unaffected = recovering->query(inspect);
+            expect(unaffected.status == "complete" && unaffected.diagnostics.empty());
+            expect((unaffected.items.size() == 1u) >> fatal);
+            expect(!unaffected.items.front().type_confidence);
         };
         "application arguments retain their graph through publication and reload"_test = [] {
             ::test::scratch scratch{"application-arguments"};
@@ -1211,6 +1433,12 @@ namespace {
                     {.id = "integer", .kind = std::string{"primitive"}, .name = "int"}}};
             semantic::store store{scratch.dir};
             auto shard = language::cpp::translate(publication, scratch.dir, {}, "app", "cpp", "cpp", "main.cpp", {}, {{"main.cpp", "source"}});
+            shard.unit.conventions = language::server<"clice">::conventions();
+            for (auto& symbol : shard.symbols)
+                if (symbol.name == "run") {
+                    symbol.language = "typescript";
+                    symbol.visibility.clear();
+                }
             auto view = store.load(store.publish_records({.snapshots = {{"app", "main", "v1", "source"}}, .configuration = "cpp"}, {shard}, {}));
             semantic::request inspect{.action = std::string{"inspect"}, .selector = semantic::selection{.name = semantic::named{"make"}}};
             auto result = view->query(inspect);
@@ -1228,9 +1456,9 @@ namespace {
             language::cpp::publication publication{
                 .column_encoding = "utf8",
                 .symbols =
-                    {{.id = "handle", .name = "Handle", .kind = std::string{"Struct"}, .visibility = "public"},
+                    {{.id = "handle", .name = "Handle", .kind = std::string{"cpp:record"}, .visibility = "public"},
                      {.id = "optional", .name = "optional", .kind = std::string{"Class"}, .visibility = "public"},
-                     {.id = "build", .name = "Handle", .kind = std::string{"Constructor"}, .owner = "handle", .type = "building", .visibility = "public"},
+                     {.id = "build", .name = "Handle", .kind = std::string{"cpp:initializer"}, .owner = "handle", .type = "building", .visibility = "public"},
                      {.id = "open", .name = "open", .kind = std::string{"Function"}, .type = "opening", .visibility = "public"},
                      {.id = "start", .name = "start", .kind = std::string{"Function"}, .type = "starting", .visibility = "public"},
                      {.id = "make",
@@ -1245,7 +1473,7 @@ namespace {
                      {.id = "helper", .name = "helper", .kind = std::string{"Function"}, .type = "describing", .visibility = "private"},
                      {.id = "nested", .name = "nested", .kind = std::string{"Function"}, .type = "describing", .visibility = "local"}},
                 .types =
-                    {{.id = "building", .kind = std::string{"function"}, .return_type = "nothing"},
+                    {{.id = "building", .kind = std::string{"signature"}, .return_type = "nothing"},
                      {.id = "opening", .kind = std::string{"function"}, .return_type = "wrapped"},
                      {.id = "making", .kind = std::string{"function"}, .return_type = "handle_type"},
                      {.id = "starting", .kind = std::string{"function"}, .return_type = "task"},
@@ -1256,16 +1484,24 @@ namespace {
                      {.id = "closing", .kind = std::string{"function"}, .return_type = "integer"},
                      {.id = "describing", .kind = std::string{"function"}, .return_type = "integer", .parameters = {"handle_ref", "integer"}},
                      {.id = "wrapped", .kind = std::string{"application"}, .name = "std::optional", .declaration = "optional", .arguments = {"handle_type"}},
-                     {.id = "handle_ref", .kind = std::string{"reference"}, .arguments = {"handle_type"}},
+                     {.id = "handle_ref", .kind = std::string{"cpp:borrow"}, .arguments = {"handle_type"}},
                      {.id = "handle_type", .kind = std::string{"named"}, .name = "Handle", .declaration = "handle"},
                      {.id = "nothing", .kind = std::string{"primitive"}, .name = "void"},
                      {.id = "integer", .kind = std::string{"primitive"}, .name = "int"}},
                 .occurrences = {{.symbol = "handle", .role = "Reference", .location = {"main.cpp", 0, 6}, .owner = "open"}}};
             semantic::store store{scratch.dir};
             auto shard = language::cpp::translate(publication, scratch.dir, {}, "app", "cpp", "cpp", "main.cpp", {}, {{"main.cpp", "source"}});
+            // `start` returns a CLR task, so the unit includes the CLR conventions too.
+            for (auto& type : shard.types)
+                if (type.name == "[System.Runtime,8.0.0.0]System.Threading.Tasks.Task`1")
+                    type.domain = "clr";
+            shard.unit.conventions = language::server<"clice">::conventions();
+            shard.unit.conventions.front().symbol_traits = {{"record", "type"}, {"initializer", "constructor"}};
+            shard.unit.conventions.front().type_traits = {{"signature", "function"}, {"borrow", "reference"}};
+            shard.unit.conventions.append_range(language::server<"clr-artifact">::conventions());
             auto view = store.load(store.publish_records({.snapshots = {{"app", "main", "v1", "source"}}, .configuration = "cpp"}, {shard}, {}));
             semantic::request inspect{.action = std::string{"inspect"},
-                                      .selector = semantic::selection{.name = semantic::named{.text = "Handle", .kind = semantic::symbol_kind::make<"type">()}},
+                                      .selector = semantic::selection{.name = semantic::named{.text = "Handle", .kind = "cpp:record"}},
                                       .include = {"producers", "consumers"}};
             auto result = view->query(inspect);
             expect((result.status == "complete") >> fatal) << result.status.str();
@@ -1273,9 +1509,9 @@ namespace {
                 return rows | std::views::transform(&semantic::records::symbol::name) | std::ranges::to<std::vector>();
             };
             const auto producers = names(result.producers);
-            expect(std::ranges::is_permutation(producers, std::vector<std::string>{"Handle", "open", "start", "make"})) << rfl::json::write(producers);
+            expect(std::ranges::is_permutation(producers, std::vector<std::string>{"Handle", "open", "start", "make"})) << json::write(producers);
             const auto consumers = names(result.consumers);
-            expect(std::ranges::is_permutation(consumers, std::vector<std::string>{"close", "describe", "helper"})) << rfl::json::write(consumers);
+            expect(std::ranges::is_permutation(consumers, std::vector<std::string>{"close", "describe", "helper"})) << json::write(consumers);
             expect(!consumers.empty() && consumers.back() == "helper");
             inspect.budget.nodes = result.symbols.size() + result.producers.size() + 1;
             auto limited = view->query(inspect);
@@ -1318,10 +1554,10 @@ namespace {
                 return result.typed_ranges | std::views::transform([](const auto& row) { return row.range.begin; }) | std::ranges::to<std::vector>();
             };
             const auto inspected = view->query({.action = std::string{"inspect"}, .selector = semantic::selection{.entity = semantic::entity{"run", "cpp"}}});
-            expect(std::ranges::is_permutation(starts(inspected), std::vector<std::uint64_t>{15, 30})) << rfl::json::write(starts(inspected));
+            expect(std::ranges::is_permutation(starts(inspected), std::vector<std::uint64_t>{15, 30})) << json::write(starts(inspected));
             expect(inspected.types.size() == 1u && inspected.types.front().id == "integer");
             const auto scoped = view->query({.action = std::string{"scopes"}, .include = {"type"}});
-            expect(starts(scoped) == std::vector<std::uint64_t>{50}) << rfl::json::write(starts(scoped));
+            expect(starts(scoped) == std::vector<std::uint64_t>{50}) << json::write(starts(scoped));
             expect(view->query({.action = std::string{"scopes"}}).typed_ranges.empty());
         };
         "module candidates follow declared inputs across restart"_test = [] {
@@ -1371,7 +1607,7 @@ namespace {
                 expect(shard.starts_with("shard-") && shard.size() == 70u) << shard;
                 expect(stored() == 1);
                 std::ifstream file{scratch.dir / "shards" / shard, std::ios::binary};
-                auto document = rfl::json::read<semantic::shard>(std::string{std::istreambuf_iterator<char>{file}, {}});
+                auto document = json::read<semantic::shard>(std::string{std::istreambuf_iterator<char>{file}, {}});
                 expect((document.has_value() && document->id == shard) >> fatal);
                 expect(semantic::shard_key(*document) == shard) << "the stored document verifies against its ID";
                 document->symbols.front().name = "forged";
@@ -1411,7 +1647,7 @@ namespace {
             published.types.push_back({.id = "node", .domain = "cpp", .kind = std::string{"named"}, .declaration = "node-declaration"});
             published.unit.contributions.symbols = {"visit"};
             published.unit.contributions.types = {"signature", "node"};
-            auto decoded = rfl::json::read<semantic::shard>(rfl::json::write(published));
+            auto decoded = json::read<semantic::shard>(json::write(published));
             expect(decoded.has_value() >> fatal);
             expect(decoded->symbols.front().ownership.owner_unit == decoded->unit.id);
             expect(decoded->types.front().parameter_groups.front().parameters.front().type == decoded->types.back().id);
@@ -1424,7 +1660,7 @@ namespace {
                                 .configuration = "cpp",
                                 .units = {{published.unit.id, {published.id}}},
                                 .state = std::string{"published"}};
-            auto restored = rfl::json::read<semantic::view>(rfl::json::write(view));
+            auto restored = json::read<semantic::view>(json::write(view));
             expect(restored.has_value() >> fatal);
             expect(restored->units.at(decoded->unit.id) == std::vector<std::string>{decoded->id});
             expect(restored->snapshots.front().version == "v1");
@@ -1496,7 +1732,7 @@ namespace {
             expect(std::ranges::count_if((*imported)->identities(), [](const auto& binding) { return binding.source.has_value(); }) == 2u);
         };
         "semantic selectors separate symbol search from persistent entity queries"_test = [] {
-            auto selected = rfl::json::read<semantic::selection>(R"({"name":{"text":"visit"}})");
+            auto selected = json::read<semantic::selection>(R"({"name":{"text":"visit"}})");
             expect(selected.has_value() >> fatal);
             expect(nothrow([&] { semantic::validate(*selected); }));
             selected->entity = semantic::entity{.symbol_id = "visit"};
@@ -1581,7 +1817,7 @@ namespace {
         "dependency manifests contain selectors but never registry configuration or commands"_test = [] {
             auto manifest = builds::dependency_manifest(
                 R"({"name":"tenant","dependencies":["fmt",{"name":"zlib","features":["core"],"default-features":false}],"features":{"tests":{"description":"tests","dependencies":["catch2"]}},"default-features":["tests"],"command":"untrusted","overrides":[{"name":"fmt","version":"10.0.0"}]})");
-            const auto encoded = rfl::json::write(manifest);
+            const auto encoded = json::write(manifest);
             expect(encoded.contains("fmt") && encoded.contains("catch2") && !encoded.contains("untrusted") && !encoded.contains("tenant"));
             for (const auto* text : {R"({"vcpkg-configuration":{}})", R"({"dependencies":["../escape"]})",
                                      R"json({"dependencies":[{"name":"fmt","platform":"$(command)"}]})json", R"({"builtin-baseline":"not-a-hash"})"})
@@ -1689,14 +1925,13 @@ namespace {
                               .build_configuration = "native",
                               .inputs = {{"compilation_database", {language::build_input{"native", "configure", "compilation_database"}}}}};
             auto plan = language::prepare(c, {{"native", configured()}});
-            auto json = rfl::json::write(plan.server.initialization);
+            auto json = json::write(plan.server.initialization);
             expect(json.contains("build/debug/compile_commands.json") && json.contains("-std=c++23"));
             auto local = language::locate(plan.server, ::test::absolute("/work/project"), {{"clice", ::test::absolute("/opt/clice/bin/clice")}}, 2,
                                           ::test::absolute("/work/analysis"));
             expect(local.argv == std::vector<std::string>{::test::absolute("/opt/clice/bin/clice"), "serve", "--mode", "pipe"});
-            expect(local.commands.at("index") == std::vector<std::string>{::test::absolute("/opt/clice/bin/clice"), "index", "--json", "--jobs", "2"});
             expect(local.commands.at("query") == std::vector<std::string>{::test::absolute("/opt/clice/bin/clice"), "query"});
-            auto initialized = rfl::json::write(local.initialization);
+            auto initialized = json::write(local.initialization);
             expect(initialized.contains("build/debug/compile_commands.json") && initialized.contains("-std=c++23") &&
                    initialized.contains("\"max_stateless_worker_count\":2"));
             expect(!json.contains("cache_dir") && initialized.contains("/work/analysis/clice")) << "the cache is the worker's, outside the prepared tree";

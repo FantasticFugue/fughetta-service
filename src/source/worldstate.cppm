@@ -9,7 +9,7 @@ import codec;
 import kernel;
 import durability;
 import archive;
-import reflection;
+import json;
 import nodestore;
 
 namespace nodes {
@@ -225,7 +225,7 @@ namespace nodes {
         for (auto& e : in.edits) {
             if (!e.document.empty() && e.kind != "edit" && e.kind != "write" && e.kind != "binary")
                 fail(nodes::code::invalid_record, "only a content change names a file identity");
-            if (e.kind == "remove" || e.kind == "move")
+            if (e.kind == "remove" || e.kind == "move" || e.kind == "recreate" || e.kind == "binary_recreate")
                 freed.insert(e.path);
             else if (e.kind == "directory_move")
                 for (auto it = state.paths.lower_bound(e.path + "/"); it != state.paths.end() && it->first.starts_with(e.path + "/"); ++it)
@@ -243,13 +243,19 @@ namespace nodes {
             checked_path(e.path);
             if (!touched.insert(e.path).second)
                 fail(nodes::code::invalid_record, "multiple edits of one path require separate observed batches");
-            if (e.kind == "create" || e.kind == "binary_create") {
+            const bool recreate = e.kind == "recreate" || e.kind == "binary_recreate";
+            if (e.kind == "create" || e.kind == "binary_create" || recreate) {
+                if (recreate) {
+                    if (in.tool != "execute.capture/1")
+                        fail(nodes::code::invalid_record, "recreate belongs to worktree capture");
+                    property(state.path(e.path).id, "presence", false);
+                }
                 claim(e.path);
                 auto file = (creating_author.empty() ? writer : creating_author) + ":" + in.operation + ":file:" + std::to_string(created++);
                 property(file, "path", e.path);
                 property(file, "presence", true);
                 property(file, "mode", e.executable);
-                if (e.kind == "binary_create")
+                if (e.kind == "binary_create" || e.kind == "binary_recreate")
                     property(file, "binary", digest_of(unhex(e.text)));
                 else
                     insert(file, {}, {}, e.text);
@@ -300,6 +306,8 @@ namespace nodes {
                 selected = held.get();
             }
             auto& file = *selected;
+            if (in.tool == "execute.capture/1" && (e.kind == "write" || e.kind == "binary") && e.executable != file.executable)
+                property(file.id, "mode", e.executable);
             if (e.kind == "move") {
                 checked_path(e.target);
                 // A move never replaces a file; a concurrent move onto one path stays a recorded path conflict.
@@ -375,6 +383,23 @@ namespace nodes {
             within_line(root_line(in.target), in.source);
         check_scope_leases(in, prior);
         auto heads = prior;
+        if (in.action == "apply" && declared_tool == "execute.capture/1" && prior != in.expected) {
+            auto now = source.projection(prior);
+            auto observed = source.projection(in.expected);
+            for (const auto& edit : in.edits) {
+                const auto old = observed->paths.find(edit.path), current = now->paths.find(edit.path);
+                if (old == observed->paths.end())
+                    continue; // The normal destination check handles files created during execution.
+                if (old->second->size() != 1 || current == now->paths.end() || *old->second != *current->second)
+                    fail(nodes::code::source_conflict, edit.path + " changed while the command ran");
+                const auto& id = *old->second->begin();
+                const auto& before = *observed->files.at(id);
+                const auto& after = *now->files.at(id);
+                if (std::tie(before.kind, before.digest, before.executable) != std::tie(after.kind, after.digest, after.executable) ||
+                    now->file_conflicts.contains(id) || now->path_conflicts.contains(edit.path))
+                    fail(nodes::code::source_conflict, edit.path + " changed while the command ran");
+            }
+        }
         std::string line;
         if (in.action == "fork") {
             heads = source.frontier(in.source);
@@ -401,7 +426,7 @@ namespace nodes {
         if (in.action != "fork") {
             std::vector<std::string> required;
             for (auto& edit : in.edits)
-                if (edit.kind == "binary" || edit.kind == "binary_create")
+                if (edit.kind == "binary" || edit.kind == "binary_create" || edit.kind == "binary_recreate")
                     required.push_back(blob(unhex(edit.text)));
             if (in.action == "promote") {
                 required.insert(required.end(), in.source.begin(), in.source.end());
@@ -500,7 +525,7 @@ namespace nodes {
         row.text(1, line);
         row.text(2, selection.starts_with('@') ? selection.substr(1) : selection);
         if (row.next()) {
-            auto record = rfl::json::read<reference_record>(row.data(0));
+            auto record = json::read<reference_record>(row.data(0));
             if (!record)
                 fail(nodes::code::storage_failure, "reference is unreadable");
             return record->version;
@@ -529,7 +554,7 @@ namespace nodes {
                     out.truncated = true;
                     break;
                 }
-                auto record = rfl::json::read<reference_record>(rows.data(0));
+                auto record = json::read<reference_record>(rows.data(0));
                 if (!record)
                     fail(nodes::code::storage_failure, "reference is unreadable");
                 out.references.push_back(*record);
@@ -549,7 +574,7 @@ namespace nodes {
                 item.receipt.size() > 1024)
                 fail(nodes::code::invalid_record, "attestation needs build, test or review kind and a conclusion");
         // Bind the caller's selection before resolving a moving channel so replay returns the original target.
-        auto digest = digest_of(rfl::json::write(std::tuple{in.action, in.worldline, in.revision, in.actor, in.intent, requested}));
+        auto digest = digest_of(json::write(std::tuple{in.action, in.worldline, in.revision, in.actor, in.intent, requested}));
         transaction tx{*db};
         refresh_external();
         if (auto previous = retry(in, digest))
@@ -564,7 +589,7 @@ namespace nodes {
         current.text(1, in.worldline);
         current.text(2, requested.name);
         if (current.next()) {
-            auto record = rfl::json::read<reference_record>(current.data(0));
+            auto record = json::read<reference_record>(current.data(0));
             if (!record)
                 fail(nodes::code::storage_failure, "reference is unreadable");
             if (record->kind != requested.kind)
@@ -593,7 +618,7 @@ namespace nodes {
         record.sequence = static_cast<std::uint64_t>(sqlite3_last_insert_rowid(db->handle));
         record.receipt = "reference:" + std::to_string(record.sequence);
         statement save{*db, "UPDATE reference_events SET data=?1 WHERE id=?2"};
-        save.text(1, rfl::json::write(record));
+        save.text(1, json::write(record));
         save.number(2, record.sequence);
         save.next();
         statement point{*db, "INSERT INTO named_refs(line,name,event) VALUES(?1,?2,?3) ON CONFLICT(line,name) DO UPDATE SET event=excluded.event"};

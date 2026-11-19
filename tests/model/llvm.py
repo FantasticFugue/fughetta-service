@@ -1,7 +1,8 @@
-"""Read ELF, Mach-O, COFF/PDB and Rust artifacts with fughetta-native."""
+"""Read ELF, Mach-O, COFF/PDB and Rust artifacts with fughetta-llvm."""
 from pathlib import Path
 import argparse
 import json
+import sys
 import tempfile
 from managed import put, run
 
@@ -30,6 +31,10 @@ def read(root, artifact, *flags):
     return json.loads(run([args.host, artifact, *flags], root))
 
 
+def compile_fixture(root, *flags):
+    run([args.compiler, "--driver-mode=gcc", "-x", "c", *flags], root)
+
+
 def symbols(report):
     return {symbol["name"]: symbol for symbol in report["symbols"]}
 
@@ -43,7 +48,9 @@ with tempfile.TemporaryDirectory(prefix="native-", dir=args.work) as directory:
     root = Path(directory).resolve()
     put(root, "m.c", source)
 
-    run([args.compiler, "-x", "c", "-g", "-O0", "-shared", "-fPIC", '-DAPI=__attribute__((visibility("default")))', "m.c", "-o", "libm.so"], root)
+    # The ELF library links without a C runtime, so any host can build it.
+    compile_fixture(root, "--target=x86_64-unknown-linux-gnu", "-fuse-ld=lld", "-nostdlib", "-g", "-O0",
+                    "-shared", "-fPIC", '-DAPI=__attribute__((visibility("default")))', "m.c", "-o", "libm.so")
     report = read(root, "libm.so", "--lines")
     found = symbols(report)
     assert report["format"].startswith("elf64"), report["format"]
@@ -52,7 +59,7 @@ with tempfile.TemporaryDirectory(prefix="native-", dir=args.work) as directory:
     assert {2, 3, 4, 7, 8, 9} <= lines(report, "m.c"), lines(report, "m.c")
 
     # Mach-O names lose their leading underscore and assembler temporaries stay out.
-    run([args.compiler, "-x", "c", "--target=arm64-apple-macos", "-g", "-O0", "-c", "-DAPI=", "m.c", "-o", "m.macho.o"], root)
+    compile_fixture(root, "--target=arm64-apple-macos", "-g", "-O0", "-c", "-DAPI=", "m.c", "-o", "m.macho.o")
     report = read(root, "m.macho.o", "--lines")
     assert report["format"] == "Mach-O arm64", report["format"]
     assert sorted(symbols(report)) == ["api", "core"], sorted(symbols(report))
@@ -60,7 +67,8 @@ with tempfile.TemporaryDirectory(prefix="native-", dir=args.work) as directory:
     assert {2, 3, 4, 7, 8, 9} <= lines(report, "m.c"), lines(report, "m.c")
 
     # A COFF object keeps its symbol sizes; a DLL takes its functions, statics and lines from the PDB.
-    run([args.compiler, "-x", "c", "--target=x86_64-pc-windows-msvc", "-gcodeview", "-O0", "-c", "-DAPI=__declspec(dllexport)", "m.c", "-o", "m.obj"], root)
+    compile_fixture(root, "--target=x86_64-pc-windows-msvc", "-gcodeview", "-O0", "-c",
+                    "-DAPI=__declspec(dllexport)", "m.c", "-o", "m.obj")
     found = symbols(read(root, "m.obj"))
     assert sorted(found) == ["api", "core"] and found["api"]["size"] and found["core"]["size"], found
     if args.lld_link:
@@ -81,10 +89,11 @@ fn helper(x: i32) -> i32 {
     x * 2
 }
 ''')
-        run([args.rustc, "--crate-type", "cdylib", "-g", "-O", "r.rs", "-o", "libr.so"], root)
-        report = read(root, "libr.so", "--lines")
+        artifact = {"win32": "r.dll", "darwin": "libr.dylib"}.get(sys.platform, "libr.so")
+        run([args.rustc, "--crate-type", "cdylib", "-g", "-O", "r.rs", "-o", artifact], root)
+        report = read(root, artifact, "--lines")
         found = symbols(report)
         assert found["rust_api"]["exported"], found["rust_api"]
-        assert any(name.endswith("6helper") and not symbol["exported"] for name, symbol in found.items()), sorted(found)
+        assert any(name.endswith(("6helper", "::helper")) and not symbol["exported"] for name, symbol in found.items()), sorted(found)
         assert {3, 7} <= lines(report, "r.rs"), lines(report, "r.rs")
 print("ELF, Mach-O, COFF and Rust artifacts read")

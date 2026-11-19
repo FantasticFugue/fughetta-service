@@ -1,6 +1,7 @@
 export module report;
 import std;
-import reflection;
+import json;
+import xml;
 export import provider;
 
 // The report protocols a step can name. Each is a format its writers keep stable across their versions, so nothing here
@@ -30,29 +31,29 @@ export namespace builds {
 
 namespace {
     struct junit_case {
-        std::string name;
-        std::string classname;
-        std::vector<std::string> failure;
-        std::vector<std::string> error;
+        xml::attribute<std::optional<std::string>, "name"> name;
+        xml::attribute<std::optional<std::string>, "classname"> classname;
+        xml::elements<std::string, "failure"> failure;
+        xml::elements<std::string, "error"> error;
     };
     struct junit_suite {
-        std::string name;
-        std::vector<junit_suite> testsuite;
-        std::vector<junit_case> testcase;
+        xml::attribute<std::optional<std::string>, "name"> name;
+        xml::elements<junit_suite, "testsuite"> suites;
+        xml::elements<junit_case, "testcase"> cases;
     };
 
     struct summary_id {
         std::string label;
     };
     struct event_id {
-        rfl::Rename<"testSummary", std::optional<summary_id>> summary;
+        json::named<"testSummary", std::optional<summary_id>> summary;
     };
     struct summary {
-        rfl::Rename<"overallStatus", std::string> status;
+        json::named<"overallStatus", std::string> status;
     };
     struct event {
         event_id id;
-        rfl::Rename<"testSummary", std::optional<summary>> summary;
+        json::named<"testSummary", std::optional<summary>> summary;
     };
 
     struct position {
@@ -79,14 +80,16 @@ namespace {
 
     // Cases are keyed by the path of suites around them, so same-named cases of different suites stay apart.
     void walk(const junit_suite& suite, const std::string& path, std::set<std::string>& seen, std::map<std::string, std::string>& failed) {
-        auto here = path + suite.name + '\0';
-        for (auto& inner : suite.testsuite)
+        auto here = path + suite.name.value.value_or("") + '\0';
+        for (auto& inner : suite.suites.value)
             walk(inner, here, seen, failed);
-        for (auto& c : suite.testcase) {
-            auto name = c.classname.empty() || c.classname == c.name ? c.name : c.classname + "." + c.name;
+        for (auto& c : suite.cases.value) {
+            auto name = c.name.value.value_or("");
+            if (c.classname.value && !c.classname.value->empty() && *c.classname.value != name)
+                name = *c.classname.value + "." + name;
             auto key = here + name;
             seen.insert(key);
-            if (!c.failure.empty() || !c.error.empty())
+            if (!c.failure.value.empty() || !c.error.value.empty())
                 failed.emplace(std::move(key), std::move(name));
         }
     }
@@ -94,12 +97,10 @@ namespace {
 
 namespace builds {
     auto protocol<"junit">::read(std::string_view text) -> reading {
-        auto suite = rfl::xml::read<junit_suite, rfl::DefaultIfMissing>(text);
-        if (!suite)
-            throw std::runtime_error(suite.error().what());
+        const auto suite = xml::read<junit_suite, "testsuite", "testsuites">(text);
         std::set<std::string> seen;
         std::map<std::string, std::string> failed;
-        walk(*suite, {}, seen, failed);
+        walk(suite, {}, seen, failed);
         tally tests{.total = static_cast<std::uint32_t>(seen.size()), .failed = static_cast<std::uint32_t>(failed.size())};
         for (auto& [key, name] : failed)
             tests.failed_tests.push_back(name);
@@ -112,7 +113,7 @@ namespace builds {
             std::string_view line{part.begin(), part.end()};
             if (line.find_first_not_of(" \t\r") == std::string_view::npos)
                 continue;
-            auto e = rfl::json::read<event, rfl::DefaultIfMissing>(line);
+            auto e = json::read<event, json::defaults>(line);
             if (!e)
                 throw std::runtime_error(e.error().what());
             if (!e->summary.get() || !e->id.summary.get())
@@ -129,7 +130,7 @@ namespace builds {
     }
 
     auto protocol<"codequality">::read(std::string_view text) -> reading {
-        auto issues = rfl::json::read<std::vector<issue>, rfl::DefaultIfMissing>(text);
+        auto issues = json::read<std::vector<issue>, json::defaults>(text);
         if (!issues)
             throw std::runtime_error(issues.error().what());
         reading out;

@@ -2,7 +2,7 @@ export module clr;
 import std;
 import evaluation;
 import coroutine;
-import reflection;
+import json;
 import records;
 import content;
 import channels;
@@ -125,9 +125,9 @@ export namespace clr {
                 symbol.type = std::move(id);
             } else if (!value.return_type.empty())
                 symbol.type = value.return_type;
-            symbol.extensions = {{"clr.assembly", object.assembly}, {"clr.token", value.id}, {"clr.sequence_points", rfl::to_generic(value.locations)}};
+            symbol.extensions = {{"clr.assembly", object.assembly}, {"clr.token", value.id}, {"clr.sequence_points", json::to_value(value.locations)}};
             if (value.layout)
-                symbol.extensions["clr.layout"] = rfl::to_generic(*value.layout);
+                symbol.extensions["clr.layout"] = json::to_value(*value.layout);
             if (!value.documentation_id.empty())
                 symbol.extensions["clr.documentation_id"] = value.documentation_id;
             if (!value.fsharp_documentation_id.empty())
@@ -135,15 +135,15 @@ export namespace clr {
             if (!value.accessor_role.empty())
                 symbol.extensions["clr.accessor_role"] = value.accessor_role;
             if (value.compilation_mapping)
-                symbol.extensions["clr.compilation_mapping"] = rfl::to_generic(*value.compilation_mapping);
+                symbol.extensions["clr.compilation_mapping"] = json::to_value(*value.compilation_mapping);
             if (!value.library.empty()) {
                 symbol.modifiers.push_back("pinvoke");
                 symbol.extensions["clr.pinvoke.library"] = value.library;
                 symbol.extensions["clr.pinvoke.entry_point"] = value.entry_point;
                 symbol.extensions["clr.pinvoke.convention"] = value.convention;
                 if (value.marshalling)
-                    symbol.extensions["clr.pinvoke.marshalling"] = rfl::to_generic(*value.marshalling);
-                symbol.extensions["clr.pinvoke.parameters"] = rfl::to_generic(value.marshalling_parameters);
+                    symbol.extensions["clr.pinvoke.marshalling"] = json::to_value(*value.marshalling);
+                symbol.extensions["clr.pinvoke.parameters"] = json::to_value(value.marshalling_parameters);
             }
             out.symbols.push_back(std::move(symbol));
             out.occurrences.push_back({.id = "definition:" + value.id,
@@ -158,7 +158,7 @@ export namespace clr {
                                      .ownership = ownership,
                                      .from = value.from,
                                      .to = value.target,
-                                     .resolution = rfl::Literal<"resolved", "candidate", "unresolved">{value.resolution},
+                                     .resolution = json::literal<"resolved", "candidate", "unresolved">{value.resolution},
                                      .from_context = out.unit.context,
                                      .to_context = out.unit.context});
         }
@@ -172,7 +172,7 @@ export namespace clr {
                                                    .location = {.artifact = semantic::artifact_location{artifact->object, module, value.from, value.offset}},
                                                    .roles = {std::string{"reference"}},
                                                    .resolution = std::string{resolved ? "resolved" : "unresolved"},
-                                                   .dispatch = rfl::Literal<"direct", "virtual", "interface", "indirect">{value.dispatch},
+                                                   .dispatch = json::literal<"direct", "virtual", "interface", "indirect">{value.dispatch},
                                                    .target_context = resolved ? std::optional{out.unit.context} : std::nullopt};
             if (resolved)
                 reference.target = value.target;
@@ -210,11 +210,11 @@ export namespace clr {
         std::vector<source> sources;
         auto extension = [](const semantic::records::symbol& symbol, const std::string& name) -> std::string {
             const auto found = symbol.extensions.find(name);
-            return found == symbol.extensions.end() ? std::string{} : rfl::from_generic<std::string>(found->second).value();
+            return found == symbol.extensions.end() ? std::string{} : json::from_value<std::string>(found->second).value();
         };
         auto sequence = [](const semantic::records::symbol& symbol, const std::string& name) -> std::optional<std::int32_t> {
             const auto found = symbol.extensions.find(name);
-            return found == symbol.extensions.end() ? std::nullopt : std::optional{rfl::from_generic<std::int32_t>(found->second).value()};
+            return found == symbol.extensions.end() ? std::nullopt : std::optional{json::from_value<std::int32_t>(found->second).value()};
         };
         for (const auto* part : source_shards) {
             std::map<semantic::symbol_id, std::vector<const semantic::identity_binding*>> identities;
@@ -269,7 +269,7 @@ export namespace clr {
                      .resolution = std::string{unique.size() == 1 ? "resolved" : "candidate"},
                      .detail =
                          semantic::records::emission_detail{
-                             .evidence = rfl::Literal<"debug_location", "metadata_signature", "compilation_mapping", "metadata_accessor">{evidence},
+                             .evidence = decltype(semantic::records::emission_detail::evidence){evidence},
                              .file = evidence == "debug_location" && source->location.source ? source->location.source->path : std::string{}},
                      .from_context = key.second,
                      .to_context = shard.unit.context});
@@ -385,6 +385,14 @@ export namespace language {
         };
         static constexpr std::array<std::string_view, 5> facts{"symbols", "types", "definitions", "references", "relations"};
         static constexpr std::string_view update_granularity = "artifact";
+        // Metadata names a generic application `[assembly]Namespace.Name`arity`.
+        static auto conventions() -> std::vector<semantic::language_conventions> {
+            return {{.language = "clr",
+                     .visibility = {"public", "protected_internal", "protected", "internal", "private_protected", "private"},
+                     .value_wrappers = {"System.Nullable", "System.Threading.Tasks.Task", "System.Threading.Tasks.ValueTask"},
+                     .wrapper_prefix = "[", .wrapper_prefix_end = "]", .wrapper_arguments = "`",
+                     .escape_types = {{"System.Object"}}}};
+        }
         static auto channels() -> std::vector<semantic::channel_definition> {
             return {{.name = "declarations", .projections = {std::string{"symbols"}, std::string{"types"}}},
                     {.name = "relations", .projections = {std::string{"references"}, std::string{"relations"}}},
@@ -413,7 +421,7 @@ export namespace language {
                         .argv = {o.executable, builds::tool(o.reader), "--clr", "${tree}/" + artifact},
                         .env = o.env,
                         .initialization =
-                            rfl::to_generic(std::map<std::string, std::string>{{"artifact", artifact}, {"symbols", symbols}, {"module", o.module}}),
+                            json::to_value(std::map<std::string, std::string>{{"artifact", artifact}, {"symbols", symbols}, {"module", o.module}}),
                         .executables = {o.reader}};
             if (!symbols.empty())
                 out.argv.push_back("${tree}/" + symbols);
@@ -429,8 +437,8 @@ export namespace clr {
         using language::reader_adapter::reader_adapter;
 
     protected:
-        auto do_open(rfl::Generic value) -> coroutine::task<> override {
-            settings_ = rfl::from_generic<std::map<std::string, std::string>>(value).value();
+        auto do_open(json::value value) -> coroutine::task<> override {
+            settings_ = json::from_value<std::map<std::string, std::string>>(value).value();
             co_return;
         }
         auto do_units(const semantic::extent&) -> coroutine::task<std::vector<semantic::unit_key>> override {
@@ -451,7 +459,7 @@ export namespace clr {
                 inputs.push_back({semantic::input_kind::artifact, path, found->second});
                 consumed.push_back({.kind = semantic::dependency_kind::artifact, .project = state_.project, .key = path, .value = found->second});
             }
-            const auto object = rfl::json::read<clr::object>(co_await run(command_.argv)).value();
+            const auto object = json::read<clr::object>(co_await run(command_.argv)).value();
             auto shard = records(object, {request.unit, state_.options}, settings_.at("module"), inputs);
             shard.unit.cacheable = !runtime_.execution.empty();
             if (!installed_.source_facts.empty()) {

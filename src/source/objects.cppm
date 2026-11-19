@@ -9,7 +9,7 @@ import codec;
 import kernel;
 import durability;
 import archive;
-import reflection;
+import json;
 import nodestore;
 
 namespace nodes {
@@ -19,6 +19,19 @@ namespace nodes {
 
     auto base_body(std::string kind, std::string project) -> value::map {
         return {{"kind", std::move(kind)}, {"project", std::move(project)}, {"schema", std::uint64_t{1}}};
+    }
+
+    auto chunked_payload(std::string_view data) -> bool {
+        if (data.size() > (1 << 20) || data.contains('\0'))
+            return true;
+        try {
+            (void)scalar_count(data);
+            return false;
+        } catch (const error& e) {
+            if (e.code != nodes::code::invalid_record)
+                throw;
+            return true;
+        }
     }
 
     auto effects_digest(const value::array& effects) -> std::string {
@@ -83,15 +96,16 @@ namespace nodes {
     // bytes for the same history, so a shard exchanged between them names exactly the events it observed.
     auto encode_causal(const causal_set& ancestors) -> std::string {
         std::string out{"DCA1"};
-        codec::integer(out, ancestors.ranges.size());
-        for (auto [first, last] : ancestors.ranges) {
+        const auto ranges = ancestors.ranges();
+        codec::integer(out, ranges.size());
+        for (auto [first, last] : ranges) {
             codec::integer(out, first);
             codec::integer(out, last);
         }
         return out;
     }
 
-    auto decode_causal(std::string_view bytes) -> causal_set {
+    auto decode_causal(std::string_view bytes, std::size_t event) -> causal_set {
         if (!bytes.starts_with("DCA1") || bytes.size() < 12)
             fail(nodes::code::invalid_record, "causal closure framing");
         std::size_t offset = 4;
@@ -108,11 +122,13 @@ namespace nodes {
         if (count > (bytes.size() - offset) / 16)
             fail(nodes::code::invalid_record, "causal closure count");
         causal_set out;
+        std::optional<std::uint64_t> previous_end;
         for (std::uint64_t i = 0; i < count; ++i) {
             auto first = integer(), last = integer();
-            if (first >= last || (!out.ranges.empty() && first <= out.ranges.back().second))
+            if (first >= last || last > event || (previous_end && first <= *previous_end))
                 fail(nodes::code::invalid_record, "causal closure intervals differ");
-            out.ranges.emplace_back(first, last);
+            out.add_range(first, last);
+            previous_end = last;
         }
         if (offset != bytes.size())
             fail(nodes::code::invalid_record, "trailing causal closure bytes");
@@ -149,6 +165,13 @@ namespace nodes {
                "DROP TABLE IF EXISTS state_payloads;"
                "CREATE TABLE IF NOT EXISTS blobs(digest TEXT PRIMARY KEY, kind TEXT NOT NULL, raw_bytes INTEGER NOT NULL, "
                "scalar_count INTEGER NOT NULL, data BLOB NOT NULL);"
+               "CREATE TABLE IF NOT EXISTS blob_payloads(digest TEXT PRIMARY KEY, raw_bytes INTEGER NOT NULL) WITHOUT ROWID;"
+               "CREATE TABLE IF NOT EXISTS blob_chunks(digest TEXT PRIMARY KEY, raw_bytes INTEGER NOT NULL, data BLOB NOT NULL) WITHOUT ROWID;"
+               "CREATE TABLE IF NOT EXISTS blob_extents(payload TEXT NOT NULL REFERENCES blob_payloads(digest), ordinal INTEGER NOT NULL, "
+               "chunk TEXT NOT NULL REFERENCES blob_chunks(digest), PRIMARY KEY(payload,ordinal)) WITHOUT ROWID;"
+               "CREATE TABLE IF NOT EXISTS object_payloads(id TEXT PRIMARY KEY REFERENCES objects(id), "
+               "payload TEXT NOT NULL REFERENCES blob_payloads(digest), project TEXT NOT NULL) WITHOUT ROWID;"
+               "CREATE INDEX IF NOT EXISTS object_payloads_payload ON object_payloads(payload);"
                "CREATE TABLE IF NOT EXISTS worldlines(name TEXT PRIMARY KEY, head_version TEXT NOT NULL, base_version TEXT, creator TEXT NOT NULL, "
                "frontier_json TEXT NOT NULL);"
                "CREATE TABLE IF NOT EXISTS events(seq INTEGER PRIMARY KEY, event_id TEXT NOT NULL UNIQUE, worldline TEXT NOT NULL, "
@@ -259,22 +282,22 @@ namespace nodes {
 
     auto local_node::impl::put(value body) -> std::string {
         auto kind = body.at("kind").text();
-        std::vector<std::string> required;
-        if (kind == "batch")
-            required = string_list(body.at("required"));
         auto id = retain(std::move(body));
         // A batch is one committed contribution: the causal engine sees it as it is written.
-        if (kind == "batch") {
-            // A binary effect names content the batch requires; the renderer reads those bytes back by digest.
-            for (auto& blob_id : required)
-                if (get(blob_id).at("kind").text() == "blob") {
-                    auto& content = get(blob_id, "blob").at("data").raw();
-                    source.add_blob(digest_of(content), content);
-                }
-            source.add(id, get(id));
-        } else if (kind == "line")
+        if (kind == "batch")
+            load_batch(id, get(id));
+        else if (kind == "line")
             line_names.reset();
         return id;
+    }
+
+    void local_node::impl::load_batch(const std::string& id, const value& body) {
+        for (const auto& required : body.at("required").list())
+            if (const auto& object = get(required.text()); object.at("kind").text() == "blob") {
+                const auto& content = object.at("data").raw();
+                source.add_blob(digest_of(content), content);
+            }
+        source.add(id, body);
     }
 
     auto local_node::impl::retain(value object) -> std::string {
@@ -284,18 +307,141 @@ namespace nodes {
         return id;
     }
 
+    namespace {
+        inline constexpr std::size_t maximum_chunk_bytes = 128 << 10;
+
+        // FastCDC skips subminimum cuts and uses a stricter mask before the
+        // target size, then a looser one to limit chunk growth.
+        inline auto chunk_bytes(std::string_view bytes) -> std::size_t {
+            static constexpr auto gear = [] {
+                std::array<std::uint64_t, 256> table{};
+                auto seed = std::uint64_t{0};
+                for (auto& value : table) {
+                    seed += 0x9e3779b97f4a7c15ull;
+                    auto mixed = (seed ^ (seed >> 30)) * 0xbf58476d1ce4e5b9ull;
+                    mixed = (mixed ^ (mixed >> 27)) * 0x94d049bb133111ebull;
+                    value = mixed ^ (mixed >> 31);
+                }
+                return table;
+            }();
+            constexpr std::size_t minimum = 16 << 10, target = 64 << 10;
+            constexpr auto mask = [](unsigned bits) {
+                auto value = std::uint64_t{0};
+                for (unsigned i = 0; i < bits; ++i)
+                    value |= std::uint64_t{1} << (i * 23 % 64);
+                return value;
+            };
+            constexpr auto strict = mask(16), relaxed = mask(15);
+            const auto limit = std::min(bytes.size(), maximum_chunk_bytes);
+            auto fingerprint = std::uint64_t{0};
+            for (auto offset = minimum; offset < limit; ++offset) {
+                fingerprint = (fingerprint << 1) + gear[static_cast<unsigned char>(bytes[offset])];
+                if ((fingerprint & (offset < target ? strict : relaxed)) == 0)
+                    return offset + 1;
+            }
+            return limit;
+        }
+
+        auto store_extents(database& db, const std::string& digest, std::string_view data) -> std::uint64_t {
+            statement payload{db, "INSERT OR IGNORE INTO blob_payloads(digest,raw_bytes) VALUES(?1,?2)"};
+            payload.text(1, digest);
+            payload.number(2, data.size());
+            payload.next();
+            if (!sqlite3_changes(db.handle))
+                return 0;
+
+            statement chunk{db, "INSERT INTO blob_chunks(digest,raw_bytes,data) VALUES(?1,?2,?3)"};
+            statement exists{db, "SELECT 1 FROM blob_chunks WHERE digest=?1"};
+            statement extent{db, "INSERT INTO blob_extents(payload,ordinal,chunk) VALUES(?1,?2,?3)"};
+            std::uint64_t written = 0;
+            for (std::uint64_t ordinal = 0; !data.empty(); ++ordinal) {
+                const auto part = data.substr(0, chunk_bytes(data));
+                data.remove_prefix(part.size());
+                const auto hash = digest_of(part);
+                exists.reset();
+                exists.text(1, hash);
+                if (!exists.next()) {
+                    const auto packed = archive::pack(part);
+                    chunk.reset();
+                    chunk.text(1, hash);
+                    chunk.number(2, part.size());
+                    chunk.bind(3, packed);
+                    chunk.next();
+                    written += packed.size();
+                }
+                extent.reset();
+                extent.text(1, digest);
+                extent.number(2, ordinal);
+                extent.text(3, hash);
+                extent.next();
+            }
+            return written;
+        }
+
+        auto read_extents(database& db, const std::string& digest, std::uint64_t* compressed = nullptr) -> std::string {
+            statement payload{db, "SELECT raw_bytes FROM blob_payloads WHERE digest=?1"};
+            payload.text(1, digest);
+            if (!payload.next())
+                fail(nodes::code::storage_failure, "missing chunked payload");
+            const auto size = payload.number(0);
+            if (size > archive::limit)
+                fail(nodes::code::storage_failure, "chunked payload exceeds limit");
+            statement chunks{db, "SELECT e.ordinal,c.raw_bytes,c.data FROM blob_extents e JOIN blob_chunks c ON c.digest=e.chunk "
+                                 "WHERE e.payload=?1 ORDER BY e.ordinal"};
+            chunks.text(1, digest);
+            std::string result;
+            result.reserve(size);
+            std::uint64_t ordinal = 0;
+            while (chunks.next()) {
+                const auto length = chunks.number(1);
+                if (chunks.number(0) != ordinal++ || !length || length > maximum_chunk_bytes || length > size - result.size())
+                    fail(nodes::code::storage_failure, "invalid chunked payload extent");
+                const auto packed = chunks.data(2);
+                const auto plain = archive::unpack(packed, length);
+                if (plain.size() != length)
+                    fail(nodes::code::storage_failure, "incorrect chunk size");
+                result += plain;
+                if (compressed)
+                    *compressed += packed.size();
+            }
+            if (result.size() != size)
+                fail(nodes::code::storage_failure, "incomplete chunked payload");
+            return result;
+        }
+
+        auto unpack_object(database& db, statement& row) -> std::string {
+            const auto payload = row.data(1);
+            if (payload.empty())
+                return archive::unpack(row.data(0));
+            auto body = base_body("blob", row.data(2));
+            body["data"] = bytes{read_extents(db, payload)};
+            return codec::encode(body);
+        }
+    }
+
     void local_node::impl::persist(value object, const std::string& id, std::string_view data) {
         check_schema(object);
-        auto packed = archive::pack(data);
+        const auto& kind = object.at("kind").text();
+        const auto chunked = kind == "blob" && chunked_payload(object.at("data").raw());
+        auto packed = chunked ? std::string{} : archive::pack(data);
         statement q{*db, "INSERT OR IGNORE INTO objects(id,data,kind) VALUES(?1,?2,?3)"};
         q.text(1, id);
         q.bind(2, packed);
-        q.text(3, object.at("kind").text());
+        q.text(3, kind);
         q.next();
         if (sqlite3_changes(db->handle)) {
             ++object_count;
-            archive_bytes += packed.size();
             object_watermark = static_cast<std::uint64_t>(sqlite3_last_insert_rowid(db->handle));
+            if (chunked) {
+                const auto& plain = object.at("data").raw();
+                const auto digest = digest_of(plain);
+                retain_chunked_blob(digest, plain);
+                statement payload{*db, "INSERT INTO object_payloads(id,payload,project) VALUES(?1,?2,?3)"};
+                payload.text(1, id);
+                payload.text(2, digest);
+                payload.text(3, object.at("project").text());
+                payload.next();
+            }
         }
         auto [stored, inserted] = objects.emplace(id, std::move(object));
         if (inserted) {
@@ -339,14 +485,14 @@ namespace nodes {
     }
 
     auto local_node::impl::object_bytes(const std::string& id) const -> std::string {
-        statement q{*db, "SELECT data FROM objects WHERE id=?1"};
+        statement q{*db, "SELECT o.data,p.payload,p.project FROM objects o LEFT JOIN object_payloads p ON p.id=o.id WHERE o.id=?1"};
         q.text(1, id);
         if (!q.next()) {
             error e{nodes::code::missing_objects, "required object unavailable"};
             e.missing.push_back(id);
             throw e;
         }
-        auto data = archive::unpack(q.data(0));
+        auto data = unpack_object(*db, q);
         if (digest_of(data) != id)
             fail(nodes::code::storage_failure, "stored object hash mismatch");
         return data;
@@ -365,7 +511,8 @@ namespace nodes {
     void local_node::impl::write_blob(const std::string& digest, std::string_view kind, std::uint64_t raw_bytes, std::uint64_t scalars, std::string_view data) {
         if (digest_of(data) != digest)
             fail(nodes::code::storage_failure, "content payload digest differs");
-        auto packed = archive::pack(data);
+        const auto chunked = chunked_payload(data);
+        auto packed = chunked ? std::string{} : archive::pack(data);
         statement q{*db, "INSERT OR IGNORE INTO blobs(digest,kind,raw_bytes,scalar_count,data) VALUES(?1,?2,?3,?4,?5)"};
         q.text(1, digest);
         q.text(2, kind);
@@ -375,7 +522,7 @@ namespace nodes {
         q.next();
         if (sqlite3_changes(db->handle)) {
             ++blob_writes;
-            state_bytes_written += packed.size();
+            state_bytes_written += chunked ? retain_chunked_blob(digest, data) : packed.size();
         }
     }
 
@@ -390,7 +537,7 @@ namespace nodes {
         state_bytes_read += packed.size();
         std::string data;
         try {
-            data = archive::unpack(packed, size);
+            data = packed.empty() ? read_chunked_blob(digest) : archive::unpack(packed, size);
         } catch (const error& e) {
             fail(nodes::code::storage_failure, "stored content payload is corrupt: " + std::string(e.what()));
         }
@@ -400,9 +547,18 @@ namespace nodes {
         return data;
     }
 
+    auto local_node::impl::read_chunked_blob(const std::string& digest) -> std::string {
+        return read_extents(*db, digest, &state_bytes_read);
+    }
+
+    auto local_node::impl::retain_chunked_blob(const std::string& digest, std::string_view data) -> std::uint64_t {
+        return store_extents(*db, digest, data);
+    }
+
     void local_node::impl::load_objects(std::uint64_t after) {
         // Rows are written in causal order, so one pass in rowid order re-adds every batch committed since the snapshot.
-        statement query{*db, "SELECT id,data FROM objects WHERE rowid>?1 ORDER BY rowid"};
+        statement query{*db, "SELECT o.data,p.payload,p.project,o.id FROM objects o LEFT JOIN object_payloads p ON p.id=o.id "
+                             "WHERE o.rowid>?1 ORDER BY o.rowid"};
         query.number(1, after);
         struct record {
             std::string id;
@@ -414,7 +570,7 @@ namespace nodes {
         auto merge = [&] {
             for (auto& row : batch) {
                 if (row.object.at("kind").text() == "batch")
-                    source.add(row.id, row.object);
+                    load_batch(row.id, row.object);
                 auto [stored, inserted] = objects.emplace(row.id, std::move(row.object));
                 if (inserted) {
                     object_order.push_back(stored->first);
@@ -429,11 +585,11 @@ namespace nodes {
             trim_objects();
         };
         while (query.next()) {
-            auto packed = query.data(1);
-            auto object = codec::decode(archive::unpack(packed));
+            auto data = unpack_object(*db, query);
+            auto object = codec::decode(data);
             check_schema(object);
-            buffered += packed.size();
-            batch.push_back({query.data(0), std::move(object), packed.size()});
+            buffered += data.size();
+            batch.push_back({query.data(3), std::move(object), data.size()});
             if (batch.size() >= 256 || buffered >= 8 * 1024 * 1024)
                 merge();
         }

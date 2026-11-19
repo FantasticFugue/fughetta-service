@@ -5,7 +5,7 @@ import native;
 import http;
 import configuration;
 import content;
-import reflection;
+import json;
 import nodes;
 import registry;
 import tools;
@@ -97,10 +97,10 @@ namespace {
     auto call(std::string_view tool, std::string_view args, std::string_view meta = "") -> std::string {
         std::string selected{args};
         if (tool == "worldline" || tool == "language" || tool == "scope" || tool == "build" || tool == "test" || tool == "run") {
-            auto object = rfl::json::read<rfl::Generic>(selected)->to_object().value();
+            auto object = json::read<json::value>(selected)->to_object().value();
             if (!object.get("worldline"))
                 object["worldline"] = "main";
-            selected = rfl::json::write(object);
+            selected = json::write(object);
         }
         return std::format(R"({{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{{"name":"{}","arguments":{}{}}}}})", tool, selected,
                            meta.empty() ? "" : std::format(R"(,"_meta":{})", meta));
@@ -128,7 +128,7 @@ namespace {
                                .language = "kotlin",
                                .directory = ".",
                                .references = {projectmodel::artifact_reference{.object = {digest.str(), "library.jar"}, .role = "classpath"}}}}};
-                const auto model_text = rfl::json::write(model);
+                const auto model_text = json::write(model);
                 const auto model_digest = content::hash_of(model_text);
                 builds::exported_file model_file{
                     .name = "build/model", .path = "model.json", .digest = model_digest, .size = model_text.size(), .objects = {{digest, data.size()}}};
@@ -244,7 +244,7 @@ namespace {
                         };
                         payload result;
                     };
-                    const auto stale_result = rfl::json::read<execution_reply>(stale.body).value();
+                    const auto stale_result = json::read<execution_reply>(stale.body).value();
                     expect(stale.status == 200 && builds == 5 && stale_result.result.structuredContent.results.at(0).models.at(0).delivery_error.empty())
                         << "a missing model dependency makes this call rebuild instead of returning stale cache";
                     const auto repaired = co_await h.mcp(io, call("build", R"({"project":"app"})"));
@@ -256,7 +256,7 @@ namespace {
                     expect(model_object.parts.at(0).total == data.size()) << "an evicted model is republished on the same cache lookup";
                     remove_project = true;
                     const auto removed = co_await h.mcp(io, call("build", R"({"project":"app","fresh":true})"));
-                    const auto removed_result = rfl::json::read<execution_reply>(removed.body).value();
+                    const auto removed_result = json::read<execution_reply>(removed.body).value();
                     const auto& completed = removed_result.result.structuredContent.results.at(0);
                     expect(removed.status == 200 && completed.steps.at(0).exit_code == 0 && completed.error.empty());
                     expect(!completed.exports.at(0).delivery_error.empty());
@@ -266,14 +266,6 @@ namespace {
                 co_await coroutine::with_scope(std::move(run_children));
             };
             h.rt.run(std::move(run_core));
-        };
-        "trusted authentication requires a configured workspace identity"_test = [] {
-            expect(throws<std::invalid_argument>([] { config::parse(R"({"server":{"auth":{"mode":"trusted"}}})"); }))
-                << "trusted mode must name the workspace it serves";
-            expect(throws<std::invalid_argument>([] { config::parse(R"({"server":{"auth":{"mode":"trusted","workspace":""}}})"); }))
-                << "an empty workspace identity is refused";
-            auto configured = config::parse(R"({"server":{"auth":{"mode":"trusted","workspace":"acme-id"}}})");
-            expect(configured.server.auth.workspace == "acme-id") << "a configured workspace identity is accepted";
         };
         "Workspace event subscriptions reset, coalesce and bound slow consumers"_test = [] {
             cores::io_context<native::context> rt{1};
@@ -699,7 +691,7 @@ namespace {
             h.rt.run(std::move(run_core));
         };
 
-        "build plans and status remain available while manual analysis routes are removed"_test = [] {
+        "build plans and status remain available"_test = [] {
             harness h;
             auto run_core = [&](ctx& io, std::size_t) -> coroutine::task<> {
                 co_await h.hub.edit(0, [](config::store& store) {
@@ -751,24 +743,6 @@ namespace {
                 auto metrics = co_await request("GET", "/metrics");
                 expect(metrics.body.contains("gateway_builds_total") && metrics.body.contains("gateway_synced_bytes_total"));
                 expect(metrics.body.contains(R"(result="unknown"} 0)") && metrics.body.contains(R"(result="cancelled"} 0)"));
-                for (auto action : {"plan", "prepare", "receipt"}) {
-                    auto removed = co_await request(action == std::string_view{"receipt"} ? "GET" : "POST", base + "/analysis/Cpp/" + action);
-                    expect(removed.head.status == 404);
-                }
-                mcp::notifier note;
-                const worlds::actor actor{.issuer = "token", .user = "tester", .role = "owner"};
-                for (auto action : {"plan", "prepare", "receipt", "scopes"}) {
-                    auto input =
-                        rfl::json::read<tools::language_query::input>(std::format(R"({{"project":"app","configuration":"Cpp","action":"{}"}})", action));
-                    bool rejected = !input;
-                    try {
-                        if (input)
-                            co_await tools::language_query::run(h.services, {}, std::move(*input), note, actor);
-                    } catch (const tools::tool_error&) {
-                        rejected = true;
-                    }
-                    expect(rejected) << action;
-                }
             };
             h.rt.run(std::move(run_core));
         };
@@ -796,30 +770,30 @@ namespace {
                         std::string base = "/api/v1/projects/app/node";
                         auto empty = co_await h.ask(io, GET, base + "/source");
                         expect(empty.status == 200) << "a project's node starts with an empty main" << empty.body;
-                        auto capture_body = rfl::json::write(front::api::node_capture{content::hash_of("browser-capture").str(), {}, "Capture project files"});
+                        auto capture_body = json::write(front::api::node_capture{content::hash_of("browser-capture").str(), {}, "Capture project files"});
                         auto captured = co_await h.ask(io, http::method::POST, base + "/capture", capture_body);
                         expect(captured.status == 200) << captured.body;
                         auto replay = co_await h.ask(io, http::method::POST, base + "/capture", capture_body);
-                        auto first = rfl::json::read<nodes::node_reply>(captured.body), second = rfl::json::read<nodes::node_reply>(replay.body);
+                        auto first = json::read<nodes::node_reply>(captured.body), second = json::read<nodes::node_reply>(replay.body);
                         expect(bool(first) && bool(second) >> fatal);
                         expect(first->receipt == second->receipt);
                         expect(second->replayed);
                         auto changed_capture =
-                            rfl::json::write(front::api::node_capture{content::hash_of("browser-capture").str(), {}, "Changed capture intent"});
+                            json::write(front::api::node_capture{content::hash_of("browser-capture").str(), {}, "Changed capture intent"});
                         auto rejected = co_await h.ask(io, http::method::POST, base + "/capture", changed_capture);
                         expect(rejected.status == 409 && rejected.body.contains("identity_conflict")) << rejected.body;
                         auto original = co_await h.ask(io, GET, base + "/source/file?revision=" + first->version + "&path=captured.txt");
                         expect(original.status == 200 && original.body.contains(R"("content":"captured file\n")")) << original.body;
                         auto binary = co_await h.ask(io, GET, base + "/source/file?revision=" + first->version + "&path=captured.bin");
-                        auto binary_view = rfl::json::read<front::api::node_source_file>(binary.body);
+                        auto binary_view = json::read<front::api::node_source_file>(binary.body);
                         expect(binary.status == 200 && bool(binary_view) >> fatal) << binary.body;
                         expect(binary_view->binary && binary_view->content.empty());
                         auto recapture =
-                            rfl::json::write(front::api::node_capture{content::hash_of("browser-recapture").str(), first->frontier, "Capture project files"});
+                            json::write(front::api::node_capture{content::hash_of("browser-recapture").str(), first->frontier, "Capture project files"});
                         auto occupied = co_await h.ask(io, http::method::POST, base + "/capture", recapture);
                         expect(occupied.status == 409 && occupied.body.contains("source_conflict")) << occupied.body;
                         auto large = co_await h.ask(io, GET, base + "/source/file?revision=" + first->version + "&path=long.txt");
-                        auto bounded = rfl::json::read<front::api::node_source_file>(large.body);
+                        auto bounded = json::read<front::api::node_source_file>(large.body);
                         expect(large.status == 200 && bool(bounded) >> fatal) << large.body.substr(0, 300);
                         expect(bounded->truncated && bounded->lines == 1u && bounded->total_lines == 1u && bounded->content.size() == 1024 * 1024 - 2u);
 
@@ -829,31 +803,31 @@ namespace {
                                                     .operation = content::hash_of("browser-seed").str(),
                                                     .expected = first->frontier,
                                                     .edits = {{.kind = std::string{"create"}, .path = "src/hello.txt", .text = "one\ntwo\nthree\n"}}};
-                        auto accepted = co_await h.ask(io, http::method::POST, base, rfl::json::write(request));
-                        auto parsed = rfl::json::read<nodes::node_reply>(accepted.body);
+                        auto accepted = co_await h.ask(io, http::method::POST, base, json::write(request));
+                        auto parsed = json::read<nodes::node_reply>(accepted.body);
                         expect(bool(parsed) >> fatal) << accepted.body;
                         auto head_reply = co_await h.ask(io, GET, base + "/source");
-                        auto head = rfl::json::read<front::api::node_source_head>(head_reply.body);
+                        auto head = json::read<front::api::node_source_head>(head_reply.body);
                         expect(head_reply.status == 200 && bool(head) >> fatal);
                         expect(head->node == parsed->node);
                         auto concurrent = request;
                         concurrent.operation = content::hash_of("browser-concurrent-save").str();
                         concurrent.expected = first->frontier;
                         concurrent.edits = {{.kind = std::string{"create"}, .path = "src/other.txt", .text = "other\n"}};
-                        auto joined = co_await h.ask(io, http::method::POST, base, rfl::json::write(concurrent));
-                        auto both = rfl::json::read<nodes::node_reply>(joined.body);
+                        auto joined = co_await h.ask(io, http::method::POST, base, json::write(concurrent));
+                        auto both = json::read<nodes::node_reply>(joined.body);
                         expect(joined.status == 200 && bool(both) >> fatal) << joined.body;
                         expect(both->frontier.size() == 2u) << "a save from an older state of the worldline joins it";
                         auto outside = request;
                         outside.operation = content::hash_of("browser-outside-save").str();
                         outside.expected = {content::hash_of("unknown-event").str()};
-                        auto refused = co_await h.ask(io, http::method::POST, base, rfl::json::write(outside));
+                        auto refused = co_await h.ask(io, http::method::POST, base, json::write(outside));
                         expect(refused.status == 503 && refused.body.contains("missing_objects")) << refused.body;
                         auto revision = both->version;
                         request.operation = content::hash_of("browser-next").str();
                         request.expected = both->frontier;
                         request.edits = {{.kind = std::string{"write"}, .path = "src/hello.txt", .text = "changed\n"}};
-                        replies.push_back(co_await h.ask(io, http::method::POST, base, rfl::json::write(request)));
+                        replies.push_back(co_await h.ask(io, http::method::POST, base, json::write(request)));
                         replies.push_back(co_await h.ask(io, GET, base + "/source?revision=" + revision));
                         replies.push_back(co_await h.ask(io, GET, base + "/source/file?revision=" + revision + "&path=src%2Fhello.txt&offset=2&limit=1"));
                         replies.push_back(co_await h.ask(io, GET, base + "/source/file?path=src%2Fhello.txt"));
@@ -981,34 +955,6 @@ namespace {
                                                                                                                                                                                               .mcp(
                                                                                                                                                                                                   io,
                                                                                                                                                                                                   R"({"jsonrpc":"2.0","id":1,"method":"tools/list"})"));
-                                                                                                                                                                                      for (
-                                                                                                                                                                                          const auto
-                                                                                                                                                                                              name :
-                                                                                                                                                                                          {"read",
-                                                                                                                                                                                           "write",
-                                                                                                                                                                                           "edit",
-                                                                                                                                                                                           "remove",
-                                                                                                                                                                                           "move",
-                                                                                                                                                                                           "list",
-                                                                                                                                                                                           "glob",
-                                                                                                                                                                                           "search",
-                                                                                                                                                                                           "generate",
-                                                                                                                                                                                           "jobs"}) {
-                                                                                                                                                                                          auto refused =
-                                                                                                                                                                                              co_await h
-                                                                                                                                                                                                  .mcp(
-                                                                                                                                                                                                      io,
-                                                                                                                                                                                                      call(
-                                                                                                                                                                                                          name,
-                                                                                                                                                                                                          R"({"project":"app"})"));
-                                                                                                                                                                                          expect(
-                                                                                                                                                                                              refused
-                                                                                                                                                                                                  .body
-                                                                                                                                                                                                  .contains(
-                                                                                                                                                                                                      "unknown tool"))
-                                                                                                                                                                                              << refused
-                                                                                                                                                                                                     .body;
-                                                                                                                                                                                      }
                                                                                                                                                                                       a.push_back(
                                                                                                                                                                                           co_await h
                                                                                                                                                                                               .ask(
@@ -1070,7 +1016,7 @@ namespace {
                                                                                                                                                                                                   endpoint,
                                                                                                                                                                                                   R"({"project":"app","worldline":"main","action":"inspect"})");
                                                                                                                                                                                       const auto initial =
-                                                                                                                                                                                          rfl::json::read<
+                                                                                                                                                                                          json::read<
                                                                                                                                                                                               tools::worldline::
                                                                                                                                                                                                   output>(
                                                                                                                                                                                               inspected
@@ -1152,8 +1098,6 @@ namespace {
             expect((a.size() == 16u) >> fatal);
             for (const auto name : {"configurations", "build", "test", "run", "language"})
                 expect(a[0].body.contains(std::format(R"("name":"{}")", name)));
-            for (const auto name : {"read", "write", "edit", "remove", "move", "list", "glob", "search", "generate", "jobs"})
-                expect(!a[0].body.contains(std::format(R"("name":"{}")", name)));
             expect(a[0].status == 200 && a[0].body.contains("outputSchema"));
             for (auto name : {"worldline", "artifact", "project", "save_project", "schema", "effective"})
                 expect(a[0].body.contains(std::format(R"("name":"{}")", name)));

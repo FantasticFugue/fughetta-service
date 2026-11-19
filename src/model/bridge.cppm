@@ -2,7 +2,7 @@ export module bridge;
 import std;
 import evaluation;
 import coroutine;
-import reflection;
+import json;
 import records;
 import channels;
 import objects;
@@ -13,10 +13,12 @@ export import provider;
 export namespace binding {
     inline auto property(const semantic::records::symbol& symbol, const std::string& key) -> std::string {
         auto found = symbol.extensions.find(key);
-        return found == symbol.extensions.end() ? "" : rfl::from_generic<std::string>(found->second).value();
+        return found == symbol.extensions.end() ? "" : json::from_value<std::string>(found->second).value();
     }
     // An artifact unit publishes its exports; a source unit does not.
-    inline auto artifact(const semantic::unit& unit) { return std::ranges::contains(unit.output_channels, std::string{"exports"}, &semantic::channel::name); }
+    inline auto artifact(const semantic::unit& unit) {
+        return std::ranges::any_of(unit.output_channels, [](const semantic::channel& channel) { return channel.name == "exports"; });
+    }
     struct target {
         const semantic::shard* shard;
         const semantic::records::symbol* symbol;
@@ -81,8 +83,8 @@ export namespace binding {
         using language::reader_adapter::reader_adapter;
 
     protected:
-        auto do_open(rfl::Generic value) -> coroutine::task<> override {
-            config_ = rfl::from_generic<typename Mechanism::options>(value).value();
+        auto do_open(json::value value) -> coroutine::task<> override {
+            config_ = json::from_value<typename Mechanism::options>(value).value();
             co_return;
         }
         auto do_units(const semantic::extent&) -> coroutine::task<std::vector<semantic::unit_key>> override {
@@ -107,11 +109,11 @@ export namespace binding {
             }
             std::vector<semantic::unit_key> out;
             for (const auto& group : groups)
-                out.push_back({state_.project, state_.stage, state_.provider, "evaluate", semantic::unit_kind::group, rfl::json::write(group)});
+                out.push_back({state_.project, state_.stage, state_.provider, "evaluate", semantic::unit_kind::group, json::write(group)});
             co_return out;
         }
         auto do_evaluate(const language::evaluation_request& request) -> coroutine::task<language::evaluated_unit> override {
-            const auto selected = rfl::json::read<group>(request.unit.name).value();
+            const auto selected = json::read<group>(request.unit.name).value();
             semantic::record_selection managed{.projects = {selected.project}, .modules = {selected.module}};
             const auto native = this->selection(selected);
             std::vector<const semantic::shard*> shards;
@@ -133,7 +135,14 @@ export namespace binding {
                     }
                 // Keep the complete selected membership, including an empty
                 // lookup. A new export in a configured library must invalidate it.
-                reads.push_back(channels::collection(state_.project, port, units, port == "native" && !selected.source ? "exports" : "linkage", selection));
+                auto channel = "linkage";
+                if (port == "native" && !selected.source) {
+                    if constexpr (requires { Mechanism::native_channel; })
+                        channel = Mechanism::native_channel;
+                    else
+                        channel = "exports";
+                }
+                reads.push_back(channels::collection(state_.project, port, units, channel, selection));
                 if (port == "native")
                     native_units = std::move(units);
             }

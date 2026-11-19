@@ -50,7 +50,7 @@ namespace {
             test::listener proxy{std::move(run_operation)};
             auto doc = test::document(tmp.dir, http_port, proxy.endpoint().port());
             auto file = tmp.dir / "config.json";
-            test::spit(file, rfl::json::write(doc));
+            test::spit(file, json::write(doc));
             auto start_source = [&] {
                 auto process = std::make_unique<test::child>(
                     test::source_command(SERVICE_EXECUTABLE, tmp.dir, {"--port", std::to_string(source_port), "--storage", (tmp.dir / "source").string()}));

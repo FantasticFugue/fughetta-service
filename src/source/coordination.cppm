@@ -9,7 +9,7 @@ import codec;
 import kernel;
 import durability;
 import archive;
-import reflection;
+import json;
 import nodestore;
 
 namespace nodes {

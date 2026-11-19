@@ -1,5 +1,5 @@
 module language;
-import reflection;
+import json;
 
 namespace language {
     auto timeout(const builds::limits& c) -> std::uint32_t { return c.timeout_s.value_or(1800); }
@@ -32,9 +32,11 @@ namespace language {
         semantic.after.clear();
         semantic.execution = {};
         auto inputs = select_builds(c, builds);
-        for (auto& [name, build] : inputs)
+        for (auto& [name, build] : inputs) {
             build.limits = {};
-        return content::hash_of(rfl::json::write(semantic) + "\n" + rfl::json::write(inputs));
+            build.relocatable_build_dirs.clear();
+        }
+        return content::hash_of(json::write(semantic) + "\n" + json::write(inputs));
     }
     namespace {
         template <class T>
@@ -209,7 +211,7 @@ namespace language {
         for (const auto& [_, stage] : c.stages)
             stage.server.visit([&](const auto& value) {
                 if constexpr (requires { value.options.registration; }) {
-                    const auto definition = rfl::json::write(std::tuple{value.options.registration, value.options.documents});
+                    const auto definition = json::write(std::tuple{value.options.registration, value.options.documents});
                     const auto [previous, inserted] = registrations.emplace(value.options.registration.id, definition);
                     if (!inserted && previous->second != definition)
                         throw std::invalid_argument("conflicting external provider registration: " + value.options.registration.id);
@@ -430,7 +432,7 @@ namespace language {
     void validate(const stage& c) {
         if (c.build_configuration.empty())
             throw std::invalid_argument("analysis build_configuration is required");
-        if (rfl::json::write(c).find("\\u0000") != std::string::npos)
+        if (json::write(c).find("\\u0000") != std::string::npos)
             throw std::invalid_argument("analysis configuration contains a null character");
         if (const auto& group = c.execution.directory_group;
             group && (group->empty() || *group == "." || *group == ".." || group->find_first_of("/\\") != std::string::npos))

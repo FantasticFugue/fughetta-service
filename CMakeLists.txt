@@ -51,7 +51,7 @@ add_layer(service)
 add_modules(service service gateway source worker runtime)
 target_link_libraries(service PUBLIC gateway source worker PRIVATE argparse::argparse)
 add_executable(fughetta-service src/fughetta-service.cpp)
-target_link_libraries(fughetta-service PRIVATE service)
+target_link_libraries(fughetta-service PRIVATE service argparse::argparse)
 
 ## Installation
 #
@@ -69,14 +69,14 @@ if(PROJECT_IS_TOP_LEVEL)
     install(FILES "${CMAKE_CURRENT_BINARY_DIR}/${DAEMON_DEFINITION}"
       DESTINATION "${CMAKE_INSTALL_DATADIR}/fughetta-service/daemon" RENAME "${DAEMON_INSTALL_NAME}")
   endif()
-  install(TARGETS fughetta-service RUNTIME DESTINATION "${CMAKE_INSTALL_BINDIR}")
+  install(TARGETS fughetta-service RUNTIME DESTINATION "${CMAKE_INSTALL_BINDIR}" COMPONENT runtime)
   install(FILES LICENSE DESTINATION "${CMAKE_INSTALL_DATADIR}/licenses/fughetta-service")
   install(PROGRAMS "${FUGHETTA_JVM_EXPORTER}" DESTINATION "${FUGHETTA_LIBEXEC}" RENAME fughetta-gradle-model)
-  install(PROGRAMS "${FUGHETTA_CLR_EXPORTER}" DESTINATION "${FUGHETTA_LIBEXEC}" RENAME fughetta-msbuild-model)
+  install(FILES providers/python/runtime.py DESTINATION "${FUGHETTA_LIBEXEC}/python" COMPONENT python)
   # Each provider installs the directory its artifact sits in.
   foreach(PROVIDER IN LISTS FUGHETTA_PROVIDERS)
     cmake_path(GET FUGHETTA_PROVIDER_${PROVIDER} PARENT_PATH PROVIDER_DIRECTORY)
-    install(DIRECTORY "${PROVIDER_DIRECTORY}/" DESTINATION "${FUGHETTA_LIBEXEC}/${PROVIDER}")
+    install(DIRECTORY "${PROVIDER_DIRECTORY}/" DESTINATION "${FUGHETTA_LIBEXEC}/${PROVIDER}" COMPONENT "${PROVIDER}")
   endforeach()
 endif()
 

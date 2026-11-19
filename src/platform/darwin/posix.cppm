@@ -1,17 +1,30 @@
 module;
+#include <cerrno>
 #include <crt_externs.h>
-#include <sandbox.h>
 #include <mach-o/dyld.h>
 #include <unistd.h>
 #include <libproc.h>
 #include <sys/resource.h>
+#include <sys/clonefile.h>
+#include <fcntl.h>
 #include <mach/mach_time.h>
 
 module posix;
 import std;
 import async;
+import descriptor;
 
 namespace posix {
+    auto try_clone_file(const std::filesystem::path& source, const std::filesystem::path& destination) -> bool {
+        auto input = descriptor::open(source, O_RDONLY | O_NOFOLLOW | O_NONBLOCK);
+        if (::fclonefileat(input.get(), AT_FDCWD, destination.c_str(), CLONE_NOOWNERCOPY) == 0)
+            return true;
+        const auto error = errno;
+        if (error == ENOTSUP || error == EXDEV || error == EINVAL || error == ENOSYS)
+            return false;
+        descriptor::fail("cannot clone into", destination, error);
+    }
+
     namespace {
         auto sample_process(int pid, bool children) -> std::optional<io::process_usage> {
             rusage_info_v2 resource{};
@@ -82,15 +95,6 @@ namespace posix {
         for (int fd = 3; fd < bound; ++fd)
             ::close(fd);
         return true;
-    }
-    // The system profile that denies every socket; the call is deprecated but remains the only one a process can apply
-    // to itself.
-    auto isolate_network() noexcept -> bool {
-        char* error = nullptr;
-        if (::sandbox_init(kSBXProfileNoNetwork, SANDBOX_NAMED, &error) == 0)
-            return true;
-        ::sandbox_free_error(error);
-        return false;
     }
     auto exit_handle(int) -> int { return -1; }
 

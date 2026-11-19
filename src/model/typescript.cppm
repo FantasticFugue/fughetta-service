@@ -2,7 +2,7 @@ export module typescript;
 import lsp;
 import std;
 import meta;
-import reflection;
+import json;
 import content;
 export import provider;
 
@@ -45,6 +45,9 @@ namespace language {
     // typescript-language-server owns tsserver and speaks LSP to the source service. Its documented initialization options are sent
     // unchanged where they are open-ended (preferences and implicitProjectConfiguration); the other settings retain typed fields.
     template <> struct server<"typescript"> {
+        static auto conventions() -> std::vector<semantic::language_conventions> {
+            return {{.language = "typescript", .escape_types = {{"any"}}}};
+        }
         static auto channels() -> std::vector<semantic::channel_definition> { return source_channels(); }
         using adapter = lsp_adapter;
         struct options {
@@ -55,8 +58,8 @@ namespace language {
             std::optional<std::string> locale;
             std::optional<std::uint32_t> max_tsserver_memory;
             std::optional<bool> disable_automatic_typing_acquisition;
-            std::map<std::string, rfl::Generic> preferences;
-            std::map<std::string, rfl::Generic> implicit_project_configuration;
+            std::map<std::string, json::value> preferences;
+            std::map<std::string, json::value> implicit_project_configuration;
         };
         static constexpr std::array<std::pair<std::string_view, std::string_view>, 8> documents{{
             {"ts", "typescript"},
@@ -94,9 +97,9 @@ namespace {
         if (value.empty() || value.starts_with('-') || value.contains("${") || (value.contains('\0') || value.find_first_of("\n\r") != std::string::npos))
             throw std::invalid_argument(std::string{field} + " is one compiler option value: " + value);
     }
-    void object(const std::map<std::string, rfl::Generic>& values, std::string_view field) {
+    void object(const std::map<std::string, json::value>& values, std::string_view field) {
         for (auto& [key, value] : values)
-            if (key.empty() || std::holds_alternative<std::nullopt_t>(value.get()))
+            if (key.empty() || std::holds_alternative<std::monostate>(value.get()))
                 throw std::invalid_argument(std::string{field} + " keys are nonempty and their values are not null: " + key);
     }
     auto tree_path(const std::string& path) -> std::string { return builds::absolute_path(path) ? path : "${tree}/" + path; }
@@ -203,22 +206,22 @@ namespace language {
                                    ? tree_path(*o.tsserver_path)
                                    : builds::tool(*o.tsserver_path));
         }
-        rfl::Generic::Object init;
+        json::object init;
         init["hostInfo"] = "fughetta";
         if (o.locale)
             init["locale"] = *o.locale;
         if (o.max_tsserver_memory)
-            init["maxTsServerMemory"] = rfl::Generic{static_cast<std::int64_t>(*o.max_tsserver_memory)};
+            init["maxTsServerMemory"] = json::value{static_cast<std::int64_t>(*o.max_tsserver_memory)};
         if (o.disable_automatic_typing_acquisition)
-            init["disableAutomaticTypingAcquisition"] = rfl::Generic{*o.disable_automatic_typing_acquisition};
+            init["disableAutomaticTypingAcquisition"] = json::value{*o.disable_automatic_typing_acquisition};
         if (!o.preferences.empty()) {
-            rfl::Generic::Object preferences;
+            json::object preferences;
             for (auto& [key, value] : o.preferences)
                 preferences[key] = value;
             init["preferences"] = std::move(preferences);
         }
         if (!o.implicit_project_configuration.empty()) {
-            rfl::Generic::Object configuration;
+            json::object configuration;
             for (auto& [key, value] : o.implicit_project_configuration)
                 configuration[key] = value;
             init["implicitProjectConfiguration"] = std::move(configuration);

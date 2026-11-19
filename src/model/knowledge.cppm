@@ -2,7 +2,7 @@ module;
 #include <sqlite3.h>
 export module knowledge;
 import std;
-import reflection;
+import json;
 import constants;
 import content;
 import codec;
@@ -83,6 +83,9 @@ export namespace semantic {
                     execute(
                         "CREATE TABLE IF NOT EXISTS source_projects (owner TEXT NOT NULL, project TEXT NOT NULL, PRIMARY KEY(owner,project)) WITHOUT ROWID");
                     execute("CREATE TABLE IF NOT EXISTS source_reclaims (owner TEXT PRIMARY KEY) WITHOUT ROWID");
+                    execute("CREATE TABLE IF NOT EXISTS python_test_reports (project TEXT NOT NULL, worldline TEXT NOT NULL, version TEXT NOT NULL, "
+                            "snapshot TEXT NOT NULL, name TEXT NOT NULL, digest TEXT NOT NULL, report TEXT NOT NULL, expires INTEGER NOT NULL, "
+                            "PRIMARY KEY(project,worldline,version,snapshot,name)) WITHOUT ROWID");
                     execute("CREATE TEMP TABLE next_sources (project TEXT NOT NULL, path TEXT NOT NULL, object TEXT NOT NULL, "
                             "PRIMARY KEY(project,path)) WITHOUT ROWID");
                     execute("CREATE TEMP TABLE next_projects (project TEXT PRIMARY KEY) WITHOUT ROWID");
@@ -238,17 +241,17 @@ export namespace semantic {
         };
         using identity_index = std::unordered_map<declaration_identity, symbol_id, identity_hash>;
         struct query_lease {
-            rfl::Literal<"query"> kind = std::string{"query"};
+            json::literal<"query"> kind = std::string{"query"};
             view_id view;
             lifetime value;
         };
         struct current_lease {
-            rfl::Literal<"current"> kind = std::string{"current"};
+            json::literal<"current"> kind = std::string{"current"};
             std::string project, worldline, configuration;
             view_id view;
         };
         struct continuation_lease {
-            rfl::Literal<"continuation"> kind = std::string{"continuation"};
+            json::literal<"continuation"> kind = std::string{"continuation"};
             view_id view;
             std::string cursor;
             semantic::request query;
@@ -275,7 +278,7 @@ export namespace semantic {
         // selected.units contains only directly reused contributions. Each updated
         // unit replaces its entire shard list; omitted units contribute nothing.
         auto publish_records(semantic::view selected, std::vector<semantic::shard> updates, const std::map<std::string, source_anchor>& anchors,
-                             const retention_roots& roots = {}) -> view_id {
+                             const retention_roots& roots = {}, std::vector<shard_receipt> receipts = {}) -> view_id {
             std::map<std::string, declaration_identity> declarations;
             std::map<std::string, const source_anchor*> retained_sources;
             std::map<std::string, std::optional<std::string>> parents;
@@ -306,7 +309,7 @@ export namespace semantic {
                             inferred.insert(symbol.id);
                         } else
                             // An unbound symbol is the same only within the same unit inputs.
-                            ids.try_emplace(symbol.id, "sym-" + content::hash_of(rfl::json::write(std::tuple{shard.unit.id, shard.unit.context,
+                            ids.try_emplace(symbol.id, "sym-" + content::hash_of(json::write(std::tuple{shard.unit.id, shard.unit.context,
                                                                                                              shard.unit.direct_inputs, symbol.id}))
                                                                     .str());
                     }
@@ -377,7 +380,7 @@ export namespace semantic {
                     }
                 // A new symbol is named by its declaration, so identical records get the
                 // same ID, and so the same shard ID, in every publication.
-                auto id = selected ? *selected : "sym-" + content::hash_of(rfl::json::write(keys.front())).str();
+                auto id = selected ? *selected : "sym-" + content::hash_of(json::write(keys.front())).str();
                 for (const auto& key : keys)
                     if (!known(key))
                         pending.emplace(key, id);
@@ -402,7 +405,7 @@ export namespace semantic {
                     if (inferred.contains(symbol.id))
                         shard.identities.push_back({declarations.at(symbol.id), symbol.id});
                 auto scope_id = [&](const std::string& native) {
-                    return "scope-" + content::hash_of(rfl::json::write(std::pair{shard.unit.context, native})).str();
+                    return "scope-" + content::hash_of(json::write(std::pair{shard.unit.context, native})).str();
                 };
                 for (auto& binding : shard.identities) {
                     binding.declaration = bound.at(binding.symbol);
@@ -453,10 +456,13 @@ export namespace semantic {
                     remap(relation.from);
                     remap(relation.to);
                 }
-                for (auto& range : shard.typed_ranges)
+                for (auto& range : shard.typed_ranges) {
                     optional(range.overload);
+                    if (range.observation)
+                        remap(range.observation->function);
+                }
             }
-            return publish_impl(std::move(selected), std::move(updates), true, roots, std::move(pending), true);
+            return publish_impl(std::move(selected), std::move(updates), true, roots, std::move(pending), true, std::move(receipts));
         }
 
         auto publish(semantic::view selected, std::vector<semantic::shard> updates, bool collect_coverage = false, const retention_roots& roots = {})
@@ -466,7 +472,7 @@ export namespace semantic {
 
     private:
         auto publish_impl(semantic::view selected, std::vector<semantic::shard> updates, bool collect_coverage, const retention_roots& roots,
-                          identity_index pending, bool remember_units = false) -> view_id {
+                          identity_index pending, bool remember_units = false, std::vector<shard_receipt> receipts = {}) -> view_id {
             normalize(selected.snapshots);
             std::set<unit_id> replaced;
             for (auto& shard : updates) {
@@ -522,17 +528,31 @@ export namespace semantic {
             // An ID names exact content: a shard already stored under it, or repeated
             // in this batch, is selected again without writing another copy.
             std::vector<semantic::shard*> fresh;
+            if (!receipts.empty() && receipts.size() != updates.size())
+                throw std::logic_error("semantic receipts do not cover the submitted shards");
+            std::size_t receipt_index = 0;
             for (auto& shard : updates) {
                 shard.unit.output_channels = outputs.at(shard.unit.id);
                 const auto& names = modules[shard.unit.id];
                 shard.unit.modules.assign(names.begin(), names.end());
                 shard.id = semantic::shard_key(shard);
+                if (!receipts.empty()) {
+                    auto& receipt = receipts[receipt_index++];
+                    receipt.published = shard.id;
+                    selected.receipts.push_back(std::move(receipt));
+                }
                 auto& listed = selected.units[shard.unit.id];
                 if (std::ranges::contains(listed, shard.id))
                     continue;
                 listed.push_back(shard.id);
                 if (!database_->get(persistence::table::shards, shard.id))
                     fresh.push_back(&shard);
+            }
+            if (!selected.receipts.empty()) {
+                std::set<shard_id> included;
+                for (const auto& [_, shards] : selected.units)
+                    included.insert(shards.begin(), shards.end());
+                std::erase_if(selected.receipts, [&](const auto& receipt) { return !included.contains(receipt.published); });
             }
             if (!fresh.empty()) {
                 persistence::database::transaction journal{*database_};
@@ -588,7 +608,7 @@ export namespace semantic {
             const auto now = timestamp();
             const lifetime life{now, now + (roots ? 0 : limits_.lifetime.count())};
             insert_identities(pending);
-            database_->insert(persistence::table::views, id, rfl::json::write(selected));
+            database_->insert(persistence::table::views, id, json::write(selected));
             reference_shards(id, selected.units);
             reference_shards(id, selected.checkpoint);
             if (remember_units)
@@ -632,7 +652,7 @@ export namespace semantic {
             if (query.from_view)
                 renew(*query.from_view);
             query.view = id;
-            auto cursor = content::hash_of(rfl::json::write(query)).str();
+            auto cursor = content::hash_of(json::write(query)).str();
             put_lease(continuation_lease{.view = id, .cursor = cursor, .query = std::move(query)});
             renew(id);
             return {id, std::move(cursor)};
@@ -667,6 +687,30 @@ export namespace semantic {
                                         lease_key(current_lease{.project = project, .worldline = worldline, .configuration = configuration}));
             return value ? std::optional{decode<current_lease>(*value).view} : std::nullopt;
         }
+        auto currents(const std::string& project, const std::string& worldline) const -> std::vector<view_id> {
+            std::vector<view_id> ids;
+            for (auto& row : database_->rows("SELECT json_extract(value,'$.view') FROM leases WHERE json_extract(value,'$.kind')='current' "
+                                            "AND json_extract(value,'$.project')=?1 AND json_extract(value,'$.worldline')=?2", {project, worldline}))
+                ids.push_back(std::move(row.front()));
+            return ids;
+        }
+        struct python_test_report {
+            std::string name, digest, bytes;
+        };
+        void remember_python_test(const semantic::snapshot& pin, const python_test_report& report) {
+            database_->rows("INSERT INTO python_test_reports VALUES(?1,?2,?3,?4,?5,?6,?7,CAST(?8 AS INTEGER)) "
+                            "ON CONFLICT(project,worldline,version,snapshot,name) DO UPDATE SET digest=excluded.digest,report=excluded.report,expires=excluded.expires",
+                            {pin.project, pin.worldline, pin.version, pin.snapshot, report.name, report.digest, report.bytes,
+                             std::to_string(timestamp() + limits_.lifetime.count())});
+        }
+        auto python_tests(const semantic::snapshot& pin) const -> std::vector<python_test_report> {
+            std::vector<python_test_report> out;
+            for (auto& row : database_->rows("SELECT name,digest,report FROM python_test_reports WHERE project=?1 AND worldline=?2 AND version=?3 "
+                                            "AND snapshot=?4 AND expires>CAST(?5 AS INTEGER) ORDER BY name",
+                                            {pin.project, pin.worldline, pin.version, pin.snapshot, std::to_string(timestamp())}))
+                out.push_back({std::move(row[0]), std::move(row[1]), std::move(row[2])});
+            return out;
+        }
         void make_current(const view_id& id) {
             const auto view = describe(id);
             persistence::database::transaction transaction{*database_};
@@ -685,6 +729,7 @@ export namespace semantic {
         }
         void sweep() {
             flush();
+            database_->rows("DELETE FROM python_test_reports WHERE expires<=CAST(?1 AS INTEGER)", {std::to_string(timestamp())});
             retained_objects roots;
             for (const auto& row : database_->rows("SELECT json_extract(value,'$.view') FROM leases WHERE json_extract(value,'$.kind')='current' OR "
                                                    "(json_extract(value,'$.kind')='query' AND json_extract(value,'$.value.expires') > CAST(?1 AS INTEGER))",
@@ -750,7 +795,7 @@ export namespace semantic {
                              database_->rows("SELECT r.owner,r.shard,CAST(json_extract(s.value,'$.bytes')+json_extract(s.value,'$.index_bytes') AS TEXT),"
                                              "(SELECT COUNT(*) FROM shard_refs other WHERE other.shard=r.shard AND other.owner<>r.owner) "
                                              "FROM shard_refs r JOIN shards s ON s.key=r.shard WHERE r.owner IN (SELECT value FROM json_each(?1))",
-                                             {rfl::json::write(wanted)})) {
+                                             {json::write(wanted)})) {
                             auto shard = std::move(row[1]);
                             references[row[0]].push_back({shard, std::move(row[2]), static_cast<std::size_t>(std::stoull(row[3]))});
                             shared[shard].push_back(row[0]);
@@ -825,7 +870,7 @@ export namespace semantic {
                 const reuse::channel_values channels;
                 const reuse::environment current{sources, inputs, channels, project};
                 for (const auto& row : database_->rows("SELECT key,CAST(accessed AS TEXT),value FROM recipes WHERE key IN (SELECT value FROM json_each(?1))",
-                                                       {rfl::json::write(unresolved)}))
+                                                       {json::write(unresolved)}))
                     state.results.emplace(row[0], reuse::sources_match(candidate_record(row), current));
             }
             std::vector<std::string> valid, invalid;
@@ -889,6 +934,7 @@ export namespace semantic {
         }
 
         auto object_unit(const shard_id& id) const -> semantic::unit { return describe_shard(id).unit; }
+        auto object_records(const shard_id& id) const -> std::shared_ptr<const semantic::shard> { return load_shard(id)->materialized(); }
         auto object_bytes(const shard_id& id, std::uint64_t offset, std::uint64_t limit) const -> std::pair<std::uint64_t, std::vector<std::byte>> {
             const auto total = describe_shard(id).bytes;
             if (offset > total || !limit || limit > constants::semantic_batch_bytes)
@@ -957,6 +1003,7 @@ export namespace semantic {
                     const auto index = out->pieces.size();
                     out->pieces.push_back(piece);
                     out->unit_projects.emplace(unit, piece->unit.recipe.unit.project);
+                    out->languages.add(piece->unit.conventions);
                     out->unit_parts[unit].push_back(index);
                     for (const auto& input : piece->unit.direct_inputs)
                         if (input.kind == input_kind::artifact && !input.object.empty()) {
@@ -999,6 +1046,8 @@ export namespace semantic {
                             out->type_parents[child].insert(parent);
                     append(out->typed_overloads, piece->index->typed_overloads);
                     append(out->typed_range_files, piece->index->typed_range_files);
+                    if (piece->index->typed_observations)
+                        append(out->typed_observations, *piece->index->typed_observations);
                     append(out->scopes, piece->index->scopes);
                     append(out->scope_owners, piece->index->scope_owners);
                     append(out->members, piece->index->members);
@@ -1007,9 +1056,28 @@ export namespace semantic {
                     append(out->diagnostics, piece->index->diagnostics);
                     if (piece->unit.resolution) {
                         const auto& resolution = *piece->unit.resolution;
-                        out->resolutions.emplace(rfl::json::write(std::tuple{resolution.action.str(), std::optional{resolution.selector}}), index);
+                        out->resolutions.emplace(json::write(std::tuple{resolution.action.str(), std::optional{resolution.selector}}), index);
                     }
                 }
+            for (const auto& [function, address] : out->typed_observations) {
+                const auto& sample = out->typed_range(address);
+                const auto& observed = *sample.observation;
+                if (observed.role != "return" && observed.role != "first_parameter")
+                    continue;
+                const auto [types, end_types] = out->types.equal_range(sample.type);
+                for (auto at = types; at != end_types; ++at) {
+                    if (at->second.shard != address.shard)
+                        continue;
+                    const auto& type = out->type(at->second);
+                    if (!type.declaration)
+                        continue;
+                    auto& capabilities = observed.role == "return" ? out->type_producers : out->type_consumers;
+                    const auto [first, last] = out->symbols.equal_range(function);
+                    for (auto symbol = first; symbol != last; ++symbol)
+                        if (out->symbol(symbol->second).ownership.context == observed.context)
+                            capabilities.emplace(*type.declaration, symbol->second);
+                }
+            }
             std::erase_if(live_views_, [](const auto& entry) { return entry.second.expired(); });
             live_views_[id] = out;
             views_.put(id, out, bytes, limits_.hot_bytes);
@@ -1045,7 +1113,7 @@ export namespace semantic {
             }
             for (const auto& row :
                  database_->rows("SELECT symbol FROM orphan_symbols WHERE NOT EXISTS (SELECT 1 FROM shard_identities WHERE symbol=orphan_symbols.symbol)")) {
-                const auto encoded = rfl::json::write(row[0]);
+                const auto encoded = json::write(row[0]);
                 for (const auto& key : database_->rows("SELECT key FROM identities WHERE value=?1", {encoded}))
                     identities_.erase(key[0]);
                 database_->rows("DELETE FROM identities WHERE value=?1", {encoded});
@@ -1085,7 +1153,7 @@ export namespace semantic {
         }
         auto timestamp() const -> std::int64_t { return std::chrono::duration_cast<std::chrono::milliseconds>(clock_().time_since_epoch()).count(); }
         auto identity(const declaration_identity& declaration) const -> std::optional<symbol_id> {
-            auto key = rfl::json::write(declaration);
+            auto key = json::write(declaration);
             if (auto cached = identities_.find(key))
                 return *cached;
             auto bytes = database_->get(persistence::table::identities, key);
@@ -1136,7 +1204,7 @@ export namespace semantic {
             std::vector<std::tuple<std::vector<input_object>, std::vector<dependency>, semantic::coverage>> inputs;
             for (const auto& unit : value.units)
                 inputs.emplace_back(unit.direct_inputs, unit.observed_dependencies, unit.coverage);
-            return rfl::json::write(inputs);
+            return json::write(inputs);
         }
         auto candidate_record(const std::vector<std::string>& row) const -> semantic::candidate {
             auto cached = candidates_.find(row[0]);
@@ -1203,13 +1271,13 @@ export namespace semantic {
                 return;
             database_->rows("INSERT OR IGNORE INTO candidate_inputs(project,input_key,candidate_id) "
                             "SELECT json_extract(value,'$[0]'),json_extract(value,'$[1]'),json_extract(value,'$[2]') FROM json_each(?1)",
-                            {rfl::json::write(rows)});
+                            {json::write(rows)});
         }
         auto update_sources(const std::string& owner, const source_vector& sources) -> std::string {
             database_->rows("DELETE FROM next_sources");
             database_->rows("DELETE FROM next_projects");
             database_->rows("DELETE FROM changed_inputs");
-            auto encoded = rfl::json::write(sources);
+            auto encoded = json::write(sources);
             database_->rows("INSERT INTO next_projects SELECT key FROM json_each(?1)", {encoded});
             database_->rows("INSERT INTO next_sources SELECT p.key,f.key,f.value FROM json_each(?1) p,json_each(p.value) f", {encoded});
             auto mark = [&](const std::string& project, const std::string& key) {
@@ -1268,7 +1336,7 @@ export namespace semantic {
             if (keys.empty())
                 return;
             database_->rows("UPDATE recipes SET dirty=0,source_valid=?2 WHERE key IN (SELECT value FROM json_each(?1))",
-                            {rfl::json::write(keys), valid ? "1" : "0"});
+                            {json::write(keys), valid ? "1" : "0"});
         }
         void save_candidate(semantic::candidate value) {
             const auto key = recipe_identifier(value.recipe);
@@ -1288,7 +1356,7 @@ export namespace semantic {
             }
             candidate_payload payload{value.snapshots, value.shards, value.units, value.nodes, value.cacheable};
             database_->rows("INSERT INTO recipes(key,recipe_id,project,options,accessed,value) VALUES (?1,?2,?3,?4,?5,?6)",
-                            {value.id, key, value.recipe.unit.project, value.recipe.options, std::to_string(value.accessed), rfl::json::write(payload)});
+                            {value.id, key, value.recipe.unit.project, value.recipe.options, std::to_string(value.accessed), json::write(payload)});
             index_candidate(value);
             reference_shards(value.id, {{unit_identifier(value.recipe.unit), value.shards}});
         }
@@ -1344,7 +1412,7 @@ export namespace semantic {
             const auto id = shard.id;
             const auto index = std::make_shared<const shard_index>(index_shard(shard));
             auto persist = [&](const std::filesystem::path& path, const auto& value) {
-                auto bytes = rfl::json::write(value);
+                auto bytes = json::write(value);
                 if (bytes.size() > constants::semantic_object_bytes)
                     throw std::length_error("semantic object exceeds storage limit");
                 durability::durable_write(path, bytes);
@@ -1371,7 +1439,7 @@ export namespace semantic {
                     reads.insert(*symbol.declaring_scope);
             metadata.scope_ids.assign(scopes.begin(), scopes.end());
             metadata.scope_reads.assign(reads.begin(), reads.end());
-            database_->put(persistence::table::shards, id, rfl::json::write(metadata));
+            database_->put(persistence::table::shards, id, json::write(metadata));
             database_->rows("UPDATE storage SET bytes=bytes+CAST(?1 AS INTEGER) WHERE id=1", {std::to_string(metadata.bytes + metadata.index_bytes)});
             database_->rows("INSERT INTO garbage VALUES (?1)", {id});
             for (const auto& symbol : index->identities)
@@ -1402,30 +1470,30 @@ export namespace semantic {
             const auto bytes = mapped.bytes();
             if (bytes.size() > constants::semantic_object_bytes)
                 throw std::length_error("semantic object exceeds storage limit");
-            auto value = rfl::json::read<T>(std::string_view{reinterpret_cast<const char*>(bytes.data()), bytes.size()});
+            auto value = json::read<T>(std::string_view{reinterpret_cast<const char*>(bytes.data()), bytes.size()});
             if (!value)
                 throw std::runtime_error("invalid semantic object: " + path.string() + ": " + value.error().what());
             return std::move(*value);
         }
 
         template <class T> static auto decode(std::string_view bytes) -> T {
-            auto value = rfl::json::read<T>(bytes);
+            auto value = json::read<T>(bytes);
             if (!value)
                 throw std::runtime_error("invalid semantic database record: " + value.error().what());
             return std::move(*value);
         }
-        static auto lease_key(const query_lease& lease) -> std::string { return rfl::json::write(std::tuple{std::string{"query"}, lease.view}); }
+        static auto lease_key(const query_lease& lease) -> std::string { return json::write(std::tuple{std::string{"query"}, lease.view}); }
         static auto lease_key(const current_lease& lease) -> std::string {
-            return rfl::json::write(std::tuple{std::string{"current"}, lease.project, lease.worldline, lease.configuration});
+            return json::write(std::tuple{std::string{"current"}, lease.project, lease.worldline, lease.configuration});
         }
         static auto lease_key(const continuation_lease& lease) -> std::string {
-            return rfl::json::write(std::tuple{std::string{"continuation"}, lease.view, lease.cursor});
+            return json::write(std::tuple{std::string{"continuation"}, lease.view, lease.cursor});
         }
-        void put_lease(const auto& lease) { database_->put(persistence::table::leases, lease_key(lease), rfl::json::write(lease)); }
+        void put_lease(const auto& lease) { database_->put(persistence::table::leases, lease_key(lease), json::write(lease)); }
         void write_accesses() {
             if (!pending_accesses_.empty())
                 database_->rows("UPDATE recipes SET accessed=MAX(accessed,CAST(?1 AS INTEGER)) WHERE key IN (SELECT value FROM json_each(?2))",
-                                {std::to_string(timestamp()), rfl::json::write(pending_accesses_)});
+                                {std::to_string(timestamp()), json::write(pending_accesses_)});
         }
         void write_leases(const std::set<view_id>& excluded = {}) {
             write_accesses();
@@ -1435,7 +1503,7 @@ export namespace semantic {
         }
         void insert_identities(const identity_index& pending) {
             for (const auto& [declaration, symbol] : pending) {
-                database_->insert(persistence::table::identities, rfl::json::write(declaration), rfl::json::write(symbol));
+                database_->insert(persistence::table::identities, json::write(declaration), json::write(symbol));
                 database_->rows("INSERT OR IGNORE INTO orphan_symbols VALUES (?1)", {symbol});
             }
         }

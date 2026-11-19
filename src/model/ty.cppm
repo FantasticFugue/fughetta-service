@@ -2,8 +2,9 @@ export module ty;
 import lsp;
 import std;
 import meta;
-import reflection;
+import json;
 import content;
+import pybind;
 export import provider;
 
 namespace builds {
@@ -52,7 +53,11 @@ namespace language {
     // python names the environment ty resolves imports from, as the adapter's does. ty finds it in VIRTUAL_ENV when no configuration
     // names one, so the server is started with that variable, bound to the tree like any other path of its environment.
     template <> struct server<"ty"> {
-        static auto channels() -> std::vector<semantic::channel_definition> { return source_channels(); }
+        static auto channels() -> std::vector<semantic::channel_definition> {
+            auto out = source_channels();
+            out.push_back(linkage_channel());
+            return out;
+        }
         using adapter = lsp_adapter;
         struct hint_settings {
             std::optional<bool> variable_types;
@@ -62,7 +67,7 @@ namespace language {
             std::optional<bool> auto_import;
         };
         struct settings {
-            std::map<std::string, rfl::Generic> configuration;
+            std::map<std::string, json::value> configuration;
             std::optional<std::string> configuration_file;
             std::optional<std::string> diagnostic_mode;
             std::optional<bool> show_syntax_errors;
@@ -86,7 +91,7 @@ namespace language {
             return {};
         }
 
-        using emits = std::tuple<>;
+        using emits = std::tuple<domain<"python">>;
         static auto requirements(const options& o) -> builds::requirements { return builds::tools({o.executable}); }
         static auto executes_project_code(const options& o) -> bool { return builds::in_project({o.executable}); }
         static void validate(const options& o);
@@ -194,7 +199,7 @@ namespace language {
         if (s.diagnostic_mode && *s.diagnostic_mode != "off" && *s.diagnostic_mode != "openFilesOnly" && *s.diagnostic_mode != "workspace")
             throw std::invalid_argument("ty diagnosticMode is off, openFilesOnly or workspace: " + *s.diagnostic_mode);
         for (auto& [key, value] : s.configuration)
-            if (key.empty() || std::holds_alternative<std::nullopt_t>(value.get()))
+            if (key.empty() || std::holds_alternative<std::monostate>(value.get()))
                 throw std::invalid_argument("a ty configuration key is a nonempty name with a value: " + key);
     }
 
@@ -205,9 +210,9 @@ namespace language {
             !std::ranges::any_of(inputs, [&](const auto& input) { return input.type == "python_environment" && input.path == *o.python; }))
             throw std::invalid_argument("the bound build does not produce the ty Python environment: " + *o.python);
         auto& s = o.server;
-        rfl::Generic::Object settings;
+        json::object settings;
         if (!s.configuration.empty()) {
-            rfl::Generic::Object configuration;
+            json::object configuration;
             for (auto& [key, value] : s.configuration)
                 configuration[key] = value;
             settings["configuration"] = std::move(configuration);
@@ -217,21 +222,21 @@ namespace language {
         if (s.diagnostic_mode)
             settings["diagnosticMode"] = *s.diagnostic_mode;
         if (s.show_syntax_errors)
-            settings["showSyntaxErrors"] = rfl::Generic{*s.show_syntax_errors};
+            settings["showSyntaxErrors"] = json::value{*s.show_syntax_errors};
         if (s.disable_language_services)
-            settings["disableLanguageServices"] = rfl::Generic{*s.disable_language_services};
-        rfl::Generic::Object hints, completions;
+            settings["disableLanguageServices"] = json::value{*s.disable_language_services};
+        json::object hints, completions;
         if (s.inlay_hints.variable_types)
-            hints["variableTypes"] = rfl::Generic{*s.inlay_hints.variable_types};
+            hints["variableTypes"] = json::value{*s.inlay_hints.variable_types};
         if (s.inlay_hints.call_argument_names)
-            hints["callArgumentNames"] = rfl::Generic{*s.inlay_hints.call_argument_names};
+            hints["callArgumentNames"] = json::value{*s.inlay_hints.call_argument_names};
         if (!hints.empty())
             settings["inlayHints"] = std::move(hints);
         if (s.completions.auto_import)
-            completions["autoImport"] = rfl::Generic{*s.completions.auto_import};
+            completions["autoImport"] = json::value{*s.completions.auto_import};
         if (!completions.empty())
             settings["completions"] = std::move(completions);
-        rfl::Generic::Object init;
+        json::object init;
         init["settings"] = std::move(settings);
         program out{.argv = {o.executable, "server"}, .env = o.env, .initialization = std::move(init)};
         if (o.python)

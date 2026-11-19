@@ -8,9 +8,6 @@ inputs:
   llvm-version:
     description: LLVM release (Linux takes its major from apt.llvm.org)
     default: 23.1.5
-  xclang-version:
-    description: xclang release for Windows
-    default: 23.1.5.2
   cmake-version:
     description: CMake release
     default: 4.5.0
@@ -71,14 +68,13 @@ runs:
         esac
 
     # Linux takes clang from apt.llvm.org and macOS from the LLVM release; both
-    # ship libc++ with its modules manifest. Upstream ships no libc++ for the
-    # MSVC target, so Windows takes clang-cl from the xclang release, whose
-    # configuration file selects the libc++ it bundles.
+    # ship libc++ with its modules manifest. Windows takes clang-cl from the
+    # LLVM release and compiles against the MSVC STL and Windows SDK of the
+    # runner's Visual Studio. The release trees also carry LLVM's libraries.
     - name: Fetch clang
       shell: bash
       env:
         LLVM_VERSION: ${{ inputs.llvm-version }}
-        XCLANG_VERSION: ${{ inputs.xclang-version }}
       run: |
         set -euo pipefail
         temporary="$RUNNER_TEMP"
@@ -104,12 +100,12 @@ runs:
             id="llvm-$LLVM_VERSION" ;;
           Windows)
             case "$RUNNER_ARCH" in X64) arch=x86_64 ;; ARM64) arch=aarch64 ;; esac
-            name="xclang-$XCLANG_VERSION-$arch-w64-mingw32.tar.xz"
+            name="clang+llvm-$LLVM_VERSION-$arch-pc-windows-msvc"
             temporary="$(cygpath -u "$temporary")"
-            curl -fsSL --retry 3 "https://github.com/clice-io/xclang/releases/download/$XCLANG_VERSION/$name" -o "$temporary/$name"
-            tar -xf "$temporary/$name" -C "$temporary"
-            root="$(cygpath -m "$temporary/xclang")"
-            id="xclang-$XCLANG_VERSION" ;;
+            curl -fsSL --retry 3 "https://github.com/llvm/llvm-project/releases/download/llvmorg-$LLVM_VERSION/$name.tar.xz" -o "$temporary/$name.tar.xz"
+            tar -xf "$temporary/$name.tar.xz" -C "$temporary"
+            root="$(cygpath -m "$temporary/$name")"
+            id="llvm-$LLVM_VERSION" ;;
         esac
         echo "CLANG_ROOT=$root" >> "$GITHUB_ENV"
         echo "CLANG_ID=$id" >> "$GITHUB_ENV"

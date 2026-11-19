@@ -3,12 +3,23 @@ module;
 #include <stdlib.h>
 #include <sys/utsname.h>
 #include <unistd.h>
+#ifdef __linux__
+#include <sched.h>
+#endif
 
 module host;
 import std;
 import posix;
 
 namespace host {
+    auto available_cpus() noexcept -> unsigned {
+#ifdef __linux__
+        cpu_set_t cpus;
+        if (::sched_getaffinity(0, sizeof cpus, &cpus) == 0)
+            return static_cast<unsigned>(CPU_COUNT(&cpus));
+#endif
+        return std::thread::hardware_concurrency();
+    }
     auto executable() -> std::filesystem::path { return posix::executable(); }
     const std::string_view default_data_root = "/srv/data";
     namespace {
@@ -94,5 +105,4 @@ namespace host {
         ::gethostname(buf.data(), buf.size() - 1);
         return buf.data();
     }
-    auto account() -> std::string { return std::format("{}:{}", ::getuid(), ::getgid()); }
 } // namespace host

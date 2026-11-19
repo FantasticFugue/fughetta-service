@@ -34,7 +34,7 @@ def export(root, kind, tool, exporter, projects=(), generated=(), prepare=True):
             ["-Dfughetta.generated." + str(i) + "=" + str(root / path) for i, path in enumerate(generated)] +
             (["fughettaPrepare", "fughettaModel"] if prepare else ["fughettaModel"]), root)
     else:
-        common = [tool, "fsi", "--exec", exporter, "--"]
+        common = [tool, exporter]
         flags = ["--tool", tool, "--root", root, "--project-dir", root, "--jobs", "2"]
         for project in projects:
             flags += ["--project", project]
@@ -158,9 +158,9 @@ def check_objects(root, model):
 
 
 def fsharp(root, tool):
-    repeated = subprocess.run([str(tool), "fsi", "--exec", str(args.exporter), "--",
+    repeated = subprocess.run([str(tool), str(args.exporter),
                                "--root", str(root), "--root", str(root), "--operations", "model"], cwd=root, text=True, capture_output=True)
-    assert repeated.returncode != 0 and "Repeated option: --root" in repeated.stderr
+    assert repeated.returncode != 0 and "--root" in repeated.stderr
     put(root, "library/Library.fsproj", """<Project Sdk="Microsoft.NET.Sdk">
 <PropertyGroup><TargetFramework>net10.0</TargetFramework></PropertyGroup>
 <ItemGroup><Compile Include="Library.fsi"/><Compile Include="Library.fs"/></ItemGroup>

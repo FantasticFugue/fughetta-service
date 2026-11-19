@@ -1,0 +1,16 @@
+#!/bin/sh
+set -eu
+
+case "$1" in
+  remove)
+    deb-systemd-helper mask fughetta-service@default.service >/dev/null || true
+    ;;
+  purge)
+    deb-systemd-helper purge fughetta-service@default.service >/dev/null || true
+    deb-systemd-helper unmask fughetta-service@default.service >/dev/null || true
+    # Workspace data and its account survive removal, including purge.
+    ;;
+esac
+if [ -d /run/systemd/system ]; then
+  systemctl --system daemon-reload
+fi

@@ -4,7 +4,7 @@ export import support;
 export import native;
 export import coroutine;
 export import http;
-export import reflection;
+export import json;
 export import configuration;
 import keyring;
 import usage;
@@ -182,7 +182,7 @@ export namespace test {
     }
 
     template <class T> auto decode(std::string_view text) -> T {
-        auto parsed = rfl::json::read<T, rfl::DefaultIfMissing>(std::string{text});
+        auto parsed = json::read<T, json::defaults>(std::string{text});
         require(bool(parsed), "invalid response: " + std::string{text});
         return std::move(*parsed);
     }
@@ -196,10 +196,10 @@ export namespace test {
     }
     auto tool(std::uint16_t port, std::string name, std::string args, bool error = false, std::string credential = "sk_test") -> std::string {
         if (credential == "sk_test" && (name == "worldline" || name == "language" || name == "scope" || name == "build" || name == "test" || name == "run")) {
-            auto object = decode<rfl::Generic>(args).to_object().value();
+            auto object = decode<json::value>(args).to_object().value();
             if (!object.get("worldline"))
                 object["worldline"] = "main";
-            args = rfl::json::write(object);
+            args = json::write(object);
         }
         auto response =
             request(port, http::method::POST, "/mcp",
@@ -207,14 +207,14 @@ export namespace test {
         require(response.status == 200, response.body);
         struct payload {
             bool isError = false;
-            rfl::Generic structuredContent;
+            json::value structuredContent;
         };
         struct reply {
             std::optional<payload> result;
         };
         auto parsed = decode<reply>(response.body);
         require(parsed.result && parsed.result->isError == error, response.body);
-        return error ? response.body : rfl::json::write(parsed.result->structuredContent);
+        return error ? response.body : json::write(parsed.result->structuredContent);
     }
     inline constexpr std::string_view project = "/api/v1/projects/app";
     auto worldline(std::uint16_t port, std::string project, std::string action, std::string fields = {}, bool error = false) -> std::string {
@@ -225,7 +225,7 @@ export namespace test {
         }
         auto response =
             request(port, http::method::POST, "/api/v1/projects/" + project + "/worldline",
-                    std::format(R"({{"project":{},"action":{}{}}})", rfl::json::write(project), rfl::json::write(action), fields.empty() ? "" : "," + fields));
+                    std::format(R"({{"project":{},"action":{}{}}})", json::write(project), json::write(action), fields.empty() ? "" : "," + fields));
         require(error ? response.status >= 400 : response.status == 200, response.body);
         return response.body;
     }

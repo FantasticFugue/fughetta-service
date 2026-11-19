@@ -2,7 +2,7 @@ export module package;
 import std;
 import content;
 import durability;
-import reflection;
+import json;
 import nodes;
 import engine;
 import codec;
@@ -85,7 +85,7 @@ export namespace package {
         auto text = bounded(journal, 4096);
         if (!text)
             return std::nullopt;
-        auto r = rfl::json::read<replacement>(*text);
+        auto r = json::read<replacement>(*text);
         if (!r || !scratch_named(r->retired, "retired") || !scratch_named(r->staging, "staging"))
             return std::nullopt;
         return *r;
@@ -107,7 +107,7 @@ export namespace package {
         auto text = bounded(root / "manifest.json", 64u << 20);
         if (!text)
             nodes::fail(nodes::code::invalid_record, "the package manifest is missing, not a plain file, or larger than any package holds");
-        auto parsed = rfl::json::read<manifest>(*text);
+        auto parsed = json::read<manifest>(*text);
         if (!parsed || parsed->format != format)
             nodes::fail(nodes::code::invalid_record, "the package manifest is unreadable or of another format");
         // Every entry of one digest declares the bytes that digest names, so limits see what is restored; no path is held twice or
@@ -315,7 +315,7 @@ export namespace package {
             out.configuration_digest = content::hash_of(configuration);
             durability::durable_write(staging / "configuration.json", configuration);
         }
-        durability::durable_write(staging / "manifest.json", rfl::json::write(out));
+        durability::durable_write(staging / "manifest.json", json::write(out));
         // The staged package is read back as a restore will read it, so the old one is never given up for one that cannot be.
         examine(staging);
         admit(staging);
@@ -323,7 +323,7 @@ export namespace package {
         if (std::filesystem::exists(std::filesystem::symlink_status(root))) {
             auto retired = scratch(root.parent_path(), "retired");
             auto journal = journal_of(root);
-            durability::durable_write(journal, rfl::json::write(replacement{retired.filename().string(), staging.filename().string()}));
+            durability::durable_write(journal, json::write(replacement{retired.filename().string(), staging.filename().string()}));
             durability::durable_rename(root, retired);
             durability::durable_rename(staging, root);
             std::filesystem::remove_all(retired);
@@ -356,7 +356,7 @@ export namespace package {
         auto done = node.call({.action = "receipt", .worldline = in.worldline, .operation = in.operation, .owner = node.node_id()});
         if (done.code == "ok") {
             // The operation ID answers only for this restore: the same package into the same worldline.
-            auto kept = rfl::json::read<restored>(done.result);
+            auto kept = json::read<restored>(done.result);
             if (!kept || kept->package != in.target || done.worldline != in.worldline)
                 nodes::fail(nodes::code::identity_conflict, "operation ID was used for another change");
             done.replayed = true;
@@ -377,7 +377,7 @@ export namespace package {
                             std::format("the package holds {} bytes, more than the {} byte project limit", total, in.project_limit));
         });
         // An empty package is restored by its fork alone, which then holds the caller's operation and the restore's record.
-        auto record = rfl::json::write(restored{in.target, kept.version, configuration});
+        auto record = json::write(restored{in.target, kept.version, configuration});
         bool empty = kept.files.empty();
         auto fork = node.call({.action = "fork",
                                .worldline = in.worldline,

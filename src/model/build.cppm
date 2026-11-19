@@ -1,7 +1,7 @@
 export module build;
 import std;
 import meta;
-import reflection;
+import json;
 import content;
 export import provider;
 export import report;
@@ -29,7 +29,7 @@ export namespace builds {
         static constexpr std::string_view name = Name.view();
         literal<Name> adapter;
         config<Name> options;
-        rfl::Rename<"requires", requirements> needs;
+        json::named<"requires", requirements> needs;
         environment env;
     };
 
@@ -37,7 +37,7 @@ export namespace builds {
     template <meta::fixed_string... Names> struct catalog {
         static_assert((system<adapter<Names>> && ...));
         static_assert(meta::distinct(std::array{std::string_view{Names}...}));
-        using builder = rfl::TaggedUnion<"adapter", with<Names>...>;
+        using builder = json::tagged<"adapter", with<Names>...>;
     };
     template <meta::fixed_string... Names> struct formats {
         static_assert((layout<format<Names>> && ...));
@@ -82,10 +82,12 @@ export namespace builds {
         std::map<std::string, task> tasks;
         std::map<std::string, operation, std::less<>> operations;
         std::map<std::string, reference> outputs;
-        rfl::Rename<"requires", requirements> needs;
+        json::named<"requires", requirements> needs;
         environment env;
         bool enabled = true;
         builds::limits limits;
+        // Only build directories whose contents can be moved to a different checkout.
+        std::vector<std::string> relocatable_build_dirs;
     };
     struct request {
         std::string operation;
@@ -94,7 +96,7 @@ export namespace builds {
 
     auto adapter_of(const builder& b) -> std::string_view;
     // The option schema of every build system, by name.
-    auto schemas() -> const std::map<std::string, rfl::Generic>&;
+    auto schemas() -> const std::map<std::string, json::value>&;
     void validate(const configuration& c);
     auto prepare(const configuration& c, const request& request) -> plan;
     // Expands the selected producers and their prerequisites, preserving consumer input order.

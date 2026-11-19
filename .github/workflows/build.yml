@@ -1,6 +1,6 @@
 name: build
 
-# The debug preset on Linux x64 and Windows x64, with sanitizers on Linux.
+# Native debug builds and tests.
 on:
   push:
     branches: [main]
@@ -24,6 +24,11 @@ jobs:
         include:
           - name: linux-x64
             os: ubuntu-24.04
+          - name: macos-arm64
+            os: macos-15
+            configure: -DCLANG_SANITIZER=
+            targets: --target executor-test
+            test: -R '^executor$'
           - name: windows-x64
             os: windows-2025
             configure: -DCLANG_SANITIZER=
@@ -51,12 +56,12 @@ jobs:
         # fail the step.
         run: |
           for attempt in $(seq 10); do
-            cmake --build --preset debug --parallel 2 && exit 0
+            cmake --build --preset debug --parallel 2 ${{ matrix.targets }} && exit 0
           done
           exit 1
 
       - name: Test
-        run: ctest --preset debug
+        run: ctest --preset debug ${{ matrix.test }}
 
       - name: Upload logs on failure
         if: failure()
@@ -67,3 +72,10 @@ jobs:
             build/debug/vcpkg-manifest-install.log
             build/debug/Testing/Temporary/LastTest.log
           if-no-files-found: ignore
+
+      - name: Retain macOS test results
+        if: matrix.name == 'macos-arm64' && success()
+        uses: actions/upload-artifact@v7
+        with:
+          name: tests-${{ matrix.name }}
+          path: build/debug/Testing/Temporary/LastTest.log

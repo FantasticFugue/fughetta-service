@@ -3,7 +3,7 @@ import std;
 import constants;
 export import reuse;
 export import utility;
-import reflection;
+import json;
 import coroutine;
 import native;
 import meta;
@@ -14,20 +14,28 @@ export import build;
 export import language;
 export import runner;
 
-// A content digest is sent as its lowercase hex text, so the frames and the JSON schema are unchanged by the
-// digest being its own type.
-export namespace rfl {
-    template <> struct Reflector<content::hash> {
-        using ReflType = std::string;
-        static auto from(const content::hash& h) -> std::string { return std::string{h.view()}; }
-        static auto to(const std::string& value) -> content::hash { return content::hash{value}; }
-    };
-} // namespace rfl
-
 export namespace jobs {
     struct platform {
         std::string os;
         std::string arch;
+    };
+
+    struct warm_session {
+        std::string stage, provider, options, snapshot;
+        std::uint64_t epoch = 0;
+        std::optional<io::process_usage> usage;
+        double rebuild_seconds = 0;
+        std::uint64_t high_water_bytes = 0;
+    };
+    struct cached_session {
+        std::string stage, options, snapshot, toolchain;
+    };
+    struct worker_slot {
+        std::string project, tree;
+        bool busy = false;
+        std::vector<warm_session> sessions;
+        std::string snapshot;
+        std::vector<cached_session> cached;
     };
 
     struct hello {
@@ -47,25 +55,13 @@ export namespace jobs {
         std::string toolchain_id;
         bool dependency_publisher = false;
         std::optional<std::uint64_t> memory_bytes;
+        std::vector<worker_slot> slots;
     };
 
     struct admission {
         bool accepted = false;
         std::string code;
         std::string worker_id;
-    };
-
-    struct warm_session {
-        std::string stage, provider, options, snapshot;
-        std::uint64_t epoch = 0;
-        std::optional<io::process_usage> usage;
-        double rebuild_seconds = 0;
-        std::uint64_t high_water_bytes = 0;
-    };
-    struct worker_slot {
-        std::string project, tree;
-        bool busy = false;
-        std::vector<warm_session> sessions;
     };
 
     struct heartbeat {
@@ -76,6 +72,11 @@ export namespace jobs {
         std::optional<std::uint64_t> limit;
         std::uint64_t reserved = 0;
         std::optional<std::uint64_t> resident, baseline;
+    };
+    struct tree_holds {
+        std::uint64_t sequence = 0;
+        std::set<std::string> trees;
+        std::optional<std::uint64_t> memory_bytes;
     };
     struct slot_report {
         std::vector<worker_slot> slots;
@@ -130,7 +131,7 @@ export namespace jobs {
     } // namespace why
 
     struct hash_file {
-        rfl::Description<"Path relative to the worker's data root; first segment names the dataset", std::string> path;
+        json::described<"Path relative to the worker's data root; first segment names the dataset", std::string> path;
         std::optional<std::string> algo;
     };
 
@@ -140,18 +141,20 @@ export namespace jobs {
     };
 
     inline auto locate(const hash_file& j) -> std::string_view {
-        std::string_view p = j.path.value();
+        std::string_view p = j.path.get();
         return p.substr(0, p.find('/'));
     }
 
     struct sync_offer {
         std::string project;
         content::manifest tree;
+        std::optional<content::hash> retained;
     };
 
     struct sync_plan {
         content::hash snapshot;
         std::vector<content::hash> missing;
+        bool needs_tree = false;
     };
 
     // The most plain bytes one piece of a blob holds.
@@ -231,7 +234,7 @@ export namespace jobs {
         semantic::input_vector inputs;
         std::vector<builds::context> artifacts;
         std::vector<std::string> argv;
-        rfl::Generic initialization;
+        json::value initialization;
         std::map<std::string, std::string> env;
         std::uint32_t seconds = 600;
         semantic::request query;
@@ -265,6 +268,35 @@ export namespace jobs {
         return out;
     }
 
+    struct worktree_capture {
+        std::vector<std::string> prefixes, excluded;
+        std::uint64_t file_limit = constants::worktree_capture_bytes;
+
+        static auto within(std::string_view path, std::string_view prefix) -> bool {
+            return path == prefix || (path.starts_with(prefix) && path.size() > prefix.size() && path[prefix.size()] == '/');
+        }
+        auto excludes(std::string_view path) const -> bool {
+            for (auto part : std::views::split(path, '/')) {
+                const std::string_view name{part.begin(), part.end()};
+                if (name == ".git" || name == ".hg" || name == ".svn" || name == "__pycache__" ||
+                    name == ".pytest_cache" || name == ".ruff_cache" || name == "node_modules" || name == ".fughetta")
+                    return true;
+            }
+            return std::ranges::any_of(excluded, [&](const auto& prefix) { return prefix == "." || within(path, prefix); });
+        }
+        auto includes(std::string_view path) const -> bool {
+            return !excludes(path) && std::ranges::any_of(prefixes, [&](const auto& prefix) { return within(path, prefix); });
+        }
+    };
+
+    struct worktree_change {
+        std::string path;
+        // Absent for removal and mode-only changes; otherwise the entire new file, encoded as hex.
+        std::optional<std::string> bytes;
+        std::optional<bool> executable;
+        auto operator==(const worktree_change&) const -> bool = default;
+    };
+
     struct build_request {
         std::string project;
         std::string tree;
@@ -285,6 +317,9 @@ export namespace jobs {
         // The analysis stage this build prepares the tree for: its report names the inputs it leaves, and a
         // preparation task that already ran on this snapshot is not run again.
         std::optional<std::string> prepares;
+        std::vector<std::string> relocatable_build_dirs;
+        std::optional<content::hash> parent_snapshot;
+        std::optional<worktree_capture> capture_worktree_changes;
     };
 
     // What a preparation leaves for the analysis of one snapshot, by content: the measured outputs of its steps.
@@ -294,7 +329,7 @@ export namespace jobs {
         std::vector<builds::artifact_result> outputs;
         // Advances whenever a preparation step runs in the tree: a measured directory has no digest.
         std::uint64_t generation = 0;
-        auto id() const -> content::hash { return content::hash_of(rfl::json::write(*this)); }
+        auto id() const -> content::hash { return content::hash_of(json::write(*this)); }
     };
 
     // An analysis of a prepared tree. `inputs` is the inventory its preparation reported; a worker whose tree
@@ -582,8 +617,52 @@ export namespace jobs {
         // Set by a build that prepares an analysis, once every step succeeded.
         std::optional<analysis_inputs> inputs;
 
+        std::vector<semantic::execution_receipt> receipts;
+        // Filled only after the control plane verifies the corresponding receipt.
+        std::vector<semantic::artifact_receipt> artifact_audit;
+        std::optional<std::vector<worktree_change>> worktree_changes;
+        std::string worktree_capture_error;
+
         auto ok() const -> bool {
             return std::ranges::all_of(steps, [](auto& s) { return s.exit_code == 0 && !s.timed_out; });
+        }
+    };
+
+    inline auto shard_claim(language::evaluated_unit& unit, semantic::shard& shard, std::string workspace, std::string worker)
+        -> semantic::execution_receipt {
+        return {std::move(workspace), std::move(worker), unit.session.snapshot, semantic::recipe_identifier(shard.unit.recipe),
+                "semantic_shard", semantic::shard_key(shard), content::hash_of(json::write(unit.request.execution)).str(), {}};
+    }
+
+    template <class Request> auto artifact_recipe(const Request& request) -> std::string {
+        return content::hash_of(json::write(request)).str();
+    }
+
+    struct artifact_submission {
+        semantic::execution_receipt receipt;
+        std::string manifest;
+    };
+
+    inline auto artifact_claim(const build_report& report, std::string snapshot, std::string recipe, std::string workspace, std::string worker)
+        -> std::optional<artifact_submission> {
+        std::vector<std::pair<std::size_t, builds::exported_file>> logs;
+        for (std::size_t index = 0; index < report.steps.size(); ++index)
+            if (report.steps[index].log)
+                logs.emplace_back(index, *report.steps[index].log);
+        if (report.measured.empty() && report.exports.empty() && report.models.empty() && logs.empty() && !report.inputs)
+            return {};
+        auto manifest = json::write(std::tie(report.measured, report.exports, report.models, logs, report.inputs));
+        return artifact_submission{
+            {std::move(workspace), std::move(worker), std::move(snapshot), std::move(recipe), "artifact_manifest", content::hash_of(manifest).str(), {}, {}},
+            std::move(manifest)};
+    }
+
+    struct receipt_signer {
+        const content::receipt_key* key = nullptr;
+        std::string workspace, worker;
+        auto sign(semantic::execution_receipt claim) const -> semantic::execution_receipt {
+            claim.signature = key->sign(claim.payload());
+            return claim;
         }
     };
 
@@ -592,6 +671,7 @@ export namespace jobs {
         analyzed.steps.insert(analyzed.steps.begin(), std::make_move_iterator(prepared.steps.begin()), std::make_move_iterator(prepared.steps.end()));
         analyzed.exports.insert(analyzed.exports.begin(), std::make_move_iterator(prepared.exports.begin()), std::make_move_iterator(prepared.exports.end()));
         analyzed.models = std::move(prepared.models);
+        std::ranges::move(prepared.artifact_audit, std::back_inserter(analyzed.artifact_audit));
         analyzed.export_error = std::move(prepared.export_error);
         analyzed.export_skipped = std::move(prepared.export_skipped);
         analyzed.inputs = std::move(prepared.inputs);
@@ -649,7 +729,7 @@ export namespace jobs {
 
     using requests = meta::list<rpc<"node.call", node_call, nodes::node_reply>, rpc<"node.capture", node_capture, nodes::node_reply>,
                                 rpc<"node.usage", node_usage, node_usage_reply>, rpc<"hash_file", hash_file, digest>, rpc<"sync.offer", sync_offer, sync_plan>,
-                                rpc<"sync.parts", source_bytes, authority_ack>, rpc<"build", build_request, build_report>,
+                                rpc<"execute.holds", tree_holds, authority_ack>, rpc<"sync.parts", source_bytes, authority_ack>, rpc<"build", build_request, build_report>,
                                 rpc<"analysis", analysis_request, build_report>, rpc<"analysis.reuse", reuse_request, reuse_reply>,
                                 rpc<"analysis.shard", shard_read, shard_piece>, rpc<"model.read", model_read, source_bytes>,
                                 rpc<"export.read", export_read, source_bytes>, rpc<"dependency.fill", dependency_fill, build_report>>;
@@ -715,7 +795,7 @@ export namespace transport {
 
     template <class T> struct codec {
         static auto encode(const T& value) -> std::vector<std::byte> {
-            auto text = rfl::json::write(value);
+            auto text = json::write(value);
             auto bytes = std::as_bytes(std::span{text});
             return {bytes.begin(), bytes.end()};
         }
@@ -725,9 +805,9 @@ export namespace transport {
             if constexpr (std::same_as<T, jobs::dependency_fill>) {
                 if (payload.size() > constants::dependency_request_bytes)
                     throw std::invalid_argument("dependency fill request exceeds size limit");
-                return rfl::json::read<T, rfl::NoExtraFields>(std::string_view{reinterpret_cast<const char*>(payload.data()), payload.size()}).value();
+                return json::read<T, json::strict>(std::string_view{reinterpret_cast<const char*>(payload.data()), payload.size()}).value();
             }
-            return rfl::json::read<T>(std::string_view{reinterpret_cast<const char*>(payload.data()), payload.size()}).value();
+            return json::read<T>(std::string_view{reinterpret_cast<const char*>(payload.data()), payload.size()}).value();
         }
     };
 
@@ -982,7 +1062,7 @@ export namespace transport {
                             committed.bytes != slot->unit_bytes)
                             throw std::invalid_argument("invalid semantic unit commit");
                         if (slot->inputs && !slot->cancelled) {
-                            auto unit = rfl::json::read<language::evaluated_unit>(slot->unit);
+                            auto unit = json::read<language::evaluated_unit>(slot->unit);
                             if (!unit || unit->request.execution != committed.execution || unit->request.slot_id != committed.slot_id ||
                                 unit->request.unit != committed.unit || unit->request.epoch != committed.epoch ||
                                 jobs::inventory(*unit) != committed.contributions)
@@ -1193,11 +1273,14 @@ export namespace transport {
 
     template <io::stream S> class dispatcher {
     public:
+        jobs::receipt_signer signer;
+
         struct exchange {
             channel<S>& chan;
             std::uint64_t corr;
             std::uint64_t committed = 0;
             std::optional<language::evaluation_identity> execution;
+            const jobs::receipt_signer& signer;
 
             auto progress(jobs::progress p) -> coroutine::task<> {
                 p.execution = execution;
@@ -1206,8 +1289,12 @@ export namespace transport {
             auto commit(language::evaluated_unit unit) -> coroutine::task<> {
                 if (execution && unit.request.execution != *execution)
                     throw std::logic_error("provider unit belongs to another execution");
+                unit.receipts.clear();
+                if (signer.key)
+                    for (auto& shard : unit.shards)
+                        unit.receipts.push_back(signer.sign(jobs::shard_claim(unit, shard, signer.workspace, signer.worker)));
                 jobs::unit_committed done{unit.request.execution, unit.request.slot_id, unit.request.unit, unit.request.epoch, 0, jobs::inventory(unit)};
-                auto data = rfl::json::write(unit);
+                auto data = json::write(unit);
                 done.bytes = data.size();
                 if (data.size() > constants::semantic_object_bytes)
                     throw std::length_error("semantic unit exceeds its storage budget");
@@ -1255,7 +1342,7 @@ export namespace transport {
             if (parent.stop_possible())
                 link.emplace(parent, forward{&source});
             std::pair key{&chan, f.corr};
-            exchange ex{chan, f.corr};
+            exchange ex{chan, f.corr, 0, {}, signer};
             running_[key] = {&source, &ex};
             struct forget {
                 dispatcher* self;
@@ -1273,7 +1360,19 @@ export namespace transport {
                 auto request = decode<Req>(f);
                 if constexpr (requires { jobs::traits<Req>::identity(request); })
                     ex.execution = jobs::traits<Req>::identity(request);
-                out.emplace(co_await handler(std::move(request), ex));
+                if constexpr (jobs::execution_request<Req>) {
+                    const auto recipe = ex.signer.key ? jobs::artifact_recipe(request) : std::string{};
+                    const auto snapshot = request.snapshot.str();
+                    auto report = co_await handler(std::move(request), ex);
+                    report.receipts.clear();
+                    report.artifact_audit.clear();
+                    if (ex.signer.key)
+                        if (auto claim = jobs::artifact_claim(report, snapshot, recipe, ex.signer.workspace, ex.signer.worker))
+                            report.receipts.push_back(ex.signer.sign(std::move(claim->receipt)));
+                    out.emplace(std::move(report));
+                } else {
+                    out.emplace(co_await handler(std::move(request), ex));
+                }
             } catch (const coded_error& e) {
                 error = e.what();
                 code = e.code;

@@ -3,12 +3,16 @@
 
 find_package(stdexec CONFIG REQUIRED)
 find_package(argparse CONFIG REQUIRED)
-find_package(reflectcpp CONFIG REQUIRED)
+find_package(yyjson CONFIG REQUIRED)
+find_package(simdjson CONFIG REQUIRED)
+find_package(pugixml CONFIG REQUIRED)
 find_package(asio CONFIG REQUIRED)
 find_package(unofficial-sodium CONFIG REQUIRED)
 find_package(unofficial-sqlite3 CONFIG REQUIRED)
 find_package(zstd CONFIG REQUIRED)
-find_package(ZLIB REQUIRED)
+find_package(ada CONFIG REQUIRED)
+find_package(libzip CONFIG REQUIRED)
+find_package(roaring CONFIG REQUIRED)
 find_package(c-ares CONFIG REQUIRED)
 
 # httpant builds from source, since module BMIs are not portable between

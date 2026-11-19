@@ -3,7 +3,14 @@ import boost.ut;
 import support;
 import jni;
 import pinvoke;
-import reflection;
+import json;
+import llvm;
+import language;
+import channels;
+import objects;
+import native;
+import coroutine;
+import knowledge;
 
 namespace {
     using namespace boost::ut;
@@ -39,9 +46,125 @@ namespace {
         const auto found = std::ranges::find(shard.relations, from, &semantic::records::relation::from);
         if (found == shard.relations.end() || !found->detail)
             throw std::invalid_argument("no binding from " + from);
-        return rfl::get<semantic::records::binding_detail>(found->detail->variant());
+        return std::get<semantic::records::binding_detail>(found->detail->variant());
     }
     const auto cases = [] {
+        "Python runtime reports bind every captured overload to its native definition"_test = [] {
+            ::test::scratch scratch{"python-native-bindings"};
+            std::ofstream{scratch.dir / "report"} << R"json({
+              "domain":"python","module":"example","library":"example.so",
+              "symbols":[{"name":"Counter","kind":"type","surface":{}},
+                {"name":"Counter.renamed","owner":"Counter","kind":"method","surface":{},"wrapper":"nanobind","native_targets":[
+                  {"library":"example.so","offset":16,"linkage_name":"first"},{"library":"impl.so","offset":16,"linkage_name":"second"}]}],
+              "calls":[{"member":"Counter.renamed","path":"caller.py","caller":"<module>","first_line":1,"begin":5,"end":17,
+                "native_targets":[{"native":{"library":"impl.so","offset":16,"linkage_name":"second"},"dispatch":"direct"}],
+                "unresolved_native_dispatch":true}]
+            })json";
+            semantic::shard cpp;
+            cpp.unit = semantic::make_unit({{"app", "cpp", "clice", "evaluate", semantic::unit_kind::file, "impl.cpp"}, "cpp"}, "cpp-context");
+            const semantic::ownership definition_owner{cpp.unit.id, cpp.unit.context};
+            const semantic::place body{"impl.cpp", 0, 25};
+            cpp.identities = {{semantic::native_identity{"app", "impl", "clice", "source", "implementation"}, "implementation"}};
+            cpp.symbols = {{.id = "implementation", .ownership = definition_owner, .language = "cpp", .domain = "source", .module = "impl",
+                            .name = "implementation", .qualified_name = "implementation", .kind = "function"}};
+            cpp.occurrences = {{.id = "implementation:definition", .ownership = definition_owner, .symbol = "implementation", .location = {.source = body},
+                                .roles = {std::string{"definition"}}, .body = body}};
+            const auto definitions = channels::source_definitions({&cpp}, {std::string{"function"}});
+            semantic::store views{scratch.dir / "views"};
+            auto graph = views.describe(views.publish_records({.snapshots = {{"app", "main", "v1", "snapshot"}}}, {cpp}, {}));
+            auto publish = [&](semantic::shard records) {
+                const auto unit = records.unit.id;
+                auto view = views.load(views.publish_records(graph, {std::move(records)}, {}));
+                graph = view->description;
+                const auto found = std::ranges::find_if(view->pieces, [&](const auto& piece) { return piece->unit.id == unit; });
+                if (found == view->pieces.end())
+                    throw std::runtime_error("published input unit has no shard");
+                return std::make_shared<semantic::shard_object>((*found)->materialized(), nullptr, std::filesystem::path{});
+            };
+            auto library = [&](std::string module, std::string artifact, std::string name) {
+                llvm::object value{.format = "elf", .arch = "x86_64",
+                                   .symbols = {{.name = std::move(name), .kind = "function", .binding = "Local", .address = 16, .size = 8}}};
+                auto records = llvm::records(value, "app", "options", module, module, artifact, {});
+                if (module == "impl")
+                    llvm::associate(records, {{16, {{"impl.cpp", 1, 5}}}}, definitions, {{"impl.cpp", "int implementation() { return 0; }\n"}},
+                                    scratch.dir);
+                records.unit.modules = {module};
+                records.unit.channel_definitions = language::server<"native-artifact">::channels();
+                records.unit.output_channels = channels::outputs(records.unit.channel_definitions, {&records});
+                return publish(std::move(records));
+            };
+            std::set<std::string> bound;
+            std::vector<semantic::shard> resolved;
+            semantic::entity caller;
+            cores::io_context<native::context> runtime{1};
+            runtime.run([&](auto& io, std::size_t) -> coroutine::task<> {
+                using reader = language::server<"python-runtime">;
+                reader::adapter observe{io, {.cwd = scratch.dir}, {.project = "app", .stage = "observe", .provider = "python-runtime", .options = "observe"}};
+                observe.objects({scratch.dir, {"report"}});
+                auto session = co_await observe.open(reader::launch({}, {{"artifact", "python-runtime", "runtime.json", "file"}}).initialization);
+                session = co_await observe.update(session.epoch, {.snapshot = "snapshot", .source_files = {{"caller.py", "caller"}},
+                                                                 .model = {{"runtime.json", "report"}}});
+                const auto entries = co_await observe.units(session.epoch, {});
+                auto read = co_await observe.evaluate({.execution = {"request", "compute", "observe"}, .slot_id = session.slot, .unit = entries.front(),
+                                                       .epoch = session.epoch, .inputs = session.inputs});
+                co_await observe.close();
+                auto& observed = read.shards.front();
+                const auto method = std::ranges::find(observed.symbols, std::string{"python:Counter.renamed"}, &semantic::records::symbol::id);
+                expect((method != observed.symbols.end()) >> fatal);
+                expect(method->name == "renamed" && method->owner == "python:Counter");
+                expect(std::ranges::any_of(observed.relations, [&](const auto& relation) {
+                    if (relation.kind != "calls" || relation.to != method->id || !relation.detail)
+                        return false;
+                    const auto& detail = std::get<semantic::records::native_call_detail>(relation.detail->variant());
+                    return detail.evidence == "unresolved" && !detail.dispatch;
+                }));
+                expect(std::ranges::any_of(observed.relations, [&](const auto& relation) {
+                    if (relation.kind != "calls" || relation.to == method->id || !relation.detail)
+                        return false;
+                    const auto& detail = std::get<semantic::records::native_call_detail>(relation.detail->variant());
+                    return detail.evidence == "observed" && detail.dispatch && *detail.dispatch == "direct";
+                }));
+                observed.unit.channel_definitions = reader::channels();
+                observed.unit.output_channels = channels::outputs(observed.unit.channel_definitions, {&observed});
+                const auto report = publish(std::move(observed));
+                const auto& records = report->data->symbols;
+                const auto method_id = std::ranges::find_if(records, [](const auto& symbol) {
+                    return symbol.qualified_name == "example.Counter.renamed" && !symbol.extensions.contains("python.observed_dispatch");
+                });
+                const auto caller_symbol = std::ranges::find(records, std::string{"<module>"}, &semantic::records::symbol::qualified_name);
+                expect((method_id != records.end() && caller_symbol != records.end()) >> fatal);
+                caller = {caller_symbol->id};
+                auto bridge = language::make_adapter(io, {.cwd = scratch.dir},
+                                                     {.slot = "slot", .project = "app", .provider = "pybind", .options = "options", .stage = "bind"}, {},
+                                                     {.execution = "runtime"});
+                auto command = language::server<"pybind">::launch({.libraries = {{"example.so", "example"}, {"impl.so", "impl"}}}, {});
+                auto active = co_await bridge->open(command.initialization);
+                const auto exported = library("example", "example.so", "first");
+                const auto implementation = library("impl", "impl.so", "second");
+                active = co_await bridge->update(active.epoch, {.snapshot = "snapshot", .source_facts = {
+                    {"managed", {report}}, {"native", {exported, implementation}}}});
+                for (const auto& unit : co_await bridge->units(active.epoch, {})) {
+                    auto result = co_await bridge->evaluate({.execution = {"request", "compute", "bind"}, .slot_id = active.slot, .unit = unit,
+                                                            .epoch = active.epoch, .inputs = active.inputs});
+                    for (const auto& relation : result.shards.front().relations)
+                        if (relation.kind == "binds" && relation.from == method_id->id && relation.resolution == "resolved" && relation.detail)
+                            if (const auto& detail = std::get<semantic::records::binding_detail>(relation.detail->variant()); detail.entry_point)
+                                bound.insert(*detail.entry_point);
+                    resolved.push_back(std::move(result.shards.front()));
+                }
+                co_await bridge->close();
+            });
+            expect(bound == std::set<std::string>{"first", "second"});
+            auto view = views.load(views.publish_records(graph, std::move(resolved), {}));
+            const auto chain = view->query({.action = std::string{"relations"}, .selector = semantic::selection{.entity = caller},
+                                            .relations = {"calls", "binds", "emits"}, .direction = std::string{"both"}, .depth = 3});
+            expect(chain.relations.size() == 6_u) << json::write(chain.relations);
+            expect(std::ranges::count(chain.relations, std::string{"calls"}, &semantic::records::relation::kind) == 2);
+            expect(std::ranges::any_of(chain.relations, [](const auto& relation) {
+                const auto& at = relation.ownership.origin.location;
+                return relation.kind == "emits" && at && at->source && at->source->path == "impl.cpp";
+            }));
+        };
         "Kotlin external declarations bind to C++ Java_ definitions without artifacts"_test = [] {
             source_unit kotlin{"app", "kotlin"}, cpp{"app", "clice"};
             kotlin.add(symbol("add", "kotlin", "kotlin", "app", "add", "sample/Native.Inner.add", "method", {"external"}), "src/Native.kt");
@@ -80,13 +203,13 @@ namespace {
         "F# DllImport declarations bind to C++ definitions without artifacts"_test = [] {
             source_unit fsharp{"app", "fsharp"}, cpp{"app", "clice"};
             auto imported = symbol("add", "fsharp", "fsharp", "app", "add", "Native.add", "function", {"pinvoke"});
-            imported.extensions = {{"clr.pinvoke.library", rfl::Generic{std::string{"native"}}},
-                                   {"clr.pinvoke.entry_point", rfl::Generic{std::string{"add_numbers"}}},
-                                   {"clr.pinvoke.convention", rfl::Generic{std::string{"cdecl"}}}};
+            imported.extensions = {{"clr.pinvoke.library", json::value{std::string{"native"}}},
+                                   {"clr.pinvoke.entry_point", json::value{std::string{"add_numbers"}}},
+                                   {"clr.pinvoke.convention", json::value{std::string{"cdecl"}}}};
             fsharp.add(imported, "src/Native.fs");
             auto missing = imported;
             missing.id = missing.name = "missing";
-            missing.extensions["clr.pinvoke.entry_point"] = rfl::Generic{std::string{"absent"}};
+            missing.extensions["clr.pinvoke.entry_point"] = json::value{std::string{"absent"}};
             fsharp.add(missing, "src/Native.fs");
             cpp.add(symbol("c-add", "cpp", "source", "app", "add_numbers", "add_numbers", "function"), "native/add.cpp");
             cpp.add(symbol("c-scoped", "cpp", "source", "app", "add_numbers", "detail::add_numbers", "function"), "native/detail.cpp");

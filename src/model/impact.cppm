@@ -1,6 +1,6 @@
 module indexing;
 import std;
-import reflection;
+import json;
 
 namespace semantic::querying {
     void impact(execution& self) {

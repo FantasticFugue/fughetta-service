@@ -1,7 +1,7 @@
 export module configuration;
 import constants;
 import std;
-import reflection;
+import json;
 import durability;
 import async;
 import host;
@@ -94,6 +94,7 @@ export namespace config {
         std::string remote_worker_bind = "127.0.0.1";
         std::uint16_t remote_worker_port = 0;
         bool remote_worker_enrollment = false;
+        std::uint32_t overflow_wait_seconds = 0;
         std::string source = "127.0.0.1:9091";
         std::string storage = "state";
         std::vector<std::string> allowed_origins;
@@ -101,42 +102,16 @@ export namespace config {
         config::auth auth;
     };
 
-    // Where a Worker's execute role runs. `local` keeps both roles in the Worker process; the other kinds run the execute
-    // role in a container the Worker starts, and the Worker answers analyses as a restricted native process.
+    // Resource bounds for the workspace's execute child process.
     struct worker_backend {
-        std::string kind = "local";
-        // The runtime command: docker, ctr or container by default, or a compatible one such as podman or nerdctl.
-        std::string program;
-        // An image that supplies the libraries the service executable links.
-        std::string image;
-        // docker: the --runtime name (runsc, kata-runtime); containerd: runsc or kata.
-        std::string runtime;
-        // The address the execute container dials back to; loopback unless the container has a network of its own.
-        std::string host = "127.0.0.1";
-        // Host directories mounted read-only at the same path. The configured tools must lie under one of them or in the image.
-        std::vector<std::string> toolchains;
+        std::optional<std::uint64_t> max_memory_bytes;
+        std::optional<std::uint32_t> max_cpu_seconds;
         friend auto operator==(const worker_backend&, const worker_backend&) -> bool = default;
     };
 
     inline void validate(const worker_backend& b) {
-        static constexpr std::array kinds{"local", "docker", "containerd", "apple"};
-        if (!std::ranges::contains(kinds, std::string_view{b.kind}))
-            throw std::invalid_argument("worker backend is local, docker, containerd or apple");
-        if (b.kind == "local") {
-            if (!b.program.empty() || !b.image.empty() || !b.runtime.empty() || !b.toolchains.empty())
-                throw std::invalid_argument("the local worker backend takes no container settings");
-            return;
-        }
-        if (b.image.empty())
-            throw std::invalid_argument("a container worker backend needs an image");
-        if (b.kind == "containerd" && b.runtime != "runsc" && b.runtime != "kata")
-            throw std::invalid_argument("the containerd worker backend runs with runsc or kata");
-        if (b.kind == "apple" && !b.runtime.empty())
-            throw std::invalid_argument("the apple worker backend has one runtime");
-        io::parse_endpoint(b.host, 0);
-        for (auto& path : b.toolchains)
-            if (path.empty() || !builds::absolute_path(path))
-                throw std::invalid_argument("worker backend toolchains must be absolute paths");
+        if ((b.max_memory_bytes && !*b.max_memory_bytes) || (b.max_cpu_seconds && !*b.max_cpu_seconds))
+            throw std::invalid_argument("worker resource limits must be positive");
     }
 
     struct revisions {
@@ -199,7 +174,7 @@ export namespace config {
     struct effective_config {
         std::string name;
         builds::configuration build;
-        rfl::Rename<"requires", std::optional<requirements>> needs;
+        json::named<"requires", std::optional<requirements>> needs;
         builds::environment env;
         effective_limits_run limits;
         bool enabled = true;
@@ -427,6 +402,9 @@ export namespace config {
         if (d.server.storage.empty())
             throw std::invalid_argument("server.storage is empty");
         validate(d.server.auth);
+        if (d.server.overflow_wait_seconds > 600 ||
+            (d.server.overflow_wait_seconds && (d.server.auth.mode != "trusted" || !d.worker_token || d.worker_token->empty())))
+            throw std::invalid_argument("overflow waiting requires a hosted Core, a private Worker token, and a deadline of at most 600 seconds");
         io::parse_endpoint(d.server.http_bind, d.server.http_port);
         io::parse_endpoint(d.server.worker_bind, d.server.worker_port);
         if (d.server.remote_worker_port) {
@@ -448,26 +426,31 @@ export namespace config {
     }
 
     template <class T> auto parse_as(std::string_view json, std::string_view what) -> T {
-        auto out = rfl::json::read<T, rfl::DefaultIfMissing, rfl::NoExtraFields>(json);
+        auto out = json::read<T, json::defaults, json::strict>(json);
         if (!out)
             throw std::invalid_argument(std::format("{}: {}", what, out.error().what()));
         return std::move(*out);
     }
 
-    inline auto parse(std::string_view json) -> document {
+    inline auto parse(std::string_view json, std::optional<allocation::budget> self_hosted_runtime = {}) -> document {
         auto d = parse_as<document>(json, "config");
+        if (self_hosted_runtime && d.server.auth.mode != "trusted") {
+            auto fields = parse_as<json::value>(json, "config").to_object();
+            if (fields && !fields->get("runtime"))
+                d.runtime = *self_hosted_runtime;
+        }
         validate(d);
         return d;
     }
 
-    template <class T> auto write(const T& value) -> std::string { return rfl::json::write(value); }
+    template <class T> auto write(const T& value) -> std::string { return json::write(value); }
 
-    inline auto load(const std::filesystem::path& file) -> document {
+    inline auto load(const std::filesystem::path& file, std::optional<allocation::budget> self_hosted_runtime = {}) -> document {
         std::ifstream in{file, std::ios::binary};
         if (!in)
             throw std::runtime_error(std::format("config: cannot open {}", file.string()));
         std::string text{std::istreambuf_iterator<char>{in}, {}};
-        return parse(text);
+        return parse(text, self_hosted_runtime);
     }
 
     struct source {
@@ -508,6 +491,7 @@ export namespace config {
         bool inherit_env = true;
         builds::toolset tools;
         config::worker_backend backend;
+        bool execute_stdio = false;
         std::map<std::string, toolchain::sdk> sdk_manifests;
         std::optional<std::string> dependency_cache;
         std::optional<std::string> dependency_upstream;
@@ -522,7 +506,8 @@ export namespace config {
         } catch (const std::exception&) {
             throw std::invalid_argument("Worker configuration is invalid");
         }
-        io::parse_endpoint(w.gateway);
+        if (!w.execute_stdio)
+            io::parse_endpoint(w.gateway);
         if (w.work_root.empty())
             throw std::invalid_argument("Worker work_root is empty");
         if (w.dependency_cache && (w.dependency_cache->empty() || !builds::absolute_path(*w.dependency_cache)))
@@ -551,10 +536,8 @@ export namespace config {
         if (w.tree_ttl_days == 0)
             throw std::invalid_argument("Worker tree_ttl_days must be positive");
         validate(w.backend);
-        if (w.backend.kind != "local" && w.roles.size() != 2)
-            throw std::invalid_argument("a container worker backend serves both roles");
-        if (w.backend.kind != "local" && w.dependency_publish)
-            throw std::invalid_argument("a dependency publisher uses the local worker backend");
+        if (w.execute_stdio && (w.worker_id || w.workspace_id || w.roles != std::vector<std::string>{std::string{constants::execute_role}}))
+            throw std::invalid_argument("execute_stdio requires an unregistered execute role");
         if (w.worker_id || w.workspace_id) {
             if (!w.worker_id || !w.workspace_id || !w.token || w.token->size() != 64)
                 throw std::invalid_argument("Registered Worker requires its identity and credentials");
@@ -764,7 +747,7 @@ export namespace config {
         return descriptions;
     }
 
-    inline auto annotate(rfl::Generic value) -> rfl::Generic {
+    inline auto annotate(json::value value) -> json::value {
         if (auto object = value.to_object()) {
             auto out = *object;
             for (auto& [key, child] : out) {
@@ -792,6 +775,6 @@ export namespace config {
         return value;
     }
 
-    template <class T> auto schema() -> rfl::Generic { return annotate(rfl::json::read<rfl::Generic>(rfl::json::to_schema<T>()).value()); }
+    template <class T> auto schema() -> json::value { return annotate(json::schema<T>()); }
 
 } // namespace config

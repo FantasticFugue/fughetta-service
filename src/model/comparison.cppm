@@ -1,6 +1,6 @@
 module indexing;
 import std;
-import reflection;
+import json;
 import content;
 
 namespace semantic {
@@ -119,6 +119,374 @@ namespace semantic {
             }
             return out;
         }
+        auto duplicates(const indexed_view& before, const indexed_view& after, const std::vector<view_change>& changes,
+                        const std::map<key, state>& current) -> std::vector<duplicate_type> {
+            using shape_key = std::pair<std::string, std::string>; // Project and shape.
+            std::map<shape_key, std::vector<duplicate_type>> added;
+            for (const auto& change : changes) {
+                if (!std::ranges::contains(change.kinds, std::string{"added"}) || before.symbols.contains(change.subject.symbol_id))
+                    continue;
+                const auto* owner = current.at({change.subject.symbol_id, *change.subject.context}).symbols.front();
+                if (const auto shape = after.record_shape(*owner))
+                    added[{after.unit_projects.at(owner->ownership.owner_unit), shape->first}].push_back(
+                        {.subject = change.subject,
+                         .subject_name = owner->qualified_name.empty() ? owner->name : owner->qualified_name,
+                         .structural_shape_hash = shape->first,
+                         .field_count = shape->second});
+            }
+            if (added.empty())
+                return {};
+            std::vector<duplicate_type> out;
+            std::set<key> examined;
+            for (auto member = after.members.begin(); member != after.members.end(); member = after.members.upper_bound(member->first)) {
+                if (!before.symbols.contains(member->first))
+                    continue;
+                const auto [begin, end] = after.symbols.equal_range(member->first);
+                for (auto at = begin; at != end; ++at) {
+                    const auto& owner = after.symbol(at->second);
+                    if (!after.languages.public_visibility(owner.language, owner.visibility) || !examined.emplace(owner.id, owner.ownership.context).second)
+                        continue;
+                    if (const auto shape = after.record_shape(owner))
+                        if (const auto matches = added.find({after.unit_projects.at(owner.ownership.owner_unit), shape->first}); matches != added.end())
+                            for (auto notice : matches->second) {
+                                notice.existing = {owner.id, owner.ownership.context};
+                                notice.existing_name = owner.qualified_name.empty() ? owner.name : owner.qualified_name;
+                                out.push_back(std::move(notice));
+                            }
+                }
+            }
+            auto order = [](const duplicate_type& notice) {
+                return std::tie(notice.subject.symbol_id, notice.subject.context, notice.existing.symbol_id, notice.existing.context);
+            };
+            std::ranges::sort(out, {}, order);
+            return out;
+        }
+        auto relation_kind_of(const semantic::unit& unit, std::string_view kind) -> std::string_view {
+            for (const auto& convention : unit.conventions)
+                if (const auto found = convention.relation_traits.find(std::string{kind}); found != convention.relation_traits.end())
+                    return found->second;
+            return kind;
+        }
+
+        auto module_of(const indexed_view& view, const records::symbol& row) -> dependency_module {
+            dependency_module out{view.unit_projects.at(row.ownership.owner_unit), row.module};
+            if (!row.module.empty() && row.module != out.project)
+                return out;
+            out.name = out.project;
+            if (row.language != "cpp")
+                return out;
+            std::set<std::string> definitions, declarations;
+            const auto [first, last] = view.occurrences.equal_range(row.id);
+            for (auto at = first; at != last; ++at) {
+                const auto& found = view.occurrence(at->second);
+                if (!found.location.source)
+                    continue;
+                if (std::ranges::contains(found.roles, std::string{"definition"}))
+                    definitions.insert(found.location.source->path);
+                else if (found.ownership.context == row.ownership.context && std::ranges::contains(found.roles, std::string{"declaration"}))
+                    declarations.insert(found.location.source->path);
+            }
+            const auto& files = definitions.empty() ? declarations : definitions;
+            if (files.size() == 1)
+                out.file = *files.begin();
+            return out;
+        }
+
+        using module_graph = std::map<dependency_module, std::set<dependency_module>>;
+        auto dependency_graph(const indexed_view& view) -> module_graph {
+            module_graph graph;
+            std::map<std::pair<symbol_id, std::optional<context_id>>, std::optional<dependency_module>> endpoints;
+            auto module = [&](const symbol_id& id, std::optional<context_id> context) -> std::optional<dependency_module> {
+                const auto [entry, inserted] = endpoints.try_emplace({id, context});
+                if (!inserted)
+                    return entry->second;
+                const auto [first, last] = view.symbols.equal_range(id);
+                std::set<dependency_module> alternatives;
+                bool unknown = false;
+                for (auto at = first; at != last; ++at) {
+                    const auto& symbol = view.symbol(at->second);
+                    if (!context || symbol.ownership.context == *context) {
+                        auto candidate = module_of(view, symbol);
+                        if (symbol.language == "cpp" && symbol.domain == "source" && candidate.name == candidate.project && !candidate.file)
+                            unknown = true;
+                        else
+                            alternatives.insert(std::move(candidate));
+                    }
+                }
+                if (!unknown && alternatives.size() == 1)
+                    entry->second = *alternatives.begin();
+                return entry->second;
+            };
+            auto edge = [&](const auto& from, const auto& to) {
+                if (from && to && from != to) {
+                    graph[*from].insert(*to);
+                    graph.try_emplace(*to);
+                }
+            };
+            for (const auto& piece : view.pieces) {
+                for (const auto& row : piece->relations()) {
+                    const auto kind = relation_kind_of(piece->unit, row.kind);
+                    if (row.resolution != "resolved" || (kind != "calls" && kind != "inherits" && kind != "imports"))
+                        continue;
+                    edge(module(row.from, row.from_context.value_or(row.ownership.context)), module(row.to, row.to_context));
+                }
+                for (const auto& row : piece->references())
+                    if (row.resolution == "resolved" && row.from && row.target &&
+                        (std::ranges::contains(row.roles, std::string{"call"}) || std::ranges::contains(row.roles, std::string{"import"})))
+                        edge(module(*row.from, row.ownership.context), module(*row.target, row.target_context));
+            }
+            return graph;
+        }
+
+        // Tarjan's stack tracks open components independently of the DFS walk.
+        // Frames retain the next edge so dependency depth does not consume the C++ stack.
+        auto cyclic_components(const module_graph& graph) -> std::vector<std::vector<dependency_module>> {
+            struct node { std::size_t index, low; bool open = true; };
+            struct frame {
+                const dependency_module* module;
+                std::set<dependency_module>::const_iterator next, end;
+            };
+            std::map<dependency_module, node> visited;
+            std::vector<const dependency_module*> open;
+            std::vector<frame> walk;
+            std::vector<std::vector<dependency_module>> cycles;
+            auto enter = [&](const auto& row) {
+                const auto index = visited.size();
+                visited.emplace(row.first, node{index, index});
+                open.push_back(&row.first);
+                walk.push_back({&row.first, row.second.begin(), row.second.end()});
+            };
+            for (const auto& root : graph) {
+                if (visited.contains(root.first))
+                    continue;
+                enter(root);
+                while (!walk.empty()) {
+                    auto& step = walk.back();
+                    auto& current = visited.at(*step.module);
+                    if (step.next != step.end) {
+                        const auto& target = *step.next++;
+                        const auto found = visited.find(target);
+                        if (found == visited.end())
+                            enter(*graph.find(target));
+                        else if (found->second.open)
+                            current.low = std::min(current.low, found->second.index);
+                        continue;
+                    }
+                    if (current.low == current.index) {
+                        std::vector<dependency_module> component;
+                        for (;;) {
+                            const auto* member = open.back();
+                            open.pop_back();
+                            visited.at(*member).open = false;
+                            component.push_back(*member);
+                            if (member == step.module)
+                                break;
+                        }
+                        if (component.size() > 1) {
+                            std::ranges::sort(component);
+                            cycles.push_back(std::move(component));
+                        }
+                    }
+                    walk.pop_back();
+                    if (!walk.empty()) {
+                        auto& parent = visited.at(*walk.back().module);
+                        parent.low = std::min(parent.low, current.low);
+                    }
+                }
+            }
+            std::ranges::sort(cycles);
+            return cycles;
+        }
+
+        auto topology_changes(const indexed_view& before, const indexed_view& after, const std::set<dependency_module>& scope, bool scoped)
+            -> std::vector<topology_warning> {
+            const auto previous = dependency_graph(before), current = dependency_graph(after);
+            const auto old_cycles = cyclic_components(previous);
+            std::map<dependency_module, std::size_t> old_component;
+            for (std::size_t i = 0; i < old_cycles.size(); ++i)
+                for (const auto& module : old_cycles[i])
+                    old_component.emplace(module, i);
+            std::vector<topology_warning> out;
+            auto eligible = [&](const auto& module) { return !scoped || scope.contains(module); };
+            for (auto& cycle : cyclic_components(current)) {
+                const auto first = old_component.find(cycle.front());
+                const bool already_connected = first != old_component.end() && std::ranges::all_of(cycle, [&](const auto& module) {
+                    const auto found = old_component.find(module);
+                    return found != old_component.end() && found->second == first->second;
+                });
+                if (!already_connected && std::ranges::any_of(cycle, eligible))
+                    out.push_back({.kind = std::string{"cycle"}, .modules = std::move(cycle)});
+            }
+            for (const auto& [module, links] : current) {
+                const auto found = previous.find(module);
+                const auto old = found == previous.end() ? 0 : found->second.size();
+                if (eligible(module) && links.size() >= old + 3 && links.size() - old >= old)
+                    out.push_back({.kind = std::string{"fan_out"}, .modules = {module}, .before = old, .after = links.size()});
+            }
+            return out;
+        }
+
+        struct slot_type {
+            std::string name;
+            bool escape = false;
+            bool concrete = true;
+            auto operator<=>(const slot_type&) const = default;
+        };
+        auto spelling(std::string name) -> std::string {
+            if (name.starts_with('['))
+                if (const auto end = name.find(']'); end != name.npos)
+                    name.erase(0, end + 1);
+            std::erase_if(name, [](char c) { return c == ' ' || c == '\t'; });
+            return name;
+        }
+        auto classify_type(const indexed_view& view, const type_id& id, const std::set<std::string>& escapes, std::set<type_id>& path) -> std::optional<slot_type> {
+            if (!path.insert(id).second)
+                return {};
+            std::set<slot_type> alternatives;
+            const auto [first, last] = view.types.equal_range(id);
+            for (auto at = first; at != last; ++at) {
+                const auto& row = view.type(at->second);
+                const auto kind = view.languages.core_kind(view.languages.type_traits, row.domain, row.kind);
+                std::optional<slot_type> value;
+                const auto name = spelling(row.name.value_or(""));
+                if (escapes.contains(name))
+                    value = slot_type{name, true};
+                else if (kind == "alias" && row.arguments.size() == 1)
+                    value = classify_type(view, row.arguments.front(), escapes, path);
+                else if (kind == "primitive" || kind == "named" || kind == "application") {
+                    if (!name.empty() && name != "any" && name != "unknown" && name != "dynamic" && name != "void")
+                        value = slot_type{name};
+                    else if (name == "void")
+                        value = slot_type{name, false, false};
+                    if (value && escapes.contains(name + "?"))
+                        value->concrete = false;
+                } else if ((kind == "pointer" || kind == "reference" || kind == "nullable" || kind == "array") && row.arguments.size() == 1) {
+                    if (const auto inner = classify_type(view, row.arguments.front(), escapes, path)) {
+                        const auto suffix = kind == "pointer" ? "*" : kind == "reference" ? "&" : kind == "nullable" ? "?" : "[]";
+                        const auto put = inner->name + suffix;
+                        value = slot_type{put, escapes.contains(put), inner->concrete};
+                    }
+                }
+                if (!value) {
+                    alternatives.clear();
+                    break;
+                }
+                alternatives.insert(std::move(*value));
+            }
+            path.erase(id);
+            return alternatives.size() == 1 ? std::optional{*alternatives.begin()} : std::nullopt;
+        }
+
+        struct signature {
+            std::optional<slot_type> result;
+            std::vector<std::vector<std::optional<slot_type>>> groups;
+            auto operator<=>(const signature&) const = default;
+        };
+        auto signature_of(const indexed_view& view, const state& state) -> std::optional<signature> {
+            std::set<signature> alternatives;
+            for (const auto* symbol : state.symbols) {
+                if (!symbol->type)
+                    continue;
+                std::set<std::string> escapes;
+                if (const auto found = view.languages.escape_types.find(symbol->language); found != view.languages.escape_types.end())
+                    for (const auto& name : found->second)
+                        escapes.insert(spelling(name));
+                if (escapes.empty())
+                    continue;
+                auto classify = [&](const auto& id) {
+                    std::set<type_id> path;
+                    return classify_type(view, id, escapes, path);
+                };
+                const auto [first, last] = view.types.equal_range(*symbol->type);
+                for (auto at = first; at != last; ++at) {
+                    const auto& type = view.type(at->second);
+                    if (view.languages.core_kind(view.languages.type_traits, type.domain, type.kind) != "function")
+                        continue;
+                    signature shape;
+                    if (type.return_type)
+                        shape.result = classify(*type.return_type);
+                    for (const auto& group : type.parameter_groups) {
+                        auto& parameters = shape.groups.emplace_back();
+                        for (const auto& parameter : group.parameters)
+                            parameters.push_back(classify(parameter.type));
+                    }
+                    alternatives.insert(std::move(shape));
+                }
+            }
+            return alternatives.size() == 1 ? std::optional{*alternatives.begin()} : std::nullopt;
+        }
+
+        auto unsafe_sites(const indexed_view& view, const key& subject) {
+            std::map<std::pair<std::string, std::optional<std::string>>, std::set<locator>> out;
+            const auto [first, last] = view.outgoing.equal_range(subject.first);
+            for (auto at = first; at != last; ++at) {
+                const auto& row = view.relation(at->second);
+                const auto& unit = view.pieces.at(at->second.shard)->unit;
+                if (row.resolution != "resolved" || row.from_context.value_or(row.ownership.context) != subject.second || !row.ownership.origin.location)
+                    continue;
+                const auto kind = relation_kind_of(unit, row.kind);
+                if (kind == "unsafe_cast") {
+                    out[{row.kind, row.fingerprint}].insert(*row.ownership.origin.location);
+                    continue;
+                }
+                if (kind != "calls")
+                    continue;
+                const auto [begin, end] = view.symbols.equal_range(row.to);
+                for (auto candidate = begin; candidate != end; ++candidate) {
+                    const auto& target = view.symbol(candidate->second);
+                    if (row.to_context && target.ownership.context != *row.to_context)
+                        continue;
+                    if (std::ranges::any_of(unit.conventions, [&](const auto& rules) {
+                            return rules.unsafe_casts && std::ranges::contains(*rules.unsafe_casts, target.qualified_name);
+                        }))
+                        out[{target.qualified_name, row.fingerprint}].insert(*row.ownership.origin.location);
+                }
+            }
+            return out;
+        }
+
+        auto degradations(const indexed_view& before, const indexed_view& after, const std::vector<view_change>& changes,
+                          const std::map<key, state>& old, const std::map<key, state>& current) -> std::vector<type_degradation> {
+            std::vector<type_degradation> out;
+            for (const auto& change : changes) {
+                const key subject{change.subject.symbol_id, *change.subject.context};
+                const auto now = current.find(subject);
+                if (now == current.end())
+                    continue;
+                const auto& symbol = *now->second.symbols.front();
+                const auto& name = symbol.qualified_name.empty() ? symbol.name : symbol.qualified_name;
+                if (const auto previous = old.find(subject);
+                    previous != old.end() && std::ranges::contains(change.kinds, std::string{"declaration"})) {
+                    const auto a = signature_of(before, previous->second), b = signature_of(after, now->second);
+                    if (a && b) {
+                        auto compare = [&](const auto& from, const auto& to, std::optional<std::uint64_t> group = {}, std::optional<std::uint64_t> index = {}) {
+                            if (from && to && from->concrete && !from->escape && to->escape)
+                                out.push_back({.subject = change.subject, .name = name, .kind = std::string{group ? "parameter" : "return_value"},
+                                               .group = group, .index = index, .before = from->name, .after = to->name});
+                        };
+                        compare(a->result, b->result);
+                        if (a->groups.size() == b->groups.size())
+                            for (std::size_t group = 0; group < a->groups.size(); ++group)
+                                if (a->groups[group].size() == b->groups[group].size())
+                                    for (std::size_t index = 0; index < a->groups[group].size(); ++index)
+                                        compare(a->groups[group][index], b->groups[group][index], group, index);
+                    }
+                }
+                const auto prior = unsafe_sites(before, subject);
+                for (const auto& [cast, locations] : unsafe_sites(after, subject)) {
+                    const auto found = prior.find(cast);
+                    const auto count = found == prior.end() ? 0 : found->second.size();
+                    if (locations.size() > count) {
+                        const auto added = std::ranges::find_if(locations, [&](const auto& location) {
+                            return found == prior.end() || !found->second.contains(location);
+                        });
+                        out.push_back({.subject = change.subject, .name = name, .kind = std::string{"unsafe_cast"}, .before = std::to_string(count),
+                                       .after = cast.first, .location = *added});
+                    }
+                }
+            }
+            return out;
+        }
         struct cursor {
             view_id before, after;
             std::string query;
@@ -144,11 +512,11 @@ namespace semantic {
         auto identity = request;
         identity.budget = {};
         identity.limit = 1;
-        const auto query = content::hash_of(rfl::json::write(identity)).str();
+        const auto query = content::hash_of(json::write(identity)).str();
         comparison::cursor progress{before.description.id, after.description.id, query};
         std::uint64_t offset = 0;
         if (page) {
-            const auto decoded = rfl::json::read<comparison::cursor>(*page);
+            const auto decoded = json::read<comparison::cursor>(*page);
             if (!decoded || decoded->before != before.description.id || decoded->after != after.description.id || decoded->query != query)
                 throw std::invalid_argument("cursor belongs to another view comparison");
             progress = *decoded;
@@ -189,7 +557,10 @@ namespace semantic {
         auto eligible = [&](const indexed_view& view, const comparison::state& value) {
             return std::ranges::any_of(value.symbols, [&](const auto* row) { return eligible_symbol(view, *row); });
         };
-        std::vector<view_change> changes;
+        std::vector<view_change> changes, critic_subjects;
+        const bool scoped = request.selector || !request.scope.projects.empty() || !request.scope.modules.empty() || !request.scope.contexts.empty() ||
+                            !request.scope.files.empty();
+        std::set<dependency_module> module_scope;
         for (const auto& key : keys) {
             const auto a = old.find(key), b = current.find(key);
             if (!(a != old.end() && eligible(before, a->second)) && !(b != current.end() && eligible(after, b->second)))
@@ -209,9 +580,26 @@ namespace semantic {
                 if (a->second.inputs != b->second.inputs)
                     change.kinds.push_back(std::string{"inputs"});
             }
+            critic_subjects.push_back(change);
             if (!change.kinds.empty())
                 changes.push_back(std::move(change));
         }
+        if (scoped)
+            for (const auto* view : {&before, &after}) {
+                auto collect = [&](const auto& rows) {
+                    for (const auto& [_, address] : rows)
+                        if (const auto& row = view->symbol(address); eligible_symbol(*view, row))
+                            module_scope.insert(comparison::module_of(*view, row));
+                };
+                if (request.selector && request.selector->entity) {
+                    const auto [first, last] = view->symbols.equal_range(request.selector->entity->symbol_id);
+                    collect(std::ranges::subrange(first, last));
+                } else if (request.selector && request.selector->name) {
+                    const auto [first, last] = view->names.equal_range(request.selector->name->text);
+                    collect(std::ranges::subrange(first, last));
+                } else
+                    collect(view->symbols);
+            }
         auto reanalysis = reanalysis_between(before, after);
         if (request.selector || !request.scope.projects.empty() || !request.scope.modules.empty() || !request.scope.contexts.empty() ||
             !request.scope.files.empty()) {
@@ -311,7 +699,12 @@ namespace semantic {
             } while (expanded);
             std::erase_if(reanalysis, [&](const auto& change) { return !selected.contains(change.id); });
         }
-        const auto count = std::max(changes.size(), reanalysis.size());
+        const auto duplicates = comparison::duplicates(before, after, changes, current);
+        const auto topology = before.description.id == after.description.id || (scoped && module_scope.empty())
+                                  ? std::vector<topology_warning>{}
+                                  : comparison::topology_changes(before, after, module_scope, scoped);
+        const auto degraded = comparison::degradations(before, after, critic_subjects, old, current);
+        const auto count = std::max({changes.size(), reanalysis.size(), duplicates.size(), topology.size(), degraded.size()});
         if (offset > count)
             throw std::invalid_argument("cursor is beyond the view changes");
         result out{.view = after.description.id, .snapshots = after.description.snapshots, .status = std::string{"complete"}};
@@ -327,6 +720,12 @@ namespace semantic {
                     out.comparison->reanalysis.push_back(reanalysis[at]);
                 if (at < changes.size())
                     out.comparison->changes.push_back(changes[at]);
+                if (at < duplicates.size())
+                    out.comparison->duplicate_types.push_back(duplicates[at]);
+                if (at < topology.size())
+                    out.comparison->topology.push_back(topology[at]);
+                if (at < degraded.size())
+                    out.comparison->degraded_types.push_back(degraded[at]);
                 progress.announced = true;
             }
             while (at < changes.size() && progress.side < 2) {
@@ -380,7 +779,7 @@ namespace semantic {
             out.coverage.missing.push_back({.reason = "view impact comparison budget exhausted", .phase = std::string{"query"}});
         }
         if (progress.offset < count)
-            out.cursor = rfl::json::write(progress);
+            out.cursor = json::write(progress);
         return out;
     }
 } // namespace semantic

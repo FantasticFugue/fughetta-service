@@ -58,8 +58,8 @@ namespace {
     auto linux_platform() -> jobs::platform { return {.os = "linux", .arch = "x86_64"}; }
 
     auto fake_worker(socket& s, std::string name, std::vector<std::string> tools = {"cmake"}, std::uint32_t max_inflight = 4, std::string auth = "",
-                     bool publisher = false, jobs::slot_report* report = nullptr, ctx* delay_io = nullptr, std::chrono::milliseconds delay = 0ms)
-        -> coroutine::task<> {
+                     bool publisher = false, jobs::slot_report* report = nullptr, ctx* delay_io = nullptr, std::chrono::milliseconds delay = 0ms,
+                     bool announce_slots = false) -> coroutine::task<> {
         transport::channel<socket> chan{s};
         co_await chan.post(jobs::hello{.name = name,
                                        .auth = auth,
@@ -69,10 +69,13 @@ namespace {
                                        .tools = tools,
                                        .toolchain_id = std::string(64, 'a'),
                                        .dependency_publisher = publisher,
-                                       .memory_bytes = report ? report->memory.limit : std::nullopt});
-        if (report)
-            ++report->sequence;
-        co_await chan.post(report ? *report : jobs::slot_report{});
+                                       .memory_bytes = report ? report->memory.limit : std::nullopt,
+                                       .slots = announce_slots ? report->slots : std::vector<jobs::worker_slot>{}});
+        if (!announce_slots) {
+            if (report)
+                ++report->sequence;
+            co_await chan.post(report ? *report : jobs::slot_report{});
+        }
         try {
             for (;;) {
                 auto f = co_await chan.recv();
@@ -292,13 +295,17 @@ namespace {
                     jobs::slot_report report;
                     for (int i = 0; i < 257; ++i)
                         report.slots.push_back({.project = "app", .tree = std::format("tree-{}", i)});
-                    // The report must outlive the worker child, so keep it outside the scope body.
-                    auto run_worker = [&]() { return fake_worker(socket, "persistent", {"cmake"}, 4, "", false, &report); };
+                    report.slots.front().snapshot = "source";
+                    report.slots.front().cached = {{"compile", "recipe", "source", std::string(64, 'a')}};
+                    auto run_worker = [&]() { return fake_worker(socket, "persistent", {"cmake"}, 4, "", false, &report, nullptr, 0ms, true); };
                     co_await coroutine::with_scope([&](coroutine::scope& worker) -> coroutine::task<> {
                         worker.spawn(run_worker());
                         while (fleet.describe(0).empty() || fleet.describe(0).front().slots.empty())
                             co_await execution::schedule_after(io, 1ms);
                         expect(fleet.describe(0).front().slots.size() == 256u);
+                        auto initial = fleet.propose({.tree_key = "app/tree-0", .options = "recipe", .snapshot = "source", .stage = "compile"});
+                        expect((!initial.candidates.empty()) >> fatal);
+                        expect(initial.candidates.front().heat == 3_i);
                         report.slots = {{.project = "app", .tree = "retained"}};
                         auto dispatch = [](auto& channel) -> coroutine::task<> {
                             auto response = co_await channel.call(jobs::hash_file{.path = "who"});

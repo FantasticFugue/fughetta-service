@@ -4,6 +4,56 @@ export module content;
 import std;
 
 export namespace content {
+    inline auto hex_encode(std::span<const unsigned char> bytes) -> std::string {
+        std::string out(bytes.size() * 2 + 1, '\0');
+        sodium_bin2hex(out.data(), out.size(), bytes.data(), bytes.size());
+        out.pop_back();
+        return out;
+    }
+
+    // Derive an Ed25519 seed from the enrollment secret in a separate domain
+    // from the credential hash kept by the registry.
+    class receipt_key {
+        std::array<unsigned char, crypto_sign_SECRETKEYBYTES> secret_{};
+        std::array<unsigned char, crypto_sign_PUBLICKEYBYTES> public_{};
+
+        static auto decode(std::string_view text, std::span<unsigned char> bytes) -> bool {
+            return text.size() == bytes.size() * 2 &&
+                   sodium_hex2bin(bytes.data(), bytes.size(), text.data(), text.size(), nullptr, nullptr, nullptr) == 0;
+        }
+    public:
+        explicit receipt_key(std::string_view credential) {
+            static const auto initialized = sodium_init();
+            if (initialized < 0)
+                throw std::runtime_error("cannot initialize Worker receipt signing");
+            std::array<unsigned char, crypto_sign_SEEDBYTES> seed{};
+            constexpr std::string_view domain = "fughetta/worker-execution-key:";
+            crypto_hash_sha256_state state{};
+            crypto_hash_sha256_init(&state);
+            crypto_hash_sha256_update(&state, reinterpret_cast<const unsigned char*>(domain.data()), domain.size());
+            crypto_hash_sha256_update(&state, reinterpret_cast<const unsigned char*>(credential.data()), credential.size());
+            crypto_hash_sha256_final(&state, seed.data());
+            sodium_memzero(&state, sizeof(state));
+            crypto_sign_seed_keypair(public_.data(), secret_.data(), seed.data());
+            sodium_memzero(seed.data(), seed.size());
+        }
+        receipt_key(const receipt_key&) = delete;
+        auto operator=(const receipt_key&) -> receipt_key& = delete;
+        ~receipt_key() { sodium_memzero(secret_.data(), secret_.size()); }
+
+        auto public_key() const -> std::string { return hex_encode(public_); }
+        auto sign(std::string_view message) const -> std::string {
+            std::array<unsigned char, crypto_sign_BYTES> signature{};
+            crypto_sign_detached(signature.data(), nullptr, reinterpret_cast<const unsigned char*>(message.data()), message.size(), secret_.data());
+            return hex_encode(signature);
+        }
+        static auto verify(std::string_view key, std::string_view message, std::string_view signature) -> bool {
+            std::array<unsigned char, crypto_sign_PUBLICKEYBYTES> public_key{};
+            std::array<unsigned char, crypto_sign_BYTES> bytes{};
+            return decode(key, public_key) && decode(signature, bytes) &&
+                   crypto_sign_verify_detached(bytes.data(), reinterpret_cast<const unsigned char*>(message.data()), message.size(), public_key.data()) == 0;
+        }
+    };
 
     class sha256 {
     public:
@@ -34,6 +84,7 @@ export namespace content {
     // `std::string_view` (hex text) for comparison, formatting and the frames, and builds from one.
     class hash {
     public:
+        using wire_type = std::string;
         hash() = default;
         hash(std::string_view text) : text_(text) {}
         hash(const char* text) : text_(text) {}
@@ -56,15 +107,7 @@ export namespace content {
     };
 
     inline auto to_hex(const sha256::digest& d) -> hash {
-        static constexpr char digits[] = "0123456789abcdef";
-        hash out(std::string(64, '0'));
-        auto* encoded = out.data();
-        auto* bytes = d.data();
-        for (std::size_t i = 0; i < d.size(); ++i) {
-            encoded[2 * i] = digits[bytes[i] >> 4];
-            encoded[2 * i + 1] = digits[bytes[i] & 15];
-        }
-        return out;
+        return hash{hex_encode(d)};
     }
 
     inline auto hash_of(std::span<const std::byte> data) -> hash {

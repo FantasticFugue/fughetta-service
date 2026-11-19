@@ -2,7 +2,7 @@ export module language;
 import std;
 import native;
 import async;
-import reflection;
+import json;
 import content;
 export import profiles;
 export import semantic;
@@ -56,7 +56,8 @@ export namespace language {
         std::optional<session_state> session;
         std::vector<semantic::view_id> stage_views;
         std::vector<semantic::view_id> checkpoint_views;
-        rfl::Skip<semantic::retention_roots> roots;
+        std::vector<semantic::artifact_receipt> artifact_receipts;
+        json::skip<semantic::retention_roots> roots;
         std::vector<semantic::missing> missing;
         bool cacheable = true;
         std::map<std::string, std::string> toolchains;

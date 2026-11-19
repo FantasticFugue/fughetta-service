@@ -3,7 +3,7 @@ import utility;
 import constants;
 import std;
 import knowledge;
-import reflection;
+import json;
 import coroutine;
 import meta;
 import protocol;
@@ -65,6 +65,10 @@ export namespace tools {
         std::vector<std::string> export_skipped;
         std::string dependency_cache;
         builds::timings timings;
+        std::vector<semantic::artifact_receipt> artifact_receipts;
+        std::vector<semantic::view_id> runtime_observation_views;
+        std::optional<std::string> runtime_observation_error;
+        json::skip<std::vector<jobs::worktree_change>> captured;
     };
 
     // Build, test and run jobs of the workspace, kept on core zero. As many run at once as the limits and the workers allow; waiting
@@ -144,6 +148,8 @@ export namespace tools {
         backlog(cores::context<native::scheduler>& rt, services& zero) : rt_(rt), zero_(zero) {}
 
         auto submit(std::size_t here, entry e, runner r) -> coroutine::task<std::shared_ptr<ticket>>;
+        struct activity { std::size_t queued = 0, running = 0; };
+        auto active(std::size_t here) -> coroutine::task<activity>;
         auto list(std::size_t here) -> coroutine::task<std::vector<view>>;
         auto forget(std::size_t here, std::string key) -> coroutine::task<>;
         // Cancels a job the caller asked for alone, or any job for an owner. Says what happened.
@@ -209,6 +215,8 @@ export namespace tools {
         std::vector<config_result> results;
         std::string worldline;
         std::string revision;
+        std::optional<mutation> worktree_commit;
+        std::string worktree_error, worktree_error_code;
 
         auto failed() const -> bool { return !ok; }
     };
@@ -238,7 +246,12 @@ export namespace tools {
             return {std::move(out), std::move(tests)};
         }
 
-        auto operation(config::effective_config c, builds::request request) -> std::pair<config::effective_config, std::vector<jobs::step>> {
+        struct planned_job {
+            config::effective_config config;
+            std::vector<jobs::step> steps;
+            std::vector<std::string> build_dirs;
+        };
+        auto operation(config::effective_config c, builds::request request) -> planned_job {
             if (!c.build.enabled)
                 throw std::invalid_argument(std::format("build configuration '{}' is disabled", c.name));
             if (!c.build.operations.contains(request.operation)) {
@@ -252,7 +265,7 @@ export namespace tools {
             auto plan = builds::prepare(c.build, request);
             c.needs = plan.needs;
             c.env = std::move(plan.env);
-            return {std::move(c), std::move(plan.steps)};
+            return {std::move(c), std::move(plan.steps), std::move(plan.build_dirs)};
         }
     } // namespace detail
 
@@ -335,8 +348,8 @@ export namespace tools {
     template <class Request>
     auto sync_and_run(native::scheduler& io, storage::registry& files, std::size_t core, transport::channel<native::socket>& worker, std::string project,
                       content::manifest tree, Request work, jobs::progress_log* progress, std::string worldline, std::string version, worlds::actor actor,
-                      std::shared_ptr<execution_identity> executor, semantic::retention_roots roots = {}, semantic::snapshot_vector snapshots = {},
-                      semantic::source_vector sources = {}, routing::fleet* beside = nullptr, routing::selection placed = {})
+                      std::shared_ptr<execution_identity> executor, routing::fleet& fleet, semantic::retention_roots roots = {}, semantic::snapshot_vector snapshots = {},
+                      semantic::source_vector sources = {}, routing::selection placed = {})
         -> coroutine::task<std::pair<jobs::build_report, sync_stats>> {
         auto& request = jobs::traits<Request>::preparation(work);
         auto* analysis = jobs::traits<Request>::analysis(work);
@@ -357,9 +370,15 @@ export namespace tools {
         auto synchronize = [&]() -> coroutine::task<> {
             const auto sync_started = std::chrono::steady_clock::now();
             executor->sync_begin();
-            auto plan = co_await within(io, offer_deadline, "the offer", worker.call(jobs::sync_offer{project, tree}));
-            if (plan.snapshot != expected_snapshot)
+            jobs::sync_plan plan;
+            plan.needs_tree = true;
+            if (fleet.offered(worker, project, expected_snapshot))
+                plan = co_await within(io, offer_deadline, "the offer", worker.call(jobs::sync_offer{.project = project, .retained = expected_snapshot}));
+            if (plan.needs_tree)
+                plan = co_await within(io, offer_deadline, "the offer", worker.call(jobs::sync_offer{project, tree}));
+            if (plan.needs_tree || plan.snapshot != expected_snapshot)
                 throw tool_error("invalid_worker_reply", "Worker returned a snapshot different from the offered source");
+            fleet.remember_offer(worker, project, expected_snapshot);
 
             struct piece {
                 content::hash digest;
@@ -425,6 +444,12 @@ export namespace tools {
             sources[project] = std::move(source_objects);
             publication = co_await publishing::bind(files, core, project, std::move(snapshots), actor, *analysis, std::move(sources), roots);
         }
+        auto authority = [&](const transport::channel<native::socket>& channel) {
+            auto [registry, worker_id] = fleet.receipt_identity(channel);
+            return publishing::receipt_authority{registry, std::move(worker_id)};
+        };
+        if (analysis)
+            publication.signer = authority(worker);
         auto units = publication.units;
         publication.files = &files;
         publication.core = core;
@@ -438,32 +463,36 @@ export namespace tools {
                 request.prepares = analysis->execution.stage_id;
                 // The same preparation of the same snapshot, whatever time it is given.
                 const auto recipe =
-                    content::hash_of(rfl::json::write(std::tuple{request.project, request.tree, request.snapshot, request.steps, request.preparation_tasks,
+                    content::hash_of(json::write(std::tuple{request.project, request.tree, request.snapshot, request.steps, request.preparation_tasks,
                                                                  request.env, request.measure, request.generation_producers}))
                         .str();
                 // Inputs a worker already reported for this preparation need no second asking; a tree that has
                 // moved on since refuses the analysis, and the preparation runs after all.
-                auto known = beside ? beside->inputs(worker, recipe) : std::optional<content::hash>{};
+                auto known = fleet.inputs(worker, recipe);
                 std::optional<jobs::build_report> prepared;
                 for (unsigned attempt = 0;; ++attempt) {
                     if (!known) {
                         auto prepare = [&](transport::channel<native::socket>& executing) -> coroutine::task<jobs::build_report> {
                             co_await synchronize();
-                            co_return co_await within(io, limit, "the preparation", executing.call(request, progress, inputs));
+                            const auto signer = authority(executing);
+                            auto report = co_await within(io, limit, "the preparation", executing.call(request, progress, inputs));
+                            signer.artifacts(request, report);
+                            co_return report;
                         };
                         // Beside an analysis, the preparation is execute work with its own place on the worker.
-                        prepared = beside && placed.analysis ? co_await beside->executing(worker, placed, prepare) : co_await prepare(worker);
+                        prepared = placed.analysis ? co_await fleet.executing(worker, placed, prepare) : co_await prepare(worker);
                         if (!prepared->inputs) {
                             prepared->analysis_execution = analysis->execution;
                             co_return std::move(*prepared);
                         }
                         known = prepared->inputs->id();
-                        if (beside)
-                            beside->remember(worker, recipe, known);
+                        fleet.remember(worker, recipe, known);
                     } else
                         executor->begin();
                     try {
-                        auto analyzed = co_await within(io, limit, "the analysis", worker.call(jobs::analysis_of(work, *known, started), progress, inputs));
+                        const auto analysis_request = jobs::analysis_of(work, *known, started);
+                        auto analyzed = co_await within(io, limit, "the analysis", worker.call(analysis_request, progress, inputs));
+                        publication.signer.artifacts(analysis_request, analyzed);
                         if (prepared)
                             jobs::merge(analyzed, std::move(*prepared));
                         co_return analyzed;
@@ -471,13 +500,15 @@ export namespace tools {
                         if (refused.code != jobs::why::stale_inputs || attempt == 2)
                             throw;
                         known.reset();
-                        if (beside)
-                            beside->remember(worker, recipe, std::nullopt);
+                        fleet.remember(worker, recipe, std::nullopt);
                     }
                 }
             } else {
                 co_await synchronize();
-                co_return co_await within(io, limit, "the build", worker.call(work, progress, inputs));
+                const auto signer = authority(worker);
+                auto report = co_await within(io, limit, "the build", worker.call(work, progress, inputs));
+                signer.artifacts(request, report);
+                co_return report;
             }
         };
         auto r = co_await coroutine::with_scope(std::move(execute));
@@ -617,6 +648,7 @@ export namespace tools {
             }
         // Transfer pins cover capture through publication. Semantic shard roots
         // take over only after the immutable inputs are installed and authorized.
+        publication.artifacts = r.artifact_audit;
         if (inputs_delivered && publication.files)
             if (auto view = co_await publication.finish())
                 r.stage_views.push_back(*view);
@@ -700,7 +732,7 @@ export namespace tools {
                 auto identity = router.workers(core).identity(worker);
                 executor->select(identity);
                 auto result =
-                    co_await sync_and_run(rt.get_scheduler(core), files, core, worker, project, tree, request, progress, worldline, version, actor, executor);
+                    co_await sync_and_run(rt.get_scheduler(core), files, core, worker, project, tree, request, progress, worldline, version, actor, executor, router.workers(core));
                 result.first.worker = std::move(identity.first);
                 result.first.worker_id = std::move(identity.second);
                 co_return result;
@@ -755,6 +787,26 @@ export namespace tools {
             r.models = std::move(rep.models);
             r.export_error = std::move(rep.export_error);
             r.export_skipped = std::move(rep.export_skipped);
+            r.artifact_receipts = std::move(rep.artifact_audit);
+            if (r.ok && request.capture_worktree_changes) {
+                if (!rep.worktree_changes) {
+                    r.ok = false;
+                    r.error_code = "worktree_capture_failed";
+                    r.error = rep.worktree_capture_error.empty() ? "Worker returned no captured worktree changes" : rep.worktree_capture_error;
+                } else {
+                    std::set<std::string> paths;
+                    for (const auto& change : *rep.worktree_changes) {
+                        if (!request.capture_worktree_changes->includes(change.path) || !paths.insert(change.path).second) {
+                            r.ok = false;
+                            r.error_code = "worktree_capture_failed";
+                            r.error = "Worker returned duplicate or out-of-scope captured paths";
+                            break;
+                        }
+                    }
+                    if (r.ok)
+                        r.captured.value() = std::move(*rep.worktree_changes);
+                }
+            }
         }
         auto last = r.steps.empty() ? nullptr : &r.steps.back();
         usage::build_event event{.project = project,
@@ -774,7 +826,8 @@ export namespace tools {
                                  .snapshot = snapshot.id().str(),
                                  .operation = operation,
                                  .actor = who,
-                                 .error_code = r.error_code};
+                                 .error_code = r.error_code,
+                                 .artifact_receipts = r.artifact_receipts};
         // Posted, not awaited: a cancellation arriving now must not leave the admission held.
         held.ended = true;
         s.files.post(s.core, [id = *id, event](usage::ledger& ledger) { ledger.record(id, event); });
@@ -839,51 +892,75 @@ export namespace tools {
     }
 
     auto hot_key(const std::string& project, const std::string& layout) -> std::string {
-        return std::string{content::hash_of(rfl::json::write(std::vector<std::string>{project, layout})).view().substr(0, 24)};
+        return std::string{content::hash_of(json::write(std::vector<std::string>{project, layout})).view().substr(0, 24)};
     }
 
     auto runtime_pool(const std::string& group, const std::string& runtime) -> std::string {
         return group + "-" + std::string{content::hash_of(runtime).view().substr(0, 24)};
     }
 
+    auto fork_snapshot(services& s, const std::string& project, const std::string& line, const nodes::node_reply& source, const worlds::actor& actor)
+        -> coroutine::task<std::optional<content::hash>> {
+        if (source.base_version.empty())
+            co_return std::nullopt;
+        auto base = source.base_version == source.version ? source : co_await selected(s, project, line, source.base_version, actor);
+        content::manifest files;
+        for (const auto& f : lines::manifest(base))
+            files.files.push_back({f.path, f.digest, f.size, f.executable});
+        co_return files.id();
+    }
+
     // Select an actual runtime before computing a content key. Busy workers still name
     // valid runtimes: a cache hit needs no slot, and a miss can wait in the backlog.
     auto select_toolchain(services& s, routing::requirements needs, const std::string& trees) -> coroutine::task<std::string> {
-        auto workers = co_await s.workers.describe(s.core);
-        std::optional<std::tuple<bool, bool, std::string>> selected;
-        std::map<std::string, std::size_t> unavailable;
-        for (const auto& worker : workers) {
-            std::string reason;
-            if (!worker.online)
-                reason = "offline";
-            else if (worker.dependency_publisher != needs.dependency_publisher)
-                reason = "different dependency publisher role";
-            else if (needs.os && worker.platform.os != *needs.os)
-                reason = "requires OS " + *needs.os;
-            else if (needs.arch && worker.platform.arch != *needs.arch)
-                reason = "requires architecture " + *needs.arch;
-            else if (auto missing = std::ranges::find_if(needs.tools, [&](const auto& name) { return !std::ranges::contains(worker.tools, name); });
-                     missing != needs.tools.end())
-                reason = "missing tool " + *missing;
-            else if (worker.toolchain_id.empty())
-                reason = "toolchain inspection not reported";
-            if (!reason.empty()) {
-                ++unavailable[reason];
-                continue;
+        const auto limit = s.workers.overflow_limit(s.core);
+        const auto deadline = std::chrono::steady_clock::now() + limit;
+        std::shared_ptr<void> waiting;
+        for (;;) {
+            auto workers = co_await s.workers.describe(s.core);
+            const bool waiting_for_overflow = std::chrono::steady_clock::now() < deadline;
+            std::optional<std::tuple<bool, bool, bool, std::string>> selected;
+            std::map<std::string, std::size_t> unavailable;
+            for (const auto& worker : workers) {
+                std::string reason;
+                if (!worker.online)
+                    reason = "offline";
+                else if (worker.dependency_publisher != needs.dependency_publisher)
+                    reason = "different dependency publisher role";
+                else if (needs.os && worker.platform.os != *needs.os)
+                    reason = "requires OS " + *needs.os;
+                else if (needs.arch && worker.platform.arch != *needs.arch)
+                    reason = "requires architecture " + *needs.arch;
+                else if (auto missing = std::ranges::find_if(needs.tools, [&](const auto& name) { return !std::ranges::contains(worker.tools, name); });
+                         missing != needs.tools.end())
+                    reason = "missing tool " + *missing;
+                else if (worker.toolchain_id.empty())
+                    reason = "toolchain inspection not reported";
+                if (!reason.empty()) {
+                    ++unavailable[reason];
+                    continue;
+                }
+                const auto pool = runtime_pool(trees, worker.toolchain_id);
+                bool cold = !std::ranges::any_of(worker.slots, [&](const auto& slot) { return !slot.busy && slot.tree.starts_with(pool + "-"); });
+                const bool publisher = std::ranges::any_of(workers, [&](const auto& candidate) {
+                    return candidate.online && candidate.dependency_publisher && candidate.toolchain_id == worker.toolchain_id;
+                });
+                const bool full = worker.inflight >= worker.max_inflight;
+                if (full && waiting_for_overflow)
+                    continue;
+                auto candidate = std::tuple{!worker.worker_id.has_value(), cold, !publisher, worker.toolchain_id};
+                if (!selected || candidate < *selected)
+                    selected = std::move(candidate);
             }
-            const auto pool = runtime_pool(trees, worker.toolchain_id);
-            bool cold = !std::ranges::any_of(worker.slots, [&](const auto& slot) { return !slot.busy && slot.tree.starts_with(pool + "-"); });
-            const bool publisher = std::ranges::any_of(workers, [&](const auto& candidate) {
-                return candidate.online && candidate.dependency_publisher && candidate.toolchain_id == worker.toolchain_id;
-            });
-            auto candidate = std::tuple{cold, !publisher, worker.toolchain_id};
-            if (!selected || candidate < *selected)
-                selected = std::move(candidate);
+            if (selected)
+                co_return std::get<3>(*selected);
+            if (!waiting_for_overflow)
+                throw tool_error("no_worker", "no worker with the required tools and a reported toolchain fingerprint is available; " +
+                                                  (workers.empty() ? std::string{"no workers attached"} : json::write(unavailable)));
+            if (!waiting)
+                waiting = s.workers.wait_for_capacity(needs);
+            co_await execution::schedule_after(s.workers.io_context().get_scheduler(s.core), std::chrono::milliseconds{250});
         }
-        if (!selected)
-            throw tool_error("no_worker", "no worker with the required tools and a reported toolchain fingerprint is online; " +
-                                              (workers.empty() ? std::string{"no workers attached"} : rfl::json::write(unavailable)));
-        co_return std::get<2>(*selected);
     }
 
     // Run fills before admitting the consumer job: no nested backlog slot is held while waiting.
@@ -940,7 +1017,7 @@ export namespace tools {
                                               .host_triplet = input.host_triplet,
                                               .features = input.features,
                                               .default_features = input.default_features};
-                const auto key = content::hash_of(rfl::json::write(std::tuple{std::string{"dependency.fill"}, toolchain, request})).str();
+                const auto key = content::hash_of(json::write(std::tuple{std::string{"dependency.fill"}, toolchain, request})).str();
                 if (!filled.insert(key).second) {
                     record_status("same dependencies as an earlier step");
                     continue;
@@ -1077,6 +1154,11 @@ export namespace tools {
                                                     .max_memory_bytes = plan.execution.limits.max_memory_bytes,
                                                     .max_cpu_seconds = plan.execution.limits.max_cpu_seconds}};
         build.preparation.generation_producers = std::move(producers);
+        if (const auto config = request.builds.find(request.config.build_configuration); config != request.builds.end()) {
+            build.preparation.relocatable_build_dirs = config->second.relocatable_build_dirs;
+            if (!build.preparation.relocatable_build_dirs.empty())
+                build.preparation.parent_snapshot = co_await fork_snapshot(zero, project, line, selected_tree, actor);
+        }
         for (auto& step : plan.build.steps)
             std::ranges::copy(step.outputs, std::back_inserter(build.preparation.measure));
         build.analysis = jobs::analysis_plan{.provider = plan.server.provider,
@@ -1134,6 +1216,7 @@ export namespace tools {
             event.blobs_sent = sync.blobs;
             event.bytes_sent = sync.bytes;
             event.error = result.analysis_error.value_or(result.error);
+            event.artifact_receipts = result.artifact_receipts;
             event.error_code = event.ok || result.status == "failed" ? "" : result.status == "prepared" ? result.analysis_error_code : result.status;
             if (!result.steps.empty()) {
                 event.exit_code = result.steps.back().exit_code;
@@ -1165,7 +1248,7 @@ export namespace tools {
                 auto identity = router.workers(core).identity(worker);
                 executor->select(identity);
                 auto result = co_await sync_and_run(rt.get_scheduler(core), registry, core, worker, project, files, build, progress, line, version, actor,
-                                                    executor, roots, snapshots, sources, &router.workers(core), placed);
+                                                    executor, router.workers(core), roots, snapshots, sources, placed);
                 result.first.worker = std::move(identity.first);
                 result.first.worker_id = std::move(identity.second);
                 co_return result;
@@ -1201,6 +1284,7 @@ export namespace tools {
         auto& report = done->first;
         auto result = prepared(plan, files, selected_tree.version, report);
         result.roots.value() = roots;
+        result.artifact_receipts = std::move(report.artifact_audit);
         result.worldline = line;
         result.timings.sync_seconds = done->second.seconds;
         result.timings.worker_seconds = report.seconds;
@@ -1257,7 +1341,7 @@ export namespace tools {
                              .version = source.version,
                              .snapshot = manifest.id().str(),
                              .reuse = "none",
-                             .parameters = rfl::json::write(requested)}};
+                             .parameters = json::write(requested)}};
         observed.event.timings.client_sync_seconds = context.client_sync_seconds;
         std::map<std::string, std::string> toolchains, groups;
         std::map<std::string, builds::requirements> placements;
@@ -1301,7 +1385,7 @@ export namespace tools {
                 if (step.generation)
                     producers.insert(step.generation->producer);
         }
-        auto key = content::hash_of(rfl::json::write(std::tuple{std::string{"language"}, project, manifest.id().str(), toolchains, requests, exposed})).str();
+        auto key = content::hash_of(json::write(std::tuple{std::string{"language"}, project, manifest.id().str(), toolchains, requests, exposed})).str();
         std::map<std::string, semantic::extent> demands;
         auto family_requests = requests;
         for (auto& request : family_requests) {
@@ -1309,7 +1393,7 @@ export namespace tools {
             request.demand = {};
         }
         auto family =
-            content::hash_of(rfl::json::write(std::tuple{std::string{"language"}, project, manifest.id().str(), toolchains, family_requests, exposed})).str();
+            content::hash_of(json::write(std::tuple{std::string{"language"}, project, manifest.id().str(), toolchains, family_requests, exposed})).str();
         double dependency_seconds = 0;
         for (std::size_t i = 0; i < requests.size(); ++i) {
             auto& request = requests[i];
@@ -1449,7 +1533,8 @@ export namespace tools {
     // One configuration of a build, test or run: queued in the backlog, waited for here, its progress passed on as it comes.
     auto execute(services& s, mcp::call_context context, std::string project, std::string operation, bool cacheable, bool fresh,
                  config::effective_config config, std::vector<jobs::step> steps, content::manifest snapshot, mcp::notifier& note, config_result& r,
-                 std::string worldline, std::string version, worlds::actor actor) -> coroutine::task<> {
+                 std::string worldline, std::string version, worlds::actor actor, std::optional<jobs::worktree_capture> capture,
+                 std::string capture_operation) -> coroutine::task<> {
         r.timings.client_sync_seconds = context.client_sync_seconds;
         for (auto& step : steps)
             if (step.generation)
@@ -1461,11 +1546,43 @@ export namespace tools {
                                     .env = config.env,
                                     .max_memory_bytes = config.limits.max_memory_bytes,
                                     .max_cpu_seconds = config.limits.max_cpu_seconds,
-                                    .fresh = fresh};
+                                    .fresh = fresh,
+                                    .capture_worktree_changes = std::move(capture)};
         for (const auto& step : steps)
             if (step.generation)
                 request.generation_producers.insert(step.generation->producer);
         request.exports = config.build.operations.at(operation).exports;
+        std::map<std::string, std::string> python_reports;
+        if (operation == "test") {
+            std::set<std::string> paths;
+            for (const auto& step : steps)
+                for (const auto& output : step.outputs)
+                    if (output.type == "python-runtime" && output.kind == "file")
+                        paths.insert(output.path);
+            std::size_t index = 0;
+            for (const auto& path : paths) {
+                std::string name;
+                do {
+                    name = "python-observations-" + std::to_string(++index);
+                } while (request.exports.contains(name));
+                request.exports.emplace(name, path);
+                python_reports.emplace(std::move(name), path);
+            }
+        }
+        std::string python_execution;
+        if (!python_reports.empty()) {
+            python_execution = nodes::hex(nodes::random_bytes(16));
+            request.env["FUGHETTA_TEST_OBSERVATION_ID"] = python_execution;
+            for (auto& step : request.steps)
+                step.env.erase("FUGHETTA_TEST_OBSERVATION_ID");
+        }
+        request.relocatable_build_dirs = config.build.relocatable_build_dirs;
+        if (request.capture_worktree_changes)
+            request.relocatable_build_dirs.clear();
+        if (!fresh && !request.relocatable_build_dirs.empty()) {
+            const auto source = co_await selected(s, project, worldline, version, actor);
+            request.parent_snapshot = co_await fork_snapshot(s, project, worldline, source, actor);
+        }
         auto trees = hot_key(project, config.name);
         auto required = config.needs.get().value_or(config::requirements{});
         auto needs = routing::requirements{.tools = required.tools, .os = required.platform.os, .arch = required.platform.arch};
@@ -1496,10 +1613,13 @@ export namespace tools {
         normalized.project.clear();
         normalized.tree.clear();
         normalized.fresh = false;
-        auto key = content::hash_of(rfl::json::write(std::tuple{operation, snapshot.id().str(), toolchain, normalized, config.needs})).str();
+        normalized.parent_snapshot.reset();
+        auto key = content::hash_of(json::write(std::tuple{operation, snapshot.id().str(), toolchain, normalized, config.needs})).str();
         // Test and run operations are effects: every call gets its own execution.
         static std::atomic<std::uint64_t> calls{0};
-        if (!cacheable)
+        if (request.capture_worktree_changes)
+            key += "/capture/" + content::hash_of(json::write(std::tuple{capture_operation, worlds::identity_key(actor), worldline, version, config.name})).str();
+        else if (!cacheable)
             key += "/call/" + std::to_string(calls.fetch_add(1));
         const auto dependency_deadline = std::chrono::steady_clock::now() + std::chrono::seconds{request.timeout_s};
         const auto dependency_started = std::chrono::steady_clock::now();
@@ -1582,19 +1702,104 @@ export namespace tools {
                 retried = true;
                 continue;
             }
+            if (r.ok && !python_reports.empty()) {
+                try {
+                    r.runtime_observation_views = co_await publishing::publish_python_tests(
+                        s.files, s.core, {project, worldline, version, snapshot.id().str()}, config.name, python_execution, python_reports, r.exports, snapshot);
+                } catch (const std::exception& error) {
+                    r.runtime_observation_error = error.what();
+                }
+            }
             break;
         }
+    }
+
+    struct capture_call {
+        std::vector<std::string> prefixes;
+        std::string operation_id, input;
+    };
+
+    auto capture_input(const std::optional<std::vector<std::string>>& prefixes, const std::optional<std::string>& operation_id,
+                       std::string_view tool, const auto& input) -> std::optional<capture_call> {
+        if (!prefixes && !operation_id)
+            return {};
+        if (!prefixes || prefixes->empty() || !operation_id)
+            throw tool_error(nodes::code::invalid_record, "capture_worktree_changes requires paths and an operation_id");
+        (void)lines::operation_of(*operation_id);
+        for (const auto& path : *prefixes) {
+            try {
+                content::checked_path(path);
+            } catch (const std::invalid_argument& e) {
+                throw tool_error(nodes::code::invalid_record, e.what());
+            }
+        }
+        return capture_call{*prefixes, *operation_id, content::hash_of(json::write(std::tuple{std::string{tool}, input})).str()};
+    }
+
+    auto captured_edits(std::vector<config_result>& reports, const nodes::node_reply& tree, std::uint64_t file_limit)
+        -> std::vector<nodes::edit> {
+        std::map<std::string, jobs::worktree_change> captures;
+        std::uint64_t used = 0;
+        for (auto& report : reports) {
+            for (auto& file : report.captured.value()) {
+                content::checked_path(file.path);
+                const auto [at, inserted] = captures.try_emplace(file.path, std::move(file));
+                if (!inserted && at->second != file)
+                    throw tool_error(nodes::code::source_conflict, "build configurations produced different changes for " + at->first);
+                if (inserted && at->second.bytes) {
+                    const auto size = at->second.bytes->size() / 2;
+                    if (at->second.bytes->size() % 2 || !at->second.executable)
+                        throw tool_error(nodes::code::invalid_record, "invalid captured file data for " + at->first);
+                    if (size > file_limit || size > constants::worktree_capture_bytes - used)
+                        throw tool_error(nodes::code::resource_limit, "worktree capture byte limit exceeded by " + at->first);
+                    used += size;
+                }
+                if (captures.size() > constants::worktree_capture_files)
+                    throw tool_error(nodes::code::resource_limit, "worktree capture file count exceeded");
+            }
+            report.captured.value().clear();
+        }
+        std::map<std::string_view, const nodes::file_view*> baseline;
+        for (const auto& file : tree.files)
+            baseline.emplace(file.path, &file);
+        std::vector<nodes::edit> edits;
+        for (auto& [path, file] : captures) {
+            const auto prior = baseline.find(path);
+            const bool exists = prior != baseline.end();
+            if (!file.bytes) {
+                if (!exists)
+                    throw tool_error(nodes::code::invalid_record, "captured removal or mode change has no input file: " + path);
+                edits.push_back({.kind = file.executable ? "mode" : "remove", .path = path, .executable = file.executable.value_or(false)});
+                continue;
+            }
+            auto bytes = lines::unhex(*file.bytes);
+            const bool text = lines::textual(bytes);
+            const bool recreate = exists && text != (prior->second->kind == "text");
+            edits.push_back({.kind = recreate ? (text ? "recreate" : "binary_recreate") :
+                                                exists ? (text ? "write" : "binary") : (text ? "create" : "binary_create"),
+                             .path = path, .text = text ? std::move(bytes) : std::move(*file.bytes), .executable = *file.executable});
+        }
+        return edits;
     }
 
     // Builds run one fixed version of the selected task worldline.
     // Only the build tool's results are cached; `fresh` rebuilds from a clean tree.
     auto execute_all(services& s, mcp::call_context context, std::string project, std::string operation, bool cacheable, bool fresh,
-                     std::vector<std::pair<config::effective_config, std::vector<jobs::step>>> jobs, mcp::notifier& note, std::string worldline,
-                     std::string version, const worlds::actor& actor) -> coroutine::task<results> {
+                     std::vector<detail::planned_job> jobs, mcp::notifier& note, std::string worldline,
+                     std::string version, const worlds::actor& actor, std::optional<capture_call> capture = {}) -> coroutine::task<results> {
         results out;
         out.results.resize(jobs.size());
         if (worldline.empty())
             throw tool_error("context_required", "worldline is required");
+        if (capture) {
+            if (auto done = co_await recorded(s, project, actor, capture->operation_id, capture->input, worldline)) {
+                const auto& pinned = done->second.observed;
+                if (!pinned)
+                    throw tool_error(nodes::code::storage_failure, "invalid worktree capture receipt");
+                co_return results{.ok = true, .snapshot = *pinned, .worldline = worldline, .revision = *pinned,
+                                  .worktree_commit = mutation{done->first.version, done->first.receipt, capture->operation_id, true}};
+            }
+        }
         auto tree = co_await selected(s, project, worldline, version, actor);
         content::manifest snapshot;
         for (auto& f : lines::manifest(tree))
@@ -1602,14 +1807,43 @@ export namespace tools {
         out.worldline = worldline;
         out.revision = tree.version;
         out.snapshot = tree.version;
+        const auto configured_limit = config::resolve(*s.snapshot(), project).limits.max_file_bytes;
+        const auto file_limit = configured_limit ? configured_limit : constants::worktree_capture_bytes;
         auto run_children = [&](coroutine::scope& children) -> coroutine::task<> {
-            for (std::size_t i = 0; i < jobs.size(); ++i)
-                children.spawn(execute(s, context, project, operation, cacheable, fresh, jobs[i].first, jobs[i].second, snapshot, note, out.results[i],
-                                       worldline, tree.version, actor));
+            for (std::size_t i = 0; i < jobs.size(); ++i) {
+                auto& job = jobs[i];
+                std::optional<jobs::worktree_capture> scope;
+                if (capture) {
+                    auto excluded = job.build_dirs;
+                    excluded.insert(excluded.end(), job.config.build.relocatable_build_dirs.begin(), job.config.build.relocatable_build_dirs.end());
+                    scope = jobs::worktree_capture{capture->prefixes, std::move(excluded), file_limit};
+                }
+                children.spawn(execute(s, context, project, operation, cacheable && !capture, fresh, job.config, job.steps, snapshot, note, out.results[i],
+                                       worldline, tree.version, actor, std::move(scope), capture ? capture->operation_id : std::string{}));
+            }
             co_await children.join();
         };
         co_await coroutine::with_scope(std::move(run_children));
         out.ok = std::ranges::all_of(out.results, &config_result::ok);
+        if (capture && out.ok) {
+            auto apply = [&]() -> coroutine::task<mutation> {
+                auto reply = co_await node_call(s, project, {.action = "apply", .worldline = worldline,
+                    .operation = lines::operation_of(capture->operation_id), .caller_operation = capture->operation_id,
+                    .expected = tree.frontier, .edits = captured_edits(out.results, tree, file_limit),
+                    .intent = "Capture " + operation + " worktree changes",
+                    .result = json::write(record{.input = capture->input, .observed = tree.version}),
+                    .tool = "execute.capture/1"}, actor);
+                co_return mutation{reply.version, reply.receipt, capture->operation_id, reply.replayed};
+            };
+            try {
+                out.worktree_commit = co_await once<mutation>(s, project, actor, capture->operation_id, capture->input, apply,
+                    [&](const auto& remembered) { return mutation{remembered.first.version, remembered.first.receipt, capture->operation_id, true}; }, worldline);
+            } catch (const tool_error& error) {
+                out.ok = false;
+                out.worktree_error = error.what();
+                out.worktree_error_code = error.code;
+            }
+        }
         co_return out;
     }
 

@@ -3,7 +3,7 @@ import utility;
 import constants;
 import std;
 import knowledge;
-import reflection;
+import json;
 import coroutine;
 import meta;
 import protocol;
@@ -70,7 +70,7 @@ export namespace tools {
                 return all;
             }
 
-            auto call(std::string_view name, rfl::Generic args, mcp::notifier& out, const worlds::actor& who, mcp::call_context context = {})
+            auto call(std::string_view name, json::value args, mcp::notifier& out, const worlds::actor& who, mcp::call_context context = {})
                 -> coroutine::task<mcp::tool_outcome> {
                 std::optional<coroutine::task<mcp::tool_outcome>> run;
                 (void)((name == Tools::name && (run.emplace(invoke<Tools>(*s_, context, std::move(args), out, who)), true)) || ...);
@@ -81,18 +81,18 @@ export namespace tools {
 
         private:
             template <class T> static auto describe() -> mcp::tool {
-                return {std::string{T::name}, std::string{T::description}, rfl::json::read<rfl::Generic>(rfl::json::to_schema<typename T::input>()).value(),
-                        rfl::json::read<rfl::Generic>(rfl::json::to_schema<typename T::output>()).value()};
+                return {std::string{T::name}, std::string{T::description}, json::schema<typename T::input>(),
+                        json::schema<typename T::output>()};
             }
 
             struct refusal {
                 std::string_view code;
                 std::string message;
             };
-            static auto refused(refusal r) -> mcp::tool_outcome { return {.text = rfl::json::write(r), .structured = rfl::to_generic(r), .error = true}; }
+            static auto refused(refusal r) -> mcp::tool_outcome { return {.text = json::write(r), .structured = json::to_value(r), .error = true}; }
 
             template <class T>
-            auto invoke(services& s, mcp::call_context context, rfl::Generic args, mcp::notifier& note, const worlds::actor& who)
+            auto invoke(services& s, mcp::call_context context, json::value args, mcp::notifier& note, const worlds::actor& who)
                 -> coroutine::task<mcp::tool_outcome> {
                 auto started = std::chrono::steady_clock::now();
                 if (!who.run.empty()) {
@@ -117,7 +117,7 @@ export namespace tools {
                     }
                     args = *object;
                 }
-                auto in = rfl::from_generic<typename T::input>(args);
+                auto in = json::from_value<typename T::input>(args);
                 if (!in)
                     co_return refused({nodes::code::invalid_record, std::format("{}: bad arguments: {}", T::name, in.error().what())});
                 std::optional<std::string> where;
@@ -150,8 +150,8 @@ export namespace tools {
                 }
                 mcp::tool_outcome outcome;
                 if (value) {
-                    outcome.text = rfl::json::write(*value);
-                    outcome.structured = rfl::to_generic(*value);
+                    outcome.text = json::write(*value);
+                    outcome.structured = json::to_value(*value);
                     if constexpr (requires { value->failed(); })
                         outcome.error = value->failed();
                 } else
@@ -172,7 +172,7 @@ export namespace tools {
 
     auto progress_note(const jobs::progress& p) -> mcp::notification {
         return {.method = "notifications/progress",
-                .params = mcp::object({{"progress", static_cast<std::int64_t>(p.done)}, {"total", static_cast<std::int64_t>(p.total)}, {"message", p.stage}})};
+                .params = json::object({{"progress", static_cast<std::int64_t>(p.done)}, {"total", static_cast<std::int64_t>(p.total)}, {"message", p.stage}})};
     }
 
 } // namespace tools

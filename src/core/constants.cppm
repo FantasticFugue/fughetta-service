@@ -26,10 +26,11 @@ export namespace constants {
     // What a worker takes. The execute role runs code the project supplies: builds, preparations and the
     // analyses that load it. The analyze role reads the project's data with this program's own code.
     inline constexpr std::string_view execute_role = "execute", analyze_role = "analyze";
-    // A container's execute role must dial back within this, and stops once idle for the other.
+    // The execute child must greet the Worker over stdio before this deadline.
     inline constexpr auto execute_start = std::chrono::seconds{60};
+    inline constexpr auto execute_memory_wait = std::chrono::seconds{5};
     inline constexpr auto execute_idle = std::chrono::minutes{10};
-    // What an analysis beside a container's execute role keeps of the host environment.
+    // Host settings shared with the execute child and analysis tools.
     inline constexpr std::array<std::string_view, 9> analysis_environment{"PATH", "HOME",      "LANG",        "LC_ALL",    "TMPDIR",
                                                                           "USER", "JAVA_HOME", "DOTNET_ROOT", "SystemRoot"};
     inline constexpr std::size_t language_sessions = 16;
@@ -47,11 +48,15 @@ export namespace constants {
     inline constexpr double worker_cost_weight = 0.25;
     inline constexpr std::uint64_t export_bytes = 1ull << 30;
     inline constexpr std::size_t export_files = 4096;
+    inline constexpr std::uint64_t worktree_capture_bytes = 8ull << 20;
+    inline constexpr std::size_t worktree_capture_files = 4096;
     inline constexpr std::uint64_t log_bytes = 64ull << 20;
     inline constexpr auto export_retention = std::chrono::hours{24 * 7};
     inline constexpr auto export_transfer_grace = std::chrono::minutes{10};
     inline constexpr auto export_collect_interval = std::chrono::minutes{1};
     inline constexpr std::uint64_t export_cache_bytes = 20ull << 30;
+    inline constexpr auto dependency_retention = std::chrono::days{30};
+    inline constexpr auto dependency_prune_interval = std::chrono::hours{1};
     inline constexpr auto dependency_lock_poll = std::chrono::milliseconds{100};
     inline constexpr std::uint64_t dependency_archive_bytes = 8ull << 30;
     inline constexpr std::size_t dependency_archive_count = 65536;

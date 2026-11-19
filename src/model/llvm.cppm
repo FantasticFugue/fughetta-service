@@ -1,15 +1,15 @@
-export module artifact;
+export module llvm;
 import evaluation;
 import coroutine;
 import toolchain;
 import enumeration;
 import channels;
 import std;
-import reflection;
+import json;
 import records;
 export import provider;
 
-export namespace native_artifact {
+export namespace llvm {
     class reader;
 }
 
@@ -19,6 +19,7 @@ export namespace language {
         static constexpr std::string_view name = "native", artifact = "native-artifact", linkage = "native.linkage_name";
     };
     template <> struct server<"native-artifact"> : reads<domain<"native">, optional_input<"ir", "llvm_ir">> {
+        static auto conventions() -> std::vector<semantic::language_conventions> { return {{.language = "native", .visibility = {"public", "internal"}}}; }
         static auto channels() -> std::vector<semantic::channel_definition> {
             return {{.name = "declarations", .projections = {std::string{"symbols"}, std::string{"types"}}},
                     {.name = "exports",
@@ -27,10 +28,10 @@ export namespace language {
                     {.name = "relations", .projections = {std::string{"relations"}}},
                     linkage_channel()};
         }
-        using adapter = native_artifact::reader;
-        // fughetta-native reads the artifact, its debug information and the LLVM IR or bitcode with LLVM's libraries.
+        using adapter = llvm::reader;
+        // fughetta-llvm reads the artifact, its debug information and the LLVM IR or bitcode with LLVM's libraries.
         struct options {
-            std::string host = "fughetta-native";
+            std::string host = "fughetta-llvm";
             std::string module;
             builds::environment env;
         };
@@ -61,15 +62,15 @@ export namespace language {
                 settings.emplace("ir", ir->path);
                 result.argv.insert(result.argv.end(), {"--ir", "${tree}/" + ir->path});
             }
-            result.initialization = rfl::to_generic(settings);
+            result.initialization = json::to_value(settings);
             return result;
         }
     };
     static_assert(domain_reader<server<"native-artifact">>);
 } // namespace language
 
-export namespace native_artifact {
-    // The object fughetta-native prints.
+export namespace llvm {
+    // The object fughetta-llvm prints.
     struct entry {
         std::string name, kind, binding, section;
         std::uint64_t address = 0, size = 0;
@@ -103,19 +104,25 @@ export namespace native_artifact {
         std::vector<location> locations;
     };
     inline auto read(std::string_view text) -> object {
-        auto decoded = rfl::json::read<object>(text);
+        auto decoded = json::read<object>(text);
         if (!decoded)
             throw std::invalid_argument("cannot decode the native artifact report: " + std::string{decoded.error().what()});
         return std::move(*decoded);
     }
 
     inline void associate(semantic::shard& out, const std::vector<location>& locations, const std::vector<channels::definition_body>& definitions,
-                          const std::map<std::string, std::string>& documents, const std::filesystem::path& root) {
+                          const std::map<std::string, std::string>& documents, const std::filesystem::path& root,
+                          const std::vector<channels::definition_body>& linkage_definitions = {}) {
         std::unordered_map<semantic::symbol_id, const semantic::records::occurrence*> positions;
         for (const auto& row : out.occurrences)
             positions.try_emplace(row.symbol, &row);
         using native_record = std::pair<const semantic::records::symbol*, const semantic::records::occurrence*>;
         std::map<std::uint64_t, std::vector<std::pair<bool, native_record>>> events;
+        std::set<std::uint64_t> debug_lines;
+        for (const auto& location : locations)
+            if (std::ranges::any_of(location.frames, [](const auto& frame) { return !frame.file.empty() && frame.line != 0; }))
+                debug_lines.insert(location.address);
+        std::set<semantic::symbol_id> covered;
         for (const auto& symbol : out.symbols) {
             if (symbol.kind != "function" || std::ranges::contains(symbol.modifiers, "import"))
                 continue;
@@ -124,7 +131,11 @@ export namespace native_artifact {
                 const auto start = *found->second->location.artifact->offset;
                 auto size = std::uint64_t{1};
                 if (const auto value = symbol.extensions.find("native.size"); value != symbol.extensions.end())
-                    size = std::max(std::uint64_t{1}, rfl::from_generic<std::uint64_t>(value->second).value());
+                    if (const auto parsed = json::from_value<std::uint64_t>(value->second); parsed)
+                        size = std::max(size, *parsed);
+                const auto first_line = debug_lines.lower_bound(start);
+                if (first_line != debug_lines.end() && *first_line - start < size)
+                    covered.insert(symbol.id);
                 events[start].push_back({true, {&symbol, found->second}});
                 if (size <= std::numeric_limits<std::uint64_t>::max() - start)
                     events[start + size].push_back({false, {&symbol, found->second}});
@@ -147,6 +158,28 @@ export namespace native_artifact {
         std::set<std::string> emitted;
         for (const auto& row : out.relations)
             emitted.insert(row.id);
+        auto emit = [&](const native_record& target, const channels::definition_body& source, std::uint64_t address,
+                        const std::string& origin_kind, semantic::records::emission_detail detail) {
+            const auto& [native, occurrence] = target;
+            const auto relation = out.unit.id + ":emits:" + native->id + ":" + source.context + ":" + source.identity.symbol;
+            if (!emitted.insert(relation).second)
+                return;
+            if (retained.insert(source.identity.symbol).second)
+                out.identities.push_back(source.identity);
+            auto origin = occurrence->ownership;
+            origin.origin.kind = origin_kind;
+            origin.origin.location = source.location;
+            origin.origin.location->artifact = occurrence->location.artifact;
+            origin.origin.location->artifact->offset = address;
+            out.relations.push_back({.id = relation,
+                                     .kind = std::string{"emits"},
+                                     .ownership = std::move(origin),
+                                     .from = source.identity.symbol,
+                                     .to = native->id,
+                                     .resolution = std::string{"resolved"},
+                                     .detail = std::move(detail),
+                                     .from_context = source.context});
+        };
         std::map<std::string, std::vector<std::pair<std::size_t, std::uint64_t>>> lines;
         for (const auto& [path, text] : documents) {
             auto& offsets = lines[path];
@@ -199,53 +232,65 @@ export namespace native_artifact {
                     return result;
                 };
                 const auto first = scalar(begin), last = scalar(end);
-                {
-                    const auto& native = *symbol;
-                    const semantic::identity_binding* selected = nullptr;
-                    std::string source_context;
-                    semantic::locator source_location;
-                    std::uint64_t width = std::numeric_limits<std::uint64_t>::max();
-                    bool ambiguous = false;
-                    for (const auto* definition : source_files[file->first]) {
-                        const auto& source = *definition;
-                        if (source.body.end <= first || source.body.begin > last)
-                            continue;
-                        const auto length = source.body.end - source.body.begin;
-                        if (!frame.column && selected && (selected->symbol != source.identity.symbol || source_context != source.context))
-                            ambiguous = true;
-                        else if (length < width) {
-                            selected = &source.identity;
-                            source_context = source.context;
-                            source_location = source.location;
-                            width = length;
-                            ambiguous = false;
-                        } else if (length == width && selected && (selected->symbol != source.identity.symbol || source_context != source.context))
-                            ambiguous = true;
-                    }
-                    if (!selected || ambiguous)
+                const channels::definition_body* selected = nullptr;
+                std::uint64_t width = std::numeric_limits<std::uint64_t>::max();
+                bool ambiguous = false;
+                for (const auto* source : source_files[file->first]) {
+                    if (source->body.end <= first || source->body.begin > last)
                         continue;
-                    const auto relation = out.unit.id + ":emits:" + native.id + ":" + source_context + ":" + selected->symbol;
-                    if (!emitted.insert(relation).second)
-                        continue;
-                    if (retained.insert(selected->symbol).second)
-                        out.identities.push_back(*selected);
-                    auto origin = occurrence->ownership;
-                    origin.origin.kind = std::string{"debug"};
-                    origin.origin.location = source_location;
-                    origin.origin.location->artifact = occurrence->location.artifact;
-                    origin.origin.location->artifact->offset = address;
-                    out.relations.push_back({.id = relation,
-                                             .kind = std::string{"emits"},
-                                             .ownership = std::move(origin),
-                                             .from = selected->symbol,
-                                             .to = native.id,
-                                             .resolution = std::string{"resolved"},
-                                             .detail = semantic::records::emission_detail{.file = file->first,
-                                                                                          .line = frame.line,
-                                                                                          .inline_depth = location.frames.size() - frame_index - 1},
-                                             .from_context = source_context});
+                    const auto length = source->body.end - source->body.begin;
+                    const bool distinct = selected && (selected->identity.symbol != source->identity.symbol || selected->context != source->context);
+                    if (!frame.column && distinct)
+                        ambiguous = true;
+                    else if (length < width) {
+                        selected = source;
+                        width = length;
+                        ambiguous = false;
+                    } else if (length == width && distinct)
+                        ambiguous = true;
                 }
+                if (selected && !ambiguous)
+                    emit({symbol, occurrence}, *selected, address, "debug",
+                         {.file = file->first, .line = frame.line, .inline_depth = location.frames.size() - frame_index - 1});
             }
+        }
+        if (linkage_definitions.empty())
+            return;
+        using linkage_key = std::pair<std::string, std::string>;
+        std::map<linkage_key, const channels::definition_body*> sources;
+        for (const auto& source : linkage_definitions) {
+            if (!source.linkage_name)
+                continue;
+            if (source.kind != "variable" && source.kind != "function" && source.kind != "method" &&
+                source.kind != "constructor" && source.kind != "destructor")
+                continue;
+            const auto kind = source.kind == "variable" ? "variable" : "function";
+            auto [found, inserted] = sources.try_emplace({kind, *source.linkage_name}, &source);
+            if (!inserted && found->second &&
+                (found->second->identity.symbol != source.identity.symbol || found->second->context != source.context || found->second->body != source.body))
+                found->second = nullptr;
+        }
+        std::map<linkage_key, std::vector<native_record>> targets;
+        for (const auto& symbol : out.symbols) {
+            if (std::ranges::contains(symbol.modifiers, "import"))
+                continue;
+            const auto linkage = symbol.extensions.find(std::string{language::domain<"native">::linkage});
+            const auto position = positions.find(symbol.id);
+            if (linkage == symbol.extensions.end() || position == positions.end() || !position->second->location.artifact ||
+                !position->second->location.artifact->offset)
+                continue;
+            const auto name = json::from_value<std::string>(linkage->second);
+            if (name && !name->empty())
+                targets[{symbol.kind, *name}].emplace_back(&symbol, position->second);
+        }
+        for (const auto& [key, rows] : targets) {
+            if (rows.size() != 1 || covered.contains(rows.front().first->id))
+                continue;
+            const auto match = sources.find(key);
+            if (match == sources.end() || !match->second)
+                continue;
+            emit(rows.front(), *match->second, *rows.front().second->location.artifact->offset, "artifact",
+                 {.evidence = decltype(semantic::records::emission_detail::evidence){"linkage_name"}, .file = match->second->body.path});
         }
     }
 
@@ -297,7 +342,7 @@ export namespace native_artifact {
                 if (method.function == s.name)
                     registered.push_back(method);
             if (!registered.empty())
-                row.extensions.emplace("native.jni_registrations", rfl::to_generic(registered));
+                row.extensions.emplace("native.jni_registrations", json::to_value(registered));
             out.occurrences.push_back({.id = out.unit.id + ":" + id,
                                        .ownership = owner(),
                                        .symbol = id,
@@ -340,16 +385,16 @@ export namespace native_artifact {
         }
         return out;
     }
-} // namespace native_artifact
+} // namespace llvm
 
-export namespace native_artifact {
+export namespace llvm {
     class reader : public language::reader_adapter {
     public:
         using language::reader_adapter::reader_adapter;
 
     protected:
-        auto do_open(rfl::Generic initialization) -> coroutine::task<> override {
-            settings_ = rfl::from_generic<std::map<std::string, std::string>>(initialization).value();
+        auto do_open(json::value initialization) -> coroutine::task<> override {
+            settings_ = json::from_value<std::map<std::string, std::string>>(initialization).value();
             co_await reader_adapter::do_open(std::move(initialization));
         }
         auto do_update(language::installation input, const std::vector<std::string>&) -> coroutine::task<> override {
@@ -374,16 +419,29 @@ export namespace native_artifact {
                     throw std::invalid_argument("LLVM IR has no measured build output");
                 inputs_.push_back({semantic::input_kind::artifact, input->first, input->second});
             }
-            for (const auto& [port, shards] : installed_.source_facts)
+            for (const auto& [port, shards] : installed_.source_facts) {
+                std::vector<const semantic::unit*> units;
                 for (const auto& object : shards) {
                     const auto& shard = *object->data;
-                    auto dependency = channels::consume(state_.project, port, shard, "definition_bodies", semantic::dependency_kind::body);
-                    semantic::input_object input{semantic::input_kind::channel, port + "/" + shard.unit.id + "/definition_bodies", dependency.value};
-                    inputs_.push_back(input);
-                    state_.inputs.push_back(std::move(input));
-                    consumed_.push_back(std::move(dependency));
+                    units.push_back(&shard.unit);
+                    if (std::ranges::contains(shard.unit.channel_definitions, std::string{"linkage"}, &semantic::channel_definition::name)) {
+                        auto dependency = channels::consume(state_.project, port, shard, "linkage", semantic::dependency_kind::declaration);
+                        semantic::input_object input{semantic::input_kind::channel, port + "/" + shard.unit.id + "/linkage", dependency.value};
+                        inputs_.push_back(input);
+                        state_.inputs.push_back(std::move(input));
+                        consumed_.push_back(std::move(dependency));
+                    }
                 }
+                // A new source contribution can make a formerly unique ABI
+                // name ambiguous even if the earlier contributions are unchanged.
+                auto dependency = channels::collection(state_.project, port, units, "definition_bodies");
+                semantic::input_object input{semantic::input_kind::channel, port + "/definition_bodies", dependency.value};
+                inputs_.push_back(input);
+                state_.inputs.push_back(std::move(input));
+                consumed_.push_back(std::move(dependency));
+            }
             definitions_ = channels::definition_bodies(installed_.source_facts, "definition_bodies");
+            linkage_definitions_ = channels::linkage_definitions(installed_.source_facts, std::string{language::domain<"native">::linkage});
             for (const auto& binding : definitions_)
                 source_documents_.insert(binding.body.path);
             if (!source_documents_.empty()) {
@@ -411,18 +469,17 @@ export namespace native_artifact {
             auto argv = command_.argv;
             if (!installed_.source_facts.empty())
                 argv.push_back("--lines");
-            auto object = native_artifact::read(co_await run(std::move(argv)));
+            auto object = llvm::read(co_await run(std::move(argv)));
             if (const auto ir = settings_.find("ir"); ir != settings_.end())
                 for (auto& call : object.calls)
                     call.artifact = ir->second;
-            auto shard =
-                native_artifact::records(object, state_.project, state_.options, state_.stage, settings_.at("module"), settings_.at("artifact"), inputs_);
+            auto shard = llvm::records(object, state_.project, state_.options, state_.stage, settings_.at("module"), settings_.at("artifact"), inputs_);
             shard.unit.cacheable = !runtime_.execution.empty();
             shard.unit.observed_dependencies = consumed_;
             if (!installed_.source_facts.empty()) {
                 auto selected = source_documents_;
                 std::erase_if(selected, [&](const auto& path) { return !installed_.source_files.contains(path); });
-                native_artifact::associate(shard, object.locations, definitions_, co_await loader_.read(std::move(selected)), root_);
+                llvm::associate(shard, object.locations, definitions_, co_await loader_.read(std::move(selected)), root_, linkage_definitions_);
             }
             shard.unit.coverage.requested = request.demand;
             language::evaluated_unit result;
@@ -434,7 +491,7 @@ export namespace native_artifact {
         std::map<std::string, std::string> settings_;
         std::vector<semantic::input_object> inputs_;
         std::vector<semantic::dependency> consumed_;
-        std::vector<channels::definition_body> definitions_;
+        std::vector<channels::definition_body> definitions_, linkage_definitions_;
         std::set<std::string> source_documents_;
     };
-} // namespace native_artifact
+} // namespace llvm

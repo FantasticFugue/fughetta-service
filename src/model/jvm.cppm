@@ -1,5 +1,5 @@
 module;
-#include <zlib.h>
+#include <zip.h>
 export module jvm;
 import std;
 import evaluation;
@@ -7,7 +7,7 @@ import coroutine;
 import constants;
 import content;
 import durability;
-import reflection;
+import json;
 import records;
 import channels;
 import enumeration;
@@ -103,7 +103,7 @@ export namespace jvm {
     struct annotation {
         std::string descriptor;
         bool visible = false;
-        std::map<std::string, rfl::Generic> values;
+        std::map<std::string, json::value> values;
     };
     struct call {
         std::uint32_t offset = 0;
@@ -189,23 +189,23 @@ export namespace jvm {
         auto klass = [&](std::uint16_t index) -> std::string { return index ? utf(pool.at(index).first) : ""; };
         // JVMS 4.7.16.1: preserve the discriminant, including nested annotation
         // and array values, instead of flattening annotation text.
-        auto annotation_value = [&](auto&& self, bytes& source, char tag) -> rfl::Generic {
-            std::map<std::string, rfl::Generic> value{{"tag", std::string(1, tag)}};
+        auto annotation_value = [&](auto&& self, bytes& source, char tag) -> json::value {
+            std::map<std::string, json::value> value{{"tag", std::string(1, tag)}};
             if (tag == '@') {
                 value["descriptor"] = utf(source.u2());
-                std::map<std::string, rfl::Generic> members;
+                std::map<std::string, json::value> members;
                 const auto count = source.u2();
                 for (unsigned i = 0; i < count; ++i) {
                     const auto name = utf(source.u2());
                     members[name] = self(self, source, source.u1());
                 }
-                value["values"] = rfl::to_generic(members);
+                value["values"] = json::to_value(members);
             } else if (tag == '[') {
-                std::vector<rfl::Generic> elements;
+                std::vector<json::value> elements;
                 const auto count = source.u2();
                 for (unsigned i = 0; i < count; ++i)
                     elements.push_back(self(self, source, source.u1()));
-                value["elements"] = rfl::to_generic(elements);
+                value["elements"] = json::to_value(elements);
             } else if (tag == 'e') {
                 value["descriptor"] = utf(source.u2());
                 value["name"] = utf(source.u2());
@@ -243,7 +243,7 @@ export namespace jvm {
                     throw std::invalid_argument("invalid JVM annotation value tag");
                 }
             }
-            return rfl::to_generic(value);
+            return json::to_value(value);
         };
         auto annotations = [&](bytes& source, bool visible, std::vector<annotation>& output) {
             const auto count = source.u2();
@@ -375,67 +375,41 @@ export namespace jvm {
         };
         if (data.size() >= 4 && static_cast<unsigned char>(data[0]) == 0xca)
             return {parse(data)};
-        auto le = [&](std::size_t at, unsigned count) -> std::uint64_t {
-            if (at > data.size() || count > data.size() - at)
-                throw std::invalid_argument("truncated JAR directory");
-            std::uint64_t out = 0;
-            for (unsigned i = 0; i < count; ++i)
-                out |= std::uint64_t{static_cast<unsigned char>(data[at + i])} << (i * 8);
-            return out;
-        };
-        if (data.size() < 22)
-            throw std::invalid_argument("artifact is not a class or JAR");
-        std::size_t end = data.size() - 22;
-        while (le(end, 4) != 0x06054b50 || end + 22 + le(end + 20, 2) != data.size()) {
-            if (!end || data.size() - end > 65557)
-                throw std::invalid_argument("JAR directory is absent");
-            --end;
-        }
-        auto count = le(end + 10, 2), directory = le(end + 16, 4);
-        if (count == 0xffff || directory == 0xffffffff) {
-            if (end < 20 || le(end - 20, 4) != 0x07064b50)
-                throw std::invalid_argument("JAR ZIP64 locator is absent");
-            auto zip64 = le(end - 12, 8);
-            if (le(zip64, 4) != 0x06064b50)
-                throw std::invalid_argument("JAR ZIP64 directory is absent");
-            count = le(zip64 + 32, 8);
-            directory = le(zip64 + 48, 8);
-        }
+        zip_error_t error;
+        zip_error_init(&error);
+        struct error_guard {
+            zip_error_t& error;
+            ~error_guard() { zip_error_fini(&error); }
+        } cleanup{error};
+        std::unique_ptr<zip_source_t, decltype(&zip_source_free)> source{
+            zip_source_buffer_create(data.data(), data.size(), 0, &error), zip_source_free};
+        if (!source)
+            throw std::invalid_argument(zip_error_strerror(&error));
+        std::unique_ptr<zip_t, decltype(&zip_discard)> archive{zip_open_from_source(source.get(), ZIP_RDONLY, &error), zip_discard};
+        if (!archive)
+            throw std::invalid_argument(zip_error_strerror(&error));
+        (void)source.release();
+        const auto count = zip_get_num_entries(archive.get(), 0);
+        if (count < 0)
+            throw std::invalid_argument("invalid JAR directory");
+
         std::map<std::string, std::pair<unsigned, object>> selected;
         std::uint64_t unpacked = 0;
-        for (std::uint64_t i = 0; i < count; ++i) {
-            auto at = directory;
-            if (le(at, 4) != 0x02014b50)
+        for (zip_int64_t i = 0; i < count; ++i) {
+            zip_stat_t entry;
+            zip_stat_init(&entry);
+            if (zip_stat_index(archive.get(), i, ZIP_FL_ENC_RAW, &entry) != 0 ||
+                !(entry.valid & ZIP_STAT_NAME))
                 throw std::invalid_argument("invalid JAR directory entry");
-            auto flags = le(at + 8, 2), method = le(at + 10, 2), packed = le(at + 20, 4), plain = le(at + 24, 4);
-            auto length = le(at + 28, 2), extra = le(at + 30, 2), comment = le(at + 32, 2), offset = le(at + 42, 4);
-            bytes names{data};
-            names.position = at + 46;
-            auto name = std::string{names.take(length)};
-            auto extras = names.take(extra);
-            directory = at + 46 + length + extra + comment;
+            std::string name{entry.name};
             if (!name.ends_with(".class"))
                 continue;
-            if (flags & 1)
-                throw std::invalid_argument("encrypted JAR entries are not analysis inputs");
-            for (std::size_t pos = 0; pos + 4 <= extras.size();) {
-                auto tag = le(at + 46 + length + pos, 2), size = le(at + 48 + length + pos, 2);
-                pos += 4;
-                if (tag == 1) {
-                    auto cursor = at + 46 + length + pos;
-                    if (plain == 0xffffffff) {
-                        plain = le(cursor, 8);
-                        cursor += 8;
-                    }
-                    if (packed == 0xffffffff) {
-                        packed = le(cursor, 8);
-                        cursor += 8;
-                    }
-                    if (offset == 0xffffffff)
-                        offset = le(cursor, 8);
-                }
-                pos += size;
-            }
+            constexpr auto required = ZIP_STAT_SIZE | ZIP_STAT_ENCRYPTION_METHOD | ZIP_STAT_COMP_METHOD;
+            if ((entry.valid & required) != required || entry.encryption_method != ZIP_EM_NONE)
+                throw std::invalid_argument("JAR class is encrypted or missing entry metadata");
+            if (entry.comp_method != ZIP_CM_STORE && entry.comp_method != ZIP_CM_DEFLATE)
+                throw std::invalid_argument("unknown JAR compression method");
+            const auto plain = entry.size;
             const auto physical_entry = name;
             unsigned version = 0;
             constexpr std::string_view prefix = "META-INF/versions/";
@@ -458,30 +432,19 @@ export namespace jvm {
             if (plain > constants::semantic_object_bytes - unpacked)
                 throw std::length_error("JAR class data exceeds analysis budget");
             unpacked += plain;
-            if (le(offset, 4) != 0x04034b50)
-                throw std::invalid_argument("invalid JAR local entry");
-            auto begin = offset + 30 + le(offset + 26, 2) + le(offset + 28, 2);
-            bytes stored{data};
-            stored.position = begin;
-            auto input = stored.take(packed);
-            std::string output;
-            if (method == 0)
-                output = input;
-            else if (method == 8) {
-                output.resize(plain);
-                z_stream stream{};
-                stream.next_in = reinterpret_cast<Bytef*>(const_cast<char*>(input.data()));
-                stream.avail_in = input.size();
-                stream.next_out = reinterpret_cast<Bytef*>(output.data());
-                stream.avail_out = output.size();
-                if (inflateInit2(&stream, -MAX_WBITS) != Z_OK)
-                    throw std::runtime_error("cannot initialize JAR decompressor");
-                auto result = inflate(&stream, Z_FINISH);
-                inflateEnd(&stream);
-                if (result != Z_STREAM_END || stream.total_out != plain)
+            std::unique_ptr<zip_file_t, decltype(&zip_fclose)> file{zip_fopen_index(archive.get(), i, 0), zip_fclose};
+            if (!file)
+                throw std::invalid_argument("cannot open JAR class");
+            std::string output(static_cast<std::size_t>(plain), '\0');
+            for (std::size_t read = 0; read < output.size();) {
+                const auto size = zip_fread(file.get(), output.data() + read, output.size() - read);
+                if (size <= 0)
                     throw std::invalid_argument("invalid compressed JAR class");
-            } else
-                throw std::invalid_argument("unknown JAR compression method");
+                read += static_cast<std::size_t>(size);
+            }
+            char end;
+            if (zip_fread(file.get(), &end, 1) != 0 || zip_fclose(file.release()) != 0)
+                throw std::invalid_argument("invalid compressed JAR class");
             auto parsed = parse(output);
             parsed.entry = physical_entry;
             selected.insert_or_assign(name, std::pair{version, std::move(parsed)});
@@ -512,6 +475,15 @@ export namespace language {
         static auto required_inputs(const options& o) -> std::vector<std::string> {
             return o.metadata_helper.empty() || !o.source_provider.empty() ? std::vector<std::string>{"artifact"}
                                                                            : std::vector<std::string>{"artifact", "source_facts"};
+        }
+        // Kotlin metadata in a class file gives its declarations Kotlin's spellings.
+        static auto conventions() -> std::vector<semantic::language_conventions> {
+            return {{.language = "jvm", .visibility = {"public", "protected", "package", "private"}},
+                    {.language = "kotlin",
+                     .visibility = {"PUBLIC", "INTERNAL", "PROTECTED", "PACKAGE_PROTECTED", "PACKAGE_PRIVATE", "PRIVATE_TO_THIS", "PRIVATE", "LOCAL"},
+                     .value_wrappers = {"kotlin.Result", "kotlinx.coroutines.Deferred"},
+                     .type_domain = "jvm", .wrapper_arguments = "<",
+                     .scope_edges = {"base", "import"}}};
         }
         static auto channels() -> std::vector<semantic::channel_definition> {
             return {{.name = "declarations", .projections = {std::string{"symbols"}, std::string{"types"}}},
@@ -565,7 +537,7 @@ export namespace language {
             }
             if (!artifact)
                 throw std::invalid_argument("JVM reader requires one jvm_artifact input");
-            program out{.provider = "jvm-artifact", .initialization = rfl::to_generic(std::tuple{artifact->path, model, o})};
+            program out{.provider = "jvm-artifact", .initialization = json::to_value(std::tuple{artifact->path, model, o})};
             if (!o.metadata_helper.empty()) {
                 out.commands["metadata"] = {o.metadata_executable, "-jar", builds::tool(o.metadata_helper), "--jvm-metadata"};
                 out.executables = {o.metadata_helper};
@@ -747,7 +719,7 @@ export namespace jvm {
                 declared_module = found->second.module;
             }
             semantic::native_identity identity{recipe.unit.project, declared_module, "jvm-artifact", "jvm",
-                                               rfl::json::write(std::tuple{recipe.options, declared_container, key})};
+                                               json::write(std::tuple{recipe.options, declared_container, key})};
             out.identities.push_back({identity, key, {}});
             out.symbols.push_back({.id = key,
                                    .ownership = ownership,
@@ -831,7 +803,7 @@ export namespace jvm {
             klass.type = class_type;
             klass.extensions = {{"jvm.access_flags", std::int64_t{object.flags}},
                                 {"jvm.signature", object.signature},
-                                {"jvm.annotations", rfl::to_generic(object.annotations)}};
+                                {"jvm.annotations", json::to_value(object.annotations)}};
             out.occurrences.push_back({.id = object.name + ":definition",
                                        .ownership = ownership,
                                        .symbol = object.name,
@@ -865,7 +837,7 @@ export namespace jvm {
                     if (member.flags & mask)
                         row.modifiers.push_back(name);
                 row.extensions = {{"jvm.class", object.name}, {"jvm.descriptor", member.descriptor}, {"jvm.signature", member.signature}};
-                row.extensions["jvm.annotations"] = rfl::to_generic(member.annotations);
+                row.extensions["jvm.annotations"] = json::to_value(member.annotations);
                 if (member.constant)
                     row.extensions["jvm.constant"] = *member.constant;
                 out.occurrences.push_back(
@@ -897,7 +869,7 @@ export namespace jvm {
                     std::vector<std::string> targets{target};
                     const bool virtual_call = call.opcode == 0xb6 || call.opcode == 0xb9;
                     if (virtual_call) {
-                        const auto dispatch = rfl::json::write(std::tuple{call.owner, call.name, call.descriptor});
+                        const auto dispatch = json::write(std::tuple{call.owner, call.name, call.descriptor});
                         if (const auto found = dispatches.find(dispatch); found != dispatches.end()) {
                             for (const auto& candidate : found->second) {
                                 const auto owner = symbol(candidate.owner, candidate.owner, "type");
@@ -1221,7 +1193,7 @@ export namespace jvm {
     }
     // Unit names are structural tuples; container paths remain explicit locator provenance.
     inline auto class_key(const std::string& container, const std::string& klass, const std::string& role) -> std::string {
-        return rfl::json::write(std::tuple{role, container, klass});
+        return json::write(std::tuple{role, container, klass});
     }
     inline void logical_locations(semantic::shard& shard, const semantic::artifact_input& input) {
         auto bind = [&](semantic::locator& location) {
@@ -1243,9 +1215,9 @@ export namespace jvm {
         using language::reader_adapter::reader_adapter;
 
     protected:
-        auto do_open(rfl::Generic initialization) -> coroutine::task<> override {
+        auto do_open(json::value initialization) -> coroutine::task<> override {
             auto value =
-                rfl::from_generic<std::tuple<std::string, std::optional<std::string>, language::server<"jvm-artifact">::options>>(initialization).value();
+                json::from_value<std::tuple<std::string, std::optional<std::string>, language::server<"jvm-artifact">::options>>(initialization).value();
             path_ = std::get<0>(value);
             model_ = std::get<1>(value);
             options_ = std::get<2>(value);
@@ -1304,7 +1276,7 @@ export namespace jvm {
                 for (const auto& binding : source->identities)
                     if (const auto* native = std::get_if<semantic::native_identity>(&binding.declaration)) {
                         source_bindings[native->native_key].insert(
-                            rfl::json::write(std::tuple{*native, binding.symbol, declarations[binding.symbol], source->unit.id}));
+                            json::write(std::tuple{*native, binding.symbol, declarations[binding.symbol], source->unit.id}));
                         source_units[native->native_key].insert(source->unit.id);
                     }
             values_.clear();
@@ -1357,12 +1329,12 @@ export namespace jvm {
                                 }
                             }
                         } guard{list};
-                        durability::durable_write(list, rfl::json::write(paths));
+                        durability::durable_write(list, json::write(paths));
                         command.push_back(list.string());
-                        container.decoded = rfl::json::read<kotlin_metadata::report>(co_await run(std::move(command))).value();
+                        container.decoded = json::read<kotlin_metadata::report>(co_await run(std::move(command))).value();
                     }
                     if (!container.decoded)
-                        container.decoded = rfl::json::read<kotlin_metadata::report>(co_await run(std::move(command))).value();
+                        container.decoded = json::read<kotlin_metadata::report>(co_await run(std::move(command))).value();
                 }
                 // Class inputs are also the source of truth after a cold worker restart.
                 if (container.locations.empty()) {
@@ -1383,7 +1355,7 @@ export namespace jvm {
                         throw std::invalid_argument("JVM class is provided by multiple artifact inputs: " + object.name);
                     inventory_.push_back(object);
                 }
-                values_[{"jvm/inventory", logical}] = content::hash_of(rfl::json::write(container.inputs)).str();
+                values_[{"jvm/inventory", logical}] = content::hash_of(json::write(container.inputs)).str();
             }
             containers_ = std::move(selected);
             dispatches_.clear();
@@ -1397,7 +1369,7 @@ export namespace jvm {
                     derived[interface].push_back(&object);
             }
             auto dispatch = [&](const call& call) {
-                const auto key = rfl::json::write(std::tuple{call.owner, call.name, call.descriptor});
+                const auto key = json::write(std::tuple{call.owner, call.name, call.descriptor});
                 if (dispatches_.contains(key))
                     return;
                 auto& targets = dispatches_[key];
@@ -1416,7 +1388,7 @@ export namespace jvm {
                             pending.insert(child->name);
                 }
                 std::ranges::sort(targets, {}, &dispatch_target::owner);
-                values_[{"jvm/dispatch", key}] = content::hash_of(rfl::json::write(targets)).str();
+                values_[{"jvm/dispatch", key}] = content::hash_of(json::write(targets)).str();
             };
             std::vector<semantic::unit_key> out;
             auto append = [&](const std::string& name, semantic::unit_kind kind) {
@@ -1435,7 +1407,7 @@ export namespace jvm {
                 for (std::size_t i = 0; i < container.classes.size(); ++i) {
                     const auto& object = container.classes[i];
                     semantic::native_identity class_identity{state_.project, container.module, state_.provider, "jvm",
-                                                             rfl::json::write(std::tuple{state_.options, logical, object.name})};
+                                                             json::write(std::tuple{state_.options, logical, object.name})};
                     targets.emplace(
                         kotlin_metadata::member_key{object.name, "class", "", ""},
                         kotlin_metadata::member_target{{class_identity, prefix + object.name, {}},
@@ -1446,11 +1418,11 @@ export namespace jvm {
                     const auto key = class_key(logical, object.name, "class");
                     append(key, semantic::unit_kind::artifact);
                     keys_[key] = {logical, i};
-                    values_[{"jvm/class", key}] = content::hash_of(rfl::json::write(std::tuple{object.entry, object.value})).str();
+                    values_[{"jvm/class", key}] = content::hash_of(json::write(std::tuple{object.entry, object.value})).str();
                     for (const auto& member : object.members) {
                         const auto raw = object.name + "." + member.name + member.descriptor;
                         semantic::native_identity identity{state_.project, container.module, state_.provider, "jvm",
-                                                           rfl::json::write(std::tuple{state_.options, logical, raw})};
+                                                           json::write(std::tuple{state_.options, logical, raw})};
                         semantic::locator location{.artifact = semantic::artifact_location{
                                                        "", container.module, object.entry + "#" + member.name + member.descriptor, 0,
                                                        semantic::artifact_input{state_.project, state_.stage, container.locations.at(object.name)}}};
@@ -1491,7 +1463,7 @@ export namespace jvm {
                                 identity_producers_[observation].insert(units->second.begin(), units->second.end());
                         }
                         // A declaration no source names takes the frontend's identity.
-                        values_[{"jvm/identities", observation}] = content::hash_of(rfl::json::write(std::tuple{reads, frontends})).str();
+                        values_[{"jvm/identities", observation}] = content::hash_of(json::write(std::tuple{reads, frontends})).str();
                     }
                 }
             }
@@ -1511,7 +1483,7 @@ export namespace jvm {
         }
         auto do_evaluate(const language::evaluation_request& request) -> coroutine::task<language::evaluated_unit> override {
             const semantic::recipe recipe{request.unit, state_.options};
-            const auto name = rfl::json::read<std::tuple<std::string, std::string, std::string>>(request.unit.name).value();
+            const auto name = json::read<std::tuple<std::string, std::string, std::string>>(request.unit.name).value();
             const auto& role = std::get<0>(name);
             const auto& logical = std::get<1>(name);
             auto& container = containers_.at(logical);
@@ -1615,7 +1587,7 @@ export namespace jvm {
                             if (!call.owner.empty())
                                 lookups.insert(call.owner);
                             if (call.opcode == 0xb6 || call.opcode == 0xb9) {
-                                const auto name = rfl::json::write(std::tuple{call.owner, call.name, call.descriptor});
+                                const auto name = json::write(std::tuple{call.owner, call.name, call.descriptor});
                                 const semantic::input_object input{semantic::input_kind::provider, name, values_.at({"jvm/dispatch", name}), "jvm/dispatch"};
                                 if (!std::ranges::contains(shard.unit.direct_inputs, input))
                                     shard.unit.direct_inputs.push_back(input);
@@ -1648,7 +1620,7 @@ export namespace jvm {
         auto lookup(const std::string& name) const -> std::string {
             const auto found = owners_.find(name);
             return content::hash_of(found == owners_.end() ? std::string{"absent"}
-                                                           : rfl::json::write(std::tuple{found->second.container, found->second.module}))
+                                                           : json::write(std::tuple{found->second.container, found->second.module}))
                 .str();
         }
         std::string path_;

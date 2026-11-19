@@ -1,3 +1,6 @@
+module Fughetta.MSBuildModel
+
+open Argu
 open System
 open System.IO
 open System.Diagnostics
@@ -59,28 +62,44 @@ let write (path: string) (value: JsonNode) =
     finally
         if File.Exists(temp) then File.Delete(temp)
 
-let main () =
-    let argv = fsi.CommandLineArgs |> Array.skip 1 |> Array.toList
-    let argv = if argv.Head = "--" then argv.Tail else argv
-    let options = Dictionary<string, ResizeArray<string>>()
-    let rec parse = function
-        | "--operations" :: rest -> rest
-        | key :: value :: rest ->
-            if options.ContainsKey key && key <> "--project" && key <> "--generated" && key <> "--argument" then
-                failwithf "Repeated option: %s" key
-            if not (options.ContainsKey key) then options[key] <- ResizeArray()
-            options[key].Add(value)
-            parse rest
-        | [] -> []
-        | _ -> failwith "Expected an option value"
-    let modes = parse argv
-    if modes.IsEmpty then failwith "At least one operation is required"
-    let get name = options[name][0]
-    let many name = if options.ContainsKey name then options[name] :> seq<string> else Seq.empty
-    let root, directory, tool = full (get "--root"), full (get "--project-dir"), get "--tool"
-    let extra = many "--argument" |> Seq.toList
-    let projects = many "--project" |> Seq.map (join directory) |> Seq.toList
-    if projects.IsEmpty then failwith "At least one project is required"
+type Arguments =
+    | [<Mandatory; Unique>] Root of string
+    | [<Mandatory; Unique>] Project_Dir of string
+    | [<Mandatory; Unique>] Tool of string
+    | [<Mandatory; Unique>] Jobs of int
+    | [<Mandatory; Unique>] Restore_Output of string
+    | [<Mandatory; Unique>] Model_Output of string
+    | [<Mandatory; Unique>] Assets of string
+    | [<Mandatory>] Project of string
+    | Generated of string
+    | Argument of string
+    | [<Mandatory; Unique; Last>] Operations of string list
+    interface IArgParserTemplate with
+        member option.Usage =
+            match option with
+            | Root _ -> "Workspace root."
+            | Project_Dir _ -> "Working directory for relative project paths."
+            | Tool _ -> "Path to dotnet."
+            | Jobs _ -> "Maximum number of MSBuild processes."
+            | Restore_Output _ -> "Destination for the restore receipt."
+            | Model_Output _ -> "Destination for the exported project model."
+            | Assets _ -> "Path to the restore receipt."
+            | Project _ -> "MSBuild project to evaluate."
+            | Generated _ -> "Generated source input."
+            | Argument _ -> "Extra MSBuild argument."
+            | Operations _ -> "Operations to execute in order."
+
+let runModel (argv: string array) =
+    let parser = ArgumentParser.Create<Arguments>(programName = "fughetta-msbuild-model")
+    let options = parser.ParseCommandLine argv
+    let modes = options.GetResult Operations
+    if modes.IsEmpty || not (modes |> List.forall (fun mode -> mode = "restore" || mode = "model")) then
+        failwith "Expected one or more restore or model operations"
+    let jobs = options.GetResult Jobs
+    if jobs < 1 then failwith "--jobs must be positive"
+    let root, directory, tool = full (options.GetResult Root), full (options.GetResult Project_Dir), options.GetResult Tool
+    let extra = options.GetResults Argument
+    let projects = options.GetResults Project |> List.map (join directory)
     let objects = Environment.GetEnvironmentVariable("FUGHETTA_STAGING")
     if String.IsNullOrEmpty objects then failwith "FUGHETTA_STAGING must name this step staging directory"
     let bindings =
@@ -132,15 +151,15 @@ let main () =
                 Regex.Replace(value, Regex.Escape(entry.Key) + "(?=$|[/\\\\,;:\\s\"'])", MatchEvaluator(fun _ -> entry.Value))) argument)
         |> strings
     let query (project: string) (flags: string list) (properties: string list) (items: string list) =
-        let args = ["msbuild"; project; "-nologo"; "-verbosity:quiet"; "-maxCpuCount:" + get "--jobs"] @ extra @ flags @
+        let args = ["msbuild"; project; "-nologo"; "-verbosity:quiet"; "-maxCpuCount:" + string jobs] @ extra @ flags @
                    ["-getProperty:" + String.concat "," properties] @
                    (if List.isEmpty items then [] else ["-getItem:" + String.concat "," items])
         run tool directory args |> JsonNode.Parse
     let execute mode =
         let output =
             match mode with
-            | "restore" -> full (get "--restore-output")
-            | "model" -> full (get "--model-output")
+            | "restore" -> full (options.GetResult Restore_Output)
+            | "model" -> full (options.GetResult Model_Output)
             | _ -> failwith "Expected restore or model"
         if mode = "restore" then
             // Query the evaluated root's assets path after Restore in the same
@@ -167,7 +186,7 @@ let main () =
             for project, result in restoredRoots do record project (Some result)
             write output (object ["kind", text "nuget_assets"; "files", array assets.Values])
         elif mode = "model" then
-            let receipt = File.ReadAllText(get "--assets") |> JsonNode.Parse
+            let receipt = File.ReadAllText(options.GetResult Assets) |> JsonNode.Parse
             if field receipt "kind" <> "nuget_assets" then failwith "Expected nuget_assets input"
             let restoredAssets = HashSet<string>()
             for file in values receipt["files"] do
@@ -175,7 +194,7 @@ let main () =
                 if not (File.Exists path) then failwithf "Missing restored assets: %s" path
                 restoredAssets.Add(path) |> ignore
                 if digest path <> field file "hash" then failwithf "Restored assets differ from nuget_assets input: %s" path
-            let generatedInputs = many "--generated" |> Seq.map full |> Seq.toArray
+            let generatedInputs = options.GetResults Generated |> Seq.map full |> Seq.toArray
             for path in generatedInputs do
                 if not (File.Exists path || Directory.Exists path) then failwithf "Missing generated_sources input: %s" path
             let units = Dictionary<string, JsonNode>()
@@ -276,6 +295,11 @@ let main () =
         else failwith "Expected restore or model"
     for mode in modes do execute mode
 
-try main () with error ->
-    eprintfn "%s" error.Message
-    exit 1
+[<EntryPoint>]
+let main argv =
+    try
+        runModel argv
+        0
+    with error ->
+        eprintfn "%s" error.Message
+        1

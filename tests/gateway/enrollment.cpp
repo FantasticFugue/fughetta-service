@@ -1,6 +1,8 @@
 import std;
 import boost.ut;
 import enrollment;
+import records;
+import content;
 import durability;
 import host;
 import support;
@@ -51,6 +53,23 @@ namespace {
                 expect(restored.authenticate("workspace-a", second.worker_id, second.secret).has_value());
             }
             expect(throws<std::runtime_error>([&] { enrollment::store wrong{recovery.dir, "workspace-b"}; }));
+        };
+        "execution receipts bind the signing credential to the active Worker"_test = [] {
+            test::scratch scratch{"worker-receipt"};
+            enrollment::store store{scratch.dir, "workspace"};
+            const auto first = store.add("first", "owner");
+            const auto second = store.add("second", "owner");
+            const content::receipt_key key{first.secret};
+            semantic::execution_receipt receipt{first.workspace_id, first.worker_id, "snapshot", "recipe", "semantic_shard", "shard", "execution", {}};
+            receipt.signature = key.sign(receipt.payload());
+            expect(store.verify(first.worker_id, receipt) == std::optional{key.public_key()});
+            expect(!store.verify(second.worker_id, receipt));
+            auto altered = receipt;
+            altered.subject_id = "different-shard";
+            expect(!store.verify(first.worker_id, altered));
+            store.revoke(first.worker_id);
+            expect(!store.verify(first.worker_id, receipt));
+            expect(content::receipt_key::verify(key.public_key(), receipt.payload(), receipt.signature));
         };
         "concurrent registrations create distinct identities"_test = [] {
             test::scratch scratch{"worker-enrollment-race"};

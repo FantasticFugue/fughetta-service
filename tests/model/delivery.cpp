@@ -5,7 +5,7 @@ import delivery;
 import protocol;
 import build;
 import projectmodel;
-import reflection;
+import json;
 import durability;
 import registry;
 import configuration;
@@ -66,7 +66,7 @@ namespace {
                            .language = "kotlin",
                            .directory = ".",
                            .references = {projectmodel::artifact_reference{.object = {hash.str(), "library.jar"}, .role = "classpath"}}}}};
-            test::spit(tree / "model.json", rfl::json::write(model));
+            test::spit(tree / "model.json", json::write(model));
             test::spit(tree / "library.jar", "library");
             const auto file = delivery::capture(tree, {{"model", "model.json"}}, storage).at(0);
             delivery::capture(tree, {{"library", "library.jar"}}, storage);
@@ -107,12 +107,12 @@ namespace {
                            .directory = ".",
                            .references = {projectmodel::artifact_reference{.object = {hash.str(), "library.jar"}, .role = "classpath"}}}}};
             test::spit(staging / hash.view(), "library");
-            test::spit(tree / "model.json", rfl::json::write(model));
+            test::spit(tree / "model.json", json::write(model));
             const builds::context output{"model", "project_model", "model.json"};
             auto first = delivery::capture_model(tree, output, staging, storage);
             expect(first.objects.size() == 1_u);
             model.units.front().project = "other";
-            test::spit(tree / "model.json", rfl::json::write(model));
+            test::spit(tree / "model.json", json::write(model));
             auto second = delivery::capture_model(tree, output, staging, storage);
             test::spit(staging / hash.view(), "poison");
             expect(throws<std::invalid_argument>([&] { delivery::capture_model(tree, output, staging, storage); }));

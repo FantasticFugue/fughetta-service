@@ -31,7 +31,8 @@ the component library `@fantasticfugue/components` (`../components`):
 
 ## Dependencies and build
 
-Requires CMake 4.5+, Ninja, vcpkg, and clang 23 or later with libc++.
+Requires CMake 4.5+, Ninja, vcpkg, and clang 23 or later. Linux and macOS compile against libc++;
+Windows uses upstream clang-cl with the MSVC STL and the Windows SDK of a Visual Studio installation.
 The service defaults to `uring` on Linux (kernel 6.1 or later), `iocp` on Windows, and `kqueue` on
 macOS. Select another mechanism with `-DHTTPANT_IO_BACKEND=NAME` when configuring the service.
 The manifest installs liburing on Linux.
@@ -47,7 +48,7 @@ into the build directory, so dependencies build with the same clang and flags.
 clang tree to compile with and `VCPKG_ROOT` the vcpkg checkout. Without
 `CLANG_ROOT` the platform's clang is used, and a `CMAKE_CXX_COMPILER` given to
 CMake wins over both; either way CMake 4.5's `import std` support synthesizes
-the std module from libc++'s manifest. vcpkg's downloads stay in the build
+the std module from the standard library's manifest. vcpkg's downloads stay in the build
 directory unless `VCPKG_DOWNLOADS` names a shared one. Each target system has a
 description in `cmake/platform/<system>.cmake` (platform units, I/O backend,
 service-manager template) and its own tests in `tests/platform/<system>.cmake`;
@@ -105,15 +106,83 @@ yourself, pass its path:
 fug worker --service /path/to/fughetta-service
 ```
 
+## Native packages
+
+Nightly releases also include a Debian amd64 package, a Windows x64 MSI, and a
+macOS arm64 archive with its Homebrew formula. Package versions are
+`0.1.<workflow run number>`. Packages install the full CMake installation tree,
+including the JVM, CLR, LLVM, and Python provider files and native runtime
+libraries. Java 25 and .NET 10 are needed when using the JVM and CLR providers;
+project build tools remain separate installations.
+
+Each package prepares a `default` workspace listening at `http://127.0.0.1:8080`,
+with internal listeners on ports 9090 and 9091. Its configuration uses token
+authentication and maps the installed provider paths. Resource allocation uses
+the service's existing host-based defaults. Configuration and workspace data
+survive upgrades and uninstall, including Debian purge.
+
+| Package | Installation and startup | Configuration and data |
+| --- | --- | --- |
+| deb | `sudo apt install ./fughetta-service_VERSION_amd64.deb` creates the `fughetta` account and starts `fughetta-service@default`. | `/etc/fughetta-service/default/config.json`; `/var/lib/fughetta-service/default` |
+| MSI | Run the installer as administrator. It registers and starts `fughetta-service-default` under LocalService. | `%ProgramData%\Fughetta\default\config.json`; `state` and `logs` beside it |
+| Homebrew | Install the release formula in a tap, then run `brew services start fughetta-service`. It runs as the signed-in user. | `$(brew --prefix)/etc/fughetta-service/default/config.json`; `$(brew --prefix)/var/lib/fughetta-service/default` |
+
+Replace `VERSION` with the downloaded package's version. Debian upgrades restart
+running workspace instances; MSI upgrades stop and replace the installed service.
+Homebrew uses its `opt` path so the service and provider mappings stay at the
+same paths across upgrades. After a Homebrew upgrade, run
+`brew services restart fughetta-service` to load the new executable.
+
+For a local Homebrew tap, download `fughetta-service.rb` from the release, then:
+
+```sh
+brew tap-new local/fughetta
+cp fughetta-service.rb "$(brew --repo local/fughetta)/Formula/fughetta-service.rb"
+brew install local/fughetta/fughetta-service
+brew services start fughetta-service
+```
+
+Replace the tap's formula with the one from a newer release before running
+`brew upgrade fughetta-service`. The release formula is also ready to place in a
+published tap. Publishing an APT repository, a Homebrew tap, or a WinGet manifest
+is a separate distribution operation; the build produces the installable files.
+
+Create an owner token once before using the API. Stop the service while changing
+its configuration, run `fughetta-service token local owner CONFIG_PATH`, save the
+printed token, and start the service again. On Debian, run the token command as
+the service account (`sudo -u fughetta`); on Windows, use an administrator shell
+and the executable under `%ProgramFiles%\Fughetta\bin`; on Homebrew, use the same
+account as `brew services`. Use `systemctl`, `Restart-Service`, or `brew services`
+for subsequent service operations. Additional workspace registration follows the
+native instance instructions below.
+
+Packaging is contained in `cmake/packaging/` and runs after building; it does not
+change the service sources or the regular CMake install rules. To build packages
+locally, make all provider targets with Java 25, Gradle, and the .NET SDKs described
+above available at configuration time, then run:
+
+```sh
+cmake --preset release
+cmake --build --preset release --target fughetta-service llvm-provider clr-providers jvm-providers --parallel 2
+python3 cmake/packaging/package.py --build build/release --output dist --version 0.1.0
+```
+
+Linux packaging uses `dpkg-deb`, `dpkg-shlibdeps`, and `patchelf`. Windows packaging
+runs natively with Python, CMake, WiX and its `WixToolset.Util.wixext` extension;
+set `CLANG_ROOT` to the compiler installation for `llvm-objdump`. On macOS, add
+`--release-url https://github.com/OWNER/REPO/releases/download/TAG` so the generated
+formula points to the archive's published location. `--runtime-search PATH` adds
+a native library search directory. Temporary package files stay under the build
+directory; the output directory receives the package and, on macOS, its formula.
+
 ## Service lifecycle and workspace boundary
 
-One workspace is one execution environment, shared by its projects and repositories.
-It groups related repositories so they can use one another without requiring a single
-large monorepo. Project names and source histories organize work; they are not OS
-security boundaries. The service schedules jobs, owns source and worker processes,
-and handles cancellation and shutdown. It does not provision isolated environments.
-Container and VM lifecycle management belongs to cloud-gateway in the future and
-is not implemented here. Run untrusted work only in an externally managed environment.
+One workspace shares an execution environment across its projects and repositories.
+The service admits and schedules jobs within the workspace budget, owns source and
+Worker processes, and handles cancellation and shutdown. A self-hosted service runs
+directly in the environment supplied by the operator. In the cloud, `cloud-gateway`
+manages workspace placement and its Host Executor backend supplies trusted isolation
+and hard quotas around each environment.
 
 ### Native lifecycle design
 
@@ -212,6 +281,11 @@ the service with an error. Shutdown cancels work, signals children, and waits
 up to ten seconds before terminating a remaining child. Linux child processes
 also terminate when their parent dies.
 
+To run the Core and Web Console as native processes on one machine, follow the
+[Console self-hosting guide](../console/README.md#single-machine-self-hosting).
+The launcher initializes a token-authenticated Core and uses the service's
+native process orchestration.
+
 The checked-in configuration listens at `127.0.0.1:18100`. Connect an HTTP MCP
 client to `http://127.0.0.1:18100/mcp` with `Authorization: Bearer <token>`.
 REST routes use the same token under `/api/v1`; `/healthz` is public.
@@ -292,6 +366,37 @@ request, arriving later, fails with `identity_conflict`, and so does a
 `receipt` for it. Agents recover with
 the worldline tool's `receipt` instead; this route is not one of their tools.
 
+## Signed execution receipts
+
+Registered remote-tunnel Workers derive an Ed25519 signing key from their
+enrollment secret. The Core registry keeps the public key with the Worker
+identity. At publication, the Core checks each receipt against the authenticated
+connection, the workspace, the pinned source snapshot, and the submitted
+recipe and output. Missing or invalid receipts reject the submission.
+Revoking a Worker disables acceptance of new receipts from that identity.
+
+The signed payload is a compact JSON array in this order:
+
+```text
+["fughetta/worker-execution-receipt", workspace_id, worker_id, snapshot,
+ recipe_digest, subject_kind, subject_id, execution]
+```
+
+The public key and signature use lowercase hexadecimal. For
+`semantic_shard`, the subject is the ID of the Worker-submitted shard and
+`execution` binds the receipt to the analysis request. The Core records the
+published shard ID alongside the receipt because publication resolves local
+symbol IDs. Pass `execution_receipts: true` to the MCP `language` tool with a
+view to read `shard_receipts` and `artifact_receipts`. The audit follows the
+view's retention policy.
+
+For `artifact_manifest`, the subject is the SHA-256 digest of the exact
+`manifest` string returned with the audit record. That manifest describes
+measured outputs, exports, project models, step logs, and prepared analysis
+inputs. Build results and the retained build history at `GET /api/v1/builds`
+expose `artifact_receipts` with the public key, signed payload fields, signature
+and manifest.
+
 ## Connect a self-hosted Worker
 
 The execution machine runs the Worker through `fug`, the Fughetta CLI:
@@ -318,6 +423,17 @@ The configuration names `gateway` (the loopback relay), `worker_id`,
 the current user with mode 0600 on Linux; Windows uses an owner-only ACL. Work
 and data roots are partitioned by immutable Workspace ID and Worker ID. The
 Worker opens no inbound listener.
+
+Builds and project-code analyses run in an on-demand execute child over inherited
+stdin/stdout. Other analyses stay in the front process. The Worker directly starts
+the execute child using the same service binary. The child uses `<work_root>-execute`
+and stops with its parent or after becoming idle. Front preparations and hot analysis
+sessions retain their trees across execute GC and restarts. Worker memory reports
+include both roles and their tracked subprocesses.
+
+`worker_backend` in the service configuration (`backend` in a Worker file) accepts
+`max_memory_bytes` and `max_cpu_seconds` as optional process limits for the execute
+child. The Worker runs both roles in the deployment environment that already hosts it.
 
 Exit status 2 means the Core refused the identity (revoked, unknown, or for
 another Workspace); `fug` does not restart a Worker that exits with it.
@@ -397,13 +513,117 @@ build manifests before executing its tasks.
 | --- | --- |
 | CMake / CTest | Configure and build with explicit directories, presets, compilers, variables, and targets. The CMake builder's `test` object controls CTest selection, parallelism, timeout, and failure behavior. An empty test selection fails by default. |
 | vcpkg | Install a manifest into `install_dir`; the task exports the installed directory. Point CMake at the selected checkout's `scripts/buildsystems/vcpkg.cmake`, bind `VCPKG_INSTALLED_DIR` to that output, and set `VCPKG_MANIFEST_INSTALL=OFF` when the graph already performs installation. |
-| clice | Read compilation-database outputs derived from the bound build graph, with compile-flag additions/removals, executable, and environment settings. |
+| clice | Read compilation-database outputs derived from the bound build graph, with compile-flag additions/removals, executable, and environment settings. The Worker runs clice in its `execute` role because toolchain discovery can launch the compiler named by the compilation database. |
 | TypeScript / tsc | Check a selected `tsconfig.json` without emitting, or compile into an explicit output directory. Compiler options are typed fields; terminal diagnostics remain available without being parsed as a structured report. |
 | typescript-language-server | Analyze TypeScript, TSX, JavaScript, and JSX through LSP. Configure tsserver, inlay/completion preferences, implicit-project settings, locale, and memory through initialization options. |
 | Bun | Build and test only. Every operation automatically performs a frozen-lockfile `bun install` first, with lifecycle scripts disabled by default. Build entrypoints, output, bundler options, test paths, and name filters are typed; there is no `run` operation or arbitrary command argument field. Tests use Bun's native JUnit reporter. |
 | uv | Lock, sync, build distributions, and run a command. Environment and distribution directories are explicit; dependency groups, extras, interpreter selection, and offline execution are modeled separately. |
 | ty | Run type checks with import environments and rule severity settings; warnings fail by default. Its language server has independent diagnostic, completion, inlay-hint, and configuration settings. |
 | Ruff | Check lint and formatting without rewriting source. The language server has independent rules, formatting, code-action, and configuration settings. |
+
+The CPython runtime host is installed at `libexec/fughetta-service/python/runtime.py`.
+Map that file to `python-runtime` in the Worker tools and run it from an
+isolated execute role using a command task in the project directory.
+
+```json
+{
+  "argv": ["python3", "-I", "${tool:python-runtime}", "mypackage", "--member", "connect", "--output", "runtime.json"],
+  "outputs": {"runtime": {"type": "python-runtime", "path": "runtime.json"}}
+}
+```
+
+The report describes selected members, callable signatures, and the one-hop
+type surface with inherited members and descriptors. The report retains
+registered Python overload signatures and inherited native method signatures.
+Deferred annotations from checkout declarations are labeled with their source.
+A CPython C function also reports its library and image-relative entry offset,
+with a linkage name when the loader reports that exact entry. Omit `--member`
+to report public members present in the module dictionary.
+
+Bind the report to the `artifact` input of a `python-runtime` analysis stage
+with `options: {}` to publish its symbols and definitions. To associate
+runtime members with source declarations, set `options.declarations` to the
+module's project-relative Python file or stub and bind the `ty` stage's facts
+to `source_facts`. A `pybind` stage takes the runtime stage's facts on
+`managed` and the `native-artifact` stage's facts on `native`. Set
+`options.libraries` to map runtime library filenames to native stage module
+names. CPython C entries resolve by offset and available linkage name.
+On Linux, pass `--native-host ${tool:fughetta-llvm}` to the runtime command
+to resolve free-function pointers held by pybind11 and nanobind wrappers.
+Keep DWARF and the symbol table in the native extension for this step. The
+bridge resolves captured overloads independently by library, linkage name,
+and entry offset. On Linux x86-64,
+selecting a class with native methods also publishes its public wrapped methods and
+resolves captured nonvirtual C++ member functions. An inherited instance method
+can be traced when the receiver is an instance of the selected class. For C++
+lambdas the bridge uses the emitted call operator, or the native function that
+contains its inlined body according to DWARF. With `--trace-import`, successful calls to
+overloaded free functions and nonvirtual methods record the C++ target per call
+site when the viable overloads lead to one implementation. Virtual calls also
+resolve the receiver's native layout to identify the implementation.
+Fixed-arity overloads can be ruled out by their required arguments,
+recorded defaults, and positional or keyword restrictions.
+Calling an instance method through its class includes the explicit receiver in
+the Python argument count. The bridge accounts for that receiver when aligning
+arguments with the C++ signature.
+For calls with explicit keywords, the bridge can rule out fixed-arity overloads
+whose binding records lack the supplied parameter names. Known keyword values
+can also rule out a matching parameter's built-in caster. The same call can use
+positional values to distinguish string and numeric overloads. The runtime uses
+observed arguments or unambiguous literal loads and skips unknown positions.
+Forwarded positional arguments can use the first expanded value reported by
+CPython, or the tuple layout and known values directly visible in bytecode.
+Expanded keyword arguments use proven keys and values even when a call merges
+additional keywords from a dynamic mapping.
+For numeric overloads, an exact floating-point value rules out integer casters. An
+exact integer value can rule out an integer caster based on its width and
+signedness. Explicit conversion restrictions are interpreted using each
+wrapper's built-in caster rules, including numeric and Boolean arguments.
+When surviving overloads have different implementations, the `calls` edge to
+the Python callable reports `detail.evidence: "unresolved"`. Its `candidates`
+list contains the known native entries that survived filtering for those
+invocations. `candidates_complete` indicates whether every surviving entry
+could be identified. With a complete list, following `binds` from the call
+endpoint follows only those candidates. The source reference still identifies
+the Python declaration, where all registered overloads are available. An incoming
+`calls` query on that declaration returns the same edge with its scoped endpoint.
+The same call site
+can also return an edge with `detail.evidence: "observed"` to a binding with an
+identified C++ target. Both details use `kind: "native_call"`. The observed
+detail reports `dispatch` as `direct` or `virtual`, or `indirect` when both
+routes can lead to the same target.
+For pybind11, this includes registered subclasses that require a C++ base
+conversion and extensions that import the base type's RTTI. For an explicit binding,
+`options.entries` maps a fully qualified Python member such as
+`mypackage.connect` to its C or C++ linkage name.
+Expose the bridge facts in the profile output to query the `binds` edges.
+Pass `--trace-import mypackage.caller` to record real calls to the selected
+exports while importing that caller module. Run from the checkout root for
+source locations. The stage publishes those call sites as `calls` edges, so a
+view containing the runtime, bridge and native facts can traverse
+`calls`, `binds` and `emits` to native source definitions. Query with
+`depth: 3` and `direction: "both"` to follow `emits` from the artifact to the source.
+
+To collect runtime types while running a Python test task, use the same Worker
+host with the `harvest` subcommand. Select the functions by name. The test
+runner still receives its own arguments after `--`.
+
+```json
+{
+  "argv": ["python3", "-I", "${tool:python-runtime}", "harvest", "mypackage", "--function", "convert", "--test-module", "pytest", "--output", "runtime.json", "--", "-q", "tests"],
+  "outputs": {"runtime": {"type": "python-runtime", "path": "runtime.json"}}
+}
+```
+
+Include the command task in the build configuration's `test` operation. The
+gateway retains its declared report for the exact tested worldline and version.
+It updates current views with matching `ty` declarations and returns their IDs
+in `runtime_observation_views`. A subsequent analysis with `ty` can attach the
+retained report when those declarations first become available. `inspect`
+returns `runtime_observed` ranges and the observed types' public member names.
+Return types feed Producers, and first parameters feed Consumers. The host
+writes the report after a successful test, and a publication failure appears
+as `runtime_observation_error` alongside the test result.
 
 The vcpkg provider binds its binary cache outside the hot checkout. Managed
 workers share `<server.storage>/dependencies/vcpkg`. An independent worker can
@@ -431,10 +651,11 @@ by the preceding one. Waiting is cancellable and counts against the execution
 deadline. The shared filesystem must support locks across participating hosts;
 unrelated cache mounts cannot coordinate builds. This currently serializes all
 vcpkg installs sharing that directory, including installs of different packages.
-Dependency archives are not covered by `max_cache_bytes` or the checkout TTL.
-Operators must provision capacity and prune old archives while cache users are
-stopped. Keep the directory lock file; removing it can break exclusion between
-processes. Automatic dependency-cache retention is not implemented yet.
+On an install, Workers prune writable vcpkg archives whose last modification
+was more than 30 days ago. Each Worker runs this maintenance at most once an
+hour under the install lock. Published and read-only upstream archives keep
+their deployment-managed retention. The checkout size budget and TTL cover
+checkout trees. Keep the directory lock file when maintaining a cache.
 
 For a trusted publisher and separate consumers, set each consumer's
 `dependency_upstream` to the absolute root of the published cache. The provider
@@ -558,9 +779,10 @@ it does not establish this deployment boundary or cross-host behavior. No such
 deployment is provisioned by this repository yet.
 
 Kotlin/JVM and F# build models use the `gradle` and `msbuild` adapters. Map
-`fughetta-gradle-model` and `fughetta-msbuild-model` to the correspondingly named
-files installed in `<prefix>/libexec/fughetta-service`. Gradle loads its init
-script; .NET runs its F# script through `dotnet fsi`. Each adapter exposes
+`fughetta-gradle-model` to the Gradle init script in
+`<prefix>/libexec/fughetta-service`. Map `fughetta-msbuild-model` to
+`msbuild/fughetta-msbuild-model.dll` under that same directory. The Worker runs
+the exporter with `dotnet` and loads its packaged argument parser locally. Each adapter exposes
 `source_dir`, `model_dir`, `executable` and `exporter` options.
 
 | Adapter | Preparation output | Required model inputs | Model output |
@@ -886,6 +1108,30 @@ Both lists are ordered by module, then visibility, and follow the requested
 module and file scope. These symbols and the type records they reference share
 the node budget.
 
+If clice reports compiler errors in a selected translation unit, `inspect`
+returns `partial` and includes a compiler diagnostic from that context, even
+when the error is in a dependency outside the requested files. Affected items
+have `type_confidence: "tentative"` and inferred ranges have
+`confidence: "tentative"`. Language replies list identical available scopes
+once and group missing entries with the same scope and reason, retaining their
+unit IDs.
+
+The query engine holds no language tables. Each provider declares its
+`conventions` per language in its description: `visibility` values from most to
+least visible (the first one is the public surface; undeclared values rank
+last), the fully qualified `value_wrappers` stripped before one-hop expansion,
+and the `scope_edges` kinds its scope records use. The gateway stamps a unit's
+conventions onto its shards and refuses a shard whose scope records use an
+undeclared edge kind. External registrations supply `conventions` in their
+registration. Providers can use the shared kind names or emit language-specific
+symbol, type and relation kinds as `<language>:<name>`. Query filters match
+the kind as published. When a custom kind shares core query behavior, the
+provider declares it in `symbol_traits`, `type_traits` or `relation_traits`.
+For example, a provider with language `cpp` can map `record` to `type` in
+`symbol_traits`. A `cpp:record` remains selectable by that name and is treated
+as a type for producer and consumer discovery. Relation traits control which
+edges impact analysis follows.
+
 `typed_ranges` record what the compiler knows but the source does not spell:
 local bindings and lambda parameters without a written type (C++ `auto`,
 Kotlin `val`/`var` and implicit `it`, F# `let`, `use` and pattern bindings),
@@ -944,9 +1190,19 @@ for units present in both views. Producer channel values are compared across
 views, so unchanged outputs stop propagation. Missing producer evidence is
 marked unavailable. Each unit lists its stage's associated build/test tasks;
 these are configured task associations, not inferred test coverage.
-`limit`/`cursor` page changed entities and reanalysis units; traversal shares the
-request budget. Both views remain pinned during the query. Requested projections
-are retained in each view's evidence.
+`comparison.duplicate_types` suggests existing public types in the same
+project when a newly added type has the same full shape of at least three
+public instance fields or properties. Each match reports both declarations, their names,
+the shared shape hash and the member count. The shape ignores member names and
+order and preserves each field's type structure. `comparison.topology` reports
+new cross-module dependency cycles and modules whose direct dependencies at
+least doubled and grew by three or more. C++ declarations outside named modules
+use their defining file when it can be resolved uniquely.
+`comparison.degraded_types` reports existing parameter and return types that
+changed to a language's configured escape type, along with newly introduced
+unsafe casts recorded by its semantic provider. `limit` and `cursor` page the
+comparison results. Traversal shares the request budget. Both views remain pinned
+during the query.
 
 Configured stdio helpers use the `external` server entry. Its options contain
 `registration` (a provider description with its own `id`, helper adapter, roles,
@@ -1113,7 +1369,7 @@ Each runs as a platform host that loads one language adapter: map
 or `dotnet`. The worker launches `java -jar fughetta-jvm.jar --adapter
 fughetta-kotlin.jar` and `dotnet fughetta-clr.dll --adapter fughetta-fsharp.dll`.
 CLR artifact stages run the same `fughetta-clr` host without an adapter.
-Native artifact stages run `fughetta-native` from `libexec/fughetta-service/native`;
+Native artifact stages run `fughetta-llvm` from `libexec/fughetta-service/llvm`;
 it is built when the configure step finds LLVM's CMake package beside the compiler
 (on Debian and Ubuntu, `llvm-23-dev`).
 Explicit worker tool mappings can name readable helper resources as well as
@@ -1158,7 +1414,7 @@ Cross-project input changes and their configured build/test tasks appear in
 view comparison and impact results.
 
 A `native-artifact` stage reads an executable, shared library or relocatable object
-(ELF, Mach-O or COFF) with `fughetta-native`, a host linked against LLVM's object,
+(ELF, Mach-O or COFF) with `fughetta-llvm`, a host linked against LLVM's object,
 DWARF, PDB and IR libraries. Declare that build output with type `native-artifact`, then bind
 it to the stage's `artifact` port. The optional `source_facts` port accepts stage
 outputs; the gateway exposes their committed shard objects and requests source symbols
@@ -1179,9 +1435,12 @@ Expose `native/facts` through a profile output to request it. Selecting only the
 source output prepares compilation commands without linking. The reader records
 linkage names, imports, exports and artifact locations. The host reads DWARF, a
 Mach-O `.dSYM` bundle or a PDB for the debug positions of `emits` relationships to
-source definitions; ambiguous positions remain unbound. Relationship endpoints carry their own contexts, and the selected
+source definitions. For a native definition with no debug line coverage, the
+reader also uses the ABI name clice publishes in `native.linkage_name`. An exact
+match to one source definition produces `emits` with `linkage_name` evidence.
+Relationship endpoints carry their own contexts, and the selected
 view retains the source shards needed to inspect either endpoint. Configure a worker
-mapping for `fughetta-native`, or set the stage's `host` option. A separate `directory_group` allows the source and artifact
+mapping for `fughetta-llvm`, or set the stage's `host` option. A separate `directory_group` allows the source and artifact
 stages to run on different workers. Stage requests carry shard IDs; workers fetch
 objects on demand and share their cached records. Each provider declares its output
 channels. Source providers expose `declarations` and `definition_bodies` across all
@@ -1266,6 +1525,13 @@ last installed source objects. The worker synchronizes from that directory's
 actual installed manifest, restoring, replacing and removing tracked source
 files before updating each stage's session epoch. Concurrent computations use
 distinct reserved directories.
+Set a build configuration's `relocatable_build_dirs` to the project-relative
+directories it can move between checkouts. A new fork slot can seed those
+directories from the fork-point snapshot of an idle slot with the same project,
+build recipe, layout, and toolchain. The Worker uses native file cloning when
+available and independent copying otherwise. A successful build retains its
+fork reuse record across Worker restarts on the same volume. Keep directories with
+checkout-specific absolute paths, such as a CMake build tree, out of this list.
 One queued computation reserves a directory from each required group pool until
 all selected stages finish, including when the stage order returns to an earlier
 directory group. Within a live worker directory, subsequent stages reuse completed
@@ -1400,6 +1666,17 @@ execution. A clean build detaches its old directory under the store lock and
 deletes it after releasing that lock. Worker startup reclaims detached directories
 left by an interrupted deletion.
 
+To commit a formatter or generator's source changes, pass
+`capture_worktree_changes: ["src", "include/generated.h"]` and a stable
+`operation_id` to `build`, `test`, or `run`. The Worker starts from the selected
+snapshot and captures files under those paths after successful execution.
+Configured build directories, tool metadata and links are excluded. The
+Gateway publishes one Worldline contribution and returns `worktree_commit`.
+The same request and operation ID retrieve the receipt without running the
+command again. If a captured source file changed since execution began, the
+result includes `worktree_error_code` and the contribution is rejected. Use
+Worldline history to identify the contribution for `reverse`.
+
 The Console exposes component-specific editors. Local executable versions,
 behavioral acceptance, and remaining deployment limits are recorded once in the
 [toolchain acceptance record](../console/DEPLOYMENT.md#c-and-python-toolchains--october-27-2026).
@@ -1449,8 +1726,12 @@ The configuration owns the execution thread count and subprocess parallelism:
 
 `threads` must be at least `6 + 2 * workers`; `jobs` must be positive and at least `workers`.
 A file-only deployment can use `{ "threads": 6, "jobs": 1, "workers": 0 }`.
-Budgets have no defaults. Local configuration determines the startup
-budget; hosted controllers can update it through the host-only
+When a self-hosted managed entry omits the `runtime` object, it sizes its startup
+budget from the available logical CPU count. It starts one Worker on up to
+three CPUs and two on larger machines, with the remaining CPUs available for
+build jobs and a minimum of one job. Set `runtime` to choose an explicit budget,
+including an optional Worker memory limit. Hosted controllers can update their
+budget through the host-only
 `GET`/`PUT /api/v1/config/runtime` endpoint. PUT uses the returned numeric
 `revision` and a budget in `value`. A stale revision returns 409; an accepted
 change returns 202 until it is applied.
@@ -1476,11 +1757,125 @@ the whole available task budget and runs alone. Idle language processes are
 reclaimed in LRU order to make room. Worker and child-group resident memory are
 reported with the session inventory; the existing reclaim loop stops work with
 `resource_limit` when observed usage exceeds its budget. Existing platform process
-limits remain separate from this resident-memory accounting.
+limits remain separate from this resident-memory accounting. When an execute
+role has started and its resident-memory report is pending, the front waits
+up to five seconds for the report before returning `worker_overloaded`.
 
 Gateway metadata stays in `server.storage`; source data lives in its `source/`
 subdirectory, and worker caches in `workers/local-<index>/`. Internal listeners
 use loopback. Back up the configuration and the complete storage directory.
+
+### Local performance measurements
+
+The comparison used the same Linux/WSL Debug configuration with sanitizers,
+real Source and Worker processes, and loopback transport.
+
+| Change | Workload and metric | Before | After | Reduction |
+| --- | --- | ---: | ---: | ---: |
+| Cached package usage and direct SQLite file accounting for source quota | Median latency of 35 single-file Worldline writes with 8,000 package files on disk | 286.691 ms | 259.591 ms | 9.5% |
+| Reuse unchanged checkout manifests and skip the filesystem sync | Linux `syncfs` calls across six repeat checkouts of a 1,000-file snapshot | 6 | 0 | 100% |
+| Send the snapshot ID for a retained Worker offer | Bytes per warm `sync.offer` frame, including its header, for a 1,000-file snapshot | 132,052 B | 131 B | 99.9% |
+| Validate delegated reads with the origin Worldline head | Median latency of 40 Source RPCs with a 1,035-file origin | 35.121 ms | 1.376 ms | 96.1% |
+
+The first checkout in the 1,000-file run issued one filesystem sync in both
+builds. Repeat checkouts previously spent a median of 2.053 ms in `syncfs`.
+Checkouts that change tracked files and builds that commit a durable warm
+marker still sync. The first offer for an unknown snapshot sends the full
+manifest. Median time in the warm synchronization stage went from 165.307 ms
+to 152.045 ms, an 8.0% reduction. The cached package usage is loaded when
+Source starts and refreshed by package operations. A source commit reads
+the SQLite file sizes for the workspace's projects. These figures describe
+the fixture workload.
+
+The first field-declared MCP writer derived JSON field names and presence rules from
+the response's C++ member types. It writes the envelope and the dynamic
+result in one pass. A single-core Clang 23 `-O3` microbenchmark compared
+serialization of the same synthetic results. It checked byte equality
+against the previous writer before timing.
+
+| Response bytes | Previous reflect-cpp writer | Field-declared writer | Speedup |
+| ---: | ---: | ---: | ---: |
+| 307 | 0.699 µs | 0.322 µs | 2.2× |
+| 10,347 | 33.630 µs | 9.653 µs | 3.5× |
+| 330,167 | 1,347.880 µs | 296.819 µs | 4.5× |
+| 1,323,959 | 5,524.352 µs | 1,223.607 µs | 4.5× |
+
+The same compiler took a median of 2.660 s for the previous isolated codec
+translation unit and 2.037 s for the field-declared version over three
+compiles. The corresponding object files were 144,256 and 27,768 bytes.
+
+MCP now writes through the shared JSON encoder. In the same single-core
+Clang 23 `-O3` setup, the two writers produced identical response bytes
+for these synthetic replies.
+
+| Response bytes | MCP writer → shared writer |
+| ---: | ---: |
+| 186 | 0.290 → 0.190 µs |
+| 7,270 | 9.925 → 4.495 µs |
+| 237,061 | 485.322 → 145.240 µs |
+| 954,682 | 1,030.786 → 546.305 µs |
+
+The shared JSON codec now uses simdjson DOM for full-document validation
+and a simdjson builder for typed serialization. The project's C++23
+field traversal drives JSON, XML and Schema generation. Explicit field
+names live in the field types. Plain aggregate fields use names resolved
+by Clang at compile time. Dynamic JSON uses an owning value with
+insertion-ordered object members. JSON output
+preserves the existing spelling of floating-point values and Unicode
+control escapes used in content identities.
+
+The following single-core Clang 23 `-O3` comparison measures the previous
+JSON backend and the current codec on the same typed synthetic records.
+
+| JSON bytes | Full read before → after | Write before → after |
+| ---: | ---: | ---: |
+| 200 | 0.187 → 0.171 µs | 0.161 → 0.139 µs |
+| 8,474 | 4.815 → 5.821 µs | 4.815 → 3.496 µs |
+| 273,735 | 154.774 → 192.574 µs | 153.744 → 103.886 µs |
+| 1,098,567 | 664.704 → 714.848 µs | 598.603 → 451.556 µs |
+
+Generating a synthetic tool's input and output schemas together took
+13.965 µs with the previous JSON round trip and 4.226 µs with direct
+generation from type metadata under the same benchmark configuration.
+
+JUnit XML declares attributes and child elements in its C++ field types.
+The shared XML module uses that metadata for both directions and calls
+pugixml directly to parse documents and write UTF-8.
+
+The same single-core Clang 23 `-O3` setup measured XML parsing and
+typed field mapping on synthetic JUnit reports. Both readers use
+pugixml 1.16. The writer column measures the new XML API.
+
+| Test cases | XML bytes | Read before → after | Write |
+| ---: | ---: | ---: | ---: |
+| 16 | 1,105 | 1.688 → 1.384 µs | 1.232 µs |
+| 256 | 16,483 | 22.615 → 20.391 µs | 17.508 µs |
+| 4,096 | 266,728 | 653.007 → 673.981 µs | 649.186 µs |
+
+The reflect-cpp removal was measured against the preceding simdjson and
+pugixml implementations using the same single-core Clang 23 `-O3` setup.
+Typed JSON reading uses compile-time field dispatch. The writer also
+precomputes the JSON spelling of property names. The synthetic
+JSON fixtures produced identical bytes before and after.
+
+| JSON bytes | Typed read before → after | Typed write before → after |
+| ---: | ---: | ---: |
+| 200 | 0.167 → 0.141 µs | 0.127 → 0.110 µs |
+| 8,474 | 6.002 → 5.566 µs | 3.738 → 3.304 µs |
+| 273,735 | 179.664 → 164.270 µs | 108.120 → 95.074 µs |
+| 1,098,567 | 743.272 → 679.808 µs | 453.994 → 416.980 µs |
+
+Generating the representative record's Schema took 3.463 → 1.239 µs.
+Compiling the isolated JSON read, write and Schema fixture took a median
+of 3.86 → 2.39 s across three compiles of each implementation. Converting
+already-parsed dynamic JSON directly into typed gateway token records took
+4.208 → 0.506 µs for 16 records and 75.676 → 10.723 µs for 256 records.
+
+| JUnit test cases | Read before → after | Write before → after |
+| ---: | ---: | ---: |
+| 16 | 1.399 → 1.393 µs | 1.235 → 1.250 µs |
+| 256 | 20.395 → 20.652 µs | 17.073 → 17.175 µs |
+| 4,096 | 330.493 → 340.588 µs | 545.034 → 542.206 µs |
 
 ## Source layout
 
@@ -1495,10 +1890,9 @@ and `agent-cloud`, use `POST /api/v1/projects/{project}/worldline`.
 The route uses `tools::worldline::input` from `src/gateway/tools.cppm`.
 
 Debug and Release builds, service test suites, and CLI Worker connections
-have passed locally on Linux and Windows. Automatic self-hosted
-capacity detection is not implemented. Hosted budget control operates on
-existing instances; host provisioning and whole-container memory allocation
-remain deployment responsibilities.
+have passed locally on Linux and Windows. Hosted budget control operates on
+existing instances. Deployments provision hosts and set whole-container memory
+limits.
 
 ## Hosted Core worker interface checks
 

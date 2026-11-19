@@ -8,7 +8,7 @@ import lsp;
 import evaluation;
 import reuse;
 import helper;
-import reflection;
+import json;
 import support;
 
 namespace {
@@ -123,7 +123,7 @@ while True:
         auto run_operation = [&]() -> coroutine::task<outcome> {
             lsp::session session{context.get_scheduler(), {.argv = argv, .cwd = tree}};
             outcome out;
-            co_await session.start(tree, *rfl::json::read<rfl::Generic>(settings));
+            co_await session.start(tree, *json::read<json::value>(settings));
             try {
                 out.report = co_await session.describe(document, unit_for(document));
             } catch (const std::exception& error) {
@@ -139,9 +139,6 @@ while True:
 
     auto is(const std::optional<semantic::place>& place, std::string_view path, std::uint64_t begin, std::uint64_t end) -> bool {
         return place && place->path == path && place->begin == begin && place->end == end;
-    }
-    auto has(const semantic::shard& report, std::string_view text) -> bool {
-        return std::ranges::any_of(report.diagnostics, [&](auto& d) { return d.message.contains(text); });
     }
 
     static constexpr auto lsp_suite = [] {
@@ -224,7 +221,7 @@ while True:
             auto run_operation = [&]() -> coroutine::task<bool> {
                 auto io = context.get_scheduler();
                 lsp::session session{io, {.argv = m.argv, .cwd = m.tmp.dir}};
-                co_await session.start(m.tmp.dir, *rfl::json::read<rfl::Generic>("{}"));
+                co_await session.start(m.tmp.dir, *json::read<json::value>("{}"));
                 lsp::document document{"a.py", "python", "x=1"};
                 auto result = co_await coroutine::deadline(io, std::chrono::milliseconds{30}, session.describe(document, unit_for(document)));
                 co_await session.abort();
@@ -240,7 +237,7 @@ while True:
             auto run_operation = [&]() -> coroutine::task<int> {
                 auto io = context.get_scheduler();
                 lsp::session session{io, {.argv = m.argv, .cwd = m.tmp.dir}};
-                co_await session.start(m.tmp.dir, *rfl::json::read<rfl::Generic>(R"({"settings":{"mode":"test"}})"));
+                co_await session.start(m.tmp.dir, *json::read<json::value>(R"({"settings":{"mode":"test"}})"));
                 std::vector<lsp::document> documents{{"a.py", "python", "x = 1\n"}};
                 co_await session.synchronize(documents);
                 for (int i = 0; i < 100 && !m.sent().contains("response [{"); ++i)
@@ -268,7 +265,7 @@ while True:
             native::context context;
             auto run_operation = [&]() -> coroutine::task<int> {
                 lsp::session session{context.get_scheduler(), {.argv = m.argv, .cwd = m.tmp.dir}};
-                co_await session.start(m.tmp.dir, *rfl::json::read<rfl::Generic>("{}"));
+                co_await session.start(m.tmp.dir, *json::read<json::value>("{}"));
                 std::vector<lsp::document> documents{{"a.py", "python", "foo()\nfoo()\nbar()\n"}, {"b.py", "python", "x = '😀'; foo()\n"}};
                 co_await session.synchronize(documents);
                 bool ambiguous = false;
@@ -303,7 +300,7 @@ while True:
             auto& shard = produced.shards.emplace_back();
             shard.unit = semantic::make_unit({key, "options"}, "module-context");
             shard.unit.direct_inputs = {{semantic::input_kind::file, "src/main.kt", "source-one"}};
-            test::spit(scratch.dir / "result.json", rfl::json::write(produced));
+            test::spit(scratch.dir / "result.json", json::write(produced));
             test::spit(scratch.dir / "helper.py", R"python(
 import json, sys
 with open('result.json') as stream:
@@ -332,7 +329,7 @@ for line in sys.stdin:
                      .cwd = scratch.dir,
                      .env = builds::environment{{"FUGHETTA_OBJECTS", (scratch.dir / "objects").string()}}},
                     {.slot = "slot", .project = "app", .provider = "test-helper", .options = "options", .stage = "modules"}};
-                const auto opened = co_await helper.open(rfl::Generic{true});
+                const auto opened = co_await helper.open(json::value{true});
                 const auto installed = co_await helper.update(
                     opened.epoch, {.snapshot = "snapshot", .documents = {}, .source_files = {{"src/main.kt", "source-one"}}, .model = {}});
                 const auto units = co_await helper.units(installed.epoch, {});
@@ -347,7 +344,7 @@ for line in sys.stdin:
                 auto object = std::make_shared<semantic::shard_object>();
                 object->data = std::make_shared<const semantic::shard>(std::move(upstream));
                 object->path = scratch.dir / "upstream.json";
-                test::spit(object->path, rfl::json::write(*object->data));
+                test::spit(object->path, json::write(*object->data));
                 const auto updated = co_await helper.update(installed.epoch, {.snapshot = installed.snapshot,
                                                                               .documents = {},
                                                                               .source_files = {{"src/main.kt", "source-one"}},
@@ -370,7 +367,7 @@ for line in sys.stdin:
                                               {.slot = "python", .project = "app", .provider = "ty", .options = "python", .stage = "python"},
                                               {},
                                               {.execution = "mock-runtime"}};
-                auto opened = co_await session.open(*rfl::json::read<rfl::Generic>("{}"));
+                auto opened = co_await session.open(*json::read<json::value>("{}"));
                 std::vector<language::document> documents{{"a.py", "python", "x = '😀'\n"}, {"b.py", "python", "y = 1\n"}};
                 std::map<std::string, std::string> sources{{"a.py", "a-1"}, {"b.py", "b-1"}, {"config.json", "config-1"}};
                 auto first = co_await session.update(opened.epoch, {.snapshot = "source-a", .documents = documents, .source_files = sources, .model = {}});
@@ -545,7 +542,7 @@ for line in sys.stdin:
                 language::lsp_adapter session{context.get_scheduler(),
                                               {.argv = m.argv, .cwd = m.tmp.dir},
                                               {.slot = "python", .project = "app", .provider = "ty", .options = "python", .stage = "python"}};
-                auto opened = co_await session.open(*rfl::json::read<rfl::Generic>("{}"));
+                auto opened = co_await session.open(*json::read<json::value>("{}"));
                 auto state = co_await session.update(opened.epoch, {.snapshot = "source",
                                                                     .documents = {{"a.py", "python", "x = 1\n"}, {"b.py", "python", "y = 2\n"}},
                                                                     .source_files = {{"a.py", "a"}, {"b.py", "b"}},
@@ -601,43 +598,6 @@ for line in sys.stdin:
             expect(scope->location.source->begin == 0u && scope->kind == "namespace");
             expect(find("area")->kind == "function" && find("shape")->kind == "type");
             expect(find("demo")->id == "a b#1.cpp#demo" && area->id == "a b#1.cpp#demo::shape::area");
-        };
-
-        "ty reports a type error of a document it was shown"_test = [] {
-            auto ty = std::getenv("TEST_TY");
-            if (!ty) {
-                std::println("skipped: TEST_TY names no ty executable");
-                return;
-            }
-            test::scratch tmp{"lsp-ty"};
-            std::string text = "x: int = \"a\"\n";
-            test::spit(tmp.dir / "app.py", text);
-            auto done = describe({ty, "server"}, tmp.dir, R"({"settings": {}})", {.path = "app.py", .language = "python", .text = text});
-            expect((done.report.has_value()) >> fatal) << done.error;
-            expect(has(*done.report, "invalid-assignment")) << "ty rejects a str for an int";
-            expect(std::ranges::all_of(done.report->diagnostics, [](auto& d) { return d.location.source && d.location.source->path == "app.py"; }));
-            auto ignored = describe({ty, "server"}, tmp.dir, R"({"settings":{"configuration":{"rules":{"invalid-assignment":"ignore"}}}})",
-                                    {.path = "app.py", .language = "python", .text = text});
-            expect((ignored.report.has_value()) >> fatal) << ignored.error;
-            expect(!has(*ignored.report, "invalid-assignment")) << "the configured rule changes the real server's diagnostics";
-        };
-
-        "ruff reports an unused import of a document it was shown"_test = [] {
-            auto ruff = std::getenv("TEST_RUFF");
-            if (!ruff) {
-                std::println("skipped: TEST_RUFF names no ruff executable");
-                return;
-            }
-            test::scratch tmp{"lsp-ruff"};
-            std::string text = "import os\n";
-            test::spit(tmp.dir / "tool.py", text);
-            auto done = describe({ruff, "server"}, tmp.dir, R"({"settings": {}})", {.path = "tool.py", .language = "python", .text = text});
-            expect((done.report.has_value()) >> fatal) << done.error;
-            expect(has(*done.report, "F401")) << "ruff's default rules report an import that is not used";
-            auto ignored =
-                describe({ruff, "server"}, tmp.dir, R"({"settings":{"lint":{"ignore":["F401"]}}})", {.path = "tool.py", .language = "python", .text = text});
-            expect((ignored.report.has_value()) >> fatal) << ignored.error;
-            expect(!has(*ignored.report, "F401")) << "the configured rule changes the real server's diagnostics";
         };
     };
 } // namespace

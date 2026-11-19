@@ -1,6 +1,6 @@
 export module semantic;
 import std;
-import reflection;
+import json;
 import profiles;
 export import records;
 
@@ -13,16 +13,18 @@ export namespace semantic {
         query_defaults defaults;
         std::map<unit_id, std::vector<shard_id>> units;
         semantic::coverage coverage;
-        rfl::Literal<"pending", "published", "expired"> state;
+        json::literal<"pending", "published", "expired"> state;
         std::optional<language::computation> computation;
         std::map<unit_id, std::vector<shard_id>> checkpoint;
+        std::vector<shard_receipt> receipts;
+        std::vector<artifact_receipt> artifact_receipts;
     };
-    inline auto schemas() -> rfl::Generic {
-        rfl::Generic::Object out;
-        out["request"] = rfl::json::read<rfl::Generic>(rfl::json::to_schema<request>()).value();
-        out["result"] = rfl::json::read<rfl::Generic>(rfl::json::to_schema<result>()).value();
-        out["shard"] = rfl::json::read<rfl::Generic>(rfl::json::to_schema<shard>()).value();
-        out["view"] = rfl::json::read<rfl::Generic>(rfl::json::to_schema<view>()).value();
+    inline auto schemas() -> json::value {
+        json::object out;
+        out["request"] = json::schema<request>();
+        out["result"] = json::schema<result>();
+        out["shard"] = json::schema<shard>();
+        out["view"] = json::schema<view>();
         out["helper"] = language::helper::schemas();
         return out;
     }

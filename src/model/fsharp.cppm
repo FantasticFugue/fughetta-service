@@ -19,6 +19,19 @@ export namespace language {
         static constexpr semantic::unit_kind unit_kind = semantic::unit_kind::module;
         static constexpr bool negotiated = false, dependency_reads = true;
         static constexpr std::string_view update_granularity = "ordered-project";
+        // F# spells applications `T option` or `Option<T>`.
+        static auto conventions() -> std::vector<semantic::language_conventions> {
+            return {{.language = "fsharp",
+                     .visibility = {"public", "internal", "protected", "private"},
+                     .value_wrappers = {"Microsoft.FSharp.Core.option", "Microsoft.FSharp.Core.Option", "Microsoft.FSharp.Core.voption",
+                                        "Microsoft.FSharp.Core.ValueOption", "Microsoft.FSharp.Core.Result", "Microsoft.FSharp.Control.Async",
+                                        "Microsoft.FSharp.Core.byref", "Microsoft.FSharp.Core.inref", "Microsoft.FSharp.Core.outref",
+                                        "Microsoft.FSharp.NativeInterop.nativeptr", "System.Nullable", "System.Threading.Tasks.Task",
+                                        "System.Threading.Tasks.ValueTask"},
+                     .wrapper_arguments = "<", .wrapper_postfix = " ",
+                     .escape_types = {{"System.Object", "obj"}},
+                     .unsafe_casts = {{"Microsoft.FSharp.Core.Operators.unbox"}}}};
+        }
         static auto channels() -> std::vector<semantic::channel_definition> {
             auto out = source_channels();
             out.front().projections = {std::string{"declarations"}};

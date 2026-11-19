@@ -4,7 +4,7 @@ import content;
 import protocol;
 import constants;
 import durability;
-import reflection;
+import json;
 import projectmodel;
 
 export namespace delivery {
@@ -48,7 +48,7 @@ export namespace delivery {
         if (!std::filesystem::exists(path))
             return {};
         std::ifstream input{path, std::ios::binary};
-        return rfl::json::read<std::vector<builds::exported_object>>(std::string{std::istreambuf_iterator<char>{input}, {}}).value();
+        return json::read<std::vector<builds::exported_object>>(std::string{std::istreambuf_iterator<char>{input}, {}}).value();
     }
 
     // The model bytes determine the reference graph; an untrusted sender's list is ignored.
@@ -61,7 +61,7 @@ export namespace delivery {
             refs.push_back({hash, std::filesystem::file_size(path)});
         }
         std::filesystem::create_directories(storage / "references");
-        durability::durable_write(storage / "references" / id.view(), rfl::json::write(refs));
+        durability::durable_write(storage / "references" / id.view(), json::write(refs));
         return refs;
     }
 
@@ -221,7 +221,7 @@ export namespace delivery {
     }
 
     // Export storage is outside mutable build trees. Files are copied, never hard-linked to a build output.
-    inline auto capture(const std::filesystem::path& tree, const std::map<std::string, std::string>& requested, const std::filesystem::path& storage,
+    auto capture(const std::filesystem::path& tree, const std::map<std::string, std::string>& requested, const std::filesystem::path& storage,
                         bool allow_missing = false, std::vector<std::string>* skipped = nullptr) -> std::vector<builds::exported_file> {
         std::vector<builds::exported_file> result;
         if (requested.empty())

@@ -105,7 +105,7 @@ namespace {
                                                                               .inputs = {{"artifact", {language::build_input{"native", "build", "binary"}}}}});
         native_settings.analysis.at("native").outputs = {{"exports", {{"main", "facts"}}}};
         doc.projects["native-lib"] = std::move(native_settings);
-        test::spit(tmp.dir / "config.json", rfl::json::write(doc));
+        test::spit(tmp.dir / "config.json", json::write(doc));
         test::child gateway{test::gateway_command(SERVICE_EXECUTABLE, tmp.dir, {"config.json"})};
         test::ready(gateway, port);
         config::worker worker_config;
@@ -114,14 +114,25 @@ namespace {
         worker_config.work_root = (tmp.dir / "worker").string();
         worker_config.parallel = 2;
         worker_config.tools["cxx"] = std::getenv("TEST_CXX");
-        worker_config.tools["fughetta-native"] = std::getenv("TEST_NATIVE_HOST");
+        worker_config.tools["fughetta-llvm"] = std::getenv("TEST_LLVM_HOST");
         worker_config.env["TMPDIR"] = (tmp.dir / "temp").string();
         worker_config.env["JAVA_TOOL_OPTIONS"] =
             "-Djava.io.tmpdir=" + (tmp.dir / "temp").string() + " -Dkotlin.daemon.options=runFilesPath=" + (tmp.dir / "daemon").string();
         std::filesystem::create_directories(tmp.dir / "temp");
-        // Gradle's home and the Kotlin daemon's run files stay in this test's tree.
-        worker_config.env["GRADLE_USER_HOME"] = (tmp.dir / "gradle").string();
-        std::filesystem::create_directories(tmp.dir / "gradle");
+        // The worker needs the dependency modules already resolved when building its JVM provider.
+        const auto gradle_home = tmp.dir / "gradle";
+        worker_config.env["GRADLE_USER_HOME"] = gradle_home.string();
+        std::filesystem::create_directories(gradle_home);
+        if (kotlin) {
+            const auto* cache = std::getenv("TEST_GRADLE_MODULES");
+            if (!cache)
+                throw std::runtime_error("TEST_GRADLE_MODULES must name the JVM provider's Gradle dependency cache");
+            const auto modules = gradle_home / "caches" / "modules-2";
+            std::filesystem::create_directories(modules);
+            for (const auto& entry : std::filesystem::directory_iterator(cache))
+                if (entry.path().extension() != ".lock" && entry.path().filename() != "gc.properties")
+                    std::filesystem::copy(entry.path(), modules / entry.path().filename(), std::filesystem::copy_options::recursive);
+        }
         const auto sdk_root = std::filesystem::path{kotlin ? std::getenv("TEST_JDK") : std::getenv("TEST_DOTNET")};
         const auto sdk = kotlin ? sdk_root : std::filesystem::canonical(sdk_root).parent_path();
         test::spit(tmp.dir / "sdk.json", kotlin ? "{\"sdk\":\"jdk\"}" : "{\"sdk\":\"dotnet\"}");
@@ -144,7 +155,7 @@ namespace {
         };
         auto online_workers = [&] { return test::decode<std::vector<worker_status>>(test::request(port, http::method::GET, "/api/v1/workers").body); };
         auto start_worker = [&] {
-            test::spit(tmp.dir / "worker.json", rfl::json::write(worker_config));
+            test::spit(tmp.dir / "worker.json", json::write(worker_config));
             auto process = std::make_unique<test::child>(test::worker_command(SERVICE_EXECUTABLE, tmp.dir, {"worker.json"}));
             test::eventually(
                 [&] {
@@ -167,10 +178,10 @@ namespace {
                                     "dependencies { implementation project(':library') }\n"
                                     "application { mainClass = 'sample.MainKt'; applicationDefaultJvmArgs = ['-Djava.library.path=' + projectDir] }\n"
                                     "gradle.projectsEvaluated { new File(" +
-                                    rfl::json::write(configured.string()) +
+                                    json::write(configured.string()) +
                                     ").append('configure\\n') }\n"
                                     "tasks.named('compileKotlin') { doLast { new File(" +
-                                    rfl::json::write(compiled.string()) + ").append('compile\\n') } }\n";
+                                    json::write(compiled.string()) + ").append('compile\\n') } }\n";
             files[path] = "package sample\nimport dependency.scale\nimport dependency.adjust\nimport dependency.choose\n"
                           "fun fromLibrary() = choose(adjust(scale(3)))\nobject Bridge {\n    external fun nativeTwice(input: Int): Int\n"
                           "    fun run(input: Int) = input * 2 + nativeTwice(input)\n}\n"
@@ -178,7 +189,7 @@ namespace {
                           "    for (value in values) total = total + value\n    val pair = first to total\n"
                           "    return listOf(first, pair.second).maxOf { it }\n}\n"
                           "fun main() { System.loadLibrary(\"native\"); check(Bridge.run(3) == 12); java.io.File(" +
-                          rfl::json::write(ran.string()) + ").appendText(\"run\\n\") }\n";
+                          json::write(ran.string()) + ").appendText(\"run\\n\") }\n";
             files["library/src/main/kotlin/Library.kt"] = "package dependency\n"
                                                           "fun scale(input: Int): Int = input * 2\n"
                                                           "inline fun adjust(input: Int): Int = input + 1\n"
@@ -199,18 +210,18 @@ namespace {
                           "        let total = named + 1\n        List.map string values, total\n";
             files["check.fsx"] = "#r \"bin/Debug/net10.0/Library.dll\"\n"
                                  "if Sample.Library.run 3 <> 12 then failwith \"wrong native result\"\nSystem.IO.File.AppendAllText(" +
-                                 rfl::json::write(ran.string()) + ", \"run\\n\")\n";
+                                 json::write(ran.string()) + ", \"run\\n\")\n";
         }
         auto initial = test::decode<tools::worldline::output>(test::tool(port, "worldline", R"({"project":"app","action":"inspect"})"));
         tools::worldline::input create{.project = "app", .action = "apply", .observed = initial.version, .operation_id = "create-managed"};
         create.changes = std::vector<tools::change>{};
         for (const auto& [name, text] : files)
             create.changes.value()->push_back({.kind = "create", .path = name, .text = text});
-        auto created = test::decode<tools::worldline::output>(test::tool(port, "worldline", rfl::json::write(create)));
+        auto created = test::decode<tools::worldline::output>(test::tool(port, "worldline", json::write(create)));
         const auto native_initial = test::decode<tools::worldline::output>(test::tool(port, "worldline", R"({"project":"native-lib","action":"inspect"})"));
         const auto native_created = test::decode<tools::worldline::output>(
             test::tool(port, "worldline",
-                       rfl::json::write(tools::worldline::input{
+                       json::write(tools::worldline::input{
                            .project = "native-lib",
                            .action = std::string{"apply"},
                            .observed = native_initial.version,
@@ -218,7 +229,7 @@ namespace {
                            .changes = std::vector<tools::change>{{.kind = "create", .path = "native.cpp", .text = files.at("native.cpp")}}})));
         test::tool(port, "task",
                    "{\"project\":\"native-lib\",\"action\":\"fork\",\"task\":\"native\",\"worldline\":\"release\",\"from\":\"main\",\"version\":" +
-                       rfl::json::write(native_created.version) + ",\"operation_id\":\"fork-native-release\"}");
+                       json::write(native_created.version) + ",\"operation_id\":\"fork-native-release\"}");
         const auto native_version =
             test::decode<tools::worldline::output>(test::tool(port, "worldline", R"({"project":"native-lib","action":"inspect","worldline":"release"})"))
                 .version;
@@ -228,7 +239,7 @@ namespace {
         auto agent = [&](const std::string& name, const std::string& args) { return test::tool(port, name, args, false, *run.credential); };
         auto query = [&](std::string output) {
             return test::decode<tools::language_query::output>(
-                agent("language", rfl::json::write(tools::language_query::input{.project = "app",
+                agent("language", json::write(tools::language_query::input{.project = "app",
                                                                                 .configuration = "managed",
                                                                                 .action = std::string{"symbols"},
                                                                                 .outputs = std::vector<std::string>{output},
@@ -236,12 +247,12 @@ namespace {
                                                                                 .limit = 250})));
         };
         auto timing = [&](std::string_view phase, const tools::language_query::output& result) {
-            std::cerr << (kotlin ? "Kotlin" : "F#") << " managed flow " << phase << ": " << rfl::json::write(result.timings)
+            std::cerr << (kotlin ? "Kotlin" : "F#") << " managed flow " << phase << ": " << json::write(result.timings)
                       << "; reused_units=" << result.reused_units << '\n';
         };
         if (kotlin) {
             const auto registered = test::decode<tools::language_query::output>(
-                agent("language", rfl::json::write(tools::language_query::input{
+                agent("language", json::write(tools::language_query::input{
                                       .project = "app", .configuration = "managed", .action = std::string{"describe"}, .provider = "configured-kotlin"})));
             test::require(registered.providers && registered.providers->size() == 1 && registered.providers->front().id == "configured-kotlin" &&
                               registered.providers->front().adapter == language::adapter_kind::helper,
@@ -249,7 +260,7 @@ namespace {
         }
         if (!kotlin) {
             const auto focused = test::decode<tools::language_query::output>(agent(
-                "language", rfl::json::write(tools::language_query::input{.project = "app",
+                "language", json::write(tools::language_query::input{.project = "app",
                                                                           .configuration = "managed",
                                                                           .action = std::string{"symbols"},
                                                                           .scope = tools::language_query::scope_filter{.files = std::vector<std::string>{path}},
@@ -274,7 +285,7 @@ namespace {
         });
         test::require(imported != source_only.items.end(), "source view has no managed native declaration");
         const auto inferred = test::decode<tools::language_query::output>(
-            agent("language", rfl::json::write(tools::language_query::input{.project = "app",
+            agent("language", json::write(tools::language_query::input{.project = "app",
                                                                             .configuration = "managed",
                                                                             .action = std::string{"inspect"},
                                                                             .selector = semantic::selection{.name = semantic::named{"inferred"}},
@@ -286,7 +297,7 @@ namespace {
                                                       : std::set<std::string>{"first", "total", "List.head values", "List.map string values"};
         expect(std::ranges::includes(spelled, expected) && !spelled.contains("named") &&
                std::ranges::none_of(spelled, [](const std::string& text) { return text.contains('+'); }))
-            << "typed ranges cover only unwritten types: " << rfl::json::write(spelled);
+            << "typed ranges cover only unwritten types: " << json::write(spelled);
         if (kotlin)
             test::require(std::ranges::any_of(
                               source_only.symbols,
@@ -294,7 +305,7 @@ namespace {
                           "helper records lost the registered provider identity");
         for (const auto& action : {"definitions", "references"}) {
             const auto selected = test::decode<tools::language_query::output>(
-                agent("language", rfl::json::write(tools::language_query::input{
+                agent("language", json::write(tools::language_query::input{
                                       .project = "app",
                                       .configuration = "managed",
                                       .action = std::string{action},
@@ -312,7 +323,7 @@ namespace {
                    .contains("permission_denied"))
             << "the app execution cannot directly read another project without its declared dependency grant";
         const auto pending_link = test::decode<tools::language_query::output>(
-            agent("language", rfl::json::write(tools::language_query::input{.project = "app",
+            agent("language", json::write(tools::language_query::input{.project = "app",
                                                                             .configuration = "managed",
                                                                             .action = std::string{"symbols"},
                                                                             .outputs = std::vector<std::string>{"linked"},
@@ -325,7 +336,7 @@ namespace {
                       "the partial graph did not pin the separately authorized native project");
         const auto native_lease =
             test::decode<tools::scope::output>(test::tool(port, "scope",
-                                                          rfl::json::write(tools::scope::input{.project = "native-lib",
+                                                          json::write(tools::scope::input{.project = "native-lib",
                                                                                                .action = std::string{"acquire"},
                                                                                                .worldline = std::string{"release"},
                                                                                                .files = std::vector<std::string>{"native.cpp"},
@@ -335,7 +346,7 @@ namespace {
         changed_native_text.replace(changed_native_text.find("input * 2"), 9, "input * 3");
         const auto native_edited = test::decode<tools::worldline::output>(
             test::tool(port, "worldline",
-                       rfl::json::write(tools::worldline::input{
+                       json::write(tools::worldline::input{
                            .project = "native-lib",
                            .action = std::string{"apply"},
                            .worldline = std::string{"release"},
@@ -344,18 +355,18 @@ namespace {
                            .operation_id = "change-native-dependency",
                            .changes = std::vector<tools::change>{{.kind = "write", .path = "native.cpp", .text = changed_native_text}}})));
         auto linked = test::decode<tools::language_query::output>(
-            agent("language", rfl::json::write(tools::language_query::input{
+            agent("language", json::write(tools::language_query::input{
                                   .project = "app", .continuation = pending_link.continuation, .budget = semantic::budget{.units = 512}})));
         test::require(linked.status == "complete" && semantic::snapshot_for(linked.snapshots, "native-lib").version == *native_version,
-                      "continuation did not complete with its original native project snapshot; first=" + rfl::json::write(pending_link.snapshots) +
-                          " resumed=" + rfl::json::write(linked));
+                      "continuation did not complete with its original native project snapshot; first=" + json::write(pending_link.snapshots) +
+                          " resumed=" + json::write(linked));
         const auto refreshed_link = query("linked");
         test::require(refreshed_link.status == "complete" && refreshed_link.version == linked.version &&
                           semantic::snapshot_for(refreshed_link.snapshots, "native-lib").version == *native_edited.version,
                       "a fresh graph did not select the native project's updated snapshot");
         const auto native_comparison = test::decode<tools::language_query::output>(
             agent("language",
-                  rfl::json::write(tools::language_query::input{
+                  json::write(tools::language_query::input{
                       .project = "app", .action = std::string{"impact"}, .from_view = linked.view, .to_view = refreshed_link.view, .limit = 250, .depth = 5})));
         test::require(native_comparison.comparison && std::ranges::any_of(native_comparison.comparison->reanalysis,
                                                                           [](const auto& unit) {
@@ -367,7 +378,7 @@ namespace {
                                                                           }),
                       "cross-project impact did not retain the native input change and its build task");
         const auto retained_link = test::decode<tools::language_query::output>(agent(
-            "language", rfl::json::write(tools::language_query::input{.project = "app", .action = std::string{"symbols"}, .view = linked.view, .limit = 250})));
+            "language", json::write(tools::language_query::input{.project = "app", .action = std::string{"symbols"}, .view = linked.view, .limit = 250})));
         expect(semantic::snapshot_for(retained_link.snapshots, "native-lib").version == *native_version)
             << "the old view keeps the separately authorized dependency snapshot after a new call";
         timing("linked", linked);
@@ -377,7 +388,7 @@ namespace {
         test::require(native != linked.items.end(), "linked view has no native export");
         auto impact = test::decode<tools::language_query::output>(
             agent("language",
-                  rfl::json::write(tools::language_query::input{.project = "app",
+                  json::write(tools::language_query::input{.project = "app",
                                                                 .action = std::string{"impact"},
                                                                 .selector = semantic::selection{.entity = semantic::entity{native->symbol_id, native->context}},
                                                                 .view = linked.view,
@@ -386,7 +397,7 @@ namespace {
                                                                 .limit = 250})));
         test::require(std::ranges::any_of(impact.items, [&](const auto& item) { return item.domain == (kotlin ? "kotlin" : "fsharp") && item.name == "run"; }),
                       "gateway impact did not reach the managed source function through binds/calls/emits");
-        auto leased = test::decode<tools::scope::output>(agent("scope", rfl::json::write(tools::scope::input{.project = "app",
+        auto leased = test::decode<tools::scope::output>(agent("scope", json::write(tools::scope::input{.project = "app",
                                                                                                              .action = std::string{"acquire"},
                                                                                                              .files = std::vector<std::string>{path},
                                                                                                              .version = created.version,
@@ -405,7 +416,7 @@ namespace {
         // same observed source mutation, under its own file lease.
         if (!kotlin) {
             auto script_lease =
-                test::decode<tools::scope::output>(agent("scope", rfl::json::write(tools::scope::input{.project = "app",
+                test::decode<tools::scope::output>(agent("scope", json::write(tools::scope::input{.project = "app",
                                                                                                        .action = std::string{"acquire"},
                                                                                                        .files = std::vector<std::string>{"check.fsx"},
                                                                                                        .version = created.version,
@@ -415,7 +426,7 @@ namespace {
             script.replace(script.find("<> 12"), 5, "<> 15");
             edit.changes.value()->push_back({.kind = "write", .path = "check.fsx", .text = script});
         }
-        const auto edited = test::decode<tools::worldline::output>(agent("worldline", rfl::json::write(edit)));
+        const auto edited = test::decode<tools::worldline::output>(agent("worldline", json::write(edit)));
         const auto before_compile = test::slurp(compiled);
         const auto before_configuration = kotlin ? test::slurp(configured) : "";
         auto updated_source = query("source");
@@ -429,14 +440,14 @@ namespace {
         timing("edited linked", updated);
         expect(updated.version == edited.version && updated.view != linked.view && test::slurp(compiled) != before_compile);
         const auto compared = test::decode<tools::language_query::output>(
-            agent("language", rfl::json::write(tools::language_query::input{
+            agent("language", json::write(tools::language_query::input{
                                   .project = "app", .action = std::string{"impact"}, .from_view = linked.view, .to_view = updated.view, .limit = 250})));
         expect(compared.comparison.has_value() && !compared.comparison->reanalysis.empty());
         struct execution {
             bool ok;
             std::string revision;
         };
-        const auto pinned = "{\"project\":\"app\",\"configurations\":[\"managed\"],\"version\":" + rfl::json::write(edited.version) + "}";
+        const auto pinned = "{\"project\":\"app\",\"configurations\":[\"managed\"],\"version\":" + json::write(edited.version) + "}";
         const auto built = test::decode<execution>(agent("build", pinned));
         const auto tested = test::decode<execution>(agent("test", pinned));
         expect(built.ok && tested.ok && tested.revision == *edited.version && std::filesystem::exists(ran));
@@ -451,7 +462,7 @@ namespace {
             persistence = persisted_reuse{.consumer = consumer->ownership.owner_unit, .initial = *source_only.view, .before = *updated_source.view};
             const std::string library_path = "library/src/main/kotlin/Library.kt";
             auto library_lease =
-                test::decode<tools::scope::output>(agent("scope", rfl::json::write(tools::scope::input{.project = "app",
+                test::decode<tools::scope::output>(agent("scope", json::write(tools::scope::input{.project = "app",
                                                                                                        .action = std::string{"acquire"},
                                                                                                        .files = std::vector<std::string>{library_path},
                                                                                                        .version = edited.version,
@@ -459,7 +470,7 @@ namespace {
             auto version = edited.version;
             auto write_library = [&](std::string text, const std::string& operation) {
                 const auto result = test::decode<tools::worldline::output>(
-                    agent("worldline", rfl::json::write(tools::worldline::input{
+                    agent("worldline", json::write(tools::worldline::input{
                                            .project = "app",
                                            .action = std::string{"apply"},
                                            .observed = version,
@@ -470,7 +481,7 @@ namespace {
             };
             auto read_source = [&] {
                 return test::decode<tools::language_query::output>(
-                    agent("language", rfl::json::write(tools::language_query::input{.project = "app",
+                    agent("language", json::write(tools::language_query::input{.project = "app",
                                                                                     .configuration = "managed",
                                                                                     .action = std::string{"symbols"},
                                                                                     .outputs = std::vector<std::string>{"source"},
@@ -503,7 +514,7 @@ namespace {
                 test::require(producer != before.symbols.end(), "comparison has no selected dependency producer");
                 persistence->producer = producer->ownership.owner_unit;
                 const auto filtered = test::decode<tools::language_query::output>(
-                    agent("language", rfl::json::write(tools::language_query::input{
+                    agent("language", json::write(tools::language_query::input{
                                           .project = "app",
                                           .action = std::string{"impact"},
                                           .selector = semantic::selection{.entity = semantic::entity{producer->id, producer->ownership.context}},
@@ -540,12 +551,12 @@ namespace {
                           "new more-specific overload did not update the consumer's inferred result");
             test::tool(port, "task",
                        "{\"project\":\"app\",\"action\":\"fork\",\"task\":\"previous\",\"worldline\":\"previous\",\"from\":\"main\",\"version\":" +
-                           rfl::json::write(created.version) + ",\"operation_id\":\"fork-managed-previous\"}");
+                           json::write(created.version) + ",\"operation_id\":\"fork-managed-previous\"}");
             const auto previous_run = test::decode<tools::task::output>(
                 test::tool(port, "task", R"({"project":"app","action":"start","task":"previous","operation_id":"start-managed-previous"})"));
             const auto previous = test::decode<tools::language_query::output>(
                 test::tool(port, "language",
-                           rfl::json::write(tools::language_query::input{.project = "app",
+                           json::write(tools::language_query::input{.project = "app",
                                                                          .configuration = "managed",
                                                                          .action = std::string{"symbols"},
                                                                          .outputs = std::vector<std::string>{"source"},
@@ -590,7 +601,7 @@ namespace {
 
     static constexpr auto cases = [] {
         "Kotlin stage graph defers compilation and connects edits to JNI execution"_test = [] {
-            for (const auto* name : {"TEST_GRADLE", "TEST_JVM_HOST", "TEST_KOTLIN_ADAPTER", "TEST_CXX", "TEST_JAVA", "TEST_JDK", "TEST_NATIVE_HOST"})
+            for (const auto* name : {"TEST_GRADLE", "TEST_JVM_HOST", "TEST_KOTLIN_ADAPTER", "TEST_CXX", "TEST_JAVA", "TEST_JDK", "TEST_LLVM_HOST"})
                 if (!std::getenv(name)) {
                     skip / "Kotlin gateway requires the installed JVM toolchain"_test = [] {};
                     return;
@@ -598,7 +609,7 @@ namespace {
             managed_flow(true);
         };
         "FSharp stage graph defers compilation and connects edits to PInvoke execution"_test = [] {
-            for (const auto* name : {"TEST_DOTNET", "TEST_CLR_HOST", "TEST_FSHARP_ADAPTER", "TEST_CXX", "TEST_NATIVE_HOST"})
+            for (const auto* name : {"TEST_DOTNET", "TEST_CLR_HOST", "TEST_FSHARP_ADAPTER", "TEST_CXX", "TEST_LLVM_HOST"})
                 if (!std::getenv(name)) {
                     skip / "FSharp gateway requires the installed CLR toolchain"_test = [] {};
                     return;
@@ -612,7 +623,7 @@ namespace {
             auto doc = test::document(tmp.dir, port, source_port);
             doc.projects["app.task"] = doc.projects.at("app");
             doc.projects.erase("app");
-            test::spit(tmp.dir / "config.json", rfl::json::write(doc));
+            test::spit(tmp.dir / "config.json", json::write(doc));
             test::child gateway{test::gateway_command(SERVICE_EXECUTABLE, tmp.dir, {"config.json"})};
             test::ready(gateway, port);
             auto initial = test::decode<tools::worldline::output>(test::tool(port, "worldline", R"({"project":"app.task","action":"inspect"})"));
@@ -623,12 +634,12 @@ namespace {
             expect(test::request(port, http::method::POST, "/api/v1/projects/app.task/node", R"({"action":"scope_register","analyzed_scopes":[]})").status ==
                    403);
             auto fork = "{\"project\":\"app.task\",\"action\":\"fork\",\"task\":\"parser\",\"worldline\":\"task-parser\",\"from\":\"main\",\"version\":" +
-                        rfl::json::write(initial.version) + ",\"operation_id\":\"task-fork\"}";
+                        json::write(initial.version) + ",\"operation_id\":\"task-fork\"}";
             test::tool(port, "task", fork);
             test::tool(port, "task", fork);
             auto start = [&](std::string operation) {
                 return test::decode<tools::task::output>(test::tool(
-                    port, "task", "{\"project\":\"app.task\",\"action\":\"start\",\"task\":\"parser\",\"operation_id\":" + rfl::json::write(operation) + "}"));
+                    port, "task", "{\"project\":\"app.task\",\"action\":\"start\",\"task\":\"parser\",\"operation_id\":" + json::write(operation) + "}"));
             };
             auto a = start("run-a"), b = start("run-b");
             expect(a.run != b.run && a.credential != b.credential && start("run-a").credential == a.credential);
@@ -644,9 +655,9 @@ namespace {
                                       R"({"project":"app.task","action":"inspect","worldline":"main"})", *a.credential);
             expect(rest.status == 403);
             auto acquired = test::decode<tools::scope::output>(agent(
-                "scope", "{\"action\":\"acquire\",\"entries\":[\"new.txt\"],\"version\":" + rfl::json::write(tree.version) + ",\"operation_id\":\"entry\"}"));
-            auto mutation = "{\"action\":\"apply\",\"observed\":" + rfl::json::write(tree.version) + ",\"operation_id\":\"create\",\"leases\":[" +
-                            rfl::json::write(acquired.leases[0].token) + "],\"changes\":[{\"kind\":\"create\",\"path\":\"new.txt\",\"text\":\"\"}]}";
+                "scope", "{\"action\":\"acquire\",\"entries\":[\"new.txt\"],\"version\":" + json::write(tree.version) + ",\"operation_id\":\"entry\"}"));
+            auto mutation = "{\"action\":\"apply\",\"observed\":" + json::write(tree.version) + ",\"operation_id\":\"create\",\"leases\":[" +
+                            json::write(acquired.leases[0].token) + "],\"changes\":[{\"kind\":\"create\",\"path\":\"new.txt\",\"text\":\"\"}]}";
             expect(agent("worldline", mutation, true, true).contains("scope_expired"));
             auto created = test::decode<tools::worldline::output>(agent("worldline", mutation));
             expect(created.version.has_value());
@@ -655,7 +666,7 @@ namespace {
             auto observed = test::decode<tools::worldline::output>(test::tool(port, "worldline", R"({"action":"inspect"})", false, *observer.credential));
             expect(observed.version == created.version);
             expect(test::tool(port, "worldline",
-                              "{\"action\":\"apply\",\"observed\":" + rfl::json::write(created.version) +
+                              "{\"action\":\"apply\",\"observed\":" + json::write(created.version) +
                                   ",\"operation_id\":\"readonly-write\",\"changes\":[{\"kind\":\"create\",\"path\":\"readonly.txt\",\"text\":\"forbidden\"}]}",
                               true, *observer.credential)
                        .contains("permission_denied"));
@@ -664,14 +675,14 @@ namespace {
             expect(test::decode<tools::worldline::output>(agent("worldline", R"({"action":"read","path":"new.txt"})")).text == "");
             auto main = test::decode<tools::worldline::output>(test::tool(port, "worldline", R"({"project":"app.task","action":"inspect"})"));
             expect(main.version == initial.version);
-            test::tool(port, "task", "{\"project\":\"app.task\",\"action\":\"stop\",\"task\":\"parser\",\"run\":" + rfl::json::write(a.run) + "}");
+            test::tool(port, "task", "{\"project\":\"app.task\",\"action\":\"stop\",\"task\":\"parser\",\"run\":" + json::write(a.run) + "}");
             auto revoked = test::request(port, http::method::POST, "/mcp", R"({"jsonrpc":"2.0","id":1,"method":"tools/list"})", *a.credential);
             expect(revoked.status == 401);
             auto remaining = test::decode<tools::scope::output>(agent("scope", R"({"action":"list"})", false, true));
             expect(remaining.leases.empty());
             auto file = test::decode<tools::scope::output>(
                 agent("scope",
-                      "{\"action\":\"acquire\",\"files\":[\"new.txt\"],\"version\":" + rfl::json::write(created.version) + ",\"operation_id\":\"empty-file\"}",
+                      "{\"action\":\"acquire\",\"files\":[\"new.txt\"],\"version\":" + json::write(created.version) + ",\"operation_id\":\"empty-file\"}",
                       false, true));
             expect(file.leases.size() == 1u && file.leases[0].kind == "file");
             test::tool(port, "task", R"({"project":"app.task","action":"close","task":"parser"})");
@@ -690,7 +701,7 @@ namespace {
             settings.analysis["cpp"] =
                 fixture::profile({.build_configuration = "native",
                                   .inputs = {{"compilation_database", {language::build_input{"native", "configure", "compilation_database"}}}}});
-            test::spit(tmp.dir / "config.json", rfl::json::write(doc));
+            test::spit(tmp.dir / "config.json", json::write(doc));
             test::child gateway{test::gateway_command(SERVICE_EXECUTABLE, tmp.dir, {"config.json"})};
             test::ready(gateway, port);
             auto error = test::tool(port, "language", R"({"project":"app","configuration":"cpp"})", true);
@@ -703,19 +714,14 @@ namespace {
             test::require(described.providers && described.providers->size() == 1, "provider description missing");
             expect(described.providers->front().facts == std::vector<semantic::fact_kind>{std::string{"diagnostics"}} && !described.analyzed);
             expect(!std::filesystem::exists(tmp.dir / "source/.analysis"));
-            for (auto action : {"plan", "prepare", "receipt"}) {
-                auto response = test::request(port, action == std::string_view{"receipt"} ? http::method::GET : http::method::POST,
-                                              std::string{test::project} + "/analysis/cpp/" + action);
-                expect(response.status == 404);
-            }
             expect(gateway.stop() == 0 && source->stop() == 0);
         };
 
         "one MCP connection edits, analyzes, builds, tests and retrieves a local executable"_test = [] {
             auto clice = std::getenv("TEST_CLICE");
-            auto native = std::getenv("TEST_NATIVE_HOST");
+            auto native = std::getenv("TEST_LLVM_HOST");
             if (!clice || !native) {
-                skip / "real worker analysis requires TEST_CLICE and TEST_NATIVE_HOST"_test = [] {};
+                skip / "real worker analysis requires TEST_CLICE and TEST_LLVM_HOST"_test = [] {};
                 return;
             }
             test::scratch tmp{"worker-analysis"};
@@ -741,6 +747,16 @@ namespace {
             artifact_profile.stages.at("artifact").execution.directory_group = "artifacts";
             artifact_profile.outputs = {{"native", {{"artifact", "facts"}}}};
             settings.analysis["artifact"] = artifact_profile;
+            auto without_debug = settings.build_configurations.at("native");
+            auto& release = fixture::options<"cmake">(without_debug.builders.at("main"));
+            release.build_dir = "build/without-debug";
+            release.build_type = "Release";
+            release.outputs.at("app").path = "build/without-debug/app";
+            settings.build_configurations["without-debug"] = std::move(without_debug);
+            auto& release_stage = artifact_profile.stages.at("artifact");
+            release_stage.build_configuration = "without-debug";
+            release_stage.inputs["artifact"] = {language::build_input{"without-debug", "build", "app"}};
+            settings.analysis["artifact-without-debug"] = std::move(artifact_profile);
             auto paired = settings.analysis.at("cpp");
             paired.stages["side"] = paired.stages.at("main");
             std::get<language::build_input>(paired.stages.at("side").inputs.at("compilation_database").front()).configuration = "alternate";
@@ -758,7 +774,7 @@ namespace {
             settings.build_configurations["native"].operations.at("test").exports = {{"app", "build/native/app"}};
             auto project_settings = settings;
             settings = {};
-            test::spit(tmp.dir / "config.json", rfl::json::write(doc));
+            test::spit(tmp.dir / "config.json", json::write(doc));
             test::child gateway{test::gateway_command(SERVICE_EXECUTABLE, tmp.dir, {"config.json"})};
             test::ready(gateway, port);
             config::worker worker_config;
@@ -766,26 +782,27 @@ namespace {
             worker_config.name = "source-reader";
             worker_config.work_root = (tmp.dir / "worker").string();
             worker_config.tools["clice"] = clice;
-            worker_config.tools["fughetta-native"] = native;
+            worker_config.tools["fughetta-llvm"] = native;
             worker_config.tools["python3"] = std::getenv("TEST_PYTHON") ? std::getenv("TEST_PYTHON") : "/usr/bin/python3";
             test::spit(tmp.dir / "sdk/include/answer.hpp", "#pragma once\ninline constexpr int expected_answer = 42;\n");
             test::spit(tmp.dir / "sdk/manifest.json", R"({"name":"test-sdk","release":"one"})");
             worker_config.sdk_manifests["native-test"] = {.manifest = (tmp.dir / "sdk/manifest.json").string(), .roots = {(tmp.dir / "sdk").string()}};
             const auto artifact_reads = tmp.dir / "artifact-reads";
             const auto reader = tmp.dir / "native-reader";
-            test::spit(reader, "#!/bin/sh\nprintf 'native\\n' >> \"$ARTIFACT_READER_LOG\"\nexec \"$TEST_NATIVE_HOST\" \"$@\"\n");
+            test::spit(reader, "#!/bin/sh\nprintf 'native\\n' >> \"$ARTIFACT_READER_LOG\"\nexec \"$TEST_LLVM_HOST\" \"$@\"\n");
             std::filesystem::permissions(reader, std::filesystem::perms::owner_exec, std::filesystem::perm_options::add);
             auto artifact_config = worker_config;
             artifact_config.name = "artifact-reader";
             artifact_config.work_root = (tmp.dir / "artifact-worker").string();
             artifact_config.tools["clice"] = (tmp.dir / "uninstalled-clice").string();
-            artifact_config.tools["fughetta-native"] = reader.string();
+            artifact_config.tools["fughetta-llvm"] = reader.string();
             artifact_config.tools["unused"] = worker_config.tools.at("python3");
             artifact_config.env["ARTIFACT_READER_LOG"] = artifact_reads.string();
-            worker_config.tools["fughetta-native"] = (tmp.dir / "uninstalled-native").string();
-            test::spit(tmp.dir / "artifact-worker.json", rfl::json::write(artifact_config));
+            artifact_config.env["TEST_LLVM_HOST"] = native;
+            worker_config.tools["fughetta-llvm"] = (tmp.dir / "uninstalled-native").string();
+            test::spit(tmp.dir / "artifact-worker.json", json::write(artifact_config));
             auto artifact_worker = std::make_unique<test::child>(test::worker_command(SERVICE_EXECUTABLE, tmp.dir, {"artifact-worker.json"}));
-            test::spit(tmp.dir / "worker.json", rfl::json::write(worker_config));
+            test::spit(tmp.dir / "worker.json", json::write(worker_config));
             test::child worker{test::worker_command(SERVICE_EXECUTABLE, tmp.dir, {"worker.json"})};
             // Registration follows toolchain inspection, including the local compiler build.
             test::eventually(
@@ -793,7 +810,7 @@ namespace {
                     test::require(!worker.finished(), worker.output());
                     test::require(!artifact_worker->finished(), artifact_worker->output());
                     auto workers = test::request(port, http::method::GET, "/api/v1/workers");
-                    return workers.status == 200 && rfl::json::read<std::vector<rfl::Generic>>(workers.body).value().size() == 2;
+                    return workers.status == 200 && json::read<std::vector<json::value>>(workers.body).value().size() == 2;
                 },
                 std::chrono::seconds{60});
             // Only MCP requests supply configuration and source; no local source sync or source REST writes.
@@ -882,11 +899,11 @@ namespace {
                                              "set_source_files_properties(other.cpp PROPERTIES COMPILE_DEFINITIONS VALUE_TYPE=long)\n"
                                              "target_include_directories(app PRIVATE \"" +
                                              (tmp.dir / "sdk/include").generic_string() + "\")\nenable_testing()\nadd_test(NAME answer COMMAND app)\n";
-            auto created = line("{\"project\":\"app\",\"action\":\"apply\",\"observed\":" + rfl::json::write(initial.version) +
-                                ",\"operation_id\":\"create\",\"changes\":[{\"kind\":\"create\",\"path\":\"main.cpp\",\"text\":" + rfl::json::write(before) +
-                                "},{\"kind\":\"create\",\"path\":\"CMakeLists.txt\",\"text\":" + rfl::json::write(cmake_source) +
-                                "},{\"kind\":\"create\",\"path\":\"shared.hpp\",\"text\":" + rfl::json::write(shared_header) +
-                                "},{\"kind\":\"create\",\"path\":\"other.cpp\",\"text\":" + rfl::json::write(other_source) + "}]}");
+            auto created = line("{\"project\":\"app\",\"action\":\"apply\",\"observed\":" + json::write(initial.version) +
+                                ",\"operation_id\":\"create\",\"changes\":[{\"kind\":\"create\",\"path\":\"main.cpp\",\"text\":" + json::write(before) +
+                                "},{\"kind\":\"create\",\"path\":\"CMakeLists.txt\",\"text\":" + json::write(cmake_source) +
+                                "},{\"kind\":\"create\",\"path\":\"shared.hpp\",\"text\":" + json::write(shared_header) +
+                                "},{\"kind\":\"create\",\"path\":\"other.cpp\",\"text\":" + json::write(other_source) + "}]}");
             test::tool(port, "task", R"({"project":"app","action":"create","task":"fix","worldline":"main","operation_id":"bind"})");
             auto execution_run =
                 test::decode<tools::task::output>(test::tool(port, "task", R"({"project":"app","action":"start","task":"fix","operation_id":"start"})"));
@@ -896,20 +913,29 @@ namespace {
             auto waiting = test::decode<tools::language_query::output>(
                 agent("language", R"({"project":"app","configuration":"cpp","action":"symbols","budget":{"units":0}})"));
             test::require(waiting.status == "partial" && waiting.view && waiting.continuation, "zero unit budget publishes pending coverage");
-            auto deferred_parts = [](const auto& result) {
-                return std::ranges::count_if(result.coverage.missing, [](const auto& missing) { return missing.deferred; });
+            const auto execute_cache = std::filesystem::path{worker_config.work_root + "-execute"} / "analysis";
+            test::require(std::filesystem::is_directory(execute_cache) &&
+                              std::ranges::any_of(std::filesystem::recursive_directory_iterator{execute_cache},
+                                                  [](const auto& item) { return item.is_directory() && item.path().filename() == "clice"; }),
+                          "clice with compiler discovery must run in the execute role");
+            auto deferred_parts = [](const auto& result, std::string_view path = {}) {
+                std::size_t count = 0;
+                for (const auto& missing : result.coverage.missing)
+                    if (missing.deferred && (path.empty() || std::ranges::contains(missing.scope.files, path)))
+                        count += missing.units.size();
+                return count;
             };
             const auto total_parts = deferred_parts(waiting);
-            const auto main_parts = std::ranges::count_if(
-                waiting.coverage.missing, [](const auto& missing) { return missing.deferred && std::ranges::contains(missing.scope.files, "main.cpp"); });
+            const auto main_parts = deferred_parts(waiting, "main.cpp");
             const auto other_parts = total_parts - main_parts;
-            expect(waiting.items.empty() && main_parts > 1 && other_parts > 1) << "both TUs expose independently deferred semantic contributions";
+            test::require(waiting.items.empty() && main_parts > 1 && other_parts > 1,
+                          "both TUs must expose independently deferred semantic contributions: " + json::write(waiting));
             auto batch = test::decode<tools::language_query::output>(
-                agent("language", "{\"project\":\"app\",\"continuation\":" + rfl::json::write(waiting.continuation) + ",\"budget\":{\"units\":1}}"));
+                agent("language", "{\"project\":\"app\",\"continuation\":" + json::write(waiting.continuation) + ",\"budget\":{\"units\":1}}"));
             test::require(batch.status == "partial" && batch.continuation, "one unit publishes results and the remaining work");
             expect(!batch.items.empty() && deferred_parts(batch) == total_parts - 1);
             auto completed_file = test::decode<tools::language_query::output>(agent(
-                "language", "{\"project\":\"app\",\"action\":\"symbols\",\"scope\":{\"files\":[\"main.cpp\"]},\"view\":" + rfl::json::write(batch.view) + "}"));
+                "language", "{\"project\":\"app\",\"action\":\"symbols\",\"scope\":{\"files\":[\"main.cpp\"]},\"view\":" + json::write(batch.view) + "}"));
             expect(completed_file.status == "partial" && completed_file.continuation)
                 << "a declaration part cannot hide deferred source-location and scope contributions";
             auto completed_batch = batch;
@@ -918,7 +944,7 @@ namespace {
                 test::require(completed_batch.continuation.has_value() && rounds < static_cast<std::size_t>(total_parts),
                               "contribution continuation did not advance");
                 completed_batch = test::decode<tools::language_query::output>(
-                    agent("language", "{\"project\":\"app\",\"continuation\":" + rfl::json::write(completed_batch.continuation) + "}"));
+                    agent("language", "{\"project\":\"app\",\"continuation\":" + json::write(completed_batch.continuation) + "}"));
                 ++rounds;
             }
             expect(rounds == static_cast<std::size_t>(total_parts) && completed_batch.reused_units == static_cast<std::uint64_t>(total_parts - 1) &&
@@ -930,24 +956,24 @@ namespace {
             expect(focused.status == "complete" && focused.view && !focused.items.empty());
             auto outside = test::decode<tools::language_query::output>(
                 agent("language",
-                      "{\"project\":\"app\",\"action\":\"symbols\",\"scope\":{\"files\":[\"other.cpp\"]},\"view\":" + rfl::json::write(focused.view) + "}"));
+                      "{\"project\":\"app\",\"action\":\"symbols\",\"scope\":{\"files\":[\"other.cpp\"]},\"view\":" + json::write(focused.view) + "}"));
             test::require(outside.status == "partial" && outside.continuation && !outside.coverage.missing.empty(), "outside scope offers continuation");
             auto supplemented = test::decode<tools::language_query::output>(
-                agent("language", "{\"project\":\"app\",\"continuation\":" + rfl::json::write(outside.continuation) +
+                agent("language", "{\"project\":\"app\",\"continuation\":" + json::write(outside.continuation) +
                                       ",\"budget\":{\"units\":" + std::to_string(total_parts) + "}}"));
             expect(supplemented.status == "complete" && supplemented.next_view == supplemented.view && supplemented.view != focused.view &&
                    supplemented.version == focused.version && supplemented.environment == focused.environment && !supplemented.items.empty());
             auto retained = test::decode<tools::language_query::output>(agent(
                 "language",
-                "{\"project\":\"app\",\"action\":\"symbols\",\"scope\":{\"files\":[\"main.cpp\"]},\"view\":" + rfl::json::write(supplemented.view) + "}"));
-            expect(retained.status == "complete" && rfl::json::write(retained.items) == rfl::json::write(focused.items))
+                "{\"project\":\"app\",\"action\":\"symbols\",\"scope\":{\"files\":[\"main.cpp\"]},\"view\":" + json::write(supplemented.view) + "}"));
+            expect(retained.status == "complete" && json::write(retained.items) == json::write(focused.items))
                 << "supplementing retains previously published units";
             auto original = test::decode<tools::language_query::output>(
                 agent("language",
-                      "{\"project\":\"app\",\"action\":\"symbols\",\"scope\":{\"files\":[\"other.cpp\"]},\"view\":" + rfl::json::write(focused.view) + "}"));
+                      "{\"project\":\"app\",\"action\":\"symbols\",\"scope\":{\"files\":[\"other.cpp\"]},\"view\":" + json::write(focused.view) + "}"));
             expect(original.status == "partial") << "continuation leaves the original view unchanged";
             auto incomplete_project = test::decode<tools::language_query::output>(
-                agent("language", "{\"project\":\"app\",\"action\":\"symbols\",\"view\":" + rfl::json::write(focused.view) + "}"));
+                agent("language", "{\"project\":\"app\",\"action\":\"symbols\",\"view\":" + json::write(focused.view) + "}"));
             test::require(incomplete_project.continuation.has_value(), "project expansion offers continuation");
             auto symbols = agent("language", "{\"project\":\"app\",\"configuration\":\"cpp\",\"action\":\"symbols\",\"limit\":250,\"budget\":{\"units\":" +
                                                  std::to_string(total_parts) + "}}");
@@ -957,7 +983,7 @@ namespace {
             test::require(published.view.has_value(), "analysis did not publish a view");
             const auto expired_symbol = test::decode<tools::language_query::output>(
                 agent("language", "{\"project\":\"app\",\"action\":\"inspect\",\"selector\":{\"entity\":{\"symbol_id\":\"sym-unretained\"}},\"view\":" +
-                                      rfl::json::write(published.view) + "}"));
+                                      json::write(published.view) + "}"));
             expect(expired_symbol.status == "expired" && expired_symbol.code == "symbol_expired");
             const auto source_directory = last_directory();
             expect(!std::filesystem::exists(source_directory / "build/native/app")) << "source analysis does not link an executable";
@@ -965,6 +991,7 @@ namespace {
                 "language", R"({"project":"app","configuration":"artifact","action":"relations","selector":{"name":{"text":"twice"}},"relations":["emits"]})"));
             test::require(emitted.relations.size() == 1, "debug information did not connect source to native artifact");
             const auto& emission = emitted.relations.front();
+            expect(emission.detail && std::get<semantic::records::emission_detail>(emission.detail->variant()).evidence == "debug_location");
             expect(emission.from_context.has_value() && *emission.from_context != emission.ownership.context);
             expect(std::ranges::any_of(emitted.items, [](const auto& item) { return item.domain == "native" && item.name == "_Z5twicei"; }));
             expect(last_directory().string().starts_with(artifact_config.work_root) && source_directory.string().starts_with(worker_config.work_root) &&
@@ -978,17 +1005,17 @@ namespace {
             expect(deferred_artifact.coverage.requested.files == std::vector<std::string>{"main.cpp"})
                 << "upstream project demand does not erase the caller's file scope";
             auto reused_artifact = test::decode<tools::language_query::output>(
-                agent("language", "{\"project\":\"app\",\"continuation\":" + rfl::json::write(deferred_artifact.continuation) +
+                agent("language", "{\"project\":\"app\",\"continuation\":" + json::write(deferred_artifact.continuation) +
                                       ",\"budget\":{\"units\":" + std::to_string(total_parts + 1) + "}}"));
             expect(reused_artifact.status == "complete" && reused_artifact.reused_units == static_cast<std::uint64_t>(total_parts + 1) &&
                    reused_artifact.relations.size() == 1u && test::slurp(artifact_reads) == "native\n")
                 << "continuation reuses both source units and the native unit without invoking LLVM again: " << reused_artifact.status
                 << " reused=" << reused_artifact.reused_units << " relations=" << reused_artifact.relations.size() << " reads=" << test::slurp(artifact_reads)
-                << " missing=" << rfl::json::write(reused_artifact.coverage.missing);
+                << " missing=" << json::write(reused_artifact.coverage.missing);
             auto restart_artifact_worker = [&] {
                 test::require(artifact_worker->stop() == 0, "artifact worker did not stop");
                 artifact_config.name += "-restarted";
-                test::spit(tmp.dir / "artifact-worker.json", rfl::json::write(artifact_config));
+                test::spit(tmp.dir / "artifact-worker.json", json::write(artifact_config));
                 artifact_worker = std::make_unique<test::child>(test::worker_command(SERVICE_EXECUTABLE, tmp.dir, {"artifact-worker.json"}));
                 test::eventually(
                     [&] {
@@ -1023,7 +1050,7 @@ namespace {
                                                           .view = emitted.view,
                                                           .relations = std::vector<std::string>{"emits"},
                                                           .direction = std::string{"incoming"}};
-            const auto back = test::decode<tools::language_query::output>(agent("language", rfl::json::write(reverse_emission)));
+            const auto back = test::decode<tools::language_query::output>(agent("language", json::write(reverse_emission)));
             expect(back.relations.size() == 1u && std::ranges::any_of(back.items, [](const auto& item) { return item.name == "twice"; }));
             auto plan = test::decode<tools::language_query::output>(
                 agent("language", R"({"project":"app","configuration":"paired","action":"plan","outputs":["primary"]})"));
@@ -1042,11 +1069,11 @@ namespace {
                 test::require(combined.continuation.has_value() && graph_rounds < static_cast<std::size_t>(3 * total_parts),
                               "stage contribution continuation did not advance");
                 combined = test::decode<tools::language_query::output>(
-                    agent("language", "{\"project\":\"app\",\"continuation\":" + rfl::json::write(combined.continuation) + "}"));
+                    agent("language", "{\"project\":\"app\",\"continuation\":" + json::write(combined.continuation) + "}"));
                 ++graph_rounds;
             }
             test::require(combined.status == "complete" && combined.items.size() == 2,
-                          "profile outputs must preserve both stage interpretations: " + rfl::json::write(combined));
+                          "profile outputs must preserve both stage interpretations: " + json::write(combined));
             expect(combined.items[0].symbol_id == combined.items[1].symbol_id && combined.items[0].context != combined.items[1].context);
             expect(combined.snapshots.size() == 1u && combined.version == published.version);
             expect(test::slurp(preparations) == before_preparation + "configure\nconfigure\n")
@@ -1062,10 +1089,10 @@ namespace {
                                                       .action = std::string{"symbols"},
                                                       .selector = semantic::selection{.name = semantic::named{.text = "twice"}},
                                                       .view = combined.view};
-            auto first_page = test::decode<tools::language_query::output>(agent("language", rfl::json::write(default_page)));
+            auto first_page = test::decode<tools::language_query::output>(agent("language", json::write(default_page)));
             test::require(first_page.items.size() == 1 && first_page.cursor.has_value(), "fixed view must retain its profile page size");
             default_page.cursor = first_page.cursor;
-            auto second_page = test::decode<tools::language_query::output>(agent("language", rfl::json::write(default_page)));
+            auto second_page = test::decode<tools::language_query::output>(agent("language", json::write(default_page)));
             expect(second_page.items.size() == 1u && second_page.items.front().context != first_page.items.front().context);
 
             const auto main_symbol = std::ranges::find(published.items, "main", &semantic::item::name);
@@ -1085,11 +1112,11 @@ namespace {
             tools::language_query::input header_query{.project = "app", .action = std::string{"inspect"}};
             header_query.view = published.view;
             header_query.selector = semantic::selection{.entity = semantic::entity{.symbol_id = variants.front().symbol_id}};
-            auto ambiguous = test::decode<tools::language_query::output>(agent("language", rfl::json::write(header_query)));
+            auto ambiguous = test::decode<tools::language_query::output>(agent("language", json::write(header_query)));
             expect(ambiguous.status == "ambiguous" && ambiguous.items.size() == 2u);
             for (const auto& variant : variants) {
                 header_query.selector.value()->entity->context = variant.context;
-                auto selected = test::decode<tools::language_query::output>(agent("language", rfl::json::write(header_query)));
+                auto selected = test::decode<tools::language_query::output>(agent("language", json::write(header_query)));
                 test::require(selected.status == "complete" && selected.items.size() == 1, "context did not select a complete header interpretation");
                 auto alias = std::ranges::find(selected.types, *selected.items.front().type_id, &semantic::records::type::id);
                 test::require(alias != selected.types.end() && alias->kind == "alias" && alias->arguments.size() == 1, "header alias type missing");
@@ -1098,16 +1125,16 @@ namespace {
             }
             tools::language_query::input packet_query{
                 .project = "app", .action = std::string{"inspect"}, .selector = semantic::selection{.name = semantic::named{"packet"}}, .view = published.view};
-            auto packet = test::decode<tools::language_query::output>(agent("language", rfl::json::write(packet_query)));
+            auto packet = test::decode<tools::language_query::output>(agent("language", json::write(packet_query)));
             test::require(packet.status == "complete" && packet.items.size() == 1 && !packet.types.empty(), "template instance missing");
             auto bounded_packet = packet_query;
             bounded_packet.budget = semantic::budget{.nodes = 0};
-            auto partial_packet = test::decode<tools::language_query::output>(agent("language", rfl::json::write(bounded_packet)));
+            auto partial_packet = test::decode<tools::language_query::output>(agent("language", json::write(bounded_packet)));
             test::require(partial_packet.status == "partial" && partial_packet.continuation, "type expansion offers a query continuation");
             auto continued_packet = test::decode<tools::language_query::output>(
-                agent("language", "{\"project\":\"app\",\"continuation\":" + rfl::json::write(partial_packet.continuation) + ",\"budget\":{\"nodes\":1000}}"));
+                agent("language", "{\"project\":\"app\",\"continuation\":" + json::write(partial_packet.continuation) + ",\"budget\":{\"nodes\":1000}}"));
             expect(continued_packet.status == "complete" && continued_packet.view == packet.view && !continued_packet.next_view &&
-                   rfl::json::write(continued_packet.types) == rfl::json::write(packet.types))
+                   json::write(continued_packet.types) == json::write(packet.types))
                 << "query budget continuation expands the existing immutable view";
             const auto& arguments = packet.types.front().application_arguments;
             test::require(arguments.size() == 5 && arguments[4].kind == "pack" && arguments[4].elements.size() == 2,
@@ -1127,7 +1154,7 @@ namespace {
             for (std::size_t i = 0; i < 2; ++i) {
                 test::require(arguments[i].declaration.has_value(), "declaration argument missing");
                 packet_query.selector = semantic::selection{.entity = semantic::entity{*arguments[i].declaration, packet.items.front().context}};
-                auto target = test::decode<tools::language_query::output>(agent("language", rfl::json::write(packet_query)));
+                auto target = test::decode<tools::language_query::output>(agent("language", json::write(packet_query)));
                 expect(target.items.size() == 1u && target.items.front().name == (i == 0 ? "Tag" : "marker"));
             }
             auto generic = [&](std::string name, std::optional<std::string> kind = {}) {
@@ -1135,7 +1162,7 @@ namespace {
                                                    .action = std::string{"inspect"},
                                                    .selector = semantic::selection{.name = semantic::named{.text = name, .kind = kind}},
                                                    .view = published.view};
-                auto result = test::decode<tools::language_query::output>(agent("language", rfl::json::write(query)));
+                auto result = test::decode<tools::language_query::output>(agent("language", json::write(query)));
                 test::require(result.status == "complete" && result.items.size() == 1 && !result.types.empty(),
                               "generic declaration missing: " + name + " (" + result.status + ", " + std::to_string(result.items.size()) + " candidates)");
                 return result;
@@ -1186,7 +1213,7 @@ namespace {
                                                    .action = std::string{"references"},
                                                    .selector = semantic::selection{.entity = semantic::entity{choice.symbol_id, choice.context}},
                                                    .view = published.view};
-                auto uses = test::decode<tools::language_query::output>(agent("language", rfl::json::write(query)));
+                auto uses = test::decode<tools::language_query::output>(agent("language", json::write(query)));
                 auto candidate = std::ranges::find_if(uses.references, [](const auto& use) { return use.resolution == "ambiguous"; });
                 test::require(candidate != uses.references.end(), "dependent overload candidates missing");
                 expect(!candidate->target && candidate->candidates.size() == 2u && !candidate->dispatch &&
@@ -1207,7 +1234,7 @@ namespace {
                                                          .scope = tools::language_query::scope_filter{.files = std::vector<std::string>{"other.cpp"}},
                                                          .limit = 250,
                                                          .view = published.view};
-            auto all_uses = test::decode<tools::language_query::output>(agent("language", rfl::json::write(reference_query)));
+            auto all_uses = test::decode<tools::language_query::output>(agent("language", json::write(reference_query)));
             auto one_candidate = generic("one_candidate"), unbound = generic("unbound"), calls = generic("calls");
             auto use_from = [&](const auto& function) -> const semantic::records::reference& {
                 auto found = std::ranges::find_if(all_uses.references, [&](const auto& use) {
@@ -1229,16 +1256,16 @@ namespace {
                                                      .action = std::string{"scopes"},
                                                      .scope = tools::language_query::scope_filter{.files = std::vector<std::string>{"other.cpp"}},
                                                      .view = published.view};
-            auto scope_result = test::decode<tools::language_query::output>(agent("language", rfl::json::write(scope_query)));
+            auto scope_result = test::decode<tools::language_query::output>(agent("language", json::write(scope_query)));
             for (auto cursor = scope_result.cursor; cursor;) {
                 scope_query.cursor = cursor;
-                auto page = test::decode<tools::language_query::output>(agent("language", rfl::json::write(scope_query)));
+                auto page = test::decode<tools::language_query::output>(agent("language", json::write(scope_query)));
                 scope_result.scopes.insert(scope_result.scopes.end(), page.scopes.begin(), page.scopes.end());
                 cursor = std::move(page.cursor);
             }
             auto entity = [&](std::string_view name, std::string_view kind = "") -> std::string {
                 auto found =
-                    std::ranges::find_if(published.items, [&](const auto& item) { return item.name == name && (kind.empty() || item.kind.str() == kind); });
+                    std::ranges::find_if(published.items, [&](const auto& item) { return item.name == name && (kind.empty() || item.kind == kind); });
                 test::require(found != published.items.end(), "scope declaration missing");
                 return found->symbol_id;
             };
@@ -1250,7 +1277,7 @@ namespace {
                 return scopes;
             };
             auto edge = [](const auto& scope, std::string_view kind, const std::string& target) {
-                return std::ranges::any_of(scope.lookup, [&](const auto& edge) { return edge.kind.str() == kind && edge.target == target; });
+                return std::ranges::any_of(scope.lookup, [&](const auto& edge) { return edge.kind == kind && edge.target == target; });
             };
             auto facade = scopes_for(entity("facade"));
             test::require(facade.size() == 2,
@@ -1283,7 +1310,7 @@ namespace {
                                                     .action = std::string{"references"},
                                                     .selector = semantic::selection{.name = semantic::named{"observed"}},
                                                     .view = published.view};
-            auto observed = test::decode<tools::language_query::output>(agent("language", rfl::json::write(role_query)));
+            auto observed = test::decode<tools::language_query::output>(agent("language", json::write(role_query)));
             std::map<std::vector<semantic::role>, std::size_t> roles;
             for (const auto& use : observed.references)
                 ++roles[use.roles];
@@ -1297,12 +1324,12 @@ namespace {
                                                         .limit = 1,
                                                         .relations = std::vector<std::string>{"aliases"},
                                                         .depth = 2};
-            auto alias_first = test::decode<tools::language_query::output>(agent("language", rfl::json::write(relation_query)));
+            auto alias_first = test::decode<tools::language_query::output>(agent("language", json::write(relation_query)));
             test::require(alias_first.analyzed && alias_first.view.has_value() && alias_first.relations.size() == 1 && alias_first.cursor.has_value(),
                           "fresh alias graph did not publish a paginated view");
             relation_query.view = alias_first.view;
             relation_query.cursor = alias_first.cursor;
-            auto alias_second = test::decode<tools::language_query::output>(agent("language", rfl::json::write(relation_query)));
+            auto alias_second = test::decode<tools::language_query::output>(agent("language", json::write(relation_query)));
             test::require(alias_second.relations.size() == 1 && !alias_second.cursor, "alias graph continuation missing");
             std::set<std::pair<std::string, std::string>> aliases{{alias_first.relations[0].from, alias_first.relations[0].to},
                                                                   {alias_second.relations[0].from, alias_second.relations[0].to}};
@@ -1312,7 +1339,7 @@ namespace {
             relation_query.cursor.reset();
             relation_query.selector = semantic::selection{.name = semantic::named{"Override::invoke"}};
             relation_query.relations = std::vector<std::string>{"overrides"};
-            auto overrides = test::decode<tools::language_query::output>(agent("language", rfl::json::write(relation_query)));
+            auto overrides = test::decode<tools::language_query::output>(agent("language", json::write(relation_query)));
             test::require(overrides.relations.size() == 1, "override relationship missing");
             const auto& overridden = overrides.relations.front();
             expect(overridden.occurrence.has_value() &&
@@ -1320,7 +1347,7 @@ namespace {
             relation_query.selector = semantic::selection{.name = semantic::named{"deferred"}};
             relation_query.relations = std::vector<std::string>{"calls"};
             relation_query.limit = 50;
-            auto candidates = test::decode<tools::language_query::output>(agent("language", rfl::json::write(relation_query)));
+            auto candidates = test::decode<tools::language_query::output>(agent("language", json::write(relation_query)));
             test::require(candidates.relations.size() == 2 && candidates.references.size() == 1, "candidate call graph missing");
             expect(candidates.relations[0].resolution == "candidate" && candidates.relations[1].resolution == "candidate" &&
                    candidates.relations[0].reference == candidates.relations[1].reference && candidates.items.size() == 3u);
@@ -1328,7 +1355,7 @@ namespace {
                                                            .action = std::string{"inspect"},
                                                            .selector = semantic::selection{.name = semantic::named{"Widget::score"}},
                                                            .view = published.view};
-            auto score = test::decode<tools::language_query::output>(agent("language", rfl::json::write(declaration_query)));
+            auto score = test::decode<tools::language_query::output>(agent("language", json::write(declaration_query)));
             test::require(score.symbols.size() == 1 && score.symbols.front().parameters.size() == 1, "method declaration details missing");
             const auto& score_record = score.symbols.front();
             const auto& parameter = score_record.parameters.front();
@@ -1337,18 +1364,18 @@ namespace {
             expect(parameter.group == 0u && parameter.index == 0u && parameter.name == "adjustment" && parameter.default_value == "1 + 2" &&
                    parameter.annotations.contains("cpp.attributes"));
             declaration_query.selector = semantic::selection{.name = semantic::named{"Widget::cached"}};
-            auto cached = test::decode<tools::language_query::output>(agent("language", rfl::json::write(declaration_query)));
+            auto cached = test::decode<tools::language_query::output>(agent("language", json::write(declaration_query)));
             test::require(cached.symbols.size() == 1, "field declaration details missing");
             expect(cached.symbols.front().visibility == "protected" && std::ranges::contains(cached.symbols.front().modifiers, "mutable"));
             declaration_query.selector = semantic::selection{.name = semantic::named{"Widget::secret"}};
-            auto secret = test::decode<tools::language_query::output>(agent("language", rfl::json::write(declaration_query)));
+            auto secret = test::decode<tools::language_query::output>(agent("language", json::write(declaration_query)));
             test::require(secret.symbols.size() == 1, "static member declaration details missing");
             expect(secret.symbols.front().visibility == "private" && std::ranges::contains(secret.symbols.front().modifiers, "static"));
             relation_query.depth = 1;
             relation_query.include = std::vector<std::string>{"declarations"};
             for (const auto& name : {"direct", "listed", "defaulted", "copied", "convert"}) {
                 relation_query.selector = semantic::selection{.name = semantic::named{name}};
-                auto construction = test::decode<tools::language_query::output>(agent("language", rfl::json::write(relation_query)));
+                auto construction = test::decode<tools::language_query::output>(agent("language", json::write(relation_query)));
                 const auto constructor = std::ranges::find_if(construction.relations, [&](const auto& relation) {
                     return std::ranges::any_of(construction.items, [&](const auto& item) {
                         return item.symbol_id == relation.to && item.kind == "constructor" && (item.name == "Widget" || item.name == "Converted");
@@ -1375,7 +1402,7 @@ namespace {
                                                    .action = std::string{"inspect"},
                                                    .selector = semantic::selection{.entity = semantic::entity{.symbol_id = sdk_symbol->symbol_id}},
                                                    .view = published.view};
-            auto sdk_detail = test::decode<tools::language_query::output>(agent("language", rfl::json::write(sdk_query)));
+            auto sdk_detail = test::decode<tools::language_query::output>(agent("language", json::write(sdk_query)));
             expect(std::ranges::any_of(sdk_detail.occurrences, [](const auto& occurrence) {
                 const auto& location = occurrence.location.artifact;
                 return location && !location->artifact.empty() && location->module == "sdk/native-test" && location->member == "include/answer.hpp";
@@ -1384,12 +1411,12 @@ namespace {
                 agent("language", R"({"project":"app","configuration":"cpp","action":"symbols","budget":{"milliseconds":0}})"));
             test::require(timed.status == "partial" && timed.continuation, "time exhaustion before provider initialization publishes a resumable view");
             auto limited =
-                test::decode<tools::language_query::output>(agent("language", "{\"project\":\"app\",\"continuation\":" + rfl::json::write(timed.continuation) +
+                test::decode<tools::language_query::output>(agent("language", "{\"project\":\"app\",\"continuation\":" + json::write(timed.continuation) +
                                                                                   ",\"budget\":{\"nodes\":0,\"milliseconds\":60000}}"));
             test::require(limited.status == "partial" && limited.continuation && limited.items.empty(),
                           "a node budget applies to cached contributions and preserves pending work");
             auto replenished = test::decode<tools::language_query::output>(
-                agent("language", "{\"project\":\"app\",\"continuation\":" + rfl::json::write(limited.continuation) + ",\"budget\":{\"nodes\":1000000}}"));
+                agent("language", "{\"project\":\"app\",\"continuation\":" + json::write(limited.continuation) + ",\"budget\":{\"nodes\":1000000}}"));
             expect(replenished.status == "complete" && replenished.version == timed.version && replenished.next_view == replenished.view)
                 << "node and time budget continuation completes the pinned computation";
             auto twice = std::ranges::find(published.items, "twice", &semantic::item::name);
@@ -1398,7 +1425,7 @@ namespace {
             tools::language_query::input inspect{.project = "app", .action = std::string{"inspect"}};
             inspect.view = published.view;
             inspect.selector = semantic::selection{.entity = semantic::entity{.symbol_id = symbol_id}};
-            auto detail = test::decode<tools::language_query::output>(agent("language", rfl::json::write(inspect)));
+            auto detail = test::decode<tools::language_query::output>(agent("language", json::write(inspect)));
             expect(detail.view == published.view && !detail.analyzed && detail.status == "complete");
             test::require(detail.items.size() == 1 && detail.items.front().symbol_id == symbol_id, "inspect did not select the published symbol");
             expect(!detail.items.front().definitions.empty() && detail.items.front().definitions.front().position->line == 2u);
@@ -1412,11 +1439,11 @@ namespace {
             expect(integer != detail.types.end() && integer->kind == "primitive" && integer->name == "int");
             expect(signature->parameter_groups.front().parameters.front().type == *signature->return_type);
             expect(detail.items.front().source && detail.items.front().source->contains("return x * 3;"))
-                << "inspect returns the definition's body text: " << rfl::json::write(detail.items.front().source);
+                << "inspect returns the definition's body text: " << json::write(detail.items.front().source);
             auto references = inspect;
             references.action = std::string{"references"};
             references.limit = 1;
-            auto first_use = test::decode<tools::language_query::output>(agent("language", rfl::json::write(references)));
+            auto first_use = test::decode<tools::language_query::output>(agent("language", json::write(references)));
             test::require(first_use.references.size() == 1 && first_use.cursor.has_value(), "reference query did not paginate uses");
             expect(first_use.references.front().target == symbol_id);
             expect(first_use.references.front().location.position->line == 3u);
@@ -1433,22 +1460,22 @@ namespace {
             });
             test::require(selected != scopes.scopes.end(), "function scope missing");
             auto range = *selected->location.source;
-            auto scoped_text = line("{\"project\":\"app\",\"action\":\"read\",\"path\":\"main.cpp\",\"version\":" + rfl::json::write(scopes.version) +
+            auto scoped_text = line("{\"project\":\"app\",\"action\":\"read\",\"path\":\"main.cpp\",\"version\":" + json::write(scopes.version) +
                                     ",\"offset\":" + std::to_string(range.begin) + ",\"count\":" + std::to_string(range.end - range.begin) + "}");
             expect(scoped_text.text == before.substr(range.begin, range.end - range.begin));
             tools::scope::input acquire{
                 .project = "app", .action = std::string{"acquire"}, .scopes = std::vector<std::string>{*selected->reference}, .operation_id = "claim"};
-            auto leased = test::decode<tools::scope::output>(agent("scope", rfl::json::write(acquire)));
-            auto replay = test::decode<tools::scope::output>(agent("scope", rfl::json::write(acquire)));
+            auto leased = test::decode<tools::scope::output>(agent("scope", json::write(acquire)));
+            auto replay = test::decode<tools::scope::output>(agent("scope", json::write(acquire)));
             expect(leased.version == *created.version && replay.leases.at(0).token == leased.leases.at(0).token);
             expect(leased.leases.at(0).begin == range.begin && leased.leases.at(0).end == range.end);
             auto token = leased.leases.at(0).token;
             auto edit = [&](std::string worldline, std::string operation, bool held) {
-                return "{\"project\":\"app\",\"action\":\"apply\",\"worldline\":" + rfl::json::write(worldline) +
-                       ",\"observed\":" + rfl::json::write(created.version) + ",\"operation_id\":" + rfl::json::write(operation) +
-                       (held ? ",\"leases\":[" + rfl::json::write(token) + "]" : "") +
+                return "{\"project\":\"app\",\"action\":\"apply\",\"worldline\":" + json::write(worldline) +
+                       ",\"observed\":" + json::write(created.version) + ",\"operation_id\":" + json::write(operation) +
+                       (held ? ",\"leases\":[" + json::write(token) + "]" : "") +
                        ",\"changes\":[{\"kind\":\"edit\",\"path\":\"main.cpp\",\"offset\":" + std::to_string(replacement) +
-                       ",\"count\":" + std::to_string(replaced_expression.size()) + ",\"text\":" + rfl::json::write(replacement_expression) + "}]}";
+                       ",\"count\":" + std::to_string(replaced_expression.size()) + ",\"text\":" + json::write(replacement_expression) + "}]}";
             };
             // A lease persists across a source restart and fences another caller's writes.
             expect(source->stop() == 0);
@@ -1460,34 +1487,34 @@ namespace {
             expect(independent.version.has_value());
             // A disjoint edit in this file moves the function without invalidating its anchored lease.
             const std::string prefix = "// concurrent note\n";
-            line("{\"project\":\"app\",\"action\":\"apply\",\"observed\":" + rfl::json::write(created.version) +
+            line("{\"project\":\"app\",\"action\":\"apply\",\"observed\":" + json::write(created.version) +
                  ",\"operation_id\":\"notes\",\"changes\":[{\"kind\":\"edit\",\"path\":\"main.cpp\",\"offset\":0,\"count\":0,\"text\":" +
-                 rfl::json::write(prefix) + "}]}");
+                 json::write(prefix) + "}]}");
             auto edited = line(edit("main", "fix", true));
-            auto reread = line("{\"project\":\"app\",\"action\":\"read\",\"path\":\"main.cpp\",\"version\":" + rfl::json::write(edited.version) +
-                               ",\"known_digest\":" + rfl::json::write(read.digest) + "}");
+            auto reread = line("{\"project\":\"app\",\"action\":\"read\",\"path\":\"main.cpp\",\"version\":" + json::write(edited.version) +
+                               ",\"known_digest\":" + json::write(read.digest) + "}");
             expect(reread.text == prefix + after);
-            auto compared = line("{\"project\":\"app\",\"action\":\"compare\",\"observed\":" + rfl::json::write(created.version) +
-                                 ",\"version\":" + rfl::json::write(edited.version) + "}");
+            auto compared = line("{\"project\":\"app\",\"action\":\"compare\",\"observed\":" + json::write(created.version) +
+                                 ",\"version\":" + json::write(edited.version) + "}");
             expect(compared.changes && compared.changes->size() == 1u && compared.files && compared.files->size() == 1u);
             expect(edited.files && edited.files->size() == 1u && edited.files->at(0).path == "main.cpp");
-            auto unchanged = line("{\"project\":\"app\",\"action\":\"read\",\"path\":\"main.cpp\",\"known_digest\":" + rfl::json::write(reread.digest) + "}");
+            auto unchanged = line("{\"project\":\"app\",\"action\":\"read\",\"path\":\"main.cpp\",\"known_digest\":" + json::write(reread.digest) + "}");
             expect(unchanged.unchanged.value_or(false) && !unchanged.text && !unchanged.data_base64);
             auto renewed = test::decode<tools::scope::output>(
-                agent("scope", rfl::json::write(tools::scope::input{.project = "app", .action = std::string{"renew"}, .token = token})));
+                agent("scope", json::write(tools::scope::input{.project = "app", .action = std::string{"renew"}, .token = token})));
             expect(renewed.version == *edited.version && renewed.leases.at(0).begin == range.begin + prefix.size());
-            agent("scope", rfl::json::write(tools::scope::input{.project = "app", .action = std::string{"release"}, .token = token}));
+            agent("scope", json::write(tools::scope::input{.project = "app", .action = std::string{"release"}, .token = token}));
             expect(agent("worldline", edit("main", "expired-fix", true), true).contains("scope_expired"));
-            auto historical = test::decode<tools::language_query::output>(agent("language", rfl::json::write(inspect)));
+            auto historical = test::decode<tools::language_query::output>(agent("language", json::write(inspect)));
             expect(historical.version == created.version && historical.view == published.view);
-            auto second_use = test::decode<tools::language_query::output>(agent("language", rfl::json::write(references)));
+            auto second_use = test::decode<tools::language_query::output>(agent("language", json::write(references)));
             test::require(second_use.references.size() == 1 && !second_use.cursor, "old view reference continuation failed");
             expect(second_use.view == published.view && second_use.references.front().id != first_use.references.front().id);
             expect(second_use.references.front().location.position->line == 3u);
             inspect.view.value().reset();
             inspect.configuration = "cpp";
             inspect.version = edited.version;
-            auto updated = test::decode<tools::language_query::output>(agent("language", rfl::json::write(inspect)));
+            auto updated = test::decode<tools::language_query::output>(agent("language", json::write(inspect)));
             expect(updated.items.size() == 1u && updated.items.front().symbol_id == symbol_id);
             expect(updated.reused_units == static_cast<std::uint64_t>(total_parts - 1))
                 << "editing a body reuses declarations in that TU and every unchanged file-context contribution";
@@ -1497,9 +1524,25 @@ namespace {
             expect(changed_artifact.version == edited.version && changed_artifact.relations.size() == 1u &&
                    test::slurp(artifact_reads) == "native\nnative\nnative\n")
                 << "changed artifact and source shards replace the native contribution";
+            const auto linked_without_debug = test::decode<tools::language_query::output>(agent(
+                "language",
+                R"({"project":"app","configuration":"artifact-without-debug","action":"relations","relations":["emits"],"direction":"outgoing","limit":250})"));
+            std::set<std::string> linked_names;
+            std::set<semantic::symbol_id> source_overloads;
+            for (const auto& edge : linked_without_debug.relations) {
+                test::require(edge.detail && std::get<semantic::records::emission_detail>(edge.detail->variant()).evidence == "linkage_name",
+                              "the executable without debug info must use linkage evidence");
+                for (const auto& item : linked_without_debug.items)
+                    if (item.symbol_id == edge.to && item.domain == "native" && item.name.starts_with("_Z6choose")) {
+                        linked_names.insert(item.name);
+                        source_overloads.insert(edge.from);
+                    }
+            }
+            expect(source_overloads.size() == 2u && linked_names == std::set<std::string>{"_Z6choosei", "_Z6choosel"})
+                << config::write(linked_without_debug);
             references.view = updated.view;
             references.cursor.reset();
-            auto moved_use = test::decode<tools::language_query::output>(agent("language", rfl::json::write(references)));
+            auto moved_use = test::decode<tools::language_query::output>(agent("language", json::write(references)));
             expect(moved_use.references.size() == 1 && moved_use.references.front().location.position->line == 4u);
             tools::language_query::input alternating{.project = "app",
                                                      .worldline = "parallel",
@@ -1508,18 +1551,18 @@ namespace {
                                                      .selector = semantic::selection{.name = semantic::named{.text = "twice"}},
                                                      .outputs = {{"combined"}},
                                                      .limit = 2};
-            auto branch = test::decode<tools::language_query::output>(test::tool(port, "language", rfl::json::write(alternating)));
+            auto branch = test::decode<tools::language_query::output>(test::tool(port, "language", json::write(alternating)));
             expect(branch.status == "complete" && branch.version == independent.version && branch.reused_units > 0u && branch.items.size() == 2u &&
                    branch.snapshots.size() == 1u && branch.snapshots.front().worldline == "parallel");
             expect(last_directory() == workspace_directory && test::slurp(workspace_directory / "main.cpp") == after)
                 << "a different worldline uses the existing profile slot and installs its source";
             alternating.worldline = "main";
-            auto returned = test::decode<tools::language_query::output>(test::tool(port, "language", rfl::json::write(alternating)));
+            auto returned = test::decode<tools::language_query::output>(test::tool(port, "language", json::write(alternating)));
             expect(returned.status == "complete" && returned.version == edited.version && returned.items.size() == 2u && returned.snapshots.size() == 1u &&
                    returned.snapshots.front().worldline == "main");
             expect(last_directory() == workspace_directory && test::slurp(workspace_directory / "main.cpp") == prefix + after)
                 << "returning to main synchronizes from the slot's actual installed source";
-            auto pinned = "{\"project\":\"app\",\"configurations\":[\"native\"],\"version\":" + rfl::json::write(edited.version) + "}";
+            auto pinned = "{\"project\":\"app\",\"configurations\":[\"native\"],\"version\":" + json::write(edited.version) + "}";
             struct build_output {
                 std::vector<builds::exported_file> exports;
             };
@@ -1536,7 +1579,7 @@ namespace {
             auto exported = tested.results.at(0).exports.at(0);
             expect(exported.executable && exported.delivery_error.empty());
             auto chunk_args = [&](std::string project, std::uint64_t offset, std::uint64_t length) {
-                return "{\"project\":" + rfl::json::write(project) + ",\"digest\":" + rfl::json::write(exported.digest) +
+                return "{\"project\":" + json::write(project) + ",\"digest\":" + json::write(exported.digest) +
                        ",\"offset\":" + std::to_string(offset) + ",\"length\":" + std::to_string(length) + "}";
             };
             agent("artifact", chunk_args("app", 0, 0), true);
@@ -1576,7 +1619,7 @@ namespace {
                 auto declaration_channel = [&](const auto& view) -> std::string {
                     for (const auto& piece : view->pieces) {
                         const auto& unit = piece->unit;
-                        const auto key = rfl::json::read<language::cpp::contribution_key>(unit.recipe.unit.name);
+                        const auto key = json::read<language::cpp::contribution_key>(unit.recipe.unit.name);
                         if (key && key->translation_unit == "main.cpp" && key->contribution == "declarations") {
                             const auto channel = std::ranges::find(unit.output_channels, "declarations", &semantic::channel::name);
                             test::require(channel != unit.output_channels.end(), "C++ declaration channel missing");
@@ -1589,7 +1632,7 @@ namespace {
                     << "body-only and source-position edits preserve the declaration channel across real clice TU recomputation";
                 std::string declaration_shard;
                 for (const auto& piece : cpp_before->pieces) {
-                    const auto key = rfl::json::read<language::cpp::contribution_key>(piece->unit.recipe.unit.name);
+                    const auto key = json::read<language::cpp::contribution_key>(piece->unit.recipe.unit.name);
                     if (key && key->translation_unit == "main.cpp" && key->contribution == "declarations")
                         declaration_shard = piece->id;
                 }
@@ -1648,16 +1691,16 @@ namespace {
                 },
                 std::chrono::seconds{60});
             auto continued_project = test::decode<tools::language_query::output>(
-                agent("language", "{\"project\":\"app\",\"continuation\":" + rfl::json::write(incomplete_project.continuation) +
+                agent("language", "{\"project\":\"app\",\"continuation\":" + json::write(incomplete_project.continuation) +
                                       ",\"budget\":{\"units\":" + std::to_string(other_parts) + "}}"));
             expect(continued_project.status == "complete" && continued_project.next_view == continued_project.view &&
                    continued_project.version == created.version && continued_project.environment == focused.environment &&
                    continued_project.items.size() > 1u && continued_project.reused_units == static_cast<std::uint64_t>(total_parts))
                 << "continuation reuses the contributions retained by checkpoint views after restart: " << config::write(continued_project);
             auto expired = test::decode<tools::language_query::output>(
-                agent("language", "{\"project\":\"app\",\"action\":\"symbols\",\"view\":" + rfl::json::write(waiting.view) + "}"));
+                agent("language", "{\"project\":\"app\",\"action\":\"symbols\",\"view\":" + json::write(waiting.view) + "}"));
             expect(expired.status == "expired" && expired.code == "view_expired") << "automatic collection withdraws an expired query view after restart";
-            auto recovered = test::decode<tools::language_query::output>(agent("language", rfl::json::write(inspect)));
+            auto recovered = test::decode<tools::language_query::output>(agent("language", json::write(inspect)));
             expect(recovered.status == "complete" && recovered.reused_units == static_cast<std::uint64_t>(total_parts) && recovered.version == edited.version &&
                    recovered.items.size() == 1u && recovered.items.front().symbol_id == symbol_id)
                 << "restarted services reuse retained contributions for the previously analyzed edited revision: " << config::write(recovered);
@@ -1665,8 +1708,8 @@ namespace {
             auto main_query = alternating;
             alternating.worldline = "parallel";
             auto concurrent = std::async(
-                std::launch::async, [&] { return test::decode<tools::language_query::output>(test::tool(port, "language", rfl::json::write(main_query))); });
-            branch = test::decode<tools::language_query::output>(test::tool(port, "language", rfl::json::write(alternating)));
+                std::launch::async, [&] { return test::decode<tools::language_query::output>(test::tool(port, "language", json::write(main_query))); });
+            branch = test::decode<tools::language_query::output>(test::tool(port, "language", json::write(alternating)));
             returned = concurrent.get();
             expect(branch.status == "complete" && branch.version == independent.version && branch.items.size() == 2u && branch.snapshots.size() == 1u &&
                    branch.snapshots.front().worldline == "parallel")
@@ -1680,7 +1723,7 @@ namespace {
                            item.definitions.front().position->line == definition_line;
                 })) << "both output stages retain their worldline's source positions during concurrent queries";
             expect(branch.view != returned.view) << "concurrent worldlines publish separate views";
-            auto added = line("{\"project\":\"app\",\"action\":\"apply\",\"observed\":" + rfl::json::write(edited.version) +
+            auto added = line("{\"project\":\"app\",\"action\":\"apply\",\"observed\":" + json::write(edited.version) +
                               ",\"operation_id\":\"optional-header\",\"changes\":[{\"kind\":\"create\",\"path\":\"optional.hpp\",\"text\":\"inline int "
                               "optional_value = 7;\\n\"}]}");
             auto optional_query = R"({"project":"app","configuration":"cpp","action":"symbols","limit":250,"selector":{"name":{"text":"optional_value"}}})";
@@ -1688,7 +1731,7 @@ namespace {
             expect(appeared.status == "complete" && appeared.reused_units >= static_cast<std::uint64_t>(main_parts) && !appeared.items.empty())
                 << "a newly present include invalidates the TU that observed its absence: " << appeared.status << " reused=" << appeared.reused_units
                 << " items=" << appeared.items.size();
-            line("{\"project\":\"app\",\"action\":\"apply\",\"observed\":" + rfl::json::write(added.version) +
+            line("{\"project\":\"app\",\"action\":\"apply\",\"observed\":" + json::write(added.version) +
                  ",\"operation_id\":\"remove-optional-header\",\"changes\":[{\"kind\":\"remove\",\"path\":\"optional.hpp\"}]}");
             auto withdrawn = test::decode<tools::language_query::output>(agent("language", optional_query));
             expect(withdrawn.status == "complete" && withdrawn.reused_units == static_cast<std::uint64_t>(total_parts) && withdrawn.items.empty())
@@ -1704,10 +1747,10 @@ pathlib.Path(sys.argv[1]).write_text(json.dumps({"files": files}))
 )python";
             const std::string generated_include = "\n#if __has_include(\"generated/value.hpp\")\n#include \"generated/value.hpp\"\n#endif\n";
             auto generated_source =
-                line("{\"project\":\"app\",\"action\":\"apply\",\"observed\":" + rfl::json::write(withdrawn.version) +
-                     ",\"operation_id\":\"add-generator\",\"changes\":[{\"kind\":\"create\",\"path\":\"generate.py\",\"text\":" + rfl::json::write(generator) +
+                line("{\"project\":\"app\",\"action\":\"apply\",\"observed\":" + json::write(withdrawn.version) +
+                     ",\"operation_id\":\"add-generator\",\"changes\":[{\"kind\":\"create\",\"path\":\"generate.py\",\"text\":" + json::write(generator) +
                      "},{\"kind\":\"create\",\"path\":\"choice.txt\",\"text\":\"yes\"},{\"kind\":\"edit\",\"path\":\"other.cpp\",\"offset\":" +
-                     std::to_string(other_source.size()) + ",\"count\":0,\"text\":" + rfl::json::write(generated_include) + "}]}");
+                     std::to_string(other_source.size()) + ",\"count\":0,\"text\":" + json::write(generated_include) + "}]}");
             auto& generated_build = project_settings.build_configurations.at("native");
             builds::config<"command"> generation_options;
             generation_options.operations["generate"] = {.argv = {"python3", "generate.py", "${reports}/generated.json"},
@@ -1731,7 +1774,7 @@ pathlib.Path(sys.argv[1]).write_text(json.dumps({"files": files}))
             expect(paired_generated.status == "complete" && paired_generated.items.size() == 2u)
                 << "another stage in the same directory retains the graph's generated files";
             auto withdrawn_generated =
-                line("{\"project\":\"app\",\"action\":\"apply\",\"observed\":" + rfl::json::write(generated_source.version) +
+                line("{\"project\":\"app\",\"action\":\"apply\",\"observed\":" + json::write(generated_source.version) +
                      ",\"operation_id\":\"withdraw-generated\",\"changes\":[{\"kind\":\"edit\",\"path\":\"choice.txt\",\"offset\":0,\"count\":3,\"text\":"
                      "\"no\"}]}");
             auto retracted = test::decode<tools::language_query::output>(agent("language", generated_query));
@@ -1739,7 +1782,7 @@ pathlib.Path(sys.argv[1]).write_text(json.dumps({"files": files}))
                    !std::filesystem::exists(generated_directory / "generated/value.hpp"))
                 << "the producer retracts its former header before analysis and preserves the unrelated TU";
             line(
-                "{\"project\":\"app\",\"action\":\"apply\",\"observed\":" + rfl::json::write(withdrawn_generated.version) +
+                "{\"project\":\"app\",\"action\":\"apply\",\"observed\":" + json::write(withdrawn_generated.version) +
                 ",\"operation_id\":\"restore-generated\",\"changes\":[{\"kind\":\"edit\",\"path\":\"choice.txt\",\"offset\":0,\"count\":2,\"text\":\"yes\"}]}");
             generated = test::decode<tools::language_query::output>(agent("language", generated_query));
             expect(generated.status == "complete" && !generated.items.empty());
@@ -1760,7 +1803,7 @@ pathlib.Path(sys.argv[1]).write_text(json.dumps({"files": files}))
                     const auto loaded = persisted.load(*id);
                     for (const auto& piece : loaded->pieces) {
                         const auto& unit = piece->unit;
-                        const auto key = rfl::json::read<language::cpp::contribution_key>(unit.recipe.unit.name);
+                        const auto key = json::read<language::cpp::contribution_key>(unit.recipe.unit.name);
                         if (key && (!tu || key->translation_unit == *tu))
                             out[unit.id].push_back(piece->id);
                     }

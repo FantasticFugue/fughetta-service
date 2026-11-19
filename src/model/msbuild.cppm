@@ -76,10 +76,7 @@ namespace builds {
             }
             if (operation == "model" || operation == "restore") {
                 std::vector<std::string> argv{tool(c.executable),
-                                              "fsi",
-                                              "--exec",
                                               tool(c.exporter),
-                                              "--",
                                               "--tool",
                                               tool(c.executable),
                                               "--root",

@@ -1,6 +1,7 @@
 export module records;
 import std;
-import reflection;
+import meta;
+import json;
 import content;
 
 // Language data refers to the immutable snapshot analyzed by the worker.
@@ -20,6 +21,25 @@ export namespace semantic {
     using shard_id = std::string;
     using view_id = std::string;
     using candidate_id = std::string;
+    struct execution_receipt {
+        std::string workspace_id, worker_id, snapshot, recipe_digest, subject_kind, subject_id, execution;
+        std::string signature;
+
+        auto payload() const -> std::string {
+            return json::write(std::array<std::string, 8>{"fughetta/worker-execution-receipt", workspace_id, worker_id, snapshot,
+                                                             recipe_digest, subject_kind, subject_id, execution});
+        }
+    };
+    struct shard_receipt {
+        execution_receipt submitted;
+        std::string public_key;
+        shard_id published;
+    };
+    struct artifact_receipt {
+        execution_receipt submitted;
+        std::string public_key;
+        std::string manifest;
+    };
     struct retained_objects {
         std::set<view_id> views;
         std::set<candidate_id> candidates;
@@ -28,16 +48,16 @@ export namespace semantic {
     using retention_roots = std::shared_ptr<retained_objects>;
     using slot_id = std::string;
 
-    using symbol_kind = rfl::Literal<"other", "module", "namespace", "type", "function", "method", "constructor", "destructor", "variable", "parameter",
-                                     "field", "property", "event", "enum_member", "macro", "label", "concept", "attribute", "operator">;
-    using scope_kind = rfl::Literal<"other", "translation_unit", "module", "namespace", "type", "function", "block", "loop", "if", "switch", "catch", "lambda",
+    using type_kind = std::string;
+    using symbol_kind = std::string;
+    using relation_kind = std::string;
+    using scope_kind = json::literal<"other", "translation_unit", "module", "namespace", "type", "function", "block", "loop", "if", "switch", "catch", "lambda",
                                     "initializer", "template">;
-    using role = rfl::Literal<"declaration", "definition", "reference", "call", "import", "implicit", "type", "qualifier", "read", "write">;
-    using fact_kind = rfl::Literal<"symbols", "types", "definitions", "references", "scopes", "diagnostics", "relations", "occurrences", "typed_ranges">;
-    using relation_kind = rfl::Literal<"calls", "overrides", "aliases", "inherits", "implements", "emits", "binds", "imports", "instantiates">;
-    using query_action = rfl::Literal<"symbols", "definitions", "references", "scopes", "diagnostics", "inspect", "relations", "impact">;
+    using role = json::literal<"declaration", "definition", "reference", "call", "import", "implicit", "type", "qualifier", "read", "write">;
+    using fact_kind = json::literal<"symbols", "types", "definitions", "references", "scopes", "diagnostics", "relations", "occurrences", "typed_ranges">;
+    using query_action = json::literal<"symbols", "definitions", "references", "scopes", "diagnostics", "inspect", "relations", "impact">;
 
-    template <rfl::internal::StringLiteral... Names> auto tool_actions(rfl::Literal<Names...>*) -> rfl::Literal<Names..., "plan", "describe", "schema">;
+    template <meta::fixed_string... Names> auto tool_actions(json::literal<Names...>*) -> json::literal<Names..., "plan", "describe", "schema">;
     using tool_action = decltype(tool_actions(static_cast<query_action*>(nullptr)));
 
     enum class unit_kind { file, module, artifact, group };
@@ -56,9 +76,9 @@ export namespace semantic {
     inline auto unit_identifier(const unit_key& key) -> unit_id {
         if (key.project.empty() || key.stage.empty() || key.provider.empty() || key.operation.empty() || key.name.empty())
             throw std::invalid_argument("a semantic unit requires project, stage, provider, operation and name");
-        return "unit-" + content::hash_of(rfl::json::write(key)).str();
+        return "unit-" + content::hash_of(json::write(key)).str();
     }
-    inline auto recipe_identifier(const recipe& value) -> std::string { return "recipe-" + content::hash_of(rfl::json::write(value)).str(); }
+    inline auto recipe_identifier(const recipe& value) -> std::string { return "recipe-" + content::hash_of(json::write(value)).str(); }
 
     struct source_anchor {
         std::string file, declaration;
@@ -148,7 +168,7 @@ export namespace semantic {
         extent scope;
         std::vector<unit_id> units;
         std::string reason;
-        rfl::Literal<"analysis", "query"> phase;
+        json::literal<"analysis", "query"> phase;
         bool deferred = false;
     };
     struct coverage {
@@ -157,6 +177,7 @@ export namespace semantic {
         std::vector<missing> missing;
         std::uint64_t unresolved_count = 0;
     };
+    inline constexpr std::string_view tentative_cpp_types = "C++ compilation reported errors. Types in this context are tentative";
     struct artifact_input {
         std::string project, stage, path;
         auto operator<=>(const artifact_input&) const = default;
@@ -181,7 +202,7 @@ export namespace semantic {
     };
     struct origin {
         std::string provider;
-        rfl::Literal<"unknown", "source", "artifact", "debug", "generated", "metadata", "resolver"> kind;
+        json::literal<"unknown", "source", "artifact", "debug", "generated", "metadata", "resolver"> kind;
         std::optional<locator> location;
         std::optional<std::string> reference, occurrence, producer;
     };
@@ -190,7 +211,7 @@ export namespace semantic {
         context_id context;
         semantic::origin origin;
     };
-    using extensions = std::map<std::string, rfl::Generic>;
+    using extensions = std::map<std::string, json::value>;
 
     // A published view selects immutable unit contributions.
     namespace records {
@@ -207,7 +228,7 @@ export namespace semantic {
             extensions annotations;
         };
         struct application_argument {
-            rfl::Literal<"type", "integral", "declaration", "null_pointer", "template", "template_expansion", "pack", "expression"> kind;
+            json::literal<"type", "integral", "declaration", "null_pointer", "template", "template_expansion", "pack", "expression"> kind;
             std::string value;
             std::optional<type_id> type;
             std::optional<symbol_id> declaration;
@@ -216,9 +237,7 @@ export namespace semantic {
         struct type {
             type_id id;
             std::string domain;
-            rfl::Literal<"primitive", "named", "parameter", "application", "function", "tuple", "array", "pointer", "reference", "nullable", "intersection",
-                         "alias", "flexible", "unresolved", "error">
-                kind;
+            type_kind kind;
             std::optional<std::string> name;
             std::optional<symbol_id> declaration, binder;
             std::optional<std::uint64_t> parameter_index, array_size;
@@ -252,6 +271,7 @@ export namespace semantic {
             std::optional<place> selection, body;
             std::optional<symbol_kind> declaration_kind;
         };
+        using call_dispatch = json::literal<"direct", "virtual", "interface", "indirect">;
         struct reference {
             std::string id;
             ownership ownership;
@@ -260,15 +280,15 @@ export namespace semantic {
             std::optional<symbol_id> target;
             std::vector<symbol_id> candidates;
             std::vector<role> roles;
-            rfl::Literal<"resolved", "ambiguous", "unresolved", "error"> resolution;
-            std::optional<rfl::Literal<"direct", "virtual", "interface", "indirect">> dispatch;
+            json::literal<"resolved", "ambiguous", "unresolved", "error"> resolution;
+            std::optional<call_dispatch> dispatch;
             // This is the declaration endpoint. ownership.context belongs to the use.
             std::optional<context_id> target_context;
         };
         struct scope_edge {
             // Targets are declaration IDs; their scopes supply lookup members.
-            rfl::Literal<"base", "using_namespace", "using_declaration", "using_enum", "inline_namespace", "anonymous_namespace", "unscoped_enum", "import">
-                kind;
+            // The kind is one the unit's language conventions declare.
+            std::string kind;
             std::string target;
             // Import lookup can expose a renamed member or every member of its target.
             std::optional<std::string> name;
@@ -286,7 +306,7 @@ export namespace semantic {
             std::optional<std::string> reference;
         };
         struct parameter_slot {
-            rfl::Literal<"parameter", "receiver", "class", "environment", "return_value"> kind;
+            json::literal<"parameter", "receiver", "class", "environment", "return_value"> kind;
             std::optional<std::uint64_t> index;
         };
         struct marshalling_descriptor {
@@ -296,21 +316,21 @@ export namespace semantic {
             std::optional<std::uint32_t> element_type, size_parameter, size_constant;
             std::optional<std::string> marshaler, cookie;
         };
-        using character_set = rfl::Literal<"none", "ansi", "unicode", "auto">;
+        using character_set = json::literal<"none", "ansi", "unicode", "auto">;
         struct layout_field {
             std::string name, type;
             std::optional<std::uint64_t> offset;
             std::optional<marshalling_descriptor> native;
         };
         struct structure_layout {
-            rfl::Literal<"auto", "sequential", "explicit"> kind;
+            json::literal<"auto", "sequential", "explicit"> kind;
             character_set charset;
             std::uint64_t packing = 0, size = 0;
             std::vector<layout_field> fields;
         };
         struct parameter_marshalling {
             std::string managed_type;
-            rfl::Literal<"default", "in", "out", "in_out"> direction;
+            json::literal<"default", "in", "out", "in_out"> direction;
             bool optional = false, by_reference = false;
             std::optional<marshalling_descriptor> native;
             std::optional<structure_layout> layout;
@@ -328,42 +348,56 @@ export namespace semantic {
         };
         struct parameter_mapping {
             parameter_slot from, to;
-            rfl::Literal<"identity", "pointer", "string", "array", "custom"> conversion;
+            json::literal<"identity", "pointer", "string", "array", "custom"> conversion;
             std::optional<parameter_marshalling> marshalling;
             std::optional<jni_parameter> jni;
         };
         struct library_selection {
             std::string name;
-            rfl::Literal<"exact", "search", "dynamic", "source"> strategy;
+            json::literal<"exact", "search", "dynamic", "source"> strategy;
             std::vector<artifact_location> candidates;
             std::optional<artifact_location> selected;
         };
         struct binding_detail {
-            rfl::Literal<"binding"> kind;
-            rfl::Literal<"jni_static", "jni_dynamic", "pinvoke"> mechanism;
-            rfl::Literal<"platform", "cdecl", "stdcall", "fastcall", "thiscall", "vectorcall"> convention;
+            json::literal<"binding"> kind;
+            json::literal<"jni_static", "jni_dynamic", "pinvoke", "python"> mechanism;
+            json::literal<"platform", "cdecl", "stdcall", "fastcall", "thiscall", "vectorcall"> convention;
             std::vector<records::parameter_mapping> parameter_mapping;
             records::library_selection library_selection;
             std::optional<std::string> entry_point;
             std::optional<import_marshalling> marshalling;
         };
         struct emission_detail {
-            rfl::Literal<"emission"> kind;
-            rfl::Literal<"debug_location", "metadata_signature", "compilation_mapping", "metadata_accessor"> evidence;
+            json::literal<"emission"> kind;
+            json::literal<"debug_location", "metadata_signature", "compilation_mapping", "metadata_accessor", "linkage_name"> evidence;
             std::string file;
             std::uint64_t line = 0;
             std::optional<std::uint64_t> inline_depth;
         };
-        using relation_detail = rfl::TaggedUnion<"kind", binding_detail, emission_detail>;
+        struct native_entry {
+            std::string library;
+            std::uint64_t offset;
+            std::optional<std::string> linkage_name;
+            auto operator<=>(const native_entry&) const = default;
+        };
+        struct native_call_detail {
+            json::literal<"native_call"> kind;
+            json::literal<"observed", "unresolved"> evidence;
+            std::optional<call_dispatch> dispatch;
+            std::optional<std::vector<native_entry>> candidates;
+            std::optional<bool> candidates_complete;
+        };
+        using relation_detail = json::tagged<"kind", binding_detail, emission_detail, native_call_detail>;
         struct relation {
             std::string id;
             relation_kind kind;
             ownership ownership;
             symbol_id from, to;
             std::optional<std::string> reference, occurrence;
-            rfl::Literal<"resolved", "candidate", "unresolved"> resolution;
+            json::literal<"resolved", "candidate", "unresolved"> resolution;
             std::optional<relation_detail> detail;
             std::optional<context_id> from_context, to_context;
+        std::optional<std::string> fingerprint;
         };
         struct diagnostic {
             std::string id, producer, code, severity, message;
@@ -372,12 +406,19 @@ export namespace semantic {
             std::vector<locator> related_locations;
             extensions fixes;
         };
+        struct observed_binding {
+            symbol_id function;
+            context_id context;
+            std::string role, slot;
+        };
         struct typed_range {
             ownership ownership;
             place range;
             type_id type;
             std::optional<symbol_id> overload;
             std::map<type_id, type_id> substitutions;
+            std::optional<std::string> confidence;
+            std::optional<observed_binding> observation;
         };
     } // namespace records
 
@@ -415,16 +456,37 @@ export namespace semantic {
     };
     struct channel_definition {
         std::string name;
-        std::vector<rfl::Literal<"symbols", "types", "occurrences", "references", "scopes", "relations", "diagnostics", "typed_ranges", "definition_bodies",
+        std::vector<json::literal<"symbols", "types", "occurrences", "references", "scopes", "relations", "diagnostics", "typed_ranges", "definition_bodies",
                                  "declarations">>
             projections;
-        rfl::Literal<"canonical_records"> digest;
+        json::literal<"canonical_records"> digest;
         std::vector<symbol_kind> symbol_kinds;
         std::optional<std::vector<std::string>> symbol_extensions;
         friend auto operator==(const channel_definition&, const channel_definition&) -> bool = default;
     };
     struct channel {
         std::string name, value;
+    };
+    // What one language's frontend or reader declares about its own spellings,
+    // so the query engine ranks and unwraps without a table per language.
+    struct language_conventions {
+        std::string language;
+        // Visibility values the provider writes, most visible first.
+        std::vector<std::string> visibility;
+        // Fully qualified names of the type applications that wrap one value
+        // (optional, task, result), as the provider names them.
+        std::vector<std::string> value_wrappers;
+        std::string type_domain;
+        std::string wrapper_prefix, wrapper_prefix_end, wrapper_arguments, wrapper_postfix;
+        // The scope lookup edge kinds the provider writes.
+        std::vector<std::string> scope_edges;
+        // Type and symbol keys belong to their type domain and symbol language.
+        // Relation keys belong to the unit that publishes the relation.
+        std::map<std::string, type_kind> type_traits;
+        std::map<std::string, symbol_kind> symbol_traits;
+        std::map<std::string, relation_kind> relation_traits;
+        std::optional<std::vector<std::string>> escape_types, unsafe_casts;
+        friend auto operator==(const language_conventions&, const language_conventions&) -> bool = default;
     };
     struct contribution {
         std::vector<std::string> files, occurrences, references, scopes, relations, diagnostics;
@@ -433,7 +495,7 @@ export namespace semantic {
         friend auto operator==(const contribution&, const contribution&) -> bool = default;
     };
     struct unit_resolution {
-        rfl::Literal<"definitions", "references"> action;
+        json::literal<"definitions", "references"> action;
         semantic::selection selector;
         std::vector<entity> targets;
     };
@@ -444,6 +506,7 @@ export namespace semantic {
         std::vector<input_object> direct_inputs;
         std::vector<dependency> observed_dependencies;
         std::vector<channel_definition> channel_definitions;
+        std::vector<language_conventions> conventions;
         std::vector<channel> output_channels;
         contribution contributions;
         semantic::coverage coverage;
@@ -453,7 +516,7 @@ export namespace semantic {
         std::vector<std::string> modules;
     };
     inline auto context_identifier(const semantic::recipe& recipe, std::string partition = {}) -> context_id {
-        return "context-" + content::hash_of(rfl::json::write(std::tuple{recipe.unit.project, recipe.unit.stage, recipe.unit.provider, recipe.options,
+        return "context-" + content::hash_of(json::write(std::tuple{recipe.unit.project, recipe.unit.stage, recipe.unit.provider, recipe.options,
                                                                          std::move(partition)}))
                                 .str();
     }
@@ -489,7 +552,7 @@ export namespace semantic {
     // empty, so any holder of the bytes can check them against the ID.
     inline auto shard_key(semantic::shard& shard) -> shard_id {
         auto named = std::exchange(shard.id, {});
-        auto key = "shard-" + content::hash_of(rfl::json::write(shard)).str();
+        auto key = "shard-" + content::hash_of(json::write(shard)).str();
         shard.id = std::move(named);
         return key;
     }
@@ -539,13 +602,13 @@ export namespace semantic {
         std::optional<resolution_target> target;
         extent scope;
         std::vector<std::string> include, relations, changes;
-        rfl::Literal<"outgoing", "incoming", "both"> direction;
+        json::literal<"outgoing", "incoming", "both"> direction;
         std::uint64_t depth = 1, limit = 50;
         std::optional<std::string> cursor, continuation;
         semantic::budget budget;
     };
     inline auto resolution_identifier(const request& request) -> std::string {
-        return content::hash_of(rfl::json::write(std::tuple{request.action.str(), request.selector, request.scope})).str();
+        return content::hash_of(json::write(std::tuple{request.action.str(), request.selector, request.scope})).str();
     }
     struct item {
         symbol_id symbol_id;
@@ -553,6 +616,7 @@ export namespace semantic {
         std::string language, domain, module, name;
         symbol_kind kind;
         std::optional<type_id> type_id;
+        std::optional<std::string> type_confidence;
         std::vector<locator> declarations, definitions;
         // The text of the definition's body, for inspect and include "source".
         std::optional<std::string> source;
@@ -564,19 +628,19 @@ export namespace semantic {
 
     struct impact_step {
         entity from, to;
-        rfl::Literal<"relation", "reference"> kind;
+        json::literal<"relation", "reference"> kind;
         std::string evidence;
     };
     struct impact_path {
         view_id view;
-        rfl::Literal<"semantic", "behavior"> category;
+        json::literal<"semantic", "behavior"> category;
         entity seed, target;
         std::vector<impact_step> steps;
         bool tentative = false;
     };
     struct view_change {
         entity subject;
-        std::vector<rfl::Literal<"added", "removed", "declaration", "metadata", "relations", "inputs">> kinds;
+        std::vector<json::literal<"added", "removed", "declaration", "metadata", "relations", "inputs">> kinds;
     };
     struct impact_evidence {
         view_id view;
@@ -612,16 +676,43 @@ export namespace semantic {
         std::vector<dependency_delta> dependencies;
         std::vector<impact_task> tasks;
     };
+    struct duplicate_type {
+        entity subject, existing;
+        std::string subject_name, existing_name;
+        std::string structural_shape_hash;
+        std::uint64_t field_count = 0;
+    };
+    struct dependency_module {
+        std::string project, name;
+        std::optional<std::string> file;
+        auto operator<=>(const dependency_module&) const = default;
+    };
+    struct topology_warning {
+        json::literal<"cycle", "fan_out"> kind;
+        std::vector<dependency_module> modules;
+        std::optional<std::uint64_t> before, after;
+    };
+    struct type_degradation {
+        entity subject;
+        std::string name;
+        json::literal<"parameter", "return_value", "unsafe_cast"> kind;
+        std::optional<std::uint64_t> group, index;
+        std::string before, after;
+        std::optional<locator> location;
+    };
     struct impact_comparison {
         view_id from_view, to_view;
         std::vector<view_change> changes;
         std::vector<impact_evidence> evidence;
         std::vector<reanalysis_change> reanalysis;
+        std::vector<duplicate_type> duplicate_types;
+        std::vector<topology_warning> topology;
+        std::vector<type_degradation> degraded_types;
     };
     struct result {
         std::optional<view_id> view;
         snapshot_vector snapshots;
-        rfl::Literal<"complete", "partial", "failed", "ambiguous", "expired"> status;
+        json::literal<"complete", "partial", "failed", "ambiguous", "expired"> status;
         semantic::coverage coverage;
         std::vector<item> items;
         std::vector<records::symbol> symbols;
@@ -656,7 +747,7 @@ export namespace semantic {
             {A::make<"relations">(), {F::make<"relations">()}},
             {A::make<"impact">(), {F::make<"symbols">(), F::make<"references">(), F::make<"relations">()}}};
         using projection =
-            rfl::Literal<"type", "scope", "declarations", "definitions", "references", "diagnostics", "relations", "producers", "consumers", "source">;
+            json::literal<"type", "scope", "declarations", "definitions", "references", "diagnostics", "relations", "producers", "consumers", "source">;
         static const std::map<projection, std::vector<F>> projections{{projection::make<"type">(), {F::make<"types">(), F::make<"typed_ranges">()}},
                                                                       {projection::make<"scope">(), {F::make<"scopes">()}},
                                                                       {projection::make<"declarations">(), {F::make<"symbols">()}},

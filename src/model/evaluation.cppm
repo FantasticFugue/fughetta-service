@@ -3,7 +3,7 @@ import std;
 import native;
 import host;
 import coroutine;
-import reflection;
+import json;
 import codec;
 export import provider;
 import records;
@@ -77,10 +77,10 @@ export namespace language {
                 std::vector<semantic::shard_id> ids;
                 for (const auto& object : objects)
                     ids.push_back(object->data->id);
-                result[{"records", port}] = rfl::json::write(ids);
+                result[{"records", port}] = json::write(ids);
             }
             for (const auto& [project, inputs] : projects)
-                result[{"project", project}] = rfl::json::write(inputs);
+                result[{"project", project}] = json::write(inputs);
             return result;
         }
     };
@@ -104,7 +104,7 @@ export namespace language {
         void objects(object_loader loader) { objects_ = std::move(loader); }
         // The directory this session may write; the tree it reads belongs to the build.
         void cache(std::filesystem::path directory) { cache_ = std::move(directory); }
-        auto open(rfl::Generic initialization) -> coroutine::task<session_state> {
+        auto open(json::value initialization) -> coroutine::task<session_state> {
             auto held = co_await lock_.lock();
             if (state_.phase != "created")
                 throw std::logic_error("provider session has already been opened");
@@ -281,7 +281,7 @@ export namespace language {
         }
 
     protected:
-        virtual auto do_open(rfl::Generic initialization) -> coroutine::task<> = 0;
+        virtual auto do_open(json::value initialization) -> coroutine::task<> = 0;
         virtual auto do_update(installation input, const std::vector<std::string>& changed) -> coroutine::task<> = 0;
         virtual auto prepare(const semantic::extent&) -> coroutine::task<> { co_return; }
         virtual auto do_units(const semantic::extent& demand) -> coroutine::task<std::vector<semantic::unit_key>> = 0;
@@ -342,7 +342,7 @@ export namespace language {
         using adapter::adapter;
 
     protected:
-        auto do_open(rfl::Generic initialization) -> coroutine::task<> override {
+        auto do_open(json::value initialization) -> coroutine::task<> override {
             initialization_ = std::move(initialization);
             co_return;
         }
@@ -366,6 +366,6 @@ export namespace language {
             co_return std::move(result.output);
         }
         installation installed_;
-        rfl::Generic initialization_;
+        json::value initialization_;
     };
 } // namespace language

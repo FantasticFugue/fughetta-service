@@ -3,7 +3,7 @@ import std;
 import native;
 import async;
 import meta;
-import reflection;
+import json;
 import content;
 import records;
 export import evaluation;
@@ -11,11 +11,12 @@ export import helper;
 import toolchain;
 export import build;
 export import clice;
-export import artifact;
+export import llvm;
 export import jvm;
 export import clr;
 export import pinvoke;
 export import jni;
+export import pybind;
 export import typescript;
 export import ty;
 export import ruff;
@@ -42,7 +43,7 @@ export namespace language {
     template <meta::fixed_string... Names> struct catalog {
         static_assert(((frontend<server<Names>> + domain_reader<server<Names>> + bridge<server<Names>> == 1) && ...));
         static_assert(meta::distinct(std::array{std::string_view{Names}...}));
-        using choice = rfl::TaggedUnion<"provider", with<Names>...>;
+        using choice = json::tagged<"provider", with<Names>...>;
         static auto validators() -> const std::vector<input_validator>& {
             static const auto registry = [] {
                 std::vector<input_validator> out;
@@ -79,10 +80,11 @@ export namespace language {
                     value.emits = emitted<implementation>();
                 if constexpr (domain_reader<implementation>)
                     value.reads = std::string{implementation::domain::name};
-                value.configuration_schema = rfl::json::read<rfl::Generic>(rfl::json::to_schema<typename implementation::options>()).value();
+                value.configuration_schema = json::schema<typename implementation::options>();
                 for (const auto name : implementation::facts)
                     value.facts.emplace_back(std::string{name});
                 value.channels = implementation::channels();
+                value.conventions = language::conventions<implementation>();
                 value.operations = language::operations<implementation>();
                 value.unit_kind = implementation::unit_kind;
                 value.adapter = implementation::adapter::transport;
@@ -133,8 +135,8 @@ export namespace language {
             return out;
         }
     };
-    using providers =
-        catalog<"clice", "typescript", "ty", "ruff", "native-artifact", "jvm-artifact", "clr-artifact", "pinvoke", "jni", "kotlin", "fsharp", "external">;
+    using providers = catalog<"clice", "typescript", "ty", "ruff", "native-artifact", "jvm-artifact", "clr-artifact", "python-runtime", "pinvoke", "jni",
+                              "pybind", "kotlin", "fsharp", "external">;
     using provider = providers::choice;
     inline auto describe_provider(const provider& configured) -> description {
         return configured.visit([](const auto& value) -> description {
@@ -191,7 +193,7 @@ export namespace language {
     }
 
     struct execution {
-        rfl::Rename<"requires", builds::requirements> needs;
+        json::named<"requires", builds::requirements> needs;
         builds::limits limits;
         semantic::budget budget;
         std::optional<std::string> directory_group;

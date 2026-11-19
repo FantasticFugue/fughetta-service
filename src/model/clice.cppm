@@ -7,7 +7,7 @@ import constants;
 import toolchain;
 import std;
 import meta;
-import reflection;
+import json;
 import records;
 import enumeration;
 export import provider;
@@ -22,6 +22,16 @@ namespace language {
     // project, and the server resolves them from the prepared tree, which a worker may hold elsewhere. The cache holds the PCH, PCM
     // and index of a session and the logs beneath it; the worker keeps it in the session's own directory, outside the tree.
     template <> struct server<"clice"> {
+        static auto conventions() -> std::vector<semantic::language_conventions> {
+            return {
+                {.language = "cpp",
+                 .visibility = {"public", "protected", "private", "local"},
+                 .value_wrappers = {"std::optional", "std::expected", "std::unique_ptr", "std::shared_ptr"},
+                 .wrapper_arguments = "<",
+                 .scope_edges = {"base", "using_namespace", "using_declaration", "using_enum", "inline_namespace", "anonymous_namespace", "unscoped_enum"},
+                 .relation_traits = {{"cpp:reinterpret_cast", "unsafe_cast"}, {"cpp:const_cast", "unsafe_cast"}, {"cpp:unsafe_c_style_cast", "unsafe_cast"}},
+                 .escape_types = {{"void*", "std::any"}}}};
+        }
         static auto channels() -> std::vector<semantic::channel_definition> {
             auto out = source_channels();
             out.front().projections = {std::string{"declarations"}};
@@ -75,11 +85,12 @@ namespace language {
         static constexpr bool negotiated = false, dependency_reads = true, multiple_inputs = true;
         using emits = std::tuple<domain<"native">>;
         static auto requirements(const options& o) -> builds::requirements { return builds::tools({o.executable}); }
-        static auto executes_project_code(const options& o) -> bool { return builds::in_project({o.executable}); }
+        // Toolchain discovery can run the driver named by the project's compilation database.
+        static auto executes_project_code(const options&) -> bool { return true; }
 
         static void configure(program& value, std::uint32_t jobs, const std::filesystem::path& cache) {
-            auto initialization = value.initialization.to_object().value_or(rfl::Generic::Object{});
-            rfl::Generic::Object project;
+            auto initialization = value.initialization.to_object().value_or(json::object{});
+            json::object project;
             project["cache_dir"] = (cache / "clice").generic_string();
             project["stateless_worker_count"] = std::int64_t{std::max(1u, jobs)};
             project["min_stateless_worker_count"] = std::int64_t{1};
@@ -110,26 +121,26 @@ namespace language {
                 throw std::invalid_argument("clice requires a compilation database to read");
             program out{.argv = {o.executable, "serve"}, .env = o.env};
             out.argv.insert(out.argv.end(), o.args.begin(), o.args.end());
-            rfl::Generic::Array paths;
+            json::array paths;
             for (auto& database : databases)
                 paths.push_back(database.path);
-            rfl::Generic::Object rule, init;
+            json::object rule, init;
             rule["compile_commands"] = std::move(paths);
             if (!o.append.empty()) {
-                rfl::Generic::Array flags;
+                json::array flags;
                 for (auto& flag : o.append)
                     flags.push_back(flag);
                 rule["append"] = std::move(flags);
             }
             if (!o.remove.empty()) {
-                rfl::Generic::Array flags;
+                json::array flags;
                 for (auto& flag : o.remove)
                     flags.push_back(flag);
                 rule["remove"] = std::move(flags);
             }
-            init["rules"] = rfl::Generic::Array{std::move(rule)};
+            init["rules"] = json::array{std::move(rule)};
             out.initialization = std::move(init);
-            out.commands = {{"index", {o.executable, "index", "--json", "--jobs", "${jobs}"}}, {"query", {o.executable, "query"}}};
+            out.commands = {{"query", {o.executable, "query"}}};
             return out;
         }
     };
@@ -167,6 +178,7 @@ export namespace language::cpp {
         std::vector<parameter> parameters;
         std::vector<std::string> attributes;
         std::optional<std::string> constant_digest, definition_digest;
+        std::map<std::string, std::string> extensions;
     };
     struct occurrence {
         std::optional<std::string> symbol;
@@ -193,6 +205,7 @@ export namespace language::cpp {
         std::optional<range> location;
         std::string resolution = "resolved";
         std::optional<std::string> dispatch;
+        std::optional<std::string> fingerprint;
     };
     struct diagnostic {
         std::string code, severity, message;
@@ -250,10 +263,10 @@ export namespace language::cpp {
             return "other";
         return value;
     }
-    // Scopes have no member kinds: a method body is a function scope.
+    // A callable declaration's body is a function scope.
     inline auto scope_kind(std::string value) -> std::string {
         value = kind(std::move(value));
-        return value == "method" || value == "constructor" || value == "destructor" ? "function" : value;
+        return value == "method" || value == "constructor" || value == "destructor" || value == "operator" ? "function" : value;
     }
     // The adapter receives the exact text installed in the worker slot. Positions cross
     // the provider boundary once, from UTF-8 bytes to source Unicode scalar offsets.
@@ -337,11 +350,12 @@ export namespace language::cpp {
             out.identities.push_back({semantic::native_identity{project, project, "clice", "source", id}, id, {}});
         for (const auto& symbol : input.symbols) {
             auto identity = semantic::native_identity{project, project, "clice", "source", symbol.id};
+            const auto module = symbol.extensions.find("cpp.module");
             out.symbols.push_back({.id = symbol.id,
                                    .ownership = own(),
                                    .language = "cpp",
                                    .domain = "source",
-                                   .module = project,
+                                   .module = module == symbol.extensions.end() ? project : module->second,
                                    .name = symbol.name,
                                    .qualified_name = symbol.qualified_name,
                                    .kind = kind(symbol.kind),
@@ -354,7 +368,7 @@ export namespace language::cpp {
             auto annotations = [](const std::vector<std::string>& attributes) {
                 semantic::extensions result;
                 if (!attributes.empty()) {
-                    rfl::Generic::Array values;
+                    json::array values;
                     for (const auto& attribute : attributes)
                         values.emplace_back(attribute);
                     result.emplace("cpp.attributes", std::move(values));
@@ -363,6 +377,8 @@ export namespace language::cpp {
             };
             auto& record = out.symbols.back();
             record.extensions = annotations(symbol.attributes);
+            if (const auto linkage = symbol.extensions.find("native.linkage_name"); linkage != symbol.extensions.end())
+                record.extensions.emplace(linkage->first, linkage->second);
             if (symbol.visibility == "local")
                 record.modifiers.push_back("local");
             if (symbol.constant_digest)
@@ -466,7 +482,8 @@ export namespace language::cpp {
                                                  .ownership = own(),
                                                  .from = value.from,
                                                  .to = value.to,
-                                                 .resolution = value.resolution};
+                                                 .resolution = value.resolution,
+                                                 .fingerprint = value.fingerprint};
             if (value.location) {
                 relation.ownership.origin.location = locate(*value.location);
                 for (std::size_t i = 0; i < out.references.size(); ++i) {
@@ -579,7 +596,7 @@ export namespace language {
             if (const auto found = indexed_parts_.find(key.name); found != indexed_parts_.end())
                 path = found->second.first.translation_unit;
             else
-                path = rfl::json::read<cpp::contribution_key>(key.name).value().translation_unit;
+                path = json::read<cpp::contribution_key>(key.name).value().translation_unit;
             semantic::extent scope{.files = {path}};
             for (const auto fact : server<"clice">::facts)
                 scope.facts.push_back(std::string{fact});
@@ -590,20 +607,20 @@ export namespace language {
         }
 
     protected:
-        auto do_open(rfl::Generic initialization) -> coroutine::task<> override {
-            overlay_ = rfl::json::write(initialization);
+        auto do_open(json::value initialization) -> coroutine::task<> override {
+            overlay_ = json::write(initialization);
             co_await lsp_adapter::do_open(std::move(initialization));
         }
         auto do_update(language::installation input, const std::vector<std::string>& changed) -> coroutine::task<> override {
             install(std::move(input));
             const auto& documents = installed_.documents;
-            if (commands_.contains("index"))
+            if (commands_.contains("query"))
                 co_await server_.synchronize({}, changed);
             else
                 co_await server_.synchronize(documents, changed);
         }
         auto prepare(const semantic::extent& demand) -> coroutine::task<> override {
-            if (commands_.contains("index") && !(demand.facts.size() == 1 && demand.facts.front() == "diagnostics"))
+            if (commands_.contains("query") && !(demand.facts.size() == 1 && demand.facts.front() == "diagnostics"))
                 co_await index();
         }
         auto input_value(const semantic::input_object& input) const -> std::optional<std::string> override {
@@ -666,7 +683,7 @@ export namespace language {
                     auto& names = indexed_by_unit_[name];
                     for (auto& part : entry.contributions) {
                         cpp::contribution_key key{name, part.key};
-                        auto id = rfl::json::write(key);
+                        auto id = json::write(key);
                         names.push_back(id);
                         indexed_parts_.emplace(std::move(id), std::pair{std::move(key), std::move(part)});
                     }
@@ -680,13 +697,13 @@ export namespace language {
                                 result.push_back({state_.project, state_.stage, state_.provider, "evaluate", semantic::unit_kind::group, name});
                 } else
                     result.push_back({state_.project, state_.stage, state_.provider, "evaluate", semantic::unit_kind::group,
-                                      rfl::json::write(cpp::contribution_key{path, "immediate"})});
+                                      json::write(cpp::contribution_key{path, "immediate"})});
             }
             co_return result;
         }
 
         auto do_evaluate(const evaluation_request& request) -> coroutine::task<evaluated_unit> override {
-            const auto key = rfl::json::read<cpp::contribution_key>(request.unit.name).value();
+            const auto key = json::read<cpp::contribution_key>(request.unit.name).value();
             auto path = key.translation_unit;
             const auto part = indexed_parts_.find(request.unit.name);
             if (part != indexed_parts_.end())
@@ -698,7 +715,7 @@ export namespace language {
             std::optional<cpp::publication> exported;
             const auto& facts = result.request.demand.facts;
             const bool immediate = facts.size() == 1 && facts.front() == "diagnostics";
-            if (!immediate && commands_.contains("index")) {
+            if (!immediate && commands_.contains("query")) {
                 co_await index();
                 if (indexed_units_.contains(document->path)) {
                     std::vector<std::string> arguments{"semantic-export", document->path};
@@ -710,7 +727,7 @@ export namespace language {
             }
             if (!exported) {
                 auto raw = co_await server_.document_request("clice/semanticExport", *document);
-                auto parsed = rfl::json::read<cpp::publication, rfl::SnakeCaseToCamelCase>(rfl::json::write(raw));
+                auto parsed = json::from_value<cpp::publication, json::camel_case>(raw);
                 if (!parsed)
                     throw std::runtime_error("clice semantic export failed: " + parsed.error().what());
                 exported = std::move(*parsed);
@@ -795,7 +812,7 @@ export namespace language {
                 std::vector<std::string> stale;
             };
             auto output = co_await command("query", std::move(arguments));
-            auto answer = rfl::json::read<response, Processors...>(output);
+            auto answer = json::read<response, Processors...>(output);
             if (!answer)
                 throw std::runtime_error("clice query returned an invalid result: " + answer.error().what());
             if (!answer->stale.empty())
@@ -807,7 +824,7 @@ export namespace language {
             if (indexed_epoch_ == state_.epoch)
                 co_return;
             co_await server_.synchronize({});
-            (void)co_await command("index", {});
+            (void)co_await server_.workspace_request("clice/index");
             struct file {
                 std::string path;
                 bool translation_unit = false;
@@ -817,7 +834,7 @@ export namespace language {
             struct inventory {
                 std::vector<file> files;
             };
-            auto files = co_await query<inventory, rfl::SnakeCaseToCamelCase>({"project-files"});
+            auto files = co_await query<inventory, json::camel_case>({"project-files"});
             indexed_units_.clear();
             indexed_owners_.clear();
             indexed_configurations_.clear();

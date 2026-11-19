@@ -24,6 +24,15 @@ namespace {
         return d;
     }
     static constexpr auto cases = [] {
+        "self-hosted runtime uses available CPUs when the runtime object is omitted"_test = [] {
+            const auto small = allocation::self_hosted(0);
+            const auto larger = allocation::self_hosted(8);
+            expect(small.threads == 8_u && small.workers == 1_u && small.jobs == 1_u);
+            expect(larger.threads == 10_u && larger.workers == 2_u && larger.jobs == 6_u);
+            expect(config::parse("{}", larger).runtime == larger);
+            expect(config::parse(R"({"runtime":{"threads":6,"jobs":1,"workers":0}})", larger).runtime.workers == 0_u);
+            expect(config::parse(R"({"server":{"auth":{"mode":"trusted","workspace":"ws"}}})", larger).runtime == allocation::budget{});
+        };
         "worker dependency publisher requires an absolute exclusive destination"_test = [] {
             for (const auto* text : {R"({"dependency_publish":""})", R"({"dependency_publish":"relative"})",
                                      R"({"dependency_publish":"/published","dependency_upstream":"/upstream"})", R"({"dependency_publish":"/published"})",
@@ -33,17 +42,13 @@ namespace {
                 R"({"dependency_publish":"/published","dependency_recipe":{"executable":"/usr/bin/vcpkg","root":"/opt/vcpkg","triplets":["x64-linux"]}})");
             expect(worker.dependency_publish == "/published" && !worker.dependency_upstream);
         };
-        "a container worker backend serves both roles and publishes no dependencies"_test = [] {
-            for (
-                const auto* text :
-                {R"({"backend":{"kind":"vm","image":"image"}})", R"({"backend":{"kind":"local","image":"image"}})", R"({"backend":{"kind":"docker"}})",
-                 R"({"backend":{"kind":"containerd","image":"image","runtime":"runc"}})", R"({"backend":{"kind":"apple","image":"image","runtime":"kata"}})",
-                 R"({"backend":{"kind":"docker","image":"image","toolchains":["relative"]}})",
-                 R"({"backend":{"kind":"docker","image":"image"},"roles":["execute"]})",
-                 R"({"backend":{"kind":"docker","image":"image"},"dependency_publish":"/published","dependency_recipe":{"executable":"/usr/bin/vcpkg","root":"/opt/vcpkg","triplets":["x64-linux"]}})"})
-                expect(throws<std::invalid_argument>([&] { config::parse_worker(text); })) << text;
-            const auto worker = config::parse_worker(R"({"backend":{"kind":"containerd","image":"image","runtime":"runsc","toolchains":["/opt/toolchains"]}})");
-            expect(worker.backend.kind == "containerd" && worker.backend.host == "127.0.0.1");
+        "worker child configuration includes resource bounds"_test = [] {
+            const auto worker = config::parse_worker(
+                R"({"backend":{"max_memory_bytes":1073741824,"max_cpu_seconds":600}})");
+            expect(worker.backend.max_cpu_seconds == 600 && worker.backend.max_memory_bytes == 1073741824);
+            expect(throws<std::invalid_argument>([] { config::parse_worker(R"({"backend":{"max_memory_bytes":0}})"); }));
+            expect(throws<std::invalid_argument>([] { config::parse_worker(R"({"backend":{"max_cpu_seconds":0}})"); }));
+            expect(throws<std::invalid_argument>([] { config::parse_worker(R"({"execute_stdio":true})"); }));
         };
         "source limits and language profiles resolve independently"_test = [] {
             auto d = document();
@@ -62,7 +67,7 @@ namespace {
             expect(throws<config::revision_conflict>([&] { s.put_project("app", settings, revision); }));
             auto restored = config::load(tmp.dir / "config.json");
             expect(restored.find("app")->ignore == std::vector<std::string>{"generated"});
-            auto& server = rfl::get<language::with<"clice">>(restored.find("app")->analysis.at("Cpp").stages.at("main").server.variant());
+            auto& server = std::get<language::with<"clice">>(restored.find("app")->analysis.at("Cpp").stages.at("main").server.variant());
             expect(server.options.args == std::vector<std::string>{"--mode", "pipe"});
         };
         "language servers are known by name and keep their files inside the source"_test = [] {

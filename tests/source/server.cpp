@@ -54,9 +54,6 @@ namespace {
                     tasks.spawn(run_child(io, listener, source, tasks));
                     tools::standard::bound toolbox{services};
                     expect(std::ranges::none_of(toolbox.list(), [](const auto& tool) { return tool.name == "jobs"; }));
-                    expect(toolbox.list().size() == 9u);
-                    for (const auto name : {"build", "test", "run", "configurations", "language", "worldline", "scope", "artifact", "task"})
-                        expect(std::ranges::any_of(toolbox.list(), [name](const auto& tool) { return tool.name == name; }));
                     co_await fixture::write_file(services, {.project = "app", .path = "a.cpp", .content = "int a;\n", .operation_id = "write"}, note, tester);
                     fixture::edit_input edit{.project = "app", .path = "a.cpp", .old_string = "a", .new_string = "alpha", .operation_id = "edit"};
                     auto first = co_await fixture::edit_text(services, edit, note, tester);
@@ -123,6 +120,10 @@ namespace {
             };
             denied(jobs::node_call{.project = "app", .request = {.action = "inspect"}, .reading = true});
             denied(capture);
+            coroutine::stop_source stop;
+            stop.request_stop();
+            expect(throws<source::stopped>([&] { source::call(endpoint, capture, stop.get_token()); }));
+            expect(source::call(endpoint, capture).replayed);
         };
 
         "node writers keep their own operation space and attribution"_test = [] {

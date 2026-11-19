@@ -63,7 +63,8 @@ type private Session(root: string, adapter: ILanguageAdapter) =
             if field request "slot_id" <> field session "slot" then failwith "evaluation belongs to another slot"
             let shard, producers = adapter.Evaluate(session, parameters["unit"], field request["unit"] "name")
             let producers = producers |> Map.toList |> List.map (fun (read, modules) -> read, modules |> Seq.map unitKey |> array)
-            object ["session", copy session; "request", copy request; "shards", array [shard]; "producer_keys", object producers; "deferred", flag false]
+            object ["session", copy session; "request", copy request; "shards", array [shard]
+                    "receipts", array []; "producer_keys", object producers; "deferred", flag false]
         | "observe" ->
             epoch parameters["session"]
             same parameters["session"]

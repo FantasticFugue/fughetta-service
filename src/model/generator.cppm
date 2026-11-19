@@ -164,8 +164,8 @@ namespace builds {
         return {std::move(out)};
     }
     auto format<"compilation_database">::check(std::string_view text) -> std::uint64_t {
-        auto data = rfl::json::read<rfl::Generic>(std::string{text});
-        auto array = data ? data->to_array() : rfl::Generic{}.to_array();
+        auto data = json::read<json::value>(std::string{text});
+        auto array = data ? data->to_array() : json::value{}.to_array();
         if (!array || array->empty())
             throw std::runtime_error("expected a nonempty compilation database");
         for (auto& unit : *array) {

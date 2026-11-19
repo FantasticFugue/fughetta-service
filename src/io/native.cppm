@@ -2,6 +2,7 @@ export module native;
 import std;
 export import httpant.io;
 import async;
+import coroutine;
 import affinity;
 import process;
 export import mpmc;
@@ -105,6 +106,44 @@ export namespace native {
     };
 
     inline auto process::waiting::get_env() const noexcept { return execution::completes_on<scheduler, execution::set_value_t>{scheduler{{s->engine}}}; }
+
+    // A borrowed duplex stream for role links; the owner keeps its transport alive.
+    class stream_view {
+    public:
+        template <io::stream S> explicit stream_view(S& stream) : stream_(&stream) {
+            read_ = [](void* p, std::span<std::byte> bytes) -> coroutine::task<std::size_t> {
+                co_return co_await io::async_read_some(*static_cast<S*>(p), net::buffer(bytes));
+            };
+            write_ = [](void* p, std::span<const std::byte> bytes) -> coroutine::task<std::size_t> {
+                co_return co_await io::async_write_some(*static_cast<S*>(p), net::buffer(bytes));
+            };
+        }
+        auto read_some(std::span<std::byte> bytes) { return read_(stream_, bytes); }
+        auto write_some(std::span<const std::byte> bytes) { return write_(stream_, bytes); }
+    private:
+        void* stream_;
+        coroutine::task<std::size_t> (*read_)(void*, std::span<std::byte>);
+        coroutine::task<std::size_t> (*write_)(void*, std::span<const std::byte>);
+    };
+
+    class stdio_stream {
+    public:
+        explicit stdio_stream(const scheduler& on)
+            : engine_(on.engine()), input_(native_process::standard_input()), output_(native_process::standard_output()) {}
+        auto read_some(std::span<std::byte> into) {
+            return http::io::net::detail::sender<concurrent::queue, std::size_t, http::io::net::detail::count_result>{
+                {.kind = native_io::operation::read, .resource = {engine_}, .file = input_,
+                 .buffer = into.data(), .size = into.size()}, {}};
+        }
+        auto write_some(std::span<const std::byte> from) {
+            return http::io::net::detail::sender<concurrent::queue, std::size_t, http::io::net::detail::count_result>{
+                {.kind = native_io::operation::write, .resource = {engine_}, .file = output_,
+                 .buffer = const_cast<std::byte*>(from.data()), .size = from.size()}, {}};
+        }
+    private:
+        native_io::engine<concurrent::queue>* engine_;
+        native_io::handle input_, output_;
+    };
 
     class context : public http::io::net::basic_io_context<concurrent::queue> {
     public:

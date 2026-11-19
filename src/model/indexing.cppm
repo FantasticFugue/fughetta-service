@@ -1,6 +1,6 @@
 export module indexing;
 import std;
-import reflection;
+import json;
 import content;
 export import semantic;
 
@@ -14,11 +14,17 @@ export namespace semantic {
         std::set<std::string> declarations, metadata, relations;
         bool inputs = false;
     };
+    struct indexed_record_shape {
+        std::string hash;
+        std::uint64_t field_count = 0;
+        std::vector<type_id> types;
+    };
     struct shard_index {
         std::map<std::string, std::vector<std::size_t>> names, symbols, positions, references, outgoing, incoming, occurrences, occurrence_ids, reference_ids,
             reference_files, unresolved, types, scopes, scope_owners, diagnostics, typed_overloads, members;
         // Typed ranges by path, ordered by their start offset.
         std::map<std::string, std::vector<std::size_t>> typed_range_files;
+        std::optional<std::map<symbol_id, std::vector<std::size_t>>> typed_observations;
         std::set<symbol_id> identities;
         // Immutable semantic projections are computed with the shard index,
         // persisted and shared by every view and comparison page.
@@ -26,6 +32,7 @@ export namespace semantic {
         std::string comparison_inputs;
         std::vector<std::string> dependency_keys;
         std::map<type_id, std::set<std::string>> type_shapes;
+        std::optional<std::map<symbol_id, std::map<context_id, indexed_record_shape>>> record_shapes;
         std::map<type_id, std::set<type_id>> type_children;
         std::map<type_id, std::vector<std::size_t>> type_declarations;
         // Callables keyed by the nominal type they produce, and by the one they
@@ -121,7 +128,7 @@ export namespace semantic {
         auto materialized() const -> const std::shared_ptr<const semantic::shard>& {
             std::scoped_lock guard{lock_};
             if (!full_) {
-                auto decoded = rfl::json::read<semantic::shard>(*document);
+                auto decoded = json::read<semantic::shard>(*document);
                 if (!decoded)
                     throw std::runtime_error("invalid semantic shard document: " + decoded.error().what());
                 full_ = std::make_shared<const semantic::shard>(std::move(*decoded));
@@ -133,7 +140,7 @@ export namespace semantic {
         template <class T> auto column(std::shared_ptr<const std::vector<T>>& slot, std::string_view name) const -> const std::vector<T>& {
             std::scoped_lock guard{lock_};
             if (!slot) {
-                auto decoded = rfl::json::read<std::vector<T>>(shard_document_member(*document, name));
+                auto decoded = json::read<std::vector<T>>(shard_document_member(*document, name));
                 if (!decoded)
                     throw std::runtime_error("invalid semantic shard column " + std::string{name} + ": " + decoded.error().what());
                 slot = std::make_shared<const std::vector<T>>(std::move(*decoded));
@@ -152,64 +159,93 @@ export namespace semantic {
         mutable std::shared_ptr<const std::vector<records::typed_range>> typed_ranges_;
         mutable std::shared_ptr<const semantic::shard> full_;
     };
-    // Providers spell visibility in their own case: clice "public", Kotlin "PUBLIC".
-    inline auto spelled(std::string_view value, std::string_view lower) -> bool {
-        return std::ranges::equal(value, lower, [](char a, char b) { return std::tolower(static_cast<unsigned char>(a)) == b; });
-    }
-    inline auto visibility_rank(std::string_view value) -> std::ptrdiff_t {
-        static constexpr std::array<std::string_view, 4> order{"public", "internal", "protected", "private"};
-        return std::ranges::find_if(order, [&](std::string_view known) { return spelled(value, known); }) - order.begin();
-    }
-    // Strip indirections, aliases and library value wrappers (optional, task, result)
-    // down to the declaration that names the value's type. Providers name
-    // applications fully qualified: "std::optional", "kotlin.Result",
-    // "System.Threading.Tasks.Task<int>" or F#'s postfix "int Microsoft.FSharp.Core.option".
-    template <class Lookup> auto nominal_declaration(type_id id, Lookup&& lookup) -> std::optional<symbol_id> {
-        static const std::set<std::string_view> wrappers{"std::optional",
-                                                         "std::expected",
-                                                         "std::unique_ptr",
-                                                         "std::shared_ptr",
-                                                         "kotlin.Result",
-                                                         "kotlinx.coroutines.Deferred",
-                                                         "System.Nullable",
-                                                         "System.Threading.Tasks.Task",
-                                                         "System.Threading.Tasks.ValueTask",
-                                                         "Microsoft.FSharp.Core.option",
-                                                         "Microsoft.FSharp.Core.Option",
-                                                         "Microsoft.FSharp.Core.voption",
-                                                         "Microsoft.FSharp.Core.ValueOption",
-                                                         "Microsoft.FSharp.Core.Result",
-                                                         "Microsoft.FSharp.Control.Async",
-                                                         "Microsoft.FSharp.Core.byref",
-                                                         "Microsoft.FSharp.Core.inref",
-                                                         "Microsoft.FSharp.Core.outref",
-                                                         "Microsoft.FSharp.NativeInterop.nativeptr"};
-        // F# spells `T option` or `Option<T>`; CLR metadata spells
-        // `[System.Runtime,8.0.0.0]System.Threading.Tasks.Task`1`.
-        auto base = [](std::string_view name) {
-            if (name.ends_with('>'))
-                name = name.substr(0, name.find('<'));
-            else
-                name = name.substr(name.rfind(' ') + 1);
-            if (name.starts_with('['))
-                name = name.substr(name.find(']') + 1);
-            if (const auto tick = name.rfind('`'); tick != std::string_view::npos)
-                name = name.substr(0, tick);
-            return name;
-        };
+    // What the providers of a shard or view declare about their languages' spellings.
+    struct language_index {
+        using wrapper_spelling = std::tuple<std::string, std::string, std::string, std::string>;
+        std::map<std::string, std::map<wrapper_spelling, std::set<std::string, std::less<>>>, std::less<>> wrappers;
+        std::map<std::string, std::vector<std::string>, std::less<>> visibility;
+        using kind_traits = std::map<std::string, std::string, std::less<>>;
+        using scoped_traits = std::map<std::string, kind_traits, std::less<>>;
+        scoped_traits type_traits, symbol_traits;
+        std::map<std::string, std::set<std::string>, std::less<>> escape_types;
+
+        static auto core_kind(const scoped_traits& traits, std::string_view scope, std::string_view kind) -> std::string_view {
+            const auto separator = kind.find(':');
+            const auto found = traits.find(scope);
+            if (found == traits.end())
+                return kind;
+            if (separator != kind.npos && kind.substr(0, separator) != scope)
+                return kind;
+            const auto local = separator == kind.npos ? kind : kind.substr(separator + 1);
+            const auto entry = found->second.find(local);
+            return entry == found->second.end() ? kind : std::string_view{entry->second};
+        }
+
+        void add(const std::vector<language_conventions>& values) {
+            for (const auto& value : values) {
+                const auto& domain = value.type_domain.empty() ? value.language : value.type_domain;
+                if (!value.value_wrappers.empty()) {
+                    auto& names = wrappers[domain][{value.wrapper_prefix, value.wrapper_prefix_end, value.wrapper_arguments, value.wrapper_postfix}];
+                    names.insert(value.value_wrappers.begin(), value.value_wrappers.end());
+                }
+                type_traits[domain].insert(value.type_traits.begin(), value.type_traits.end());
+                if (value.escape_types)
+                    escape_types[value.language].insert(value.escape_types->begin(), value.escape_types->end());
+                symbol_traits[value.language].insert(value.symbol_traits.begin(), value.symbol_traits.end());
+                if (!value.visibility.empty())
+                    visibility.try_emplace(value.language, value.visibility);
+            }
+        }
+
+        auto wraps(const records::type& type) const -> bool {
+            const auto found = wrappers.find(type.domain);
+            if (found == wrappers.end() || !type.name)
+                return false;
+            for (const auto& [spelling, names] : found->second) {
+                const auto& [prefix, prefix_end, arguments, postfix] = spelling;
+                std::string_view name = *type.name;
+                if (!prefix_end.empty() && name.starts_with(prefix))
+                    if (const auto end = name.find(prefix_end); end != name.npos)
+                        name.remove_prefix(end + prefix_end.size());
+                if (const auto at = arguments.empty() ? name.npos : name.find(arguments); at != name.npos)
+                    name = name.substr(0, at);
+                else if (const auto start = postfix.empty() ? name.npos : name.rfind(postfix); start != name.npos)
+                    name.remove_prefix(start + postfix.size());
+                if (names.contains(name))
+                    return true;
+            }
+            return false;
+        }
+        // Declared order, most visible first; values a language does not declare rank last.
+        auto rank(std::string_view language, std::string_view value) const -> std::size_t {
+            const auto found = visibility.find(language);
+            if (found == visibility.end())
+                return std::numeric_limits<std::size_t>::max();
+            return static_cast<std::size_t>(std::ranges::find(found->second, value) - found->second.begin());
+        }
+        auto most_visible(std::string_view language, std::string_view value) const -> bool { return !visibility.contains(language) || rank(language, value) == 0; }
+        auto public_visibility(std::string_view language, std::string_view value) const -> bool {
+            return value == "public" || (!value.empty() && visibility.contains(language) && rank(language, value) == 0);
+        }
+    };
+    // Strip indirections, aliases and the value wrappers (optional, task, result)
+    // the providers declare down to the declaration that names the value's type.
+    template <class Lookup>
+    auto nominal_declaration(type_id id, Lookup&& lookup, const language_index& languages) -> std::optional<symbol_id> {
         std::set<type_id> seen;
         while (seen.insert(id).second) {
             const records::type* type = lookup(id);
             if (!type)
                 return std::nullopt;
-            if ((type->kind == "pointer" || type->kind == "reference" || type->kind == "nullable" || type->kind == "alias") && !type->arguments.empty())
+            const auto kind = languages.core_kind(languages.type_traits, type->domain, type->kind);
+            if ((kind == "pointer" || kind == "reference" || kind == "nullable" || kind == "alias") && !type->arguments.empty())
                 id = type->arguments.front();
-            else if (type->kind == "flexible" && type->lower_bound)
+            else if (kind == "flexible" && type->lower_bound)
                 id = *type->lower_bound;
-            else if (type->kind == "application" && type->name && (type->arguments.size() == 1 || type->arguments.size() == 2) &&
-                     wrappers.contains(base(*type->name)))
+            else if (kind == "application" && type->name && (type->arguments.size() == 1 || type->arguments.size() == 2) &&
+                     languages.wraps(*type))
                 id = type->arguments.front();
-            else if (type->kind == "named" || type->kind == "application")
+            else if (kind == "named" || kind == "application")
                 return type->declaration;
             else
                 return std::nullopt;
@@ -217,15 +253,135 @@ export namespace semantic {
         return std::nullopt;
     }
 
+    inline auto compound_record(const language_index& languages, const records::symbol& owner) -> bool {
+        const auto kind = languages.core_kind(languages.symbol_traits, owner.language, owner.kind);
+        return kind == "type" || kind == "struct" || kind == "class" || kind == "record";
+    }
+
+    template <class Types>
+    auto make_record_shape(const language_index& languages, const records::symbol& owner, const std::vector<const records::symbol*>& members,
+                           Types&& types) -> std::optional<indexed_record_shape> {
+        if (!compound_record(languages, owner))
+            return {};
+        std::map<symbol_id, std::set<type_id>> fields;
+        for (const auto* member : members) {
+            const auto& field = *member;
+            const auto kind = languages.core_kind(languages.symbol_traits, field.language, field.kind);
+            if (field.ownership.context != owner.ownership.context || !languages.public_visibility(field.language, field.visibility) ||
+                (kind != "field" && kind != "property") ||
+                std::ranges::contains(field.modifiers, "static"))
+                continue;
+            if (!field.type)
+                return {};
+            fields[field.id].insert(*field.type);
+        }
+        if (fields.size() < 3)
+            return {};
+
+        using type_key = std::pair<type_id, std::vector<std::string>>;
+        std::map<type_key, std::optional<std::string>> normalized;
+        auto core = [&](this auto& self, const type_id& id, const std::vector<std::string>& qualifiers = {}) -> std::optional<std::string> {
+            auto [found, inserted] = normalized.try_emplace(type_key{id, qualifiers});
+            if (!inserted)
+                return found->second;
+            std::set<std::string> alternatives;
+            for (const auto* definition : types(id)) {
+                auto type = *definition;
+                type.kind = languages.core_kind(languages.type_traits, type.domain, type.kind);
+                type.qualifiers.insert(type.qualifiers.end(), qualifiers.begin(), qualifiers.end());
+                std::ranges::sort(type.qualifiers);
+                type.qualifiers.erase(std::ranges::unique(type.qualifiers).begin(), type.qualifiers.end());
+                if (type.kind == "alias" && type.arguments.size() == 1) {
+                    auto underlying = self(type.arguments.front(), type.qualifiers);
+                    if (!underlying)
+                        return {};
+                    alternatives.insert(std::move(*underlying));
+                    continue;
+                }
+                if (type.kind == "unknown" || type.kind == "unresolved" || type.kind == "error" ||
+                    ((type.kind == "primitive" || type.kind == "named" || type.kind == "application") && !type.name && !type.declaration))
+                    return {};
+                type.id.clear();
+                type.extensions.clear();
+                if (type.declaration == owner.id)
+                    type.declaration = std::string{};
+                if (type.declaration || type.parameter_index || (!type.arguments.empty() && type.kind != "application"))
+                    type.name.reset();
+                if (type.binder == owner.id)
+                    type.binder = std::string{};
+                if (type.kind == "parameter" && type.parameter_index && (!type.binder || type.binder->empty()))
+                    type.declaration.reset();
+                auto replace = [&](type_id& child) {
+                    auto value = self(child);
+                    if (!value)
+                        return false;
+                    child = std::move(*value);
+                    return true;
+                };
+                for (auto* arguments : {&type.arguments, &type.constraints, &type.elements, &type.type_parameters})
+                    if (!std::ranges::all_of(*arguments, replace))
+                        return {};
+                for (auto* child : {&type.receiver, &type.return_type, &type.lower_bound, &type.upper_bound})
+                    if (*child && !replace(**child))
+                        return {};
+                for (auto& group : type.parameter_groups)
+                    for (auto& parameter : group.parameters)
+                        if (!replace(parameter.type))
+                            return {};
+                auto arguments = [&](this auto& visit, auto& list) -> bool {
+                    for (auto& argument : list) {
+                        if (argument.type) {
+                            if (!replace(*argument.type))
+                                return false;
+                            if (argument.kind == "type")
+                                argument.value.clear();
+                        }
+                        if (argument.declaration == owner.id)
+                            argument.declaration = std::string{};
+                        if (!visit(argument.elements))
+                            return false;
+                    }
+                    return true;
+                };
+                if (!arguments(type.application_arguments))
+                    return {};
+                alternatives.insert(content::hash_of(json::write(type)).str());
+            }
+            if (alternatives.size() == 1)
+                found->second = *alternatives.begin();
+            return found->second;
+        };
+        std::vector<std::string> shape;
+        for (const auto& [_, choices] : fields) {
+            std::set<std::string> alternatives;
+            for (const auto& id : choices)
+                if (auto value = core(id))
+                    alternatives.insert(std::move(*value));
+                else
+                    return {};
+            if (alternatives.size() != 1)
+                return {};
+            shape.push_back(*alternatives.begin());
+        }
+        std::ranges::sort(shape);
+        indexed_record_shape out{content::hash_of(json::write(shape)).str(), shape.size()};
+        for (const auto& [key, _] : normalized)
+            if (out.types.empty() || out.types.back() != key.first)
+                out.types.push_back(key.first);
+        return out;
+    }
+
     inline auto index_shard(const semantic::shard& shard) -> shard_index {
         shard_index out;
-        out.comparison_inputs = content::hash_of(rfl::json::write(std::tuple{shard.unit.direct_inputs, shard.unit.observed_dependencies})).str();
+        language_index languages;
+        languages.add(shard.unit.conventions);
+        out.comparison_inputs = content::hash_of(json::write(std::tuple{shard.unit.direct_inputs, shard.unit.observed_dependencies})).str();
         for (auto read : shard.unit.observed_dependencies) {
             read.value.clear();
             read.producers.clear();
             if (read.project.empty())
                 read.project = shard.unit.recipe.unit.project;
-            out.dependency_keys.push_back(content::hash_of(rfl::json::write(read)).str());
+            out.dependency_keys.push_back(content::hash_of(json::write(read)).str());
         }
         auto retain = [&](const std::optional<symbol_id>& id) {
             if (id)
@@ -258,6 +414,12 @@ export namespace semantic {
             retain(range.overload);
             if (range.overload)
                 out.typed_overloads[*range.overload].push_back(row);
+            if (range.observation) {
+                out.identities.insert(range.observation->function);
+                if (!out.typed_observations)
+                    out.typed_observations.emplace();
+                (*out.typed_observations)[range.observation->function].push_back(row);
+            }
             out.typed_range_files[range.range.path].push_back(row);
         }
         for (auto& [path, rows] : out.typed_range_files)
@@ -275,10 +437,10 @@ export namespace semantic {
             out.symbols[symbol.id].push_back(row);
             auto& compared = out.comparisons[symbol.id][symbol.ownership.context];
             compared.declarations.insert(
-                content::hash_of(rfl::json::write(std::tuple{symbol.language, symbol.domain, symbol.module, symbol.name, symbol.qualified_name, symbol.kind,
+                content::hash_of(json::write(std::tuple{symbol.language, symbol.domain, symbol.module, symbol.name, symbol.qualified_name, symbol.kind,
                                                              symbol.type, symbol.owner, symbol.visibility, symbol.modifiers, symbol.parameters}))
                     .str());
-            compared.metadata.insert(content::hash_of(rfl::json::write(symbol.extensions)).str());
+            compared.metadata.insert(content::hash_of(json::write(symbol.extensions)).str());
             compared.inputs = true;
             if (symbol.type)
                 out.type_declarations[*symbol.type].push_back(row);
@@ -305,7 +467,7 @@ export namespace semantic {
             retain(reference.from);
             if (reference.from)
                 out.comparisons[*reference.from][reference.ownership.context].relations.insert(
-                    content::hash_of(rfl::json::write(std::tuple{reference.target, reference.target_context, reference.candidates, reference.roles,
+                    content::hash_of(json::write(std::tuple{reference.target, reference.target_context, reference.candidates, reference.roles,
                                                                  reference.resolution, reference.dispatch}))
                         .str());
             retain(reference.target);
@@ -316,20 +478,37 @@ export namespace semantic {
                 out.references[candidate].push_back(row);
         }
         for (std::size_t row = 0; row < shard.relations.size(); ++row) {
-            out.identities.insert(shard.relations[row].from);
-            out.identities.insert(shard.relations[row].to);
-            out.outgoing[shard.relations[row].from].push_back(row);
-            out.incoming[shard.relations[row].to].push_back(row);
             const auto& relation = shard.relations[row];
+            out.identities.insert(relation.from);
+            out.identities.insert(relation.to);
+            out.outgoing[relation.from].push_back(row);
+            out.incoming[relation.to].push_back(row);
+            if (relation.kind == "calls" && relation.reference && relation.detail) {
+                relation.detail->visit([&](const auto& call) {
+                    if constexpr (std::same_as<std::remove_cvref_t<decltype(call)>, records::native_call_detail>) {
+                        if (call.evidence != "unresolved" || !call.candidates_complete.value_or(false))
+                            return;
+                        // The call's scoped endpoint narrows its bindings. The source
+                        // reference still makes that edge incoming to the declaration.
+                        const auto found = out.reference_ids.find(*relation.reference);
+                        if (found != out.reference_ids.end() && found->second.size() == 1) {
+                            const auto& reference = shard.references[found->second.front()];
+                            if (reference.from == relation.from && reference.target && *reference.target != relation.to &&
+                                reference.target_context == relation.to_context.value_or(relation.ownership.context))
+                                out.incoming[*reference.target].push_back(row);
+                        }
+                    }
+                });
+            }
+            const auto shape = std::tie(relation.kind, relation.from, relation.to, relation.resolution, relation.detail,
+                                        relation.from_context, relation.to_context);
             out.comparisons[relation.from][relation.from_context.value_or(relation.ownership.context)].relations.insert(
-                content::hash_of(rfl::json::write(std::tuple{relation.kind, relation.from, relation.to, relation.resolution, relation.detail,
-                                                             relation.from_context, relation.to_context}))
-                    .str());
+                content::hash_of(relation.fingerprint ? json::write(std::tuple{shape, *relation.fingerprint}) : json::write(shape)).str());
         }
         for (std::size_t row = 0; row < shard.types.size(); ++row) {
             const auto& type = shard.types[row];
             out.types[type.id].push_back(row);
-            out.type_shapes[type.id].insert(content::hash_of(rfl::json::write(type)).str());
+            out.type_shapes[type.id].insert(content::hash_of(json::write(type)).str());
             auto& children = out.type_children[type.id];
             for (const auto* list : {&type.arguments, &type.constraints, &type.elements, &type.type_parameters})
                 children.insert(list->begin(), list->end());
@@ -348,6 +527,24 @@ export namespace semantic {
             };
             arguments(type.application_arguments);
         }
+        auto definitions = [&](const type_id& id) {
+            std::vector<const records::type*> rows;
+            if (const auto found = out.types.find(id); found != out.types.end())
+                for (auto row : found->second)
+                    rows.push_back(&shard.types[row]);
+            return rows;
+        };
+        for (const auto& owner : shard.symbols)
+            if (const auto found = out.members.find(owner.id); found != out.members.end()) {
+                std::vector<const records::symbol*> members;
+                for (auto row : found->second)
+                    members.push_back(&shard.symbols[row]);
+                if (auto shape = make_record_shape(languages, owner, members, definitions)) {
+                    if (!out.record_shapes)
+                        out.record_shapes.emplace();
+                    (*out.record_shapes)[owner.id].try_emplace(owner.ownership.context, std::move(*shape));
+                }
+            }
         auto local = [&](const type_id& id) -> const records::type* {
             const auto found = out.types.find(id);
             return found == out.types.end() ? nullptr : &shard.types[found->second.front()];
@@ -355,23 +552,25 @@ export namespace semantic {
         for (std::size_t row = 0; row < shard.symbols.size(); ++row) {
             const auto& symbol = shard.symbols[row];
             const auto* signature = symbol.type ? local(*symbol.type) : nullptr;
-            if (!signature || signature->kind != "function" || std::ranges::contains(symbol.modifiers, "local") || spelled(symbol.visibility, "local") ||
-                (symbol.kind.str() != "function" && symbol.kind.str() != "method" && symbol.kind.str() != "constructor"))
+            const auto kind = languages.core_kind(languages.symbol_traits, symbol.language, symbol.kind);
+            if (!signature || languages.core_kind(languages.type_traits, signature->domain, signature->kind) != "function" ||
+                std::ranges::contains(symbol.modifiers, "local") ||
+                (kind != "function" && kind != "method" && kind != "constructor"))
                 continue;
             // C++ constructors return void; every constructor produces its owner.
-            const auto produced = symbol.kind.str() == "constructor" ? symbol.owner
-                                  : signature->return_type           ? nominal_declaration(*signature->return_type, local)
-                                                                     : std::nullopt;
+            const auto produced = kind == "constructor"  ? symbol.owner
+                                  : signature->return_type ? nominal_declaration(*signature->return_type, local, languages)
+                                                           : std::nullopt;
             if (produced)
                 out.type_producers[*produced].push_back(row);
             // Instance methods without a receiver (C++ and Kotlin members) take their owner.
             std::optional<symbol_id> consumed;
             if (signature->receiver)
-                consumed = nominal_declaration(*signature->receiver, local);
-            else if (symbol.kind.str() == "method" && symbol.owner && !std::ranges::contains(symbol.modifiers, "static"))
+                consumed = nominal_declaration(*signature->receiver, local, languages);
+            else if (kind == "method" && symbol.owner && !std::ranges::contains(symbol.modifiers, "static"))
                 consumed = symbol.owner;
             else if (!signature->parameter_groups.empty() && !signature->parameter_groups.front().parameters.empty())
-                consumed = nominal_declaration(signature->parameter_groups.front().parameters.front().type, local);
+                consumed = nominal_declaration(signature->parameter_groups.front().parameters.front().type, local, languages);
             if (consumed)
                 out.type_consumers[*consumed].push_back(row);
         }
@@ -405,6 +604,8 @@ export namespace semantic {
         std::map<type_id, std::set<type_id>> type_parents;
         std::multimap<type_id, record_address> type_declarations;
         std::multimap<symbol_id, record_address> type_producers, type_consumers;
+        std::multimap<symbol_id, record_address> typed_observations;
+        language_index languages;
 
         auto symbol(record_address address) const -> const records::symbol& { return pieces.at(address.shard)->symbols().at(address.row); }
         auto type(record_address address) const -> const records::type& { return pieces.at(address.shard)->types().at(address.row); }
@@ -451,7 +652,65 @@ export namespace semantic {
         }
 
         auto query(semantic::request request) const -> semantic::result;
+        auto record_shape(const records::symbol& owner) const -> std::optional<std::pair<std::string, std::uint64_t>>;
+
+    private:
+        auto compute_record_shape(const records::symbol& owner) const -> std::optional<std::pair<std::string, std::uint64_t>>;
+        mutable std::mutex shape_lock_;
+        mutable std::map<comparison_key, std::optional<std::pair<std::string, std::uint64_t>>> shapes_;
     };
+
+    inline auto indexed_view::record_shape(const records::symbol& owner) const -> std::optional<std::pair<std::string, std::uint64_t>> {
+        if (!compound_record(languages, owner))
+            return {};
+        const comparison_key key{owner.id, owner.ownership.context};
+        {
+            std::scoped_lock lock{shape_lock_};
+            if (const auto found = shapes_.find(key); found != shapes_.end())
+                return found->second;
+        }
+        auto shape = compute_record_shape(owner);
+        std::scoped_lock lock{shape_lock_};
+        return shapes_.try_emplace(key, std::move(shape)).first->second;
+    }
+
+    inline auto indexed_view::compute_record_shape(const records::symbol& owner) const -> std::optional<std::pair<std::string, std::uint64_t>> {
+        const auto [first, last] = members.equal_range(owner.id);
+        if (first == last)
+            return {};
+        const auto index = first->second.shard;
+        const auto& piece = *pieces.at(index);
+        if (piece.index->record_shapes) {
+            const auto shapes = piece.index->record_shapes->find(owner.id);
+            if (shapes != piece.index->record_shapes->end() && shapes->second.contains(owner.ownership.context) &&
+                std::all_of(first, last, [&](const auto& member) { return member.second.shard == index; })) {
+                const auto& shape = shapes->second.at(owner.ownership.context);
+                language_index local;
+                local.add(piece.unit.conventions);
+                const auto local_types = [&](const type_id& id) {
+                    const auto [begin, end] = types.equal_range(id);
+                    return begin != end && std::all_of(begin, end, [&](const auto& type) { return type.second.shard == index; });
+                };
+                if (local.symbol_traits == languages.symbol_traits && local.type_traits == languages.type_traits &&
+                    local.visibility == languages.visibility && std::ranges::all_of(shape.types, local_types))
+                    return std::pair{shape.hash, shape.field_count};
+            }
+        }
+        // The view can contain member or type records published in other shards.
+        std::vector<const records::symbol*> fields;
+        for (auto at = first; at != last; ++at)
+            fields.push_back(&symbol(at->second));
+        auto definitions = [&](const type_id& id) {
+            std::vector<const records::type*> out;
+            const auto [begin, end] = types.equal_range(id);
+            for (auto at = begin; at != end; ++at)
+                out.push_back(&type(at->second));
+            return out;
+        };
+        if (const auto shape = make_record_shape(languages, owner, fields, definitions))
+            return std::pair{shape->hash, shape->field_count};
+        return {};
+    }
 
     auto compare_views(const indexed_view& before, const indexed_view& after, semantic::request request) -> semantic::result;
     auto reanalysis_between(const indexed_view& before, const indexed_view& after) -> std::vector<reanalysis_change>;
@@ -549,9 +808,9 @@ export namespace semantic {
                     identity.budget = {};
                     identity.limit = 1;
                 }
-                query_key = content::hash_of(rfl::json::write(identity)).str();
+                query_key = content::hash_of(json::write(identity)).str();
                 if (cursor) {
-                    auto decoded = rfl::json::read<page>(*cursor);
+                    auto decoded = json::read<page>(*cursor);
                     if (!decoded || decoded->view != view.description.id || decoded->query != query_key)
                         throw std::invalid_argument("cursor belongs to another query or view");
                     offset = decoded->offset;
@@ -694,7 +953,7 @@ export namespace semantic {
                 if (!request.selector && request.include.empty() && (request.action == "diagnostics" || request.action == "scopes"))
                     return;
                 std::optional<std::set<symbol_key>> resolved;
-                const auto resolution_key = rfl::json::write(std::tuple{request.action.str(), request.selector});
+                const auto resolution_key = json::write(std::tuple{request.action.str(), request.selector});
                 const auto [begin, end] = view.resolutions.equal_range(resolution_key);
                 for (auto at = begin; at != end; ++at) {
                     const auto& unit = view.pieces[at->second]->unit;
@@ -806,7 +1065,7 @@ export namespace semantic {
                                              .type_id = row.type});
                 }
                 if (!page_records && end < ordered.size())
-                    out.cursor = rfl::json::write(page{view.description.id, query_key, end});
+                    out.cursor = json::write(page{view.description.id, query_key, end});
             }
 
             template <class F> void each_file(const auto& index, F&& visit) const {
@@ -862,7 +1121,10 @@ export namespace semantic {
             // wall-clock-dependent prefix. All addresses refer to the pinned view.
             auto traverse(bool impact) -> std::vector<walk_path> {
                 if (!traversal) {
-                    traversal.emplace();
+                    // Not emplace(): the MSVC STL settles walk_state's default
+                    // constructibility inside this class, before its member
+                    // initializers are parsed.
+                    traversal = walk_state{};
                     for (const auto& [key, row] : selected)
                         traversal->seeds.push_back(key);
                 }
@@ -972,11 +1234,16 @@ export namespace semantic {
                             if ((incoming ? to : from) != key.second || (!request.relations.empty() && !std::ranges::contains(request.relations, row.kind)))
                                 continue;
                             if (impact) {
-                                const bool follows =
-                                    row.kind == "emits" ||
-                                    (incoming && (state.semantic ? (row.kind == "inherits" || row.kind == "implements" || row.kind == "overrides" ||
-                                                                    row.kind == "aliases" || row.kind == "instantiates")
-                                                                 : (row.kind == "calls" || row.kind == "binds")));
+                                std::string_view kind = row.kind;
+                                for (const auto& convention : view.pieces[address.shard]->unit.conventions)
+                                    if (const auto trait = convention.relation_traits.find(row.kind); trait != convention.relation_traits.end()) {
+                                        kind = trait->second;
+                                        break;
+                                    }
+                                const bool follows = kind == "emits" ||
+                                                     (incoming && (state.semantic ? (kind == "inherits" || kind == "implements" || kind == "overrides" ||
+                                                                                     kind == "aliases" || kind == "instantiates")
+                                                                                  : (kind == "calls" || kind == "binds")));
                                 if (!follows)
                                     continue;
                             } else if ((!in_scope(row) && !std::ranges::contains(request.scope.contexts, from) &&
@@ -1007,7 +1274,7 @@ export namespace semantic {
                 }
                 out.query_nodes += work;
                 if (!state.done && page_relations)
-                    out.cursor = rfl::json::write(page{view.description.id, query_key, offset + result.size(), state});
+                    out.cursor = json::write(page{view.description.id, query_key, offset + result.size(), state});
                 if (exhausted)
                     out.coverage.missing.push_back(
                         {.scope = {.facts = {std::string{"relations"}}}, .reason = "graph traversal budget exhausted", .phase = std::string{"query"}});
@@ -1121,7 +1388,7 @@ export namespace semantic {
                 self.out.symbols.push_back(self.view.symbol({shard, row}));
             }
             if (self.page_references && last < matches.size())
-                self.out.cursor = rfl::json::write(execution::page{self.view.description.id, self.query_key, last});
+                self.out.cursor = json::write(execution::page{self.view.description.id, self.query_key, last});
         }
         inline void types(execution& self, std::vector<type_id> pending) {
             using use_key = std::tuple<symbol_id, context_id, std::string, std::string>;
@@ -1179,6 +1446,13 @@ export namespace semantic {
             };
             if (self.request.action == "inspect")
                 for (const auto& item : self.out.items) {
+                    const auto [samples, last_sample] = self.view.typed_observations.equal_range(item.symbol_id);
+                    for (auto it = samples; it != last_sample; ++it) {
+                        const auto& range = self.view.typed_range(it->second);
+                        if (range.observation->context == item.context &&
+                            (self.request.scope.files.empty() || std::ranges::contains(self.request.scope.files, range.range.path)))
+                            add(it->second);
+                    }
                     const auto [first, last] = self.view.occurrences.equal_range(item.symbol_id);
                     for (auto it = first; it != last; ++it)
                         if (const auto& occurrence = self.view.occurrence(it->second); occurrence.ownership.context == item.context && occurrence.body)
@@ -1241,7 +1515,7 @@ export namespace semantic {
                 throw std::invalid_argument("cursor is beyond the query result");
             const auto end = self.offset + std::min<std::uint64_t>(self.request.limit, rows.size() - self.offset);
             if (end < rows.size())
-                self.out.cursor = rfl::json::write(execution::page{self.view.description.id, self.query_key, end});
+                self.out.cursor = json::write(execution::page{self.view.description.id, self.query_key, end});
             rows.erase(rows.begin() + end, rows.end());
             rows.erase(rows.begin(), rows.begin() + self.offset);
         }
@@ -1293,6 +1567,42 @@ export namespace semantic {
                 self.out.symbols.push_back(*row);
             }
         }
+        inline void mark_tentative_cpp_types(execution& self) {
+            std::set<context_id> contexts;
+            for (const auto& item : self.out.items)
+                contexts.insert(item.context);
+            for (const auto& range : self.out.typed_ranges)
+                contexts.insert(range.ownership.context);
+            if (contexts.empty())
+                contexts.insert(self.out.coverage.requested.contexts.begin(), self.out.coverage.requested.contexts.end());
+
+            std::map<context_id, const records::diagnostic*> errors;
+            for (const auto& piece : self.view.pieces) {
+                const auto& unit = piece->unit;
+                if (unit.recipe.unit.provider != "clice" || !contexts.contains(unit.context) || piece->index->diagnostics.empty())
+                    continue;
+                for (const auto& diagnostic : piece->diagnostics()) {
+                    if (diagnostic.severity != "error" && diagnostic.severity != "fatal")
+                        continue;
+                    auto [found, inserted] = errors.try_emplace(unit.context, &diagnostic);
+                    if (!inserted && diagnostic.code == "err_pp_file_not_found" && found->second->code != "err_pp_file_not_found")
+                        found->second = &diagnostic;
+                }
+            }
+            for (const auto& [context, diagnostic] : errors) {
+                self.out.coverage.missing.push_back(
+                    {.scope = {.contexts = {context}, .facts = {std::string{"types"}, std::string{"typed_ranges"}}},
+                     .reason = std::string{tentative_cpp_types}});
+                if (!std::ranges::contains(self.out.diagnostics, diagnostic->id, &records::diagnostic::id))
+                    self.out.diagnostics.push_back(*diagnostic);
+            }
+            for (auto& item : self.out.items)
+                if (item.type_id && errors.contains(item.context))
+                    item.type_confidence = "tentative";
+            for (auto& range : self.out.typed_ranges)
+                if (!range.confidence && errors.contains(range.ownership.context))
+                    range.confidence = "tentative";
+        }
         inline void inspect(execution& self) {
             declarations(self);
             // One hop of type surface: the public members of the nominal types a
@@ -1302,10 +1612,11 @@ export namespace semantic {
                 const auto found = self.view.types.find(id);
                 return found == self.view.types.end() ? nullptr : &self.view.type(found->second);
             };
+            const auto& languages = self.view.languages;
             std::set<symbol_id> owners;
             for (const auto& item : self.out.items) {
                 const auto* signature = item.type_id ? lookup(*item.type_id) : nullptr;
-                if (!signature || signature->kind != "function")
+                if (!signature || languages.core_kind(languages.type_traits, signature->domain, signature->kind) != "function")
                     continue;
                 std::vector<type_id> named;
                 for (const auto& group : signature->parameter_groups)
@@ -1315,12 +1626,12 @@ export namespace semantic {
                     if (*end)
                         named.push_back(**end);
                 for (const auto& id : named)
-                    if (auto declaration = nominal_declaration(id, lookup))
+                    if (auto declaration = nominal_declaration(id, lookup, languages))
                         owners.insert(std::move(*declaration));
             }
-            auto surface = [](const records::symbol& row) {
+            auto surface = [&](const records::symbol& row) {
                 static const std::set<std::string_view> kinds{"constructor", "field", "property", "enum_member", "function", "method"};
-                return kinds.contains(row.kind.str()) && spelled(row.visibility, "public");
+                return kinds.contains(languages.core_kind(languages.symbol_traits, row.language, row.kind)) && self.view.languages.most_visible(row.language, row.visibility);
             };
             std::set<std::pair<symbol_id, context_id>> included;
             for (const auto& row : self.out.symbols)
@@ -1354,7 +1665,7 @@ export namespace semantic {
                     return;
                 std::set<std::pair<symbol_id, context_id>> seen;
                 for (const auto& item : self.out.items) {
-                    if (item.kind.str() != "type")
+                    if (languages.core_kind(languages.symbol_traits, item.language, item.kind) != "type")
                         continue;
                     const auto [first, last] = index.equal_range(item.symbol_id);
                     for (auto at = first; at != last; ++at)
@@ -1362,8 +1673,9 @@ export namespace semantic {
                             self.in_scope(row) && self.in_modules(row) && self.declared_in_files(row) && seen.emplace(row.id, row.ownership.context).second)
                             into.push_back(row);
                 }
-                std::ranges::sort(into, {},
-                                  [](const records::symbol& row) { return std::tuple{row.module, visibility_rank(row.visibility), row.qualified_name}; });
+                std::ranges::sort(into, {}, [&](const records::symbol& row) {
+                    return std::tuple{row.module, self.view.languages.rank(row.language, row.visibility), row.qualified_name};
+                });
                 const auto used = self.out.symbols.size() + self.out.producers.size() + self.out.consumers.size() - into.size();
                 if (used + into.size() > budget) {
                     into.resize(budget > used ? budget - used : 0);
@@ -1377,6 +1689,7 @@ export namespace semantic {
             capabilities("producers", self.view.type_producers, self.out.producers);
             capabilities("consumers", self.view.type_consumers, self.out.consumers);
             types(self, std::move(pending));
+            mark_tentative_cpp_types(self);
         }
         enum class paging { symbols, references, relations };
         struct handler {

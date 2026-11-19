@@ -1,6 +1,6 @@
 export module channels;
 import std;
-import reflection;
+import json;
 import content;
 import records;
 
@@ -26,7 +26,7 @@ export namespace channels {
             if (!inserted && previous->second != found->value)
                 throw std::invalid_argument("one input unit has conflicting output channels");
         }
-        return content::hash_of(rfl::json::write(values)).str();
+        return content::hash_of(json::write(values)).str();
     }
     inline auto collection(const std::string& project, const std::string& port, const std::vector<const semantic::unit*>& units, const std::string& name,
                            semantic::record_selection selection = {}) -> semantic::dependency {
@@ -65,34 +65,54 @@ export namespace channels {
         semantic::locator location;
         semantic::place body;
         semantic::symbol_kind kind;
+        std::optional<std::string> linkage_name;
     };
 
-    inline auto definition_bodies(const std::vector<const semantic::shard*>& shards, const std::vector<semantic::symbol_kind>& kinds)
+    inline auto source_definitions(const std::vector<const semantic::shard*>& shards, const std::vector<semantic::symbol_kind>& kinds,
+                                   const std::string& linkage_extension = {})
         -> std::vector<definition_body> {
-        using key = std::pair<semantic::unit_id, semantic::symbol_id>;
+        using key = std::pair<std::string, semantic::symbol_id>;
+        auto key_for = [&](const semantic::unit& unit, const semantic::symbol_id& symbol) -> key {
+            return {linkage_extension.empty() ? unit.id : unit.context, symbol};
+        };
         std::map<key, const semantic::records::symbol*> symbols;
         std::map<key, const semantic::identity_binding*> identities;
         for (const auto* shard : shards) {
             for (const auto& symbol : shard->symbols)
-                symbols.try_emplace({shard->unit.id, symbol.id}, &symbol);
+                symbols.try_emplace(key_for(shard->unit, symbol.id), &symbol);
             for (const auto& identity : shard->identities)
-                identities.try_emplace({shard->unit.id, identity.symbol}, &identity);
+                identities.try_emplace(key_for(shard->unit, identity.symbol), &identity);
         }
         std::vector<definition_body> out;
         for (const auto* shard : shards)
             for (const auto& occurrence : shard->occurrences) {
-                if (!occurrence.body || !std::ranges::contains(occurrence.roles, std::string{"definition"}))
+                if (!std::ranges::contains(occurrence.roles, std::string{"definition"}))
                     continue;
-                const key id{shard->unit.id, occurrence.symbol};
+                const auto& extent = linkage_extension.empty() ? occurrence.body : occurrence.location.source;
+                if (!extent)
+                    continue;
+                const auto id = key_for(shard->unit, occurrence.symbol);
                 const auto symbol = symbols.find(id);
                 auto kind = occurrence.declaration_kind;
                 if (!kind && symbol != symbols.end())
                     kind = symbol->second->kind;
                 if (!kind || (!kinds.empty() && !std::ranges::contains(kinds, *kind)))
                     continue;
+                std::optional<std::string> linkage_name;
+                if (!linkage_extension.empty()) {
+                    if (symbol == symbols.end())
+                        continue;
+                    const auto name = symbol->second->extensions.find(linkage_extension);
+                    if (name == symbol->second->extensions.end())
+                        continue;
+                    auto parsed = json::from_value<std::string>(name->second);
+                    if (!parsed || parsed->empty())
+                        continue;
+                    linkage_name = std::move(*parsed);
+                }
                 const auto identity = identities.find(id);
                 if (identity != identities.end())
-                    out.push_back({shard->unit.context, *identity->second, occurrence.location, *occurrence.body, *kind});
+                    out.push_back({shard->unit.context, *identity->second, occurrence.location, *extent, *kind, std::move(linkage_name)});
             }
         return out;
     }
@@ -108,10 +128,26 @@ export namespace channels {
             const auto selected = std::ranges::find(definitions, channel, &semantic::channel_definition::name);
             if (selected == definitions.end())
                 throw std::invalid_argument("semantic unit did not declare channel " + channel);
-            auto values = definition_bodies(shards, selected->symbol_kinds);
+            auto values = source_definitions(shards, selected->symbol_kinds);
             std::ranges::move(values, std::back_inserter(out));
         }
         return out;
+    }
+
+    inline auto definition_bodies(const std::vector<const semantic::shard*>& shards, const std::vector<semantic::symbol_kind>& kinds)
+        -> std::vector<definition_body> {
+        return source_definitions(shards, kinds);
+    }
+
+    template <class Ports> auto linkage_definitions(const Ports& ports, const std::string& extension) -> std::vector<definition_body> {
+        std::vector<const semantic::shard*> shards;
+        for (const auto& [port, objects] : ports)
+            for (const auto& object : objects)
+                if (std::ranges::contains(object->data->unit.channel_definitions, std::string{"linkage"}, &semantic::channel_definition::name))
+                    shards.push_back(object->data.get());
+        // clice separates declarations and definition sites into different
+        // contributions in the same translation-unit context.
+        return source_definitions(shards, {}, extension);
     }
 
     inline auto declarations(const std::vector<const semantic::shard*>& shards) -> std::vector<semantic::records::symbol> {
@@ -202,7 +238,7 @@ export namespace channels {
                             if (definition.symbol_extensions)
                                 std::erase_if(row.extensions,
                                               [&](const auto& value) { return !std::ranges::contains(*definition.symbol_extensions, value.first); });
-                        values.push_back(rfl::json::write(row));
+                        values.push_back(json::write(row));
                     }
                 };
                 if (projection == "definition_bodies")
@@ -234,7 +270,7 @@ export namespace channels {
                 values.erase(std::unique(values.begin(), values.end()), values.end());
             }
             std::ranges::sort(projections, {}, [](const auto& value) { return value.first; });
-            out.push_back({definition.name, content::hash_of(rfl::json::write(std::pair{definition, projections})).str()});
+            out.push_back({definition.name, content::hash_of(json::write(std::pair{definition, projections})).str()});
         }
         return out;
     }

@@ -1,6 +1,6 @@
 export module cmake;
 import std;
-import reflection;
+import json;
 export import provider;
 
 namespace builds {

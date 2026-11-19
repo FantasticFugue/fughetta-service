@@ -29,9 +29,9 @@ function(add_implementation TARGET DIRECTORY)
   set_source_files_properties(${UNITS} PROPERTIES LANGUAGE CXX)
 endfunction()
 
-# core: the execution model, reflection and the runtime constants
+# core: the execution model, wire codecs and runtime constants
 add_layer(core)
-add_modules(core core async coroutine reflection meta constants utility mpmc)
+add_modules(core core async coroutine fields meta constants utility mpmc value json xml)
 
 # platform: operating system providers
 add_layer(platform)
@@ -45,7 +45,7 @@ add_implementation(io io entropy dns)
 # model
 add_layer(model)
 add_modules(model model allocation content codec archive records objects profiles semantic enumeration reuse channels indexing knowledge world nodes provider report cmake bazel
-  commands clice artifact jvm kmetadata clr bridge pinvoke jni vcpkg typescript bun uv ty ruff gradle msbuild projectmodel build language protocol configuration usage runner replica delivery lsp evaluation helper kotlin fsharp toolchain)
+  commands clice llvm jvm kmetadata clr bridge pinvoke jni pybind vcpkg typescript bun uv ty ruff gradle msbuild projectmodel build language protocol configuration usage runner replica delivery lsp evaluation helper kotlin fsharp toolchain)
 add_implementation(model model crypto planning generator analysis impact comparison reanalysis)
 
 # gateway
@@ -77,10 +77,10 @@ target_link_libraries(platform PRIVATE ${PLATFORM_LIBRARIES})
 #
 # PUBLIC is part of the interface, PRIVATE is implementation.
 
-target_link_libraries(core PUBLIC STDEXEC::stdexec httpant::io reflectcpp::reflectcpp)
+target_link_libraries(core PUBLIC STDEXEC::stdexec httpant::io PRIVATE yyjson::yyjson simdjson::simdjson pugixml::pugixml)
 target_link_libraries(platform PUBLIC core)
-target_link_libraries(io PUBLIC platform httpant::httpant httpant::tls PRIVATE unofficial-sodium::sodium c-ares::cares)
-target_link_libraries(model PUBLIC io PRIVATE unofficial-sodium::sodium ZLIB::ZLIB zstd::libzstd unofficial::sqlite3::sqlite3)
+target_link_libraries(io PUBLIC platform httpant::httpant httpant::tls PRIVATE unofficial-sodium::sodium c-ares::cares ada::ada)
+target_link_libraries(model PUBLIC io PRIVATE unofficial-sodium::sodium ada::ada libzip::zip zstd::libzstd unofficial::sqlite3::sqlite3)
 target_link_libraries(gateway PUBLIC model PRIVATE unofficial-sodium::sodium)
-target_link_libraries(source PUBLIC model PRIVATE unofficial::sqlite3::sqlite3)
+target_link_libraries(source PUBLIC model PRIVATE unofficial::sqlite3::sqlite3 roaring::roaring)
 target_link_libraries(worker PUBLIC model)

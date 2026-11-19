@@ -21,6 +21,15 @@ export namespace language {
         static constexpr semantic::unit_kind unit_kind = semantic::unit_kind::module;
         static constexpr bool negotiated = false, dependency_reads = true;
         static constexpr std::string_view update_granularity = "module";
+        static auto conventions() -> std::vector<semantic::language_conventions> {
+            return {{.language = "kotlin",
+                     .visibility = {"PUBLIC", "INTERNAL", "PROTECTED", "PACKAGE_PROTECTED", "PACKAGE_PRIVATE", "PRIVATE_TO_THIS", "PRIVATE", "LOCAL"},
+                     .value_wrappers = {"kotlin.Result", "kotlinx.coroutines.Deferred"},
+                     .wrapper_arguments = "<",
+                     .scope_edges = {"base", "import"},
+                     .escape_types = {{"kotlin.Any?", "Any?"}},
+                     .unsafe_casts = {{"kotlin.js.unsafeCast"}}}};
+        }
         static auto channels() -> std::vector<semantic::channel_definition> {
             auto out = source_channels();
             out.front().projections = {std::string{"declarations"}};

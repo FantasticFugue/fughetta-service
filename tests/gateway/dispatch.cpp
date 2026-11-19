@@ -4,13 +4,15 @@ import coroutine;
 import native;
 import protocol;
 import mcp;
-import reflection;
+import json;
 import http;
 import configuration;
 import usage;
 import world;
 import registry;
 import fleet;
+import enrollment;
+import publication;
 import tools;
 import executor;
 import host;
@@ -31,7 +33,7 @@ namespace {
         for (std::size_t at = 0; (at = text.find(lead, at)) != std::string::npos;) {
             at += lead.size();
             auto end = text.find("\n\n", at);
-            out.push_back(rfl::json::read<mcp::notification>(text.substr(at, end - at)).value());
+            out.push_back(json::read<mcp::notification>(text.substr(at, end - at)).value());
             at = end;
         }
         return out;
@@ -424,6 +426,8 @@ int main(int argc, char** argv) {
             auto handle_sync_offer = [this](jobs::sync_offer offer, auto&) -> coroutine::task<jobs::sync_plan> {
                 if (publisher)
                     captured.leaked.push_back("sync.offer");
+                if (offer.retained)
+                    co_return jobs::sync_plan{.snapshot = *offer.retained, .needs_tree = true};
                 co_return jobs::sync_plan{.snapshot = offer.tree.id()};
             };
             handlers.on<jobs::sync_offer>(std::move(handle_sync_offer));
@@ -588,6 +592,57 @@ int main(int argc, char** argv) {
     };
 
     static constexpr auto build_suite = [] {
+        "remote artifact receipts cross the jobs protocol and gate publication"_test = [] {
+            test::scratch scratch{"remote-receipts"};
+            enrollment::store registry{scratch.dir, "workspace"};
+            const auto credential = registry.add("builder", "owner");
+            const content::receipt_key key{credential.secret};
+            execution::thread_pool pool{1};
+            cores::io_context<native::context> rt{1};
+            routing::router router{rt};
+            auto run_core = [&](ctx& io, std::size_t) -> coroutine::task<> {
+                auto listener = native::listener{io, {net::ip::address_v4::loopback(), 0}};
+                auto socket = co_await io::connect(io, listener.local_endpoint());
+                auto [peer, endpoint] = co_await net::async_accept(listener);
+                transport::channel<decltype(socket)> channel{socket};
+                transport::dispatcher<decltype(socket)> dispatcher;
+                dispatcher.signer = {&key, credential.workspace_id, credential.worker_id};
+                dispatcher.on<jobs::build_request>([](jobs::build_request, auto&) -> coroutine::task<jobs::build_report> {
+                    jobs::build_report report;
+                    report.exports.push_back({.name = "binary", .path = "out/app", .digest = content::hash_of("artifact"), .size = 8});
+                    co_return report;
+                });
+                co_await channel.post(jobs::hello{.name = "builder", .auth = credential.secret, .protocol = jobs::protocol_version,
+                                                  .worker_id = credential.worker_id, .workspace_id = credential.workspace_id, .heartbeat_seconds = 15});
+                auto tasks = [&](coroutine::scope& children) -> coroutine::task<> {
+                    auto enabled = [] { return true; };
+                    children.spawn(router.workers(0).admit(io, std::move(peer), &registry, &pool, enabled));
+                    auto admission = transport::decode<jobs::admission>(co_await channel.recv());
+                    expect(admission.accepted >> fatal);
+                    auto serve = [&]() -> coroutine::task<> {
+                        co_await dispatcher.handle(channel, co_await channel.recv());
+                    };
+                    children.spawn(serve());
+                    auto call = [&](auto& selected) -> coroutine::task<> {
+                        auto [store, id] = router.workers(0).receipt_identity(selected);
+                        publishing::receipt_authority authority{store, std::move(id)};
+                        const jobs::build_request request{.project = "app", .snapshot = content::hash_of("snapshot")};
+                        auto result = co_await selected.call(request);
+                        expect(result.has_value() >> fatal);
+                        auto changed = *result;
+                        changed.exports.front().size++;
+                        expect(throws<tools::tool_error>([&] { authority.artifacts(request, changed); }));
+                        authority.artifacts(request, *result);
+                        expect(result->artifact_audit.size() == 1_u);
+                        expect(result->artifact_audit.front().public_key == key.public_key());
+                    };
+                    co_await router.workers(0).with({}, call);
+                };
+                co_await coroutine::with_scope(std::move(tasks));
+            };
+            rt.run(run_core);
+        };
+
         "a Worker cannot substitute the offered source snapshot"_test = [] {
             harness h;
             bool rejected = false;
@@ -609,7 +664,7 @@ int main(int argc, char** argv) {
                     auto run = [&]() -> coroutine::task<> {
                         try {
                             co_await tools::sync_and_run(io, h.files, 0, outgoing, "app", {}, jobs::build_request{}, nullptr, "main", "selected-version", {},
-                                                         std::make_shared<tools::execution_identity>());
+                                                         std::make_shared<tools::execution_identity>(), h.router.workers(0));
                         } catch (const tools::tool_error& error) {
                             rejected = error.code == "invalid_worker_reply";
                         }
@@ -673,7 +728,7 @@ int main(int argc, char** argv) {
 
             // The publisher boundary transmits only the typed manifest: no consumer commands, env or layout.
             expect(c.leaked.empty()) << "the publisher only ever heard dependency.fill, the consumer never did";
-            auto wire = rfl::json::write(fill);
+            auto wire = json::write(fill);
             expect(wire.contains("fmt") && wire.contains("x64-linux"));
             expect(!wire.contains("consumer-app") && !wire.contains("$schema") && !wire.contains("1.2.3"))
                 << "only declarative registry selectors cross the publisher boundary";

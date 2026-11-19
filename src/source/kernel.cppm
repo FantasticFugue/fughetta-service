@@ -1,3 +1,5 @@
+module;
+#include <roaring/roaring64.h>
 export module kernel;
 import std;
 import content;
@@ -19,53 +21,53 @@ export namespace nodes {
         std::uint64_t first = 0, count = 0;
         auto operator==(const fragment&) const -> bool = default;
     };
-    // Sparse half-open event positions, sorted and disjoint: a version's causal closure.
-    struct causal_set {
-        std::vector<std::pair<std::size_t, std::size_t>> ranges;
-        auto contains(std::size_t n) const -> bool {
-            auto it = std::upper_bound(ranges.begin(), ranges.end(), n, [](auto value, auto& range) { return value < range.first; });
-            return it != ranges.begin() && n < std::prev(it)->second;
+    // In memory, the causal closure is a 64-bit bitmap. Persistence observes sorted half-open ranges.
+    namespace causal_bitmap = roaring::api;
+    class causal_set {
+        using bitmap = std::unique_ptr<causal_bitmap::roaring64_bitmap_t, decltype(&causal_bitmap::roaring64_bitmap_free)>;
+        bitmap bits_;
+
+        explicit causal_set(causal_bitmap::roaring64_bitmap_t* bits) : bits_{bits, causal_bitmap::roaring64_bitmap_free} {
+            if (!bits_)
+                throw std::bad_alloc{};
         }
+
+    public:
+        causal_set() : causal_set(causal_bitmap::roaring64_bitmap_create()) {}
+        causal_set(const causal_set& other) : causal_set(causal_bitmap::roaring64_bitmap_copy(other.bits_.get())) {}
+        causal_set(causal_set&&) noexcept = default;
+        auto operator=(causal_set&&) noexcept -> causal_set& = default;
+        auto operator=(const causal_set& other) -> causal_set& {
+            if (this != &other)
+                *this = causal_set{other};
+            return *this;
+        }
+        auto contains(std::size_t n) const -> bool { return causal_bitmap::roaring64_bitmap_contains(bits_.get(), n); }
+        auto empty() const -> bool { return causal_bitmap::roaring64_bitmap_is_empty(bits_.get()); }
+        auto size() const -> std::uint64_t { return causal_bitmap::roaring64_bitmap_get_cardinality(bits_.get()); }
         void unite(const causal_set& other) {
-            std::vector<std::pair<std::size_t, std::size_t>> next;
-            next.reserve(ranges.size() + other.ranges.size());
-            auto a = ranges.begin();
-            auto b = other.ranges.begin();
-            while (a != ranges.end() || b != other.ranges.end()) {
-                auto item = b == other.ranges.end() || (a != ranges.end() && *a < *b) ? *a++ : *b++;
-                if (!next.empty() && item.first <= next.back().second)
-                    next.back().second = std::max(next.back().second, item.second);
-                else
-                    next.push_back(item);
-            }
-            ranges = std::move(next);
+            if (this != &other)
+                causal_bitmap::roaring64_bitmap_or_inplace(bits_.get(), other.bits_.get());
         }
-        void add(std::size_t n) {
-            causal_set one;
-            one.ranges.emplace_back(n, n + 1);
-            unite(one);
-        }
+        void add(std::size_t n) { causal_bitmap::roaring64_bitmap_add(bits_.get(), n); }
+        void add_range(std::uint64_t first, std::uint64_t last) { causal_bitmap::roaring64_bitmap_add_range(bits_.get(), first, last); }
         auto without(const causal_set& other) const -> causal_set {
-            causal_set out;
-            std::size_t j = 0;
-            for (auto [first, last] : ranges) {
-                while (j < other.ranges.size() && other.ranges[j].second <= first)
-                    ++j;
-                for (auto k = j; k < other.ranges.size() && other.ranges[k].first < last; ++k) {
-                    auto [lo, hi] = other.ranges[k];
-                    if (first < lo)
-                        out.ranges.emplace_back(first, std::min(lo, last));
-                    first = std::max(first, hi);
-                    if (first >= last)
-                        break;
-                }
-                if (first < last)
-                    out.ranges.emplace_back(first, last);
-            }
+            return causal_set{causal_bitmap::roaring64_bitmap_andnot(bits_.get(), other.bits_.get())};
+        }
+        auto ranges() const -> std::vector<std::pair<std::uint64_t, std::uint64_t>> {
+            std::unique_ptr<causal_bitmap::roaring64_iterator_t, decltype(&causal_bitmap::roaring64_iterator_free)> it{
+                causal_bitmap::roaring64_iterator_create(bits_.get()), causal_bitmap::roaring64_iterator_free};
+            if (!it)
+                throw std::bad_alloc{};
+            std::vector<std::pair<std::uint64_t, std::uint64_t>> out;
+            std::array<causal_bitmap::roaring64_range_closed_t, 32> block;
+            while (const auto count = causal_bitmap::roaring64_iterator_read_ranges(it.get(), block.data(), block.size()))
+                for (const auto& range : std::span{block}.first(count))
+                    out.emplace_back(range.min, range.max + 1);
             return out;
         }
         template <class F> void each(F f) const {
-            for (auto [first, last] : ranges)
+            for (auto [first, last] : ranges())
                 for (auto i = first; i < last; ++i)
                     f(i);
         }
@@ -289,11 +291,13 @@ export namespace nodes {
             e.dependencies = string_list(h.at("dependencies"));
             e.retained_effects = h.at("effects").number();
             e.complete = false;
+            std::optional<std::uint64_t> previous_end;
             for (auto& r : h.at("ancestors").list()) {
                 auto first = r.at("first").number(), last = r.at("last").number();
-                if (first >= last || last > index || (!e.ancestors.ranges.empty() && first <= e.ancestors.ranges.back().second))
+                if (first >= last || last > index || (previous_end && first <= *previous_end))
                     fail(nodes::code::invalid_record, "causal proof intervals differ");
-                e.ancestors.ranges.emplace_back(first, last);
+                e.ancestors.add_range(first, last);
+                previous_end = last;
             }
             if (!content::is_hash(e.id) || !content::is_hash(e.author) || !content::is_hash(e.operation) || !e.clock)
                 fail(nodes::code::invalid_record, "causal event metadata differs");
@@ -855,7 +859,7 @@ export namespace nodes {
         auto event_header(std::size_t index) const -> value {
             auto& e = event_at(index);
             value::array ranges;
-            for (auto [first, last] : e.ancestors.ranges)
+            for (auto [first, last] : e.ancestors.ranges())
                 ranges.emplace_back(value::map{{"first", static_cast<std::uint64_t>(first)}, {"last", static_cast<std::uint64_t>(last)}});
             return value::map{{"index", static_cast<std::uint64_t>(index)},
                               {"id", e.id},
@@ -1291,7 +1295,7 @@ export namespace nodes {
                 // A metadata-only change keeps the authenticated content of the file it names; anything that can change
                 // visible characters or their activation replays just this file's effects.
                 bool metadata_only = serial && previous && !previous->fragments_ready && controls.empty() && resolutions.empty() &&
-                                     base.causal.without(bits).ranges.empty() && !base.file_conflicts.contains(id) &&
+                                     base.causal.without(bits).empty() && !base.file_conflicts.contains(id) &&
                                      std::ranges::all_of(list, [](auto* e) { return e->type == "path" || e->type == "presence" || e->type == "mode"; });
                 std::shared_ptr<const source_file> current;
                 if (metadata_only) {
@@ -1424,9 +1428,7 @@ export namespace nodes {
                 std::uint64_t score = std::numeric_limits<std::uint64_t>::max();
                 for (std::size_t i = 0; i < projected_.size(); ++i) {
                     auto difference = changed(projected_[i].second->causal, wanted);
-                    std::uint64_t size = 0;
-                    for (auto [first, last] : difference.ranges)
-                        size += last - first;
+                    const auto size = difference.size();
                     if (size < score) {
                         score = size;
                         best = i;

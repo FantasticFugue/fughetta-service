@@ -1,3 +1,5 @@
+module;
+#include <argparse/argparse.hpp>
 export module worker;
 import std;
 import runtime;
@@ -5,6 +7,7 @@ import coroutine;
 import native;
 import signals;
 import protocol;
+import json;
 import executor;
 import configuration;
 import durability;
@@ -53,14 +56,16 @@ namespace worker {
                       compute_) {}
 
         auto run(native::scheduler& io, std::size_t core) -> coroutine::task<> {
-            if (cfg_.backend.kind == "local") {
+            if (cfg_.execute_stdio || cfg_.dependency_publish || !std::ranges::contains(cfg_.roles, constants::execute_role)) {
                 co_await builds_.run(core, connected(io, core));
                 co_return;
             }
-            // A container backend runs the execute role in a sibling Worker this one starts on demand.
+            // Execute work runs in a separate process connected through inherited standard streams.
+            // Keep native handles inside the scheduler lifetime, after the execute tasks have joined.
+            std::optional<sibling::manager> execute;
             auto beside = [&](coroutine::scope& tasks) -> coroutine::task<> {
-                execute_.emplace(io, tasks, cfg_, builds_.root());
-                builds_.set_execute(*execute_);
+                execute.emplace(io, tasks, cfg_, builds_.root());
+                builds_.set_execute(*execute);
                 co_await builds_.run(core, connected(io, core));
             };
             co_await coroutine::with_scope(std::move(beside));
@@ -110,6 +115,11 @@ namespace worker {
 
     private:
         auto serve(native::scheduler& io, std::size_t core) -> coroutine::task<> {
+            if (cfg_.execute_stdio) {
+                native::stdio_stream stream{io};
+                co_await session(io, core, stream);
+                co_return;
+            }
             std::optional<socket> sock;
             if (!co_await coroutine::deadline(io, std::chrono::seconds{10}, connect(io, sock)))
                 throw std::runtime_error(std::format("worker '{}': no answer from {} in 10s", name_, cfg_.gateway));
@@ -119,8 +129,13 @@ namespace worker {
 
         template <io::stream S> auto session(native::scheduler& io, std::size_t core, S& stream) -> coroutine::task<> {
             transport::channel<S> chan{stream};
+            std::optional<content::receipt_key> signing_key;
             transport::dispatcher<S> serve;
-            builds_.install(serve, core);
+            if (cfg_.worker_id) {
+                signing_key.emplace(cfg_.token.value());
+                serve.signer = {&*signing_key, cfg_.workspace_id.value(), *cfg_.worker_id};
+            }
+            builds_.install(serve, core, cfg_.execute_stdio);
             auto handle_hash_file = [this, &io](jobs::hash_file job, auto&) -> coroutine::task<jobs::digest> {
                 if (cfg_.dependency_publish)
                     throw std::invalid_argument("dependency publishers only accept dependency.fill");
@@ -130,6 +145,14 @@ namespace worker {
                 co_return *out;
             };
             serve.template on<jobs::hash_file>(std::move(handle_hash_file));
+            auto inventory = co_await builds_.status(core);
+            // Keep the initial frame bounded when many projects share the worker.
+            std::size_t inventory_bytes = 0;
+            auto first_omitted = std::ranges::find_if(inventory.slots, [&](const auto& slot) {
+                inventory_bytes += json::write(slot).size() + 1;
+                return inventory_bytes > constants::worker_hello_bytes / 2;
+            });
+            inventory.slots.erase(first_omitted, inventory.slots.end());
             co_await chan.post(jobs::hello{.name = name_,
                                            .auth = cfg_.token.value_or(""),
                                            .platform = {.os = std::string{host::os}, .arch = std::string{host::arch}},
@@ -144,7 +167,8 @@ namespace worker {
                                            .heartbeat_seconds = cfg_.worker_id ? cfg_.heartbeat_seconds : 2,
                                            .toolchain_id = toolchain_,
                                            .dependency_publisher = cfg_.dependency_publish.has_value(),
-                                           .memory_bytes = cfg_.memory_bytes});
+                                           .memory_bytes = cfg_.memory_bytes,
+                                           .slots = std::move(inventory.slots)});
 
             if (cfg_.worker_id) {
                 auto first = co_await coroutine::deadline(io, std::chrono::seconds{30}, chan.recv(constants::worker_hello_bytes));
@@ -261,7 +285,6 @@ namespace worker {
         std::string toolchain_;
         execution::thread_pool compute_;
         replica::service builds_;
-        std::optional<sibling::manager> execute_;
     };
 } // namespace worker
 
@@ -284,10 +307,16 @@ export int run_worker(int argc, char** argv, bool private_file = false) {
 
 // `worker run --config PATH` serves a registered machine; its credential file must be owner-only.
 export int worker_cli(int argc, char** argv) {
-    if (argc != 4 || std::string_view{argv[1]} != "run" || std::string_view{argv[2]} != "--config") {
-        logging::error("worker: use worker run --config PATH");
+    try {
+        argparse::ArgumentParser arguments{"worker", "", argparse::default_arguments::help};
+        arguments.add_argument("action").choices("run");
+        arguments.add_argument("--config").required();
+        arguments.parse_args(argc, argv);
+        auto file = arguments.get<std::string>("--config");
+        std::array<char*, 2> forwarded{argv[0], file.data()};
+        return run_worker(static_cast<int>(forwarded.size()), forwarded.data(), true);
+    } catch (const std::exception& e) {
+        logging::error(std::format("worker: {}", e.what()));
         return 1;
     }
-    std::array<char*, 2> arguments{argv[0], argv[3]};
-    return run_worker(static_cast<int>(arguments.size()), arguments.data(), true);
 }

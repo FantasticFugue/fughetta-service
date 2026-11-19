@@ -6,9 +6,14 @@ import utility;
 export namespace durability {
     auto is_executable(const std::filesystem::path& path) -> bool;
     void set_executable(const std::filesystem::path& path, bool executable);
+    // Create a separate file using copy-on-write extents. A false result leaves
+    // the destination absent so the caller can write an independent copy.
+    auto try_clone_file(const std::filesystem::path& source, const std::filesystem::path& destination) -> bool;
     void write_part(const std::filesystem::path& path, std::uint64_t offset, std::span<const std::byte> bytes, bool complete);
     void sync_dir(const std::filesystem::path& dir);
     void sync_filesystem(const std::filesystem::path& path);
+    // Refresh the modification time of a regular file without following a link.
+    void touch_file(const std::filesystem::path& path);
     void durable_write(const std::filesystem::path& target, std::span<const std::byte> bytes, bool executable = false,
                        std::string_view temp_suffix = constants::temporary_suffix);
     void durable_write(const std::filesystem::path& target, std::string_view text, bool executable = false,

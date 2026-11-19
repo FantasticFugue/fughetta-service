@@ -16,7 +16,7 @@ parser.add_argument("reader")
 parser.add_argument("work")
 parser.add_argument("--exporter", required=True)
 parser.add_argument("--compiler", default=os.environ.get("CXX", "c++"))
-parser.add_argument("--native-host", default=os.environ.get("TEST_NATIVE_HOST", "fughetta-native"))
+parser.add_argument("--native-host", default=os.environ.get("TEST_LLVM_HOST", "fughetta-llvm"))
 args = parser.parse_args()
 dotnet, host, adapter, validator, reader, work = args.dotnet, args.host, args.adapter, args.validator, args.reader, args.work
 dotnet, host, adapter, validator, reader = [str(Path(value).resolve()) for value in (dotnet, host, adapter, validator, reader)]

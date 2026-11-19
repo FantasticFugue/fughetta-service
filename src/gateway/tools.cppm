@@ -3,7 +3,7 @@ import utility;
 import constants;
 import std;
 import knowledge;
-import reflection;
+import json;
 import coroutine;
 import meta;
 import protocol;
@@ -25,7 +25,7 @@ export import :analysis;
 export namespace tools {
     struct configurations : tool<"configurations", "List build and run configurations and the operations each build configuration provides."> {
         struct input {
-            rfl::Description<"Project; supplied by the execution context when absent", std::optional<std::string>> project;
+            json::described<"Project; supplied by the execution context when absent", std::optional<std::string>> project;
         };
         struct config_view {
             std::string name;
@@ -66,13 +66,15 @@ export namespace tools {
                                  "execute its build steps, and return each configuration's "
                                  "steps, output and diagnostics in one result."> {
         struct input {
-            rfl::Description<"Project; supplied by the execution context when absent", std::optional<std::string>> project;
-            rfl::Description<"Configurations to build at once; the defaults if absent; [\"*\"] for all enabled", std::optional<std::vector<std::string>>>
+            json::described<"Project; supplied by the execution context when absent", std::optional<std::string>> project;
+            json::described<"Configurations to build at once; the defaults if absent; [\"*\"] for all enabled", std::optional<std::vector<std::string>>>
                 configurations;
-            rfl::Description<"Targets accepted by the selected build operation; configured targets if absent", std::optional<std::vector<std::string>>> targets;
-            rfl::Description<"Worldline to build; task binding when absent; explicit selection required without a task", std::optional<std::string>> worldline;
-            rfl::Description<"Version of the worldline to build; its current one when absent", std::optional<std::string>> version;
-            rfl::Description<"Rebuild from a clean working tree, bypassing cached and in-flight build results", std::optional<bool>> fresh;
+            json::described<"Targets accepted by the selected build operation; configured targets if absent", std::optional<std::vector<std::string>>> targets;
+            json::described<"Worldline to build; task binding when absent; explicit selection required without a task", std::optional<std::string>> worldline;
+            json::described<"Version of the worldline to build; its current one when absent", std::optional<std::string>> version;
+            json::described<"Rebuild from a clean working tree, bypassing cached and in-flight build results", std::optional<bool>> fresh;
+            json::described<"Capture changes under these project-relative paths into the selected worldline", std::optional<std::vector<std::string>>> capture_worktree_changes;
+            json::described<"Stable operation ID for a captured contribution and its retries", std::optional<std::string>> operation_id;
         };
         using output = results;
 
@@ -80,11 +82,12 @@ export namespace tools {
             auto project = project_of(in);
             auto e = config::resolve(*s.snapshot(), project);
             auto targets = in.targets.value().value_or(std::vector<std::string>{});
-            std::vector<std::pair<config::effective_config, std::vector<jobs::step>>> jobs;
+            auto capture = capture_input(in.capture_worktree_changes.value(), in.operation_id.value(), "build", in);
+            std::vector<detail::planned_job> jobs;
             for (auto* c : e.pick(in.configurations.value().value_or(std::vector<std::string>{}), "build"))
                 jobs.push_back(detail::operation(*c, {.operation = "build", .parameters = {.targets = targets}}));
             co_return co_await execute_all(s, context, project, "build", true, in.fresh.value().value_or(false), std::move(jobs), note,
-                                           execution_line(actor, in.worldline.value()), in.version.value().value_or(""), actor);
+                                           execution_line(actor, in.worldline.value()), in.version.value().value_or(""), actor, std::move(capture));
         }
     };
 
@@ -92,35 +95,40 @@ export namespace tools {
                                "returns steps, diagnostics and output, plus a test summary when the test runner is one the "
                                "service reads (CTest, Bazel, pytest)."> {
         struct input {
-            rfl::Description<"Project; supplied by the execution context when absent", std::optional<std::string>> project;
-            rfl::Description<"Configurations to test on at once; the defaults if absent; [\"*\"] for all enabled", std::optional<std::vector<std::string>>>
+            json::described<"Project; supplied by the execution context when absent", std::optional<std::string>> project;
+            json::described<"Configurations to test on at once; the defaults if absent; [\"*\"] for all enabled", std::optional<std::vector<std::string>>>
                 configurations;
-            rfl::Description<"Test filter, if the selected operation accepts one", std::optional<std::string>> filter;
-            rfl::Description<"Test labels, if the selected operation accepts them", std::optional<std::string>> labels;
-            rfl::Description<"Worldline to build; task binding when absent; explicit selection required without a task", std::optional<std::string>> worldline;
-            rfl::Description<"Version of the worldline to build; its current one when absent", std::optional<std::string>> version;
+            json::described<"Test filter, if the selected operation accepts one", std::optional<std::string>> filter;
+            json::described<"Test labels, if the selected operation accepts them", std::optional<std::string>> labels;
+            json::described<"Worldline to build; task binding when absent; explicit selection required without a task", std::optional<std::string>> worldline;
+            json::described<"Version of the worldline to build; its current one when absent", std::optional<std::string>> version;
+            json::described<"Capture changes under these project-relative paths into the selected worldline", std::optional<std::vector<std::string>>> capture_worktree_changes;
+            json::described<"Stable operation ID for a captured contribution and its retries", std::optional<std::string>> operation_id;
         };
         using output = results;
 
         static auto run(services& s, mcp::call_context context, input in, mcp::notifier& note, const worlds::actor& actor) -> coroutine::task<output> {
             auto project = project_of(in);
             auto e = config::resolve(*s.snapshot(), project);
-            std::vector<std::pair<config::effective_config, std::vector<jobs::step>>> jobs;
+            auto capture = capture_input(in.capture_worktree_changes.value(), in.operation_id.value(), "test", in);
+            std::vector<detail::planned_job> jobs;
             for (auto* c : e.pick(in.configurations.value().value_or(std::vector<std::string>{}), "test")) {
                 jobs.push_back(detail::operation(*c, {.operation = "test", .parameters = {.filter = in.filter.value(), .labels = in.labels.value()}}));
             }
             co_return co_await execute_all(s, context, project, "test", false, false, std::move(jobs), note, execution_line(actor, in.worldline.value()),
-                                           in.version.value().value_or(""), actor);
+                                           in.version.value().value_or(""), actor, std::move(capture));
         }
     };
 
     struct launch : tool<"run", "Invoke a saved run configuration's operation on its selected build configurations."> {
         struct input {
-            rfl::Description<"Project; supplied by the execution context when absent", std::optional<std::string>> project;
-            rfl::Description<"The run configuration", std::string> configuration;
-            rfl::Description<"Build configurations to run on; the run configuration's own if absent", std::optional<std::vector<std::string>>> configurations;
-            rfl::Description<"Worldline to build; task binding when absent; explicit selection required without a task", std::optional<std::string>> worldline;
-            rfl::Description<"Version of the worldline to build; its current one when absent", std::optional<std::string>> version;
+            json::described<"Project; supplied by the execution context when absent", std::optional<std::string>> project;
+            json::described<"The run configuration", std::string> configuration;
+            json::described<"Build configurations to run on; the run configuration's own if absent", std::optional<std::vector<std::string>>> configurations;
+            json::described<"Worldline to build; task binding when absent; explicit selection required without a task", std::optional<std::string>> worldline;
+            json::described<"Version of the worldline to build; its current one when absent", std::optional<std::string>> version;
+            json::described<"Capture changes under these project-relative paths into the selected worldline", std::optional<std::vector<std::string>>> capture_worktree_changes;
+            json::described<"Stable operation ID for a captured contribution and its retries", std::optional<std::string>> operation_id;
         };
         using output = results;
 
@@ -129,7 +137,8 @@ export namespace tools {
             auto e = config::resolve(*s.snapshot(), project);
             auto& r = e.run(in.configuration.value());
             auto names = in.configurations.value().value_or(r.configurations);
-            std::vector<std::pair<config::effective_config, std::vector<jobs::step>>> jobs;
+            auto capture = capture_input(in.capture_worktree_changes.value(), in.operation_id.value(), "run", in);
+            std::vector<detail::planned_job> jobs;
             for (auto* c : e.pick(names, r.spec.operation)) {
                 auto build = *c;
                 for (auto& [key, value] : r.spec.env)
@@ -138,7 +147,7 @@ export namespace tools {
                 jobs.push_back(detail::operation(std::move(build), {.operation = r.spec.operation, .parameters = r.spec.parameters}));
             }
             co_return co_await execute_all(s, context, project, r.spec.operation, false, false, std::move(jobs), note,
-                                           execution_line(actor, in.worldline.value()), in.version.value().value_or(""), actor);
+                                           execution_line(actor, in.worldline.value()), in.version.value().value_or(""), actor, std::move(capture));
         }
     };
 
@@ -154,7 +163,7 @@ export namespace tools {
             co_return out;
         if (operation_id.empty())
             throw tool_error(nodes::code::invalid_record, "generation names an operation_id");
-        std::string input = content::hash_of(rfl::json::write(parameters)).str();
+        std::string input = content::hash_of(json::write(parameters)).str();
         auto apply_once = [&]() -> coroutine::task<mutation> {
             auto observed = co_await main_tree(s, project, actor);
             std::vector<change> changes;
@@ -164,7 +173,7 @@ export namespace tools {
                 changes.push_back({.kind = std::string{"create"}, .path = file.path, .text = file.text});
             }
             auto r = co_await main_apply(s, project, actor, observed, std::move(changes), operation_id, "generate " + parameters.template_id,
-                                         rfl::json::write(record{input}));
+                                         json::write(record{input}));
             co_return mutation{r.version, r.receipt, operation_id, r.replayed};
         };
         out.receipt = co_await once<mutation>(s, project, actor, operation_id, input, std::move(apply_once),
@@ -183,16 +192,16 @@ export namespace tools {
                                  "references returned by language(scopes). Pass tokens to worldline(apply); renew or release each token. "
                                  "Conflicts return immediately. A single agent never needs this: apply locks implicitly."> {
         struct input {
-            rfl::Description<"Project; supplied by the execution context when absent", std::optional<std::string>> project;
-            rfl::Description<"acquire, renew, release or list", std::string> action;
-            rfl::Description<"Task worldline; explicit selection required without execution context", std::optional<std::string>> worldline;
-            rfl::Description<"acquire: scope references returned by language", std::optional<std::vector<std::string>>> scopes;
-            rfl::Description<"acquire: whole files, including empty and binary files", std::optional<std::vector<std::string>>> files;
-            rfl::Description<"acquire: path entries for create/remove/move", std::optional<std::vector<std::string>>> entries;
-            rfl::Description<"acquire with files/entries: observed version", std::optional<std::string>> version;
-            rfl::Description<"acquire: unique operation ID", std::optional<std::string>> operation_id;
-            rfl::Description<"renew/release: lease token", std::optional<std::string>> token;
-            rfl::Description<"Lease duration, 1 through 600 seconds; default 120", std::optional<std::uint64_t>> seconds;
+            json::described<"Project; supplied by the execution context when absent", std::optional<std::string>> project;
+            json::described<"acquire, renew, release or list", std::string> action;
+            json::described<"Task worldline; explicit selection required without execution context", std::optional<std::string>> worldline;
+            json::described<"acquire: scope references returned by language", std::optional<std::vector<std::string>>> scopes;
+            json::described<"acquire: whole files, including empty and binary files", std::optional<std::vector<std::string>>> files;
+            json::described<"acquire: path entries for create/remove/move", std::optional<std::vector<std::string>>> entries;
+            json::described<"acquire with files/entries: observed version", std::optional<std::string>> version;
+            json::described<"acquire: unique operation ID", std::optional<std::string>> operation_id;
+            json::described<"renew/release: lease token", std::optional<std::string>> token;
+            json::described<"Lease duration, 1 through 600 seconds; default 120", std::optional<std::uint64_t>> seconds;
         };
         struct output {
             std::string worldline, version;
@@ -225,10 +234,10 @@ export namespace tools {
                                        "decode them in offset order into a local file, and preserve its executable flag. "
                                        "Continue at next_offset until eof; no source synchronization is required."> {
         struct input {
-            rfl::Description<"Project that produced the artifact; supplied by execution context when absent", std::optional<std::string>> project;
-            rfl::Description<"Digest returned in exports or a step log", std::string> digest;
-            rfl::Description<"Byte offset; defaults to zero", std::optional<std::uint64_t>> offset;
-            rfl::Description<"Bytes to retrieve, 1 through 65536; defaults to 65536", std::optional<std::uint64_t>> length;
+            json::described<"Project that produced the artifact; supplied by execution context when absent", std::optional<std::string>> project;
+            json::described<"Digest returned in exports or a step log", std::string> digest;
+            json::described<"Byte offset; defaults to zero", std::optional<std::uint64_t>> offset;
+            json::described<"Bytes to retrieve, 1 through 65536; defaults to 65536", std::optional<std::uint64_t>> length;
         };
         struct output {
             std::string digest;
@@ -253,15 +262,15 @@ export namespace tools {
     struct task : tool<"task", "Create a task on an explicit worldline, fork a task worldline, start an execution, stop a run or close a task. Only the "
                                "orchestrator's account credential can administer tasks."> {
         struct input {
-            rfl::Description<"Project", std::string> project;
-            rfl::Description<"create, fork, start, stop or close", std::string> action;
-            rfl::Description<"Task identifier", std::string> task;
-            rfl::Description<"create/fork: task worldline", std::optional<std::string>> worldline;
-            rfl::Description<"fork: source worldline", std::optional<std::string>> from;
-            rfl::Description<"fork: source version", std::optional<std::string>> version;
-            rfl::Description<"create/fork/start: unique operation ID", std::optional<std::string>> operation_id;
-            rfl::Description<"stop: execution identifier", std::optional<std::string>> run;
-            rfl::Description<"start: permit source writes; default true", std::optional<bool>> writable;
+            json::described<"Project", std::string> project;
+            json::described<"create, fork, start, stop or close", std::string> action;
+            json::described<"Task identifier", std::string> task;
+            json::described<"create/fork: task worldline", std::optional<std::string>> worldline;
+            json::described<"fork: source worldline", std::optional<std::string>> from;
+            json::described<"fork: source version", std::optional<std::string>> version;
+            json::described<"create/fork/start: unique operation ID", std::optional<std::string>> operation_id;
+            json::described<"stop: execution identifier", std::optional<std::string>> run;
+            json::described<"start: permit source writes; default true", std::optional<bool>> writable;
         };
         struct output {
             std::string task, worldline;
@@ -295,7 +304,7 @@ export namespace tools {
                 auto base = co_await selected(s, project, *in.from.value(), *in.version.value(), actor);
                 request.action = "fork";
                 request.source = base.frontier;
-                request.result = rfl::json::write(std::tuple{in.task.value(), *in.from.value(), *in.version.value()});
+                request.result = json::write(std::tuple{in.task.value(), *in.from.value(), *in.version.value()});
             }
             auto result = co_await node_call(s, project, std::move(request), actor);
             if (!result.execution)

@@ -2,7 +2,7 @@ import std;
 import boost.ut;
 import build;
 import support;
-import reflection;
+import json;
 import projectmodel;
 import delivery;
 import toolchain;
@@ -24,7 +24,7 @@ namespace {
                                                     .variants = {{{"target", "jvm"}}}},
                                                    {.id = "test", .project = "library", .language = "kotlin", .directory = "library"},
                                                    {.id = "app", .project = "app", .language = "kotlin", .directory = "app", .references = {ref}}}};
-            auto read = [&] { return projectmodel::read(rfl::json::write(model)); };
+            auto read = [&] { return projectmodel::read(json::write(model)); };
             expect(read().units.size() == 3_u);
             model.units[1].variants = model.units[0].variants;
             expect(throws<std::invalid_argument>(read));
@@ -101,9 +101,9 @@ namespace {
             projectmodel::document model{
                 .producer = "test", .producer_version = "current", .units = {{.id = "main", .project = "app", .language = "fsharp", .directory = "."}}};
             expect(!projectmodel::loads_code(model));
-            model.units[0].extensions["type_providers"] = rfl::Generic{false};
+            model.units[0].extensions["type_providers"] = json::value{false};
             expect(!projectmodel::loads_code(model));
-            model.units[0].extensions["type_providers"] = rfl::Generic{true};
+            model.units[0].extensions["type_providers"] = json::value{true};
             expect(projectmodel::loads_code(model));
             model.units[0].extensions.clear();
             model.units[0].references = {projectmodel::artifact_reference{.object = {std::string(64, 'a'), "Library.dll"}, .role = "classpath"}};
@@ -136,46 +136,46 @@ namespace {
                            .sources = {"Library.fsi", "Library.fs"},
                            .references = {projectmodel::artifact_reference{.object = {hash, "Library.dll"}, .role = "classpath"},
                                           projectmodel::sdk_reference{.name = "sdk/dotnet", .path = "ref/Core.dll", .role = "classpath"}}}}};
-            test::spit(temp.dir / "model.json", rfl::json::write(model));
+            test::spit(temp.dir / "model.json", json::write(model));
             auto measured = builds::inspect({"model", "project_model", "model.json"}, temp.dir);
             expect(measured.units == 1_u);
-            auto parsed = projectmodel::read(rfl::json::write(model));
+            auto parsed = projectmodel::read(json::write(model));
             std::vector<toolchain::binding> bindings{{"sdk/dotnet", "sdk-object", {sdk.string()}}};
             projectmodel::installed(parsed, temp.dir / "objects", bindings);
             model.units[0].references = {projectmodel::artifact_reference{.object = {"invalid", "Library.dll"}, .role = "classpath"}};
-            test::spit(temp.dir / "model.json", rfl::json::write(model));
+            test::spit(temp.dir / "model.json", json::write(model));
             expect(throws<std::invalid_argument>([&] { builds::inspect({"model", "project_model", "model.json"}, temp.dir); }));
         };
     };
-    template <class Params, class Result> void conforms(const rfl::Generic& params, const rfl::Generic& result) {
-        (void)rfl::json::read<Params>(rfl::json::write(params)).value();
-        (void)rfl::json::read<Result>(rfl::json::write(result)).value();
+    template <class Params, class Result> void conforms(const json::value& params, const json::value& result) {
+        (void)json::read<Params>(json::write(params)).value();
+        (void)json::read<Result>(json::write(result)).value();
     }
     // Each line holds one helper exchange; both sides must read as the published wire types.
     auto conforming_transcript(const std::filesystem::path& path) -> std::size_t {
-        namespace wire = language::helper;
+        namespace json = language::helper;
         struct exchange {
-            wire::message<rfl::Generic> message;
-            wire::response<rfl::Generic> response;
+            json::message<json::value> message;
+            json::response<json::value> response;
         };
         std::ifstream file{path};
         std::size_t count = 0;
         for (std::string line; std::getline(file, line); ++count) {
-            const auto [message, response] = rfl::json::read<exchange>(line).value();
+            const auto [message, response] = json::read<exchange>(line).value();
             if (response.request_id != message.request_id || response.error || !response.result)
                 throw std::runtime_error("helper exchange " + std::to_string(message.request_id) + " did not succeed");
             const auto& params = message.params;
             const auto& result = *response.result;
             if (message.operation == "open")
-                conforms<wire::opening, rfl::Generic>(params, result);
+                conforms<json::opening, json::value>(params, result);
             else if (message.operation == "update")
-                conforms<wire::installation, rfl::Generic>(params, result);
+                conforms<json::installation, json::value>(params, result);
             else if (message.operation == "units")
-                conforms<wire::selection, std::vector<semantic::unit_key>>(params, result);
+                conforms<json::selection, std::vector<semantic::unit_key>>(params, result);
             else if (message.operation == "evaluate")
-                conforms<wire::evaluation, wire::evaluation_result>(params, result);
+                conforms<json::evaluation, json::evaluation_result>(params, result);
             else if (message.operation == "observe")
-                conforms<wire::observation, std::vector<semantic::input_object>>(params, result);
+                conforms<json::observation, std::vector<semantic::input_object>>(params, result);
             // Graceful shutdown is a host convenience outside the worker contract.
             else if (message.operation != "close")
                 throw std::runtime_error("helper transcript names unknown operation " + message.operation);
@@ -189,13 +189,13 @@ auto main(int argc, const char** argv) -> int {
     // Keep argv access behind a built-in short circuit; UT overloads logical
     // operators for its comparison expressions in this translation unit.
     if (argc == 3 && std::string_view{argv[1]}.compare("--unit") == 0) {
-        std::ofstream{argv[2]} << rfl::json::write(semantic::unit{.id = "unit", .context = "context"});
+        std::ofstream{argv[2]} << json::write(semantic::unit{.id = "unit", .context = "context"});
         return 0;
     }
     if (argc == 3 && (std::string_view{argv[1]}.compare("--shard") == 0 || std::string_view{argv[1]}.compare("--read-shard") == 0)) {
         try {
             std::ifstream file{argv[2]};
-            auto shard = rfl::json::read<semantic::shard>(std::string{std::istreambuf_iterator<char>{file}, {}}).value();
+            auto shard = json::read<semantic::shard>(std::string{std::istreambuf_iterator<char>{file}, {}}).value();
             const auto actual = semantic::contributions(std::as_const(shard));
             if (actual != shard.unit.contributions || shard.symbols.empty() || (std::string_view{argv[1]}.compare("--shard") == 0 && shard.references.empty()))
                 throw std::runtime_error("helper shard has inconsistent contributions");
@@ -219,7 +219,7 @@ auto main(int argc, const char** argv) -> int {
         try {
             std::ifstream file{argv[2]};
             auto model = projectmodel::read(std::string{std::istreambuf_iterator<char>{file}, {}});
-            auto bindings = rfl::json::read<std::vector<toolchain::binding>>(std::getenv("FUGHETTA_SDKS")).value();
+            auto bindings = json::read<std::vector<toolchain::binding>>(std::getenv("FUGHETTA_SDKS")).value();
             const auto path = std::filesystem::path{argv[2]};
             const auto storage = path.parent_path() / ".admitted";
             delivery::capture_model(path.parent_path(), {"model", "project_model", path.filename().string()}, std::getenv("FUGHETTA_STAGING"), storage);

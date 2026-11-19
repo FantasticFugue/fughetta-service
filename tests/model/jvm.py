@@ -97,9 +97,9 @@ JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM* vm, void*) {
         run([compiler, "-shared", "-fPIC", "-g", "-I" + sdk + "/include", "-I" + sdk + "/include/linux", "native.cpp", "-o", "libnative.so"], root)
         run([compiler, "-S", "-emit-llvm", "-fPIC", "-g", "-I" + sdk + "/include", "-I" + sdk + "/include/linux", "native.cpp", "-o", "native.ll"], root)
         run([compiler, "-c", "-fPIC", "-g", "-I" + sdk + "/include", "-I" + sdk + "/include/linux", "native.cpp", "-o", "native.o"], root)
-        reader = os.environ.get("TEST_NATIVE_HOST") or shutil.which("fughetta-native")
+        reader = os.environ.get("TEST_LLVM_HOST") or shutil.which("fughetta-llvm")
         if not reader:
-            raise RuntimeError("the Kotlin JNI flow requires fughetta-native")
+            raise RuntimeError("the Kotlin JNI flow requires fughetta-llvm")
         put(root, "native.json", run([reader, "libnative.so", "--ir", "native.ll"], root))
         put(root, "native-object.json", run([reader, "native.o"], root))
         put(root, "inline.cpp", """__attribute__((always_inline)) inline int inline_leaf(int value) {

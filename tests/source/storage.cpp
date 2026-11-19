@@ -25,6 +25,8 @@ namespace {
             test::spit(tmp.dir / "a.txt", "second");
             w.rescan();
             expect(throws<storage::stale_blob>([&] { w.blob_part(content::hash_of("first"), 0, 5); }));
+            part = w.blob_part(content::hash_of("second"), 2, 3);
+            expect(std::string_view{reinterpret_cast<const char*>(part.data()), part.size()} == "con");
         };
 
         "ignored paths are not tracked"_test = [] {

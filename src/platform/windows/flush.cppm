@@ -1,6 +1,7 @@
 module;
 #include <aclapi.h>
 #include <windows.h>
+#include <winioctl.h>
 module durability;
 import std;
 import constants;
@@ -67,6 +68,59 @@ namespace durability {
             }
         }
     } // namespace
+    auto try_clone_file(const std::filesystem::path& source, const std::filesystem::path& destination) -> bool {
+        auto input = open(source, GENERIC_READ);
+        const auto path = winapi::path(destination);
+        std::wstring volume(32768, L'\0');
+        DWORD sectors = 0, sector_size = 0, free_clusters = 0, clusters = 0;
+        if (!::GetVolumePathNameW(winapi::path(destination.parent_path()).c_str(), volume.data(), static_cast<DWORD>(volume.size())) ||
+            !::GetDiskFreeSpaceW(volume.c_str(), &sectors, &sector_size, &free_clusters, &clusters) || !sectors || !sector_size)
+            return false;
+        const auto cluster = LONGLONG{sectors} * sector_size;
+        LARGE_INTEGER size{};
+        if (!::GetFileSizeEx(input.value, &size))
+            winapi::fail("read clone source size");
+        const auto aligned = size.QuadPart / cluster * cluster;
+        if (!aligned)
+            return false;
+
+        auto output = open(destination, GENERIC_WRITE, CREATE_NEW);
+        try {
+            if (!::SetFilePointerEx(output.value, size, nullptr, FILE_BEGIN) || !::SetEndOfFile(output.value))
+                winapi::fail("size clone destination");
+            // ReFS accepts less than 4 GiB per request. Copy only the unaligned tail.
+            const auto batch = ((1ll << 32) - 1) / cluster * cluster;
+            for (LONGLONG offset = 0; offset < aligned;) {
+                DUPLICATE_EXTENTS_DATA range{.FileHandle = input.value};
+                range.SourceFileOffset.QuadPart = offset;
+                range.TargetFileOffset.QuadPart = offset;
+                range.ByteCount.QuadPart = std::min(batch, aligned - offset);
+                DWORD count = 0;
+                if (!::DeviceIoControl(output.value, FSCTL_DUPLICATE_EXTENTS_TO_FILE, &range, sizeof range, nullptr, 0, &count, nullptr)) {
+                    output.reset();
+                    remove_file(destination);
+                    return false;
+                }
+                offset += range.ByteCount.QuadPart;
+            }
+            if (aligned != size.QuadPart) {
+                LARGE_INTEGER tail{};
+                tail.QuadPart = aligned;
+                if (!::SetFilePointerEx(input.value, tail, nullptr, FILE_BEGIN) || !::SetFilePointerEx(output.value, tail, nullptr, FILE_BEGIN))
+                    winapi::fail("seek clone tail");
+                std::vector<std::byte> bytes(static_cast<std::size_t>(size.QuadPart - aligned));
+                DWORD count = 0;
+                if (!::ReadFile(input.value, bytes.data(), static_cast<DWORD>(bytes.size()), &count, nullptr) || count != bytes.size())
+                    winapi::fail("read clone tail");
+                write(output.value, bytes);
+            }
+        } catch (...) {
+            output.reset();
+            remove_file(destination);
+            throw;
+        }
+        return true;
+    }
     void write_part(const std::filesystem::path& path, std::uint64_t offset, std::span<const std::byte> bytes, bool complete) {
         auto file = open(path, GENERIC_WRITE, OPEN_ALWAYS);
         if (offset > static_cast<std::uint64_t>(std::numeric_limits<LONGLONG>::max()))
@@ -99,6 +153,22 @@ namespace durability {
         }
         for (auto& dir : std::views::reverse(directories))
             sync_dir(dir);
+    }
+    void touch_file(const std::filesystem::path& path) {
+        winapi::handle file{::CreateFileW(winapi::path(path).c_str(), FILE_READ_ATTRIBUTES | FILE_WRITE_ATTRIBUTES,
+                                         FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
+                                         FILE_FLAG_OPEN_REPARSE_POINT, nullptr)};
+        if (file.value == INVALID_HANDLE_VALUE)
+            winapi::fail("open file for timestamp update");
+        FILE_ATTRIBUTE_TAG_INFO info{};
+        if (!::GetFileInformationByHandleEx(file.value, FileAttributeTagInfo, &info, sizeof(info)))
+            winapi::fail("inspect file for timestamp update");
+        if ((info.FileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)) != 0)
+            throw unreadable{path.string()};
+        FILETIME now;
+        ::GetSystemTimeAsFileTime(&now);
+        if (!::SetFileTime(file.value, nullptr, nullptr, &now))
+            winapi::fail("update modification time");
     }
     void durable_rename(const std::filesystem::path& from, const std::filesystem::path& to) {
         if (!::MoveFileExW(winapi::path(from).c_str(), winapi::path(to).c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH))

@@ -19,11 +19,110 @@ import fixture;
 import templates;
 import content;
 import package;
-import reflection;
+import json;
+import knowledge;
 namespace {
     using namespace boost::ut;
     using namespace std::chrono_literals;
     using ctx = native::scheduler;
+    auto observed_test(tools::services& services, mcp::notifier& note, const worlds::actor& actor) -> coroutine::task<> {
+        const std::string project = "observe";
+        const auto initial = co_await tools::selected(services, project, "main", "", actor);
+        const auto host = std::filesystem::path{__FILE__}.parent_path().parent_path().parent_path() / "providers/python/runtime.py";
+        std::ifstream script{host, std::ios::binary};
+        if (!script)
+            throw std::runtime_error("cannot read Python runtime host fixture");
+        const std::string text{std::istreambuf_iterator<char>{script}, {}};
+        const auto written = co_await tools::worldline::run(services, {}, {.project = project, .action = "apply", .worldline = std::string{"main"},
+            .observed = initial.version, .operation_id = std::string{"seed-python"}, .changes = std::vector<tools::change>{
+                {.kind = "create", .path = "runtime.py", .text = text},
+                {.kind = "create", .path = "sample.py", .text = std::string{"def convert(value):\n    return str(value)\n"}},
+                {.kind = "create", .path = "suite.py", .text = std::string{"from sample import convert\nassert convert(3) == '3'\n"}}}}, note, actor);
+        const auto source = co_await tools::selected(services, project, "main", written.version.value(), actor);
+        content::manifest manifest;
+        for (const auto& file : source.files)
+            manifest.files.push_back({file.path, file.digest, file.size, file.executable});
+        const semantic::snapshot pin{project, "main", source.version, manifest.id().str()};
+        const auto base = co_await services.files.with_semantic(services.core, [pin](semantic::store& store) {
+            semantic::shard shard;
+            shard.unit = semantic::make_unit({{pin.project, "static", "ty", "evaluate", semantic::unit_kind::file, "sample.py"}, "ty"}, "static-context");
+            const semantic::ownership owner{shard.unit.id, shard.unit.context};
+            shard.identities = {{semantic::native_identity{pin.project, "sample", "ty", "source", "convert"}, "convert"}};
+            shard.symbols = {{.id = "convert", .ownership = owner, .language = "python", .domain = "source", .module = "sample",
+                              .name = "convert", .qualified_name = "sample.convert", .kind = "function"}};
+            shard.occurrences = {{.id = "definition", .ownership = owner, .symbol = "convert", .location = {.source = semantic::place{"sample.py", 0, 40}},
+                                  .roles = {std::string{"definition"}}, .selection = semantic::place{"sample.py", 4, 11}}};
+            auto id = store.publish_records({.snapshots = {pin}, .configuration = "static"}, {std::move(shard)}, {});
+            store.make_current(id);
+            return id;
+        });
+        auto run = [&]() -> coroutine::task<semantic::view_id> {
+            const auto result = co_await tools::test::run(services, {}, {.project = project, .worldline = std::string{"main"}}, note, actor);
+            if (!result.ok || result.results.size() != 1 || result.results.front().runtime_observation_error ||
+                result.results.front().runtime_observation_views.size() != 1)
+                throw std::runtime_error("Python test observations were not published: " + config::write(result));
+            co_return result.results.front().runtime_observation_views.front();
+        };
+        auto inspect = [&](const semantic::view_id& view) {
+            return tools::language_query::run(services, {}, {.project = project, .action = semantic::tool_action::make<"inspect">(),
+                .selector = semantic::selection{.name = semantic::named{"convert"}}, .view = view, .include = std::vector<std::string>{"type"}}, note, actor);
+        };
+        const auto first = co_await run();
+        const auto second = co_await run();
+        for (const auto& view : {first, second}) {
+            const auto inspected = co_await inspect(view);
+            std::map<std::string, std::string> observed;
+            for (const auto& range : inspected.typed_ranges)
+                if (range.confidence == "runtime_observed" && range.observation)
+                    if (const auto type = std::ranges::find(inspected.types, range.type, &semantic::records::type::id); type != inspected.types.end() && type->name)
+                        observed.emplace(range.observation->slot, *type->name);
+            expect(inspected.typed_ranges.size() == 2u && observed == std::map<std::string, std::string>{{"value", "builtins.int"}, {"return", "builtins.str"}});
+        }
+        const auto original = co_await inspect(base);
+        expect(first != second && original.typed_ranges.empty());
+    }
+    auto captured_build(tools::services& services, mcp::notifier& note, const worlds::actor& actor) -> coroutine::task<> {
+        const std::string project = "capture";
+        const auto initial = co_await tools::selected(services, project, "main", "", actor);
+        auto source = [&](tools::worldline::input request) {
+            request.project = project;
+            request.worldline = std::string{"main"};
+            return tools::worldline::run(services, {}, std::move(request), note, actor);
+        };
+        co_await source({.action = "apply", .observed = initial.version, .operation_id = std::string{"seed"},
+            .changes = std::vector<tools::change>{{.kind = "create", .path = "src/change.txt", .text = std::string{"original"}},
+                                                  {.kind = "create", .path = "src/drop.txt", .text = std::string{"keep"}},
+                                                  {.kind = "create", .path = "src/payload", .text = std::string{"old"}}}});
+        tools::build::input invocation{.project = project, .worldline = std::string{"main"},
+            .capture_worktree_changes = std::vector<std::string>{"src"}, .operation_id = std::string{"generate"}};
+        const auto built = co_await tools::build::run(services, {}, invocation, note, actor);
+        if (!built.ok || !built.worktree_commit)
+            throw std::runtime_error("worktree build failed: " + config::write(built));
+        const auto read = co_await tools::node_call(services, project, {.action = "read", .target = "src/change.txt"}, actor, true);
+        const auto generated = co_await tools::selected(services, project, "main", "", actor);
+        std::vector<std::string> paths;
+        for (const auto& file : generated.files)
+            paths.push_back(file.path);
+        expect(read.files.front().text == "formatted" && paths == std::vector<std::string>{"src/change.txt", "src/generated.txt", "src/payload"} &&
+               generated.files.back().kind == "binary");
+        const auto retried = co_await tools::build::run(services, {}, invocation, note, actor);
+        expect(retried.ok && retried.worktree_commit && retried.worktree_commit->replayed &&
+               retried.worktree_commit->receipt == built.worktree_commit->receipt && retried.results.empty());
+        const auto reversed = co_await source({.action = "reverse", .observed = generated.version, .target = generated.frontier.front(),
+                                               .operation_id = std::string{"undo-generator"}});
+        const auto restored = co_await tools::node_call(services, project, {.action = "inspect", .revision = reversed.version.value()}, actor, true);
+        std::map<std::string, std::string> restored_files;
+        for (const auto& file : restored.files)
+            restored_files.emplace(file.path, file.text);
+        expect(restored_files == std::map<std::string, std::string>{{"src/change.txt", "original"}, {"src/drop.txt", "keep"}, {"src/payload", "old"}});
+        const auto edited = co_await source({.action = "apply", .observed = reversed.version, .operation_id = std::string{"human-edit"},
+            .changes = std::vector<tools::change>{{.kind = "write", .path = "src/change.txt", .text = std::string{"human"}}}});
+        invocation.version = reversed.version;
+        invocation.operation_id = std::string{"stale-generator"};
+        const auto conflict = co_await tools::build::run(services, {}, invocation, note, actor);
+        const auto head = co_await tools::selected(services, project, "main", "", actor);
+        expect(!conflict.ok && !conflict.worktree_commit && conflict.worktree_error_code == "source_conflict" && head.version == edited.version);
+    }
     auto worker_loop(ctx& io, std::uint16_t port, replica::service& worker) -> coroutine::task<> {
         auto run_operation = [&]() -> coroutine::task<> {
             auto sock = co_await io::connect(io, {net::ip::address_v4{{127, 0, 0, 1}}, port});
@@ -108,7 +207,7 @@ namespace {
                 observed.files.push_back({.path = "f", .kind = std::string{"text"}, .text = "é{ret 1}\né{ret 1}\n"});
                 const std::map<std::string, semantic::place> located{{"second", {"f", 9, 18}}, {"elsewhere", {"g", 0, 1}}};
                 auto edits = [&](std::string_view changes) {
-                    return tools::edits_of(rfl::json::read<std::vector<tools::change>>(changes).value(), observed, {}, located);
+                    return tools::edits_of(json::read<std::vector<tools::change>>(changes).value(), observed, {}, located);
                 };
                 auto scoped = edits(R"([{"kind":"replace","path":"f","old_text":"ret 1","new_text":"ret 2","scope":"second"}])");
                 expect(fatal(scoped.size() == 1u));
@@ -153,6 +252,26 @@ namespace {
                     project.default_configurations = {"print"};
                     configuration.projects["tiny"] = {};
                     configuration.projects["full"] = {};
+                    auto generator = fixture::commands({"python", "-c", R"py(
+from pathlib import Path
+Path('src/change.txt').write_text('formatted', encoding='utf8')
+Path('src/drop.txt').unlink()
+Path('src/generated.txt').write_text('generated', encoding='utf8')
+Path('src/payload').write_bytes(bytes((0, 255)))
+Path('outside.txt').touch()
+for path in ('src/build', 'src/__pycache__'):
+    Path(path).mkdir()
+    (Path(path) / 'metadata').touch()
+)py"});
+                    fixture::options<"command">(generator.builders.at("main")).operations.at("build").build_dirs = {"src/build"};
+                    configuration.projects["capture"].build_configurations["generate"] = std::move(generator);
+                    configuration.projects["capture"].default_configurations = {"generate"};
+                    auto observed = fixture::commands({"python", "-c", "pass"}, {},
+                        {"python", "-I", "runtime.py", "harvest", "sample", "--function", "convert", "--test-module", "suite", "--output", "observed.json"});
+                    fixture::options<"command">(observed.builders.at("main")).operations.at("test").outputs["observations"] =
+                        {.type = "python-runtime", .path = "observed.json"};
+                    configuration.projects["observe"].build_configurations["python"] = std::move(observed);
+                    configuration.projects["observe"].default_configurations = {"python"};
                     config::validate(configuration);
                     config::slots config{1, std::make_shared<const config::document>(std::move(configuration))};
                     cores::io_context<native::context> rt{1};
@@ -235,6 +354,8 @@ namespace {
                                                                                                                                       co_await execution::
                                                                                                                                           schedule_after(io,
                                                                                                                                                          1ms);
+                                                                                                                                  co_await captured_build(services, note, tester);
+                                                                                                                                  co_await observed_test(services, note, tester);
                                                                                                                                   auto line =
                                                                                                                                       [&](tools::worldline::
                                                                                                                                               input in)
@@ -1662,7 +1783,7 @@ def publication(path):
         'tools': {'executables': [], 'complete': True},
         'configurations': {'commands': {}, 'complete': False},
         'symbols': [{'id': 'probe', 'name': 'probe', 'qualified_name': 'probe', 'kind': 'variable',
-                     'modifiers': [], 'visibility': 'public', 'parameters': [], 'attributes': []}],
+                     'modifiers': [], 'visibility': 'public', 'parameters': [], 'attributes': [], 'extensions': {}}],
         'types': [], 'scopes': [], 'relations': [], 'typed_ranges': [], 'typedRanges': [], 'identities': ['probe'],
         'occurrences': [
             {'symbol': 'probe', 'role': 'Definition', 'location': location, 'candidates': [], 'resolution': 'resolved', 'roles': []},
@@ -1728,7 +1849,7 @@ while True:
                                                                                                                                           "time.sleep(0.1); "
                                                                                                                                           "[Path(name).write_"
                                                                                                                                           "text(" +
-                                                                                                                                          rfl::json::write(
+                                                                                                                                          json::write(
                                                                                                                                               language_server) +
                                                                                                                                           ") for name in "
                                                                                                                                           "('serve', "
@@ -1870,7 +1991,7 @@ while True:
                                                                                                                                               0u &&
                                                                                                                                           extended.items
                                                                                                                                                   .size() == 1u)
-                                                                                                                                          << rfl::json::write(
+                                                                                                                                          << json::write(
                                                                                                                                                  extended);
                                                                                                                                       symbols = co_await tools::
                                                                                                                                           language_query::run(
@@ -1996,7 +2117,7 @@ while True:
                                                                                                                                               0 &&
                                                                                                                                           shared.reused_units ==
                                                                                                                                               1u)
-                                                                                                                                          << rfl::json::write(
+                                                                                                                                          << json::write(
                                                                                                                                                  shared);
                                                                                                                                       auto records =
                                                                                                                                           co_await registry.with_ledger(
@@ -2303,11 +2424,11 @@ while True:
                                                                                                                                               "{\"project\":"
                                                                                                                                               "\"app\","
                                                                                                                                               "\"action\":" +
-                                                                                                                                              rfl::json::write(
+                                                                                                                                              json::write(
                                                                                                                                                   std::string{
                                                                                                                                                       action}) +
                                                                                                                                               "}";
-                                                                                                                                          expect(!rfl::json::read<
+                                                                                                                                          expect(!json::read<
                                                                                                                                                  tools::
                                                                                                                                                      language_query::
                                                                                                                                                          input>(
@@ -2331,8 +2452,8 @@ while True:
                                                                                                                                   auto malformed =
                                                                                                                                       co_await box.call(
                                                                                                                                           "build",
-                                                                                                                                          rfl::json::read<
-                                                                                                                                              rfl::Generic>(
+                                                                                                                                          json::read<
+                                                                                                                                              json::value>(
                                                                                                                                               R"({"project":"app","fresh":"not-a-boolean"})")
                                                                                                                                               .value(),
                                                                                                                                           note, tester);
@@ -3800,7 +3921,7 @@ while True:
                                                                                                                                       auto text = test::slurp(
                                                                                                                                           manifest_path);
                                                                                                                                       auto doubled =
-                                                                                                                                          rfl::json::read<
+                                                                                                                                          json::read<
                                                                                                                                               package::
                                                                                                                                                   manifest>(
                                                                                                                                               text)
@@ -3814,7 +3935,7 @@ while True:
                                                                                                                                           copy);
                                                                                                                                       test::spit(
                                                                                                                                           manifest_path,
-                                                                                                                                          rfl::json::write(
+                                                                                                                                          json::write(
                                                                                                                                               doubled));
                                                                                                                                       auto run_operation = [&]()
                                                                                                                                           -> coroutine::task<> {

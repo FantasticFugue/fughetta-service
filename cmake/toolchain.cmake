@@ -12,8 +12,9 @@
 #
 # CLANG_STDLIB selects the standard library clang compiles and CLANG_SANITIZER
 # names the sanitizers, if any. CMake 4.5's import std support synthesizes the
-# std module from the selected library's own manifest, so the compiler, the
-# library and the module always agree.
+# std module from the selected library's own manifest (the Visual Studio
+# toolset's for the MSVC STL), so the compiler, the library and the module
+# always agree.
 #
 # The same file serves every repository that builds with it.
 set(CLANG_ROOT "$ENV{CLANG_ROOT}" CACHE PATH "clang tree")
@@ -27,8 +28,8 @@ endif()
 # Each host names its drivers, the standard libraries it offers (the first
 # is the default), the option that selects one, the option that keeps frame
 # pointers, and the target clang compiles for when its default is not the
-# one wanted. Windows uses clang-cl and the MSVC ABI, whose configuration
-# file in the clang tree already selects libc++.
+# one wanted. Windows uses upstream clang-cl with the MSVC STL and the
+# Windows SDK of the Visual Studio installation, which clang-cl finds itself.
 
 set(CLANG_ARCH_x86_64 x86_64)
 set(CLANG_ARCH_AMD64 x86_64)
@@ -44,7 +45,7 @@ set(CLANG_STDLIBS_Darwin libc++)
 set(CLANG_STDLIB_OPTION_Darwin "-stdlib=@CLANG_STDLIB@")
 set(CLANG_FRAME_POINTER_OPTION_Darwin -fno-omit-frame-pointer)
 set(CLANG_DRIVERS_Windows clang-cl)
-set(CLANG_STDLIBS_Windows libc++)
+set(CLANG_STDLIBS_Windows msvc)
 set(CLANG_FRAME_POINTER_OPTION_Windows /Oy-)
 set(CLANG_TARGET_Windows "@CLANG_ARCH@-pc-windows-msvc")
 
@@ -109,7 +110,8 @@ endif()
 # triplet from the tables below. On Windows, libtool unpacks archives with
 # lib /EXTRACT, which llvm-lib lacks, so the ports archive with Microsoft's
 # lib from the vcvars environment vcpkg loads for them; the triplet reads
-# that environment when a port builds.
+# that environment when a port builds. Ports that require an old CMake
+# (sqlite3) would ignore the static runtime without the CMP0091 default.
 
 set(TRIPLET_ARCH_x86_64 x64)
 set(TRIPLET_ARCH_aarch64 arm64)
@@ -122,12 +124,13 @@ set(TRIPLET_SETTINGS_Windows [[
 set(VCPKG_CRT_LINKAGE static)
 set(VCPKG_LOAD_VCVARS_ENV ON)
 file(TO_CMAKE_PATH "$ENV{VCToolsInstallDir}" VCPKG_MSVC_TOOLS)
-set(VCPKG_CMAKE_CONFIGURE_OPTIONS "-DCMAKE_AR=${VCPKG_MSVC_TOOLS}/bin/Host${VCPKG_TARGET_ARCHITECTURE}/${VCPKG_TARGET_ARCHITECTURE}/lib.exe")]])
+set(VCPKG_CMAKE_CONFIGURE_OPTIONS "-DCMAKE_AR=${VCPKG_MSVC_TOOLS}/bin/Host${VCPKG_TARGET_ARCHITECTURE}/${VCPKG_TARGET_ARCHITECTURE}/lib.exe" -DCMAKE_POLICY_DEFAULT_CMP0091=NEW)]])
 
 set(TRIPLET_ARCH "${TRIPLET_ARCH_${CLANG_ARCH}}")
-# An MSVC link embeds its manifest with a manifest tool, which the clang tree
-# lacks; the newest Windows SDK, which names architectures as vcpkg does,
-# ships one. Other hosts have no SDK and keep CMake's own search.
+# An MSVC link embeds its manifest with a manifest tool and a resource
+# compiler: the release's llvm-mt and llvm-rc, else the newest Windows SDK's,
+# whose directories name architectures as vcpkg does. Other hosts have no SDK
+# and keep CMake's own search.
 cmake_host_system_information(RESULT WINDOWS_KITS QUERY WINDOWS_REGISTRY
   "HKLM/SOFTWARE/Microsoft/Windows Kits/Installed Roots" VALUE KitsRoot10)
 cmake_path(CONVERT "${WINDOWS_KITS}" TO_CMAKE_PATH_LIST WINDOWS_KITS NORMALIZE)
@@ -136,6 +139,7 @@ file(GLOB WINDOWS_KITS_BINS LIST_DIRECTORIES true ${WINDOWS_KITS_BINS})
 list(SORT WINDOWS_KITS_BINS COMPARE NATURAL ORDER DESCENDING)
 list(TRANSFORM WINDOWS_KITS_BINS APPEND "/${TRIPLET_ARCH}")
 find_program(CMAKE_MT NAMES llvm-mt mt HINTS "${CLANG_BIN}" ${WINDOWS_KITS_BINS} NAMES_PER_DIR)
+find_program(CMAKE_RC_COMPILER NAMES llvm-rc rc HINTS "${CLANG_BIN}" ${WINDOWS_KITS_BINS} NAMES_PER_DIR)
 set(TRIPLET_PLATFORM "${TRIPLET_PLATFORM_${CMAKE_HOST_SYSTEM_NAME}}")
 set(TRIPLET_SETTINGS "${TRIPLET_SETTINGS_${CMAKE_HOST_SYSTEM_NAME}}")
 string(REPLACE "+" "p" TRIPLET_STDLIB "${CLANG_STDLIB}")

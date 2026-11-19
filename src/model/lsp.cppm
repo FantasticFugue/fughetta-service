@@ -1,9 +1,12 @@
+module;
+#include <ada.h>
 export module lsp;
 import std;
 import host;
+import http;
 import native;
 import coroutine;
-import reflection;
+import json;
 import records;
 import provider;
 import evaluation;
@@ -11,15 +14,11 @@ import toolchain;
 
 // The Language Server Protocol is spoken only inside this module.
 namespace lsp::detail {
-    using generic = rfl::Generic;
-    inline auto object(std::initializer_list<std::pair<std::string, generic>> fields) -> generic {
-        generic::Object out;
-        for (auto& [k, v] : fields)
-            out.insert(k, v);
-        return out;
+    inline auto object(std::initializer_list<std::pair<std::string, json::value>> fields) -> json::value {
+        return json::object(fields);
     }
-    inline auto text(std::string value) -> generic { return generic{std::move(value)}; }
-    inline const generic null{std::nullopt};
+    inline auto text(std::string value) -> json::value { return json::value{std::move(value)}; }
+    inline const json::value null{std::nullopt};
 
     struct position {
         std::uint64_t line = 0, character = 0;
@@ -44,7 +43,7 @@ namespace lsp::detail {
     };
     struct diagnostic {
         detail::range range;
-        std::optional<generic> severity, code;
+        std::optional<json::value> severity, code;
         std::optional<std::string> message;
     };
     struct published {
@@ -61,16 +60,16 @@ namespace lsp::detail {
         std::string message;
     };
     struct message {
-        std::optional<generic> id;
+        std::optional<json::value> id;
         std::optional<std::string> method;
-        std::optional<generic> params;
-        std::optional<generic> result;
+        std::optional<json::value> params;
+        std::optional<json::value> result;
         std::optional<failure> error;
     };
     // What the server's answer to `initialize` says it offers. What it does not name, it does not offer.
     struct capabilities {
         std::optional<std::string> positionEncoding;
-        std::optional<generic> documentSymbolProvider, diagnosticProvider, definitionProvider, referencesProvider;
+        std::optional<json::value> documentSymbolProvider, diagnosticProvider, definitionProvider, referencesProvider;
     };
     // One request at a time is admitted by the session lock. Its reader may finish the
     // response before the caller starts waiting, or after cancellation has removed it.
@@ -116,18 +115,18 @@ namespace lsp::detail {
         detail::capabilities capabilities;
     };
     struct configuration_items {
-        std::vector<generic> items;
+        std::vector<json::value> items;
     };
 
     // A capability is offered when it is present and neither `false` nor `null`.
-    inline auto offered(const std::optional<generic>& capability) -> bool {
-        if (!capability || std::holds_alternative<std::nullopt_t>(capability->get()))
+    inline auto offered(const std::optional<json::value>& capability) -> bool {
+        if (!capability || std::holds_alternative<std::monostate>(capability->get()))
             return false;
         if (auto* flag = std::get_if<bool>(&capability->get()))
             return *flag;
         return true;
     }
-    inline auto number(const std::optional<generic>& value) -> std::optional<std::int64_t> {
+    inline auto number(const std::optional<json::value>& value) -> std::optional<std::int64_t> {
         if (!value)
             return std::nullopt;
         if (auto* integer = std::get_if<std::int64_t>(&value->get()))
@@ -136,8 +135,8 @@ namespace lsp::detail {
             return static_cast<std::int64_t>(*real);
         return std::nullopt;
     }
-    inline auto field_of(const generic::Object& fields, std::string_view name) -> const generic* {
-        auto found = std::ranges::find(fields, name, &generic::Object::value_type::first);
+    inline auto field_of(const json::object& fields, std::string_view name) -> const json::value* {
+        auto found = fields.find(name);
         return found == fields.end() ? nullptr : &found->second;
     }
 
@@ -173,7 +172,7 @@ namespace lsp::detail {
     // Kinds whose extent other declarations live in, and so make a scope.
     inline auto encloses(std::string_view kind) -> bool { return kind == "namespace" || kind == "type" || kind == "function" || kind == "module"; }
     // LSP severities (1 error to 4 hint) by their number; a diagnostic without one is an error, as the specification says.
-    inline auto severity_name(const std::optional<generic>& severity) -> std::string {
+    inline auto severity_name(const std::optional<json::value>& severity) -> std::string {
         switch (number(severity).value_or(1)) {
         case 2:
             return "warning";
@@ -196,51 +195,40 @@ namespace lsp::detail {
 
     // A file URI for an absolute path, with every byte outside the unreserved set percent-encoded.
     inline auto uri(const std::filesystem::path& path) -> std::string {
-        auto text = path.generic_string();
-        std::string out = "file:";
+        static constexpr auto encode = [] {
+            std::array<std::uint8_t, 32> chars{};
+            for (unsigned i = 0; i < 256; ++i)
+                if (!((i >= 'a' && i <= 'z') || (i >= 'A' && i <= 'Z') || (i >= '0' && i <= '9') ||
+                      i == '-' || i == '.' || i == '_' || i == '~' || i == '/' || i == ':'))
+                    chars[i / 8] |= std::uint8_t{1} << (i % 8);
+            return chars;
+        }();
+        const auto utf8 = path.generic_u8string();
+        std::string_view text{reinterpret_cast<const char*>(utf8.data()), utf8.size()};
+        auto prefix = text.starts_with('/') ? "file://" : "file:///";
         if (text.starts_with("//"))
-            text.erase(0, 2), out += "//";
-        else
-            out += text.starts_with('/') ? "//" : "///";
-        for (unsigned char c : text) {
-            if (std::isalnum(c) || c == '-' || c == '.' || c == '_' || c == '~' || c == '/' || c == ':')
-                out += static_cast<char>(c);
-            else
-                out += std::format("%{:02X}", c);
-        }
-        return out;
+            text.remove_prefix(2);
+        return prefix + ada::unicode::percent_encode(text, encode.data());
     }
-    // The absolute path a `file:` URI names, the inverse of `uri`; nothing for another scheme or an undecodable escape.
+    // Interpret the URL as a local filesystem path, including UNC authority on Windows.
     inline auto path_of(std::string_view text) -> std::optional<std::filesystem::path> {
-        if (!text.starts_with("file:"))
+        auto url = ada::parse(text);
+        if (!url || url->get_protocol() != "file:" || url->has_search() || url->has_hash())
             return std::nullopt;
-        auto encoded = text.substr(5);
-        if (encoded.starts_with("///"))
-            encoded.remove_prefix(2);
         std::string decoded;
-        decoded.reserve(encoded.size());
-        for (std::size_t i = 0; i < encoded.size(); ++i) {
-            if (encoded[i] == '%') {
-                unsigned byte = 0;
-                if (i + 3 > encoded.size())
-                    return std::nullopt;
-                auto* end = encoded.data() + i + 3;
-                auto [last, error] = std::from_chars(encoded.data() + i + 1, end, byte, 16);
-                if (error != std::errc{} || last != end)
-                    return std::nullopt;
-                decoded += static_cast<char>(byte);
-                i += 2;
-                continue;
-            }
-            decoded += encoded[i];
-        }
-        // The authority is empty here, so the local path follows its slashes: 'file:///x' names '/x'.
-        if (decoded.empty() || decoded.front() != '/')
+        try {
+            const auto host = url->get_hostname();
+            if (!host.empty())
+                decoded = "//" + std::string{host};
+            decoded += web::target::unescape(url->get_pathname());
+        } catch (const std::invalid_argument&) {
             return std::nullopt;
-        // On Windows 'file:///C:/x' names 'C:/x'.
+        }
+        if (decoded.empty() || decoded.front() != '/' || decoded.contains('\0'))
+            return std::nullopt;
         if (host::os == "windows" && decoded.size() >= 4 && std::isalpha(static_cast<unsigned char>(decoded[1])) && decoded[2] == ':' && decoded[3] == '/')
             decoded.erase(0, 1);
-        return std::filesystem::path{decoded};
+        return std::filesystem::path{std::u8string_view{reinterpret_cast<const char8_t*>(decoded.data()), decoded.size()}};
     }
 
     // Line starts of a UTF-8 text and the Unicode scalar count before each, so a position costs one line scan.
@@ -342,16 +330,16 @@ namespace lsp::detail {
         return true;
     }
     // An answer is converted only when its nesting and size are bounded, so parsing cannot run away.
-    inline auto bounded(const generic& value, std::size_t depth, std::size_t& seen) -> bool {
+    inline auto bounded(const json::value& value, std::size_t depth, std::size_t& seen) -> bool {
         if (depth > 4 * depth_limit || ++seen > 1'000'000)
             return false;
-        if (auto* list = std::get_if<generic::Array>(&value.get()))
+        if (auto* list = std::get_if<json::array>(&value.get()))
             return std::ranges::all_of(*list, [&](auto& v) { return bounded(v, depth + 1, seen); });
-        if (auto* fields = std::get_if<generic::Object>(&value.get()))
+        if (auto* fields = std::get_if<json::object>(&value.get()))
             return std::ranges::all_of(*fields, [&](auto& field) { return bounded(field.second, depth + 1, seen); });
         return true;
     }
-    inline auto same_id(const generic& id, std::int64_t expected) -> bool {
+    inline auto same_id(const json::value& id, std::int64_t expected) -> bool {
         if (auto* n = std::get_if<std::int64_t>(&id.get()))
             return *n == expected;
         if (auto* d = std::get_if<double>(&id.get()))
@@ -377,13 +365,13 @@ export namespace lsp {
         // Starts the server on a workspace directory with its provider's initialization options, offering the capabilities this
         // client uses, and agrees on how positions are counted. The `settings` of the options also answer the server's
         // workspace/configuration requests, as editors do.
-        auto start(const std::filesystem::path& root, detail::generic initialization) -> coroutine::task<> {
+        auto start(const std::filesystem::path& root, json::value initialization) -> coroutine::task<> {
             using detail::object, detail::text;
             auto held = co_await lock_.lock();
             if (started_)
                 throw std::logic_error("language server session was started twice");
             root_ = std::filesystem::absolute(root);
-            if (auto* fields = std::get_if<detail::generic::Object>(&initialization.get()))
+            if (auto* fields = std::get_if<json::object>(&initialization.get()))
                 if (auto found = detail::field_of(*fields, "settings"))
                     settings_ = *found;
             auto uri = detail::uri(root_);
@@ -394,17 +382,17 @@ export namespace lsp {
                         {"clientInfo", object({{"name", text("fughetta-service")}})},
                         {"rootUri", text(uri)},
                         {"initializationOptions", std::move(initialization)},
-                        {"workspaceFolders", detail::generic::Array{object({{"uri", text(uri)}, {"name", text(root_.filename().string())}})}},
+                        {"workspaceFolders", json::array{object({{"uri", text(uri)}, {"name", text(root_.filename().string())}})}},
                         {"capabilities",
-                         object({{"general", object({{"positionEncodings", detail::generic::Array{text("utf-32"), text("utf-16")}}})},
-                                 {"workspace", object({{"configuration", detail::generic{true}}, {"workspaceFolders", detail::generic{true}}})},
+                         object({{"general", object({{"positionEncodings", json::array{text("utf-32"), text("utf-16")}}})},
+                                 {"workspace", object({{"configuration", json::value{true}}, {"workspaceFolders", json::value{true}}})},
                                  // Diagnostics are pulled where the server offers it, and pushed otherwise; the pull is announced, since servers
                                  // such as ty and ruff pull only for a client that says it can.
-                                 {"textDocument", object({{"synchronization", object({{"dynamicRegistration", detail::generic{false}}})},
-                                                          {"documentSymbol", object({{"hierarchicalDocumentSymbolSupport", detail::generic{true}}})},
-                                                          {"diagnostic", object({{"dynamicRegistration", detail::generic{false}}})},
+                                 {"textDocument", object({{"synchronization", object({{"dynamicRegistration", json::value{false}}})},
+                                                          {"documentSymbol", object({{"hierarchicalDocumentSymbolSupport", json::value{true}}})},
+                                                          {"diagnostic", object({{"dynamicRegistration", json::value{false}}})},
                                                           {"publishDiagnostics", object({})}})}})}}));
-            auto parsed = rfl::from_generic<detail::initialized, rfl::DefaultIfMissing>(reply);
+            auto parsed = json::from_value<detail::initialized, json::defaults>(reply);
             if (!parsed)
                 throw std::runtime_error("language server answered initialize with an unreadable result: " + std::string{parsed.error().what()});
             auto& capabilities = parsed->capabilities;
@@ -423,7 +411,12 @@ export namespace lsp {
             reader_.spawn(pump());
         }
 
-        auto document_request(std::string method, const document& d) -> coroutine::task<rfl::Generic> {
+        auto workspace_request(std::string method) -> coroutine::task<json::value> {
+            auto held = co_await lock_.lock();
+            co_return co_await call(std::move(method), detail::object({{"uri", detail::text(detail::uri(root_))}}));
+        }
+
+        auto document_request(std::string method, const document& d) -> coroutine::task<json::value> {
             auto held = co_await lock_.lock();
             co_await update(d);
             co_return co_await call(std::move(method), detail::object({{"uri", detail::text(detail::uri(root_ / d.path))}}));
@@ -468,7 +461,7 @@ export namespace lsp {
                 std::size_t seen = 0;
                 if (!detail::bounded(answer, 0, seen))
                     throw std::runtime_error("language symbol response exceeds the record limit");
-                if (auto symbols = rfl::from_generic<std::vector<detail::symbol>>(answer)) {
+                if (auto symbols = json::from_value<std::vector<detail::symbol>>(answer)) {
                     auto visit = [&](this auto&& self, const detail::symbol& symbol, std::string prefix) -> void {
                         auto qualified = prefix.empty() ? symbol.name : prefix + "::" + symbol.name;
                         if (symbol_name == symbol.name || symbol_name == qualified)
@@ -510,27 +503,27 @@ export namespace lsp {
                                                                     : "symbol name is ambiguous in the selected file");
             auto position = candidates.front();
             auto params = object({{"textDocument", object({{"uri", text(detail::uri(root_ / path_name))}})},
-                                  {"position", object({{"line", detail::generic{static_cast<std::int64_t>(position.line)}},
-                                                       {"character", detail::generic{static_cast<std::int64_t>(position.character)}}})}});
+                                  {"position", object({{"line", json::value{static_cast<std::int64_t>(position.line)}},
+                                                       {"character", json::value{static_cast<std::int64_t>(position.character)}}})}});
             if (query.action == "references")
                 params = object({{"textDocument", object({{"uri", text(detail::uri(root_ / path_name))}})},
-                                 {"position", object({{"line", detail::generic{static_cast<std::int64_t>(position.line)}},
-                                                      {"character", detail::generic{static_cast<std::int64_t>(position.character)}}})},
-                                 {"context", object({{"includeDeclaration", detail::generic{true}}})}});
+                                 {"position", object({{"line", json::value{static_cast<std::int64_t>(position.line)}},
+                                                      {"character", json::value{static_cast<std::int64_t>(position.character)}}})},
+                                 {"context", object({{"includeDeclaration", json::value{true}}})}});
             auto answer = co_await call(query.action == "definitions" ? "textDocument/definition" : "textDocument/references", std::move(params));
             std::size_t seen = 0;
             if (!detail::bounded(answer, 0, seen))
                 throw std::runtime_error("language locations exceed the response limit");
             lookup_result result;
             std::vector<detail::location> locations;
-            if (std::holds_alternative<std::nullopt_t>(answer.get()))
+            if (std::holds_alternative<std::monostate>(answer.get()))
                 co_return result;
-            if (auto list = rfl::from_generic<std::vector<detail::location>>(answer))
+            if (auto list = json::from_value<std::vector<detail::location>>(answer))
                 locations = std::move(*list);
-            else if (auto links = rfl::from_generic<std::vector<detail::location_link>, rfl::DefaultIfMissing>(answer)) {
+            else if (auto links = json::from_value<std::vector<detail::location_link>, json::defaults>(answer)) {
                 for (const auto& link : *links)
                     locations.push_back({link.targetUri, link.targetSelectionRange});
-            } else if (auto one = rfl::from_generic<detail::location>(answer))
+            } else if (auto one = json::from_value<detail::location>(answer))
                 locations.push_back(std::move(*one));
             else
                 throw std::runtime_error("language server returned unreadable locations");
@@ -590,9 +583,9 @@ export namespace lsp {
             }
             for (const auto& d : documents)
                 co_await update(d);
-            detail::generic::Array events;
+            json::array events;
             for (const auto& path : changed)
-                events.push_back(object({{"uri", text(detail::uri(root_ / path))}, {"type", detail::generic{std::int64_t{2}}}}));
+                events.push_back(object({{"uri", text(detail::uri(root_ / path))}, {"type", json::value{std::int64_t{2}}}}));
             if (!events.empty())
                 co_await notify("workspace/didChangeWatchedFiles", object({{"changes", std::move(events)}}));
         }
@@ -636,13 +629,13 @@ export namespace lsp {
         }
 
     private:
-        auto send(const detail::generic& body) -> coroutine::task<> {
-            auto text = rfl::json::write(body);
+        auto send(const json::value& body) -> coroutine::task<> {
+            auto text = json::write(body);
             auto frame = std::format("Content-Length: {}\r\n\r\n{}", text.size(), text);
             auto turn = co_await writing_.lock();
             co_await io::async_write(*child_, std::as_bytes(std::span{frame}));
         }
-        auto notify(std::string method, detail::generic params) -> coroutine::task<> {
+        auto notify(std::string method, json::value params) -> coroutine::task<> {
             co_await send(detail::object({{"jsonrpc", detail::text("2.0")}, {"method", detail::text(std::move(method))}, {"params", std::move(params)}}));
         }
         auto pump() -> coroutine::task<> {
@@ -671,7 +664,7 @@ export namespace lsp {
             }
         }
 
-        auto call(std::string method, detail::generic params) -> coroutine::task<detail::generic> {
+        auto call(std::string method, json::value params) -> coroutine::task<json::value> {
             if (ended_)
                 std::rethrow_exception(ended_);
             auto id = ++next_;
@@ -685,7 +678,7 @@ export namespace lsp {
                 pending_ = &response;
             }
             co_await send(detail::object(
-                {{"jsonrpc", detail::text("2.0")}, {"id", detail::generic{id}}, {"method", detail::text(method)}, {"params", std::move(params)}}));
+                {{"jsonrpc", detail::text("2.0")}, {"id", json::value{id}}, {"method", detail::text(method)}, {"params", std::move(params)}}));
             for (;;) {
                 detail::message incoming;
                 if (reading_) {
@@ -715,22 +708,22 @@ export namespace lsp {
         auto answer(const detail::message& request) -> coroutine::task<> {
             using detail::object, detail::text;
             auto& method = *request.method;
-            detail::generic reply = object({{"jsonrpc", text("2.0")}, {"id", *request.id}, {"result", detail::null}});
+            json::value reply = object({{"jsonrpc", text("2.0")}, {"id", *request.id}, {"result", detail::null}});
             if (method == "workspace/configuration") {
                 std::size_t count = 0;
                 if (request.params)
-                    if (auto items = rfl::from_generic<detail::configuration_items, rfl::DefaultIfMissing>(*request.params))
+                    if (auto items = json::from_value<detail::configuration_items, json::defaults>(*request.params))
                         count = items->items.size();
-                reply = object({{"jsonrpc", text("2.0")}, {"id", *request.id}, {"result", detail::generic::Array(count, settings_)}});
+                reply = object({{"jsonrpc", text("2.0")}, {"id", *request.id}, {"result", json::array(count, settings_)}});
             } else if (method != "client/registerCapability" && method != "client/unregisterCapability" && method != "window/workDoneProgress/create")
                 reply = object({{"jsonrpc", text("2.0")},
                                 {"id", *request.id},
-                                {"error", object({{"code", detail::generic{std::int64_t{-32601}}}, {"message", text("method not supported")}})}});
+                                {"error", object({{"code", json::value{std::int64_t{-32601}}}, {"message", text("method not supported")}})}});
             co_await send(reply);
         }
         // Ignore delayed diagnostics from an earlier document version.
-        void pushed(const detail::generic& params) {
-            auto parsed = rfl::from_generic<detail::published, rfl::DefaultIfMissing>(params);
+        void pushed(const json::value& params) {
+            auto parsed = json::from_value<detail::published, json::defaults>(params);
             if (!parsed)
                 return;
             auto path = detail::path_of(parsed->uri);
@@ -774,7 +767,7 @@ export namespace lsp {
                         auto text = std::string_view{buffer_}.substr(body, *length);
                         if (!detail::shallow(text))
                             throw std::runtime_error("language server message is nested too deeply or too large");
-                        auto parsed = rfl::json::read<detail::message, rfl::DefaultIfMissing>(text);
+                        auto parsed = json::read<detail::message, json::defaults>(text);
                         if (!parsed)
                             throw std::runtime_error("language server sent an unreadable message");
                         buffer_.erase(0, body + *length);
@@ -811,7 +804,7 @@ export namespace lsp {
                 }
                 std::string code;
                 if (item.code)
-                    code = std::holds_alternative<std::string>(item.code->get()) ? std::get<std::string>(item.code->get()) : rfl::json::write(*item.code);
+                    code = std::holds_alternative<std::string>(item.code->get()) ? std::get<std::string>(item.code->get()) : json::write(*item.code);
                 out.diagnostics.push_back({.id = out.unit.id + ":diagnostic:" + std::to_string(out.diagnostics.size()),
                                            .producer = out.unit.recipe.unit.provider,
                                            .code = std::move(code),
@@ -821,24 +814,24 @@ export namespace lsp {
                                            .location = {.source = semantic::place{d.path, first, last}}});
             }
         }
-        void converted(const detail::generic& answer, const document& d, semantic::shard& out) const {
+        void converted(const json::value& answer, const document& d, semantic::shard& out) const {
             std::size_t seen = 0;
             if (!detail::bounded(answer, 0, seen))
                 throw std::runtime_error("language server diagnostic report is nested too deeply or too large");
-            auto parsed = rfl::from_generic<detail::report_of, rfl::DefaultIfMissing>(answer);
+            auto parsed = json::from_value<detail::report_of, json::defaults>(answer);
             if (!parsed)
                 throw std::runtime_error("language server answered an unreadable diagnostic report: " + std::string{parsed.error().what()});
             if (parsed->kind != "full")
                 throw std::runtime_error("language server answered a " + parsed->kind + " diagnostic report, which holds no diagnostics");
             located(d, parsed->items.value_or(std::vector<detail::diagnostic>{}), out);
         }
-        void described(const detail::generic& answer, const document& d, semantic::shard& out) const {
-            if (std::holds_alternative<std::nullopt_t>(answer.get()))
+        void described(const json::value& answer, const document& d, semantic::shard& out) const {
+            if (std::holds_alternative<std::monostate>(answer.get()))
                 return;
             std::size_t seen = 0;
             if (!detail::bounded(answer, 0, seen))
                 throw std::runtime_error("language server symbols are nested too deeply or too large");
-            auto symbols = rfl::from_generic<std::vector<detail::symbol>>(answer);
+            auto symbols = json::from_value<std::vector<detail::symbol>>(answer);
             if (!symbols)
                 throw std::runtime_error("language server returned unreadable document symbols: " + std::string{symbols.error().what()});
             detail::lines lines{d.text, utf16_};
@@ -918,12 +911,12 @@ export namespace lsp {
                 co_await notify(
                     "textDocument/didOpen",
                     object({{"textDocument",
-                             object({{"uri", uri}, {"languageId", text(d.language)}, {"version", detail::generic{version}}, {"text", text(d.text)}})}}));
+                             object({{"uri", uri}, {"languageId", text(d.language)}, {"version", json::value{version}}, {"text", text(d.text)}})}}));
             } else if (found->second.value.text != d.text) {
                 auto version = ++version_;
                 found->second = opened{d, version};
-                co_await notify("textDocument/didChange", object({{"textDocument", object({{"uri", uri}, {"version", detail::generic{version}}})},
-                                                                  {"contentChanges", detail::generic::Array{object({{"text", text(d.text)}})}}}));
+                co_await notify("textDocument/didChange", object({{"textDocument", object({{"uri", uri}, {"version", json::value{version}}})},
+                                                                  {"contentChanges", json::array{object({{"text", text(d.text)}})}}}));
             }
         }
 
@@ -983,7 +976,7 @@ export namespace lsp {
         std::array<std::byte, 16 * 1024> chunk_{};
         std::filesystem::path root_;
         std::map<std::string, opened> documents_;
-        detail::generic settings_ = detail::null;
+        json::value settings_ = detail::null;
         std::int64_t next_ = 0;
         bool started_ = false, utf16_ = true, symbols_ = false, pull_ = false, definitions_ = false, references_ = false;
     };
@@ -1007,7 +1000,7 @@ export namespace language {
             : adapter(io, command, std::move(identity), std::move(commands), std::move(runtime), std::move(loader)), server_(io, std::move(command)) {}
 
     protected:
-        auto do_open(rfl::Generic initialization) -> coroutine::task<> override { co_await server_.start(root_, std::move(initialization)); }
+        auto do_open(json::value initialization) -> coroutine::task<> override { co_await server_.start(root_, std::move(initialization)); }
         auto do_update(language::installation input, const std::vector<std::string>& changed) -> coroutine::task<> override {
             install(std::move(input));
             const auto& documents = installed_.documents;

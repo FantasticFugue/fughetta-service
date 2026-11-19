@@ -2,7 +2,7 @@ module front;
 import std;
 import native;
 import constants;
-import reflection;
+import json;
 import coroutine;
 import meta;
 import http;
@@ -33,7 +33,7 @@ namespace front {
         using params = typename path::values;
     };
 
-    template <class T> auto ok(const T& value, http::status status = 200) -> web::reply { return web::json_reply(status, rfl::json::write(value)); }
+    template <class T> auto ok(const T& value, http::status status = 200) -> web::reply { return web::json_reply(status, json::write(value)); }
 
     struct message {
         std::string message;
@@ -174,7 +174,7 @@ namespace front {
                 co_await c.config.edit(c.core, [revision, value](config::store& st) { st.put_runtime(value, revision); });
                 auto doc = c.config.current(c.core);
                 auto observed = c.runtime->observe(doc->revisions.runtime, doc->runtime);
-                co_return web::json_reply(observed.phase == "ready" ? http::status{200} : http::status{202}, rfl::json::write(observed));
+                co_return web::json_reply(observed.phase == "ready" ? http::status{200} : http::status{202}, json::write(observed));
             }
         };
 
@@ -262,7 +262,7 @@ namespace front {
                 std::string credential;
             };
             static auto handle(context& c, params, const web::target&, std::string_view body) -> coroutine::task<web::reply> {
-                auto in = rfl::json::read<input, rfl::NoExtraFields>(body);
+                auto in = json::read<input, json::strict>(body);
                 if (!in)
                     throw coded_error(400, nodes::code::invalid_record, "execution credential is required");
                 try {
@@ -278,7 +278,7 @@ namespace front {
         };
         struct post_worldline : endpoint<"POST", "/api/v1/projects/{project}/worldline", access::member> {
             static auto handle(context& c, params p, const web::target&, std::string_view body) -> coroutine::task<web::reply> {
-                auto in = rfl::json::read<tools::worldline::input, rfl::NoExtraFields>(body);
+                auto in = json::read<tools::worldline::input, json::strict>(body);
                 if (!in || in->project.value() != p[0])
                     throw coded_error(400, nodes::code::invalid_record, "worldline request must name the project in the URL");
                 mcp::notifier note;
@@ -313,7 +313,7 @@ namespace front {
                 std::string worldline = "main", operation_id, recipient, body;
             };
             static auto handle(context& c, params p, const web::target&, std::string_view body) -> coroutine::task<web::reply> {
-                auto in = rfl::json::read<input, rfl::DefaultIfMissing, rfl::NoExtraFields>(body);
+                auto in = json::read<input, json::defaults, json::strict>(body);
                 if (!in || in->operation_id.empty() || in->operation_id.size() > 256)
                     throw coded_error(400, nodes::code::invalid_record, "d-mail requires an operation_id of 1 through 256 characters");
                 auto& services = *c.services;
@@ -343,7 +343,7 @@ namespace front {
         };
         struct post_node : endpoint<"POST", "/api/v1/projects/{project}/node", access::owner> {
             static auto handle(context& c, params p, const web::target&, std::string_view body) -> coroutine::task<web::reply> {
-                auto in = rfl::json::read<nodes::node_request, rfl::DefaultIfMissing, rfl::NoExtraFields>(body);
+                auto in = json::read<nodes::node_request, json::defaults, json::strict>(body);
                 if (!in)
                     throw coded_error(400, nodes::code::invalid_record, in.error().what());
                 if (in->action.starts_with("scope_") || in->action.starts_with("task_") || !in->task_id.empty() || !in->run_id.empty() ||
@@ -357,7 +357,7 @@ namespace front {
         };
         struct post_node_capture : endpoint<"POST", "/api/v1/projects/{project}/node/capture", access::owner> {
             static auto handle(context& c, params p, const web::target&, std::string_view body) -> coroutine::task<web::reply> {
-                auto in = rfl::json::read<node_capture, rfl::DefaultIfMissing, rfl::NoExtraFields>(body);
+                auto in = json::read<node_capture, json::defaults, json::strict>(body);
                 if (!in)
                     throw coded_error(400, nodes::code::invalid_record, in.error().what());
                 auto reply = co_await c.files.capture(c.core, p[0], in->operation, in->expected, in->intent, *c.who);
@@ -780,6 +780,24 @@ namespace front {
                 }
             });
         };
+        struct get_host_activity : endpoint<"GET", "/api/v1/hosting/activity", access::host> {
+            struct activity {
+                std::size_t queued = 0, running = 0, inflight = 0;
+                std::vector<routing::capacity_demand> waiting;
+            };
+            static auto handle(context& c, params, const web::target&, std::string_view) -> coroutine::task<web::reply> {
+                activity out;
+                if (c.services && c.services->queue) {
+                    const auto counts = co_await c.services->queue->active(c.core);
+                    out.queued = counts.queued;
+                    out.running = counts.running;
+                }
+                for (const auto& worker : co_await all_workers(c))
+                    out.inflight += worker.inflight + worker.analysis_inflight;
+                out.waiting = c.workers.demand();
+                co_return ok(out);
+            }
+        };
         struct get_health : endpoint<"GET", "/healthz", access::open> {
             static auto handle(context& c, params, const web::target&, std::string_view) -> coroutine::task<web::reply> {
                 auto workers = co_await all_workers(c);
@@ -894,7 +912,7 @@ namespace front {
                api::post_node, api::post_node_capture, api::get_node_source, api::get_node_file, api::get_templates, api::post_generate, api::list_projects,
                api::get_project, api::put_project, api::delete_project, api::get_effective, api::get_build_adapters, api::get_settings_schema, api::plan_build,
                api::abandon_operation, api::get_calls, api::get_builds, api::get_workers, api::register_worker, api::delete_worker, api::rename_worker,
-               api::get_usage, api::get_events, api::get_stats, api::get_me, api::get_health, api::get_metrics>;
+               api::get_usage, api::get_events, api::get_stats, api::get_me, api::get_host_activity, api::get_health, api::get_metrics>;
 
     auto route(context& c, std::string_view method, const web::target& target, std::string_view body) -> coroutine::task<web::reply> {
         co_return co_await admin_api::handle(c, method, target, body);

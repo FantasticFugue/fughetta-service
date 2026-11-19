@@ -2,11 +2,12 @@ import std;
 import boost.ut;
 import language;
 import configuration;
-import reflection;
+import json;
 import support;
 import fixture;
 import protocol;
 import semantic;
+import xml;
 
 namespace {
     using namespace boost::ut;
@@ -86,7 +87,7 @@ namespace {
                 {{"native", mixed()}});
             expect(prepared.build.steps.size() == 2u && prepared.inputs[0].type == "compilation_database");
             expect(prepared.server.provider == "clice" && prepared.server.argv == std::vector<std::string>{"clice", "serve"});
-            expect(rfl::json::write(prepared.server.initialization) == R"({"rules":[{"compile_commands":["build/cmake/compile_commands.json"]}]})");
+            expect(json::write(prepared.server.initialization) == R"({"rules":[{"compile_commands":["build/cmake/compile_commands.json"]}]})");
             auto build = builds::locate(plan.steps[2], ::test::absolute("/tree"), {}, 3);
             expect(build.env.at("CMAKE_BUILD_PARALLEL_LEVEL") == "3") << "a step uses the jobs its runner allows";
             expect(std::ranges::contains(builds::locate(plan.steps[0], ::test::absolute("/tree"), {}, 3).argv, "--jobs=3"));
@@ -176,12 +177,12 @@ namespace {
             expect(graph.nodes[1].outputs.at("compilation_database") == "compilation_database");
             expect(graph.nodes.back().dependencies == std::vector<std::string>{"stage/cpp", "directory/native/build/native/configure"});
             expect(graph.nodes.back().outputs.at("facts") == "semantic_shard" && graph.nodes.back().server->provider == "clice");
-            const auto saved = config::parse_as<language::configuration>(rfl::json::write(profile), "analysis");
+            const auto saved = config::parse_as<language::configuration>(json::write(profile), "analysis");
             const auto saved_graph = language::expand(saved, {{"native", mixed()}}, {"reviewed"});
             expect(std::get<language::build_input>(saved_graph.nodes.back().inputs.at("compilation_database").front()).configuration == "native");
             auto linked = profile;
             linked.stages.at("review").inputs.at("compilation_database") = {language::reference{"cpp", "facts"}};
-            linked = config::parse_as<language::configuration>(rfl::json::write(linked), "analysis");
+            linked = config::parse_as<language::configuration>(json::write(linked), "analysis");
             expect(std::get<language::reference>(linked.stages.at("review").inputs.at("compilation_database").front()).stage == "cpp");
             try {
                 language::expand(linked, {{"native", mixed()}}, {"reviewed"});
@@ -202,10 +203,10 @@ namespace {
             const auto artifact_graph = language::expand(artifact_profile, {{"native", native}}, {"native"});
             expect(artifact_graph.stages == std::vector<std::string>{"main", "artifact"});
             expect(std::ranges::contains(artifact_graph.nodes.back().dependencies, "stage/main"));
-            expect(std::ranges::contains(artifact_graph.directory_groups.at("native").tools, "fughetta-native"));
+            expect(std::ranges::contains(artifact_graph.directory_groups.at("native").tools, "fughetta-llvm"));
             auto cross_project = artifact_profile;
             cross_project.stages.at("artifact").inputs.at("source_facts") = {language::project_input{"library", "release", "cpp", "source", std::nullopt}};
-            const auto restored_cross = config::parse_as<language::configuration>(rfl::json::write(cross_project), "analysis");
+            const auto restored_cross = config::parse_as<language::configuration>(json::write(cross_project), "analysis");
             const auto foreign_graph = language::expand(restored_cross, {{"native", native}}, {"native"});
             expect(foreign_graph.stages == std::vector<std::string>{"artifact"});
             const auto& foreign = std::get<language::project_input>(foreign_graph.nodes.back().inputs.at("source_facts").front());
@@ -275,8 +276,8 @@ namespace {
                                   {{"native", {}}});
             })) << "clice requires an artifact producer";
             expect(throws<std::invalid_argument>([&] { language::prepare({}, {{"native", baseline}}); })) << "analysis requires a build reference";
-            expect(!rfl::json::read<builds::builder>(R"({"adapter":"missing","options":{}})")) << "an unknown adapter is refused when parsed";
-            expect(!rfl::json::read<language::provider>(R"({"provider":"clangd"})")) << "so is an unknown language provider";
+            expect(!json::read<builds::builder>(R"({"adapter":"missing","options":{}})")) << "an unknown adapter is refused when parsed";
+            expect(!json::read<language::provider>(R"({"provider":"clangd"})")) << "so is an unknown language provider";
         };
 
         "independent configurations preserve argv boundaries and local output identities"_test = [] {
@@ -396,6 +397,25 @@ namespace {
             expect(throws<std::invalid_argument>([&] { builds::validate(c); }));
         };
         "CTest and Bazel tests report in JUnit and the Build Event Protocol"_test = [] {
+            struct testcase {
+                xml::attribute<std::string, "name"> name;
+                xml::attribute<std::string, "classname"> classname;
+                xml::element<std::optional<std::string>, "failure"> failure;
+            };
+            struct testsuite {
+                xml::attribute<std::string, "name"> name;
+                xml::elements<testcase, "testcase"> cases;
+            };
+            const testsuite typed{.name = {"typed"},
+                                  .cases = {{testcase{.name = {"x<y"}, .classname = {"a&b"}, .failure = {std::string{"failure < &"}}},
+                                             testcase{.name = {"passes"}, .classname = {"m"}, .failure = {}}}}};
+            const auto xml_text = xml::write<"testsuite">(typed);
+            const auto parsed = xml::read<testsuite, "testsuite">(xml_text);
+            expect(parsed.cases.value.size() == 2u && parsed.cases.value[0].failure.value == "failure < &" &&
+                   !parsed.cases.value[1].failure.value);
+            auto typed_report = builds::report_protocols::read("junit", xml_text);
+            expect(typed_report.tests && typed_report.tests->total == 2 && typed_report.tests->failed_tests == std::vector<std::string>{"a&b.x<y"});
+
             auto c = fixture::cmake("build/cmake");
             auto p = builds::prepare(c, {.operation = "test"});
             expect(p.steps.front().reports.empty() && p.steps.back().reports.size() == 1u) << "only the test step writes a report";

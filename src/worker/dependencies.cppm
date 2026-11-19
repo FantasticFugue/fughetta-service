@@ -5,8 +5,33 @@ import durability;
 import constants;
 
 export namespace dependencies {
+    // The caller holds the install lock. The published or upstream cache is never a cleanup target.
+    void prune(const std::filesystem::path& cache, std::chrono::steady_clock::time_point deadline) {
+        const auto root = cache / "vcpkg";
+        if (!std::filesystem::is_directory(std::filesystem::symlink_status(root)))
+            return;
+        const auto cutoff = std::filesystem::file_time_type::clock::now() - constants::dependency_retention;
+        for (const auto& bucket : std::filesystem::directory_iterator(root)) {
+            if (std::chrono::steady_clock::now() >= deadline)
+                return;
+            const auto prefix = bucket.path().filename().string();
+            if (prefix.size() != 2 || prefix.find_first_not_of("0123456789abcdef") != std::string::npos ||
+                !std::filesystem::is_directory(bucket.symlink_status()))
+                continue;
+            for (const auto& archive : std::filesystem::directory_iterator(bucket.path())) {
+                if (std::chrono::steady_clock::now() >= deadline)
+                    return;
+                const auto name = archive.path().filename();
+                const auto abi = name.stem().string();
+                if (name.extension() == ".zip" && abi.starts_with(prefix) && content::is_hash(abi) &&
+                    std::filesystem::is_regular_file(archive.symlink_status()) && archive.last_write_time() < cutoff)
+                    std::filesystem::remove(archive.path());
+            }
+        }
+    }
+
     // The caller holds the publisher lock and only runs trusted inputs in its private cache.
-    inline auto publish(const std::filesystem::path& cache, const std::filesystem::path& destination, std::chrono::steady_clock::time_point deadline)
+    auto publish(const std::filesystem::path& cache, const std::filesystem::path& destination, std::chrono::steady_clock::time_point deadline)
         -> std::size_t {
         const auto source = cache / "vcpkg", target = destination / "vcpkg";
         if (!std::filesystem::exists(source))

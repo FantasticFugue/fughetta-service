@@ -3,11 +3,11 @@ import boost.ut;
 import support;
 import clr;
 import pinvoke;
-import artifact;
+import llvm;
 import fsharp;
 import knowledge;
 import channels;
-import reflection;
+import json;
 import native;
 import coroutine;
 import language;
@@ -23,8 +23,8 @@ namespace {
     }
     const auto cases = [] {
         "CLR IL and portable symbols connect source declarations, calls and PInvoke imports"_test = [] {
-            const auto report = rfl::json::read<clr::object>(load(report_file)).value();
-            auto source = rfl::json::read<semantic::shard>(load(shard_file)).value();
+            const auto report = json::read<clr::object>(load(report_file)).value();
+            auto source = json::read<semantic::shard>(load(shard_file)).value();
             source.unit.id = semantic::unit_identifier(source.unit.recipe.unit);
             auto own = [&](auto& rows) {
                 for (auto& row : rows)
@@ -56,7 +56,7 @@ namespace {
             auto member_id = [&](const std::string& documentation) {
                 const auto found = std::ranges::find_if(shard.symbols, [&](const auto& symbol) {
                     const auto value = symbol.extensions.find("clr.documentation_id");
-                    return value != symbol.extensions.end() && rfl::from_generic<std::string>(value->second).value() == documentation;
+                    return value != symbol.extensions.end() && json::from_value<std::string>(value->second).value() == documentation;
                 });
                 expect((found != shard.symbols.end()) >> fatal) << documentation;
                 return found->id;
@@ -84,7 +84,7 @@ namespace {
             const auto contract = member_id("T:Sample.IValue");
             auto relation = [&](const std::string& kind, const std::string& from, const std::string& to) {
                 return std::ranges::any_of(shard.relations, [&](const auto& edge) {
-                    return edge.kind.str() == kind && edge.from == from && edge.to == to && edge.resolution == "resolved";
+                    return edge.kind == kind && edge.from == from && edge.to == to && edge.resolution == "resolved";
                 });
             };
             expect(relation("inherits", derived, base) && relation("implements", derived, contract));
@@ -96,8 +96,8 @@ namespace {
             const auto native = std::ranges::find(shard.symbols, "Native", &semantic::records::symbol::name);
             expect((native != shard.symbols.end()) >> fatal);
             expect(std::ranges::contains(native->modifiers, "pinvoke"));
-            expect(rfl::json::write(native->extensions.at("clr.pinvoke.entry_point")) == "\"native_twice\"");
-            expect(rfl::json::write(native->extensions.at("clr.pinvoke.convention")) == "\"cdecl\"");
+            expect(json::write(native->extensions.at("clr.pinvoke.entry_point")) == "\"native_twice\"");
+            expect(json::write(native->extensions.at("clr.pinvoke.convention")) == "\"cdecl\"");
             expect(std::ranges::any_of(shard.relations, [&](const auto& edge) { return edge.kind == "calls" && edge.to == native->id; }));
             std::vector<const semantic::shard*> source_parts;
             for (const auto& part : selected->pieces)
@@ -143,15 +143,15 @@ namespace {
                     const auto variant = symbol.extensions.find("fsharp.variant");
                     const auto index = symbol.extensions.find("fsharp.sequence");
                     if (owner != symbol.extensions.end() && variant != symbol.extensions.end() && index != symbol.extensions.end() &&
-                        rfl::from_generic<std::string>(owner->second).value() == "T:Sample.Shape" && rfl::from_generic<int>(variant->second).value() == 0 &&
-                        rfl::from_generic<int>(index->second).value() == 0)
+                        json::from_value<std::string>(owner->second).value() == "T:Sample.Shape" && json::from_value<int>(variant->second).value() == 0 &&
+                        json::from_value<int>(index->second).value() == 0)
                         source_field = &symbol;
                 }
             expect((source_field != nullptr) >> fatal);
             const auto field_target = member_id("P:Sample.Shape.Point.x");
             expect(std::ranges::any_of(shard.relations, [&](const auto& edge) {
                 return edge.kind == "emits" && edge.from == source_field->id && edge.to == field_target && edge.detail &&
-                       rfl::get<semantic::records::emission_detail>(edge.detail->variant()).evidence == "compilation_mapping";
+                       std::get<semantic::records::emission_detail>(edge.detail->variant()).evidence == "compilation_mapping";
             }));
 
             const auto combined = store.publish_records(store.describe(source_view), {shard}, {});
@@ -161,9 +161,9 @@ namespace {
             const auto references = store.load(combined)->query(
                 {.action = std::string{"references"}, .selector = semantic::selection{.entity = semantic::entity{result.items.front().symbol_id}}});
             expect(!references.references.empty());
-            const auto library = native_artifact::read(load(native_file));
+            const auto library = llvm::read(load(native_file));
             expect(std::ranges::any_of(library.symbols, [](const auto& symbol) { return symbol.name == "native_twice" && symbol.exported; }));
-            auto exported = native_artifact::records(library, "app", "options", "native", "native", "libnative.so", {});
+            auto exported = llvm::records(library, "app", "options", "native", "native", "libnative.so", {});
             exported.unit.channel_definitions = language::server<"native-artifact">::channels();
             auto with_native = store.publish_records(store.describe(combined), {exported}, {});
             const auto ready = store.load(with_native);
@@ -175,13 +175,13 @@ namespace {
             expect((bound.relations.size() == 2_u) >> fatal);
             expect(bound.relations.front().resolution == "resolved");
             expect(bound.relations.front().from_context != bound.relations.front().to_context);
-            const auto detail = rfl::json::write(bound.relations.front().detail);
+            const auto detail = json::write(bound.relations.front().detail);
             expect(detail.contains("identity") && detail.contains("return_value"));
             const auto marshaled = std::ranges::find_if(bound.relations, [](const auto& relation) {
-                return relation.detail && rfl::get<semantic::records::binding_detail>(relation.detail->variant()).entry_point == "native_sum";
+                return relation.detail && std::get<semantic::records::binding_detail>(relation.detail->variant()).entry_point == "native_sum";
             });
             expect((marshaled != bound.relations.end()) >> fatal);
-            const auto& marshal_detail = rfl::get<semantic::records::binding_detail>(marshaled->detail->variant());
+            const auto& marshal_detail = std::get<semantic::records::binding_detail>(marshaled->detail->variant());
             expect((marshal_detail.marshalling.has_value() && marshal_detail.parameter_mapping.size() == 5_u) >> fatal);
             expect(marshal_detail.marshalling->charset == "unicode" && marshal_detail.marshalling->exact_spelling &&
                    marshal_detail.marshalling->set_last_error);
@@ -261,7 +261,7 @@ namespace {
                 const auto units = co_await adapter->units(updated.epoch, {});
                 expect((units.size() == 4_u) >> fatal);
                 const auto selected_unit = std::ranges::find_if(units, [](const auto& unit) {
-                    const auto group = rfl::json::read<pinvoke::group>(unit.name).value();
+                    const auto group = json::read<pinvoke::group>(unit.name).value();
                     return group.module == "Library" && !group.native.empty();
                 });
                 expect((selected_unit != units.end()) >> fatal);
@@ -320,7 +320,7 @@ namespace {
                 const auto absent = co_await adapter->update(updated.epoch, std::move(missing));
                 const auto absent_groups = co_await adapter->units(absent.epoch, {});
                 const auto missing_group =
-                    std::ranges::find_if(absent_groups, [](const auto& unit) { return rfl::json::read<pinvoke::group>(unit.name)->module == "Library"; });
+                    std::ranges::find_if(absent_groups, [](const auto& unit) { return json::read<pinvoke::group>(unit.name)->module == "Library"; });
                 expect((missing_group != absent_groups.end()) >> fatal);
                 auto unresolved = co_await adapter->evaluate({.execution = {"request", "computation", "bindings"},
                                                               .slot_id = "slot",
@@ -343,7 +343,7 @@ namespace {
             };
             cores::run(runtime, evaluate());
 
-            auto revised_source = rfl::json::read<semantic::shard>(load(edited_shard)).value();
+            auto revised_source = json::read<semantic::shard>(load(edited_shard)).value();
             revised_source.unit.id = semantic::unit_identifier(revised_source.unit.recipe.unit);
             auto revised_ownership = [&](auto& rows) {
                 for (auto& row : rows)
@@ -363,7 +363,7 @@ namespace {
             for (const auto& part : source_updated->pieces)
                 if (part->unit.recipe.unit.provider == "fsharp")
                     revised_parts.push_back(part->materialized().get());
-            const auto revised_object = rfl::json::read<clr::object>(load(edited_report)).value();
+            const auto revised_object = json::read<clr::object>(load(edited_report)).value();
             auto revised_clr = clr::records(revised_object, recipe, "Library", {{semantic::input_kind::artifact, "Library.dll", "assembly-two"}});
             revised_clr.unit.channel_definitions = language::server<"clr-artifact">::channels();
             clr::associate(revised_clr, revised_object, revised_parts, {{"Library.fs", load(edited_source)}});

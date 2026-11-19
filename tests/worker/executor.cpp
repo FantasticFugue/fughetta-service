@@ -15,7 +15,7 @@ import durability;
 import host;
 import dependencies;
 import constants;
-import reflection;
+import json;
 import knowledge;
 import delivery;
 import projectmodel;
@@ -88,14 +88,13 @@ namespace {
     }
 
     template <class F>
-    void exercise(F work, std::optional<std::filesystem::path> dependency_cache = {}, std::optional<std::filesystem::path> dependency_upstream = {},
-                  std::optional<std::filesystem::path> dependency_publish = {}, std::optional<builds::dependency_recipe> recipe = {},
-                  std::optional<std::uint64_t> memory_bytes = {}) {
-        test::scratch tmp{"executor"};
+    void exercise_at(std::filesystem::path root, F work, std::optional<std::filesystem::path> dependency_cache = {},
+                     std::optional<std::filesystem::path> dependency_upstream = {}, std::optional<std::filesystem::path> dependency_publish = {},
+                     std::optional<builds::dependency_recipe> recipe = {}, std::optional<std::uint64_t> memory_bytes = {}) {
         cores::io_context<native::context> rt{2};
         execution::thread_pool disk{2};
         replica::service service{rt,
-                                 {.root = tmp.dir / "cache",
+                                 {.root = root / "cache",
                                   .worker = "worker-test",
                                   .env = {{"VALUE", "worker"}},
                                   .inherit_env = false,
@@ -127,12 +126,12 @@ namespace {
                     transport::channel<native::socket> channel{socket};
                     auto run_pump = [&](coroutine::scope& pump) -> coroutine::task<> {
                         pump.spawn(channel.pump([](const transport::frame&) {}));
-                        if constexpr (std::invocable<F&, decltype(channel)&, decltype(tmp.dir)&, replica::service&, ctx&>)
-                            co_await work(channel, tmp.dir, service, io);
-                        else if constexpr (std::invocable<F&, decltype(channel)&, decltype(tmp.dir)&, replica::service&>)
-                            co_await work(channel, tmp.dir, service);
+                        if constexpr (std::invocable<F&, decltype(channel)&, decltype(root)&, replica::service&, ctx&>)
+                            co_await work(channel, root, service, io);
+                        else if constexpr (std::invocable<F&, decltype(channel)&, decltype(root)&, replica::service&>)
+                            co_await work(channel, root, service);
                         else
-                            co_await work(channel, tmp.dir);
+                            co_await work(channel, root);
                     };
                     co_await coroutine::with_scope(std::move(run_pump));
                 };
@@ -143,13 +142,24 @@ namespace {
         rt.run(std::move(run_core));
     }
 
-    // An execute role in this process, as a container backend's would run beside the Worker.
+    template <class F>
+    void exercise(F work, std::optional<std::filesystem::path> dependency_cache = {}, std::optional<std::filesystem::path> dependency_upstream = {},
+                  std::optional<std::filesystem::path> dependency_publish = {}, std::optional<builds::dependency_recipe> recipe = {},
+                  std::optional<std::uint64_t> memory_bytes = {}) {
+        test::scratch tmp{"executor"};
+        exercise_at(tmp.dir, std::move(work), std::move(dependency_cache), std::move(dependency_upstream), std::move(dependency_publish),
+                    std::move(recipe), memory_bytes);
+    }
+
+    // An execute service beside the front, with a controllable lifecycle and memory report.
     struct execute_beside final : replica::execute_side {
         std::filesystem::path dir;
-        transport::channel<native::socket>* chan = nullptr;
+        transport::channel<native::stream_view>* chan = nullptr;
+        jobs::worker_memory reported_memory{.resident = 0, .baseline = 0};
         std::size_t opens = 0;
         bool running = true;
         auto root() const -> const std::filesystem::path& override { return dir; }
+        auto memory() const -> jobs::worker_memory override { return reported_memory; }
         auto open() -> coroutine::task<replica::execute_link> override {
             ++opens;
             if (!running)
@@ -159,12 +169,12 @@ namespace {
     };
 
     // Runs `work` against a Worker whose execute role is a second service with its own root.
-    template <class F> void beside(F work) {
+    template <class F> void beside(F work, std::optional<std::uint64_t> memory_bytes = {}) {
         test::scratch tmp{"executor-beside"};
         cores::io_context<native::context> rt{1};
         execution::thread_pool disk{2};
         replica::service execute{rt, {.root = tmp.dir / "execute", .worker = "worker-execute", .inherit_env = false}, disk};
-        replica::service front{rt, {.root = tmp.dir / "cache", .worker = "worker-test", .inherit_env = false}, disk};
+        replica::service front{rt, {.root = tmp.dir / "cache", .worker = "worker-test", .inherit_env = false, .memory_bytes = memory_bytes}, disk};
         execute_beside side;
         side.dir = tmp.dir / "execute";
         front.set_execute(side);
@@ -177,7 +187,7 @@ namespace {
                         auto [socket, endpoint] = co_await net::async_accept(listener);
                         transport::channel<native::socket> channel{socket};
                         transport::dispatcher<native::socket> dispatch;
-                        service.install(dispatch, 0);
+                        service.install(dispatch, 0, true);
                         auto serve = [&](coroutine::scope& requests) -> coroutine::task<> {
                             co_await channel.pump([&](const transport::frame& frame) { requests.spawn(dispatch.handle(channel, frame)); });
                         };
@@ -186,7 +196,8 @@ namespace {
                     tasks.spawn(run_child(to_execute, execute));
                     tasks.spawn(run_child(to_front, front));
                     auto execute_socket = co_await io::connect(io, {net::ip::address_v4{{127, 0, 0, 1}}, to_execute.local_endpoint().port()});
-                    transport::channel<native::socket> execute_channel{execute_socket};
+                    native::stream_view execute_stream{execute_socket};
+                    transport::channel<native::stream_view> execute_channel{execute_stream};
                     side.chan = &execute_channel;
                     auto socket = co_await io::connect(io, {net::ip::address_v4{{127, 0, 0, 1}}, to_front.local_endpoint().port()});
                     transport::channel<native::socket> channel{socket};
@@ -223,11 +234,11 @@ namespace {
     static constexpr auto cases = [] {
         "dependency RPC rejects oversized payloads and undeclared registry fields before execution"_test = [] {
             jobs::dependency_fill valid{.manifest = builds::dependency_manifest(R"({"dependencies":["fmt",{"name":"zlib","features":["core"]}]})")};
-            expect(rfl::json::write(transport::codec<jobs::dependency_fill>::decode(transport::codec<jobs::dependency_fill>::encode(valid))) ==
-                   rfl::json::write(valid));
+            expect(json::write(transport::codec<jobs::dependency_fill>::decode(transport::codec<jobs::dependency_fill>::encode(valid))) ==
+                   json::write(valid));
             std::vector<std::byte> oversized(constants::dependency_request_bytes + 1);
             expect(throws<std::invalid_argument>([&] { transport::codec<jobs::dependency_fill>::decode(oversized); }));
-            auto text = rfl::json::write(jobs::dependency_fill{});
+            auto text = json::write(jobs::dependency_fill{});
             text.insert(1, "\"vcpkg-configuration\":{},");
             expect(throws([&] { transport::codec<jobs::dependency_fill>::decode(std::as_bytes(std::span{text})); }));
         };
@@ -533,6 +544,11 @@ set(VCPKG_ENV_PASSTHROUGH_UNTRACKED PROBE_LEDGER)
         };
         "workers bind the shared dependency cache outside fresh checkout trees"_test = [] {
             test::scratch shared{"dependency-cache"};
+            const auto old = shared.dir / "vcpkg/aa" / (std::string(64, 'a') + ".zip");
+            const auto recent = shared.dir / "vcpkg/bb" / (std::string(64, 'b') + ".zip");
+            test::spit(old, "expired");
+            test::spit(recent, "retained");
+            std::filesystem::last_write_time(old, std::filesystem::file_time_type::clock::now() - std::chrono::days{31});
             for (int worker = 0; worker < 2; ++worker) {
                 auto run_operation = [&](auto& channel, auto&) -> coroutine::task<> {
                     content::manifest tree;
@@ -552,6 +568,7 @@ set(VCPKG_ENV_PASSTHROUGH_UNTRACKED PROBE_LEDGER)
                     expect(result.has_value() >> fatal);
                     expect(result->ok() && result->steps.front().output == "compiled");
                     expect(test::slurp(shared.dir / "vcpkg/package") == "compiled");
+                    expect(!std::filesystem::exists(old) && test::slurp(recent) == "retained");
                 };
                 exercise(std::move(run_operation), shared.dir);
             }
@@ -628,7 +645,7 @@ set(VCPKG_ENV_PASSTHROUGH_UNTRACKED PROBE_LEDGER)
                            .language = "kotlin",
                            .directory = ".",
                            .references = {projectmodel::artifact_reference{.object = {hash.str(), "library.jar"}, .role = "classpath"}}}}};
-            const auto text = rfl::json::write(model);
+            const auto text = json::write(model);
             builds::exported_file exported;
             auto produce = [&](auto& channel, auto& root) -> coroutine::task<> {
                 content::manifest tree{{entry("model.json", text)}};
@@ -722,6 +739,39 @@ set(VCPKG_ENV_PASSTHROUGH_UNTRACKED PROBE_LEDGER)
             };
             exercise(run_operation);
         };
+        "a fork reuses its parent build directories after a worker restarts"_test = [] {
+            test::scratch tmp{"executor-retained-tree"};
+            std::optional<content::hash> parent_snapshot;
+            auto run_operation = [&](auto& channel, const auto& root) -> coroutine::task<> {
+                const bool child = parent_snapshot.has_value();
+                const auto text = child ? "child" : "parent";
+                content::manifest tree{{entry("source.txt", text)}};
+                const auto offer = co_await channel.call(jobs::sync_offer{"app", tree});
+                expect(offer.has_value() >> fatal);
+                co_await channel.call(jobs::source_bytes{{blob(text)}});
+                jobs::build_request request{
+                    .project = "app",
+                    .snapshot = offer->snapshot,
+                    .tree = child ? "pool-1" : "pool-0",
+                    .steps = {{.name = "build", .argv = {test::shell(), "-c",
+                        "mkdir -p build/nested && if [ ! -f build/cache ]; then cat source.txt > build/cache; fi"
+                        " && cat source.txt > build/nested/record"}}},
+                    .relocatable_build_dirs = {"build/nested", "build"},
+                    .parent_snapshot = parent_snapshot};
+                const auto report = co_await channel.call(request);
+                expect((report.has_value() && report->ok()) >> fatal);
+                if (!child) {
+                    parent_snapshot = offer->snapshot;
+                    co_return;
+                }
+                const auto trees = root / "cache/trees/app";
+                expect(test::slurp(trees / "pool-1/build/cache") == "parent");
+                expect(test::slurp(trees / "pool-1/build/nested/record") == "child");
+                expect(test::slurp(trees / "pool-0/build/nested/record") == "parent");
+            };
+            exercise_at(tmp.dir, run_operation);
+            exercise_at(tmp.dir, run_operation);
+        };
         "a checkout writes what changed and keeps build outputs"_test = [] {
             test::scratch tmp{"replica"};
             replica::store s{tmp.dir};
@@ -738,16 +788,32 @@ set(VCPKG_ENV_PASSTHROUGH_UNTRACKED PROBE_LEDGER)
             expect(dir == tmp.dir / "trees/app/default");
             expect(test::slurp(dir / "src/a.txt") == "a1");
             expect(durability::is_executable(dir / "bin/run.sh"));
-            test::spit(dir / "build.out", "made by the build");
+            std::filesystem::create_directories(dir / "build");
+            const auto built = std::string(2u << 20, 'p') + "tail\n";
+            test::spit(dir / "build/output", built);
+            test::spit(dir / "build/settings", "build options");
 
             content::manifest v2{{entry("bin/run.sh", "#!/bin/sh\n", true), entry("src/a.txt", "a2")}};
             auto plan2 = s.offer({"app", v2});
             expect(plan2.missing == std::vector<content::hash>{content::hash_of("a2")});
             s.put({{blob("a2")}});
+            const auto child = s.checkout("app", plan2.snapshot, "fork", "app/default", {"build"});
+            expect(test::slurp(child / "src/a.txt") == "a2");
+            expect(!std::filesystem::exists(child / "src/old.txt"));
+            expect(test::slurp(child / "build/output") == built);
+            expect(test::slurp(child / "build/settings") == "build options");
+            {
+                std::fstream output{child / "build/output", std::ios::in | std::ios::out | std::ios::binary};
+                output.put('c');
+                output.close();
+                expect(output.good());
+            }
+            expect(test::slurp(child / "build/output") == "c" + built.substr(1));
+            expect(test::slurp(dir / "build/output") == built);
             s.checkout("app", plan2.snapshot);
             expect(test::slurp(dir / "src/a.txt") == "a2");
             expect(!std::filesystem::exists(dir / "src/old.txt"));
-            expect(std::filesystem::exists(dir / "build.out"));
+            expect(std::filesystem::exists(dir / "build/output"));
         };
 
         "generated contributions survive restart, retract per producer and recover interrupted writes"_test = [] {
@@ -995,22 +1061,16 @@ set(VCPKG_ENV_PASSTHROUGH_UNTRACKED PROBE_LEDGER)
             exercise(run_operation);
         };
 
-        "beside a container's execute role, builds run there and analyses that run no project code stay here, offline"_test = [] {
+        "separate roles retain hot trees across execute collection and account for both processes"_test = [] {
             static constexpr auto run_operation = [](auto& channel, const auto& root, replica::service& front, execute_beside& side,
                                                      ctx& io) -> coroutine::task<> {
                 const std::string python = std::getenv("TEST_PYTHON") ? std::getenv("TEST_PYTHON") : "/usr/bin/python3";
                 front.set_runtime(
                     {.id = "lsp-runtime", .execution = "lsp-runtime-object", .platform = "platform-object", .executables = {{python, "python-object"}}});
-                auto open = native::listener{io, {net::ip::address_v4::loopback(), 0}};
                 auto script = root / "language.py";
-                test::spit(script, std::format(R"python(
-import json, os, socket, sys
+                test::spit(script, R"python(
+import json, os, sys
 with open(os.path.join(os.path.dirname(__file__), "observed"), "w", newline="\n") as f:
-    try:
-        socket.create_connection(("127.0.0.1", {}), timeout=2).close()
-        f.write("online ")
-    except OSError:
-        f.write("offline ")
     f.write(os.environ.get("SECRET", "no-secret") + " " + os.getcwd())
 while True:
     length = 0
@@ -1022,14 +1082,13 @@ while True:
     m = json.loads(sys.stdin.buffer.read(length))
     if "id" not in m: continue
     result = None
-    if m.get("method") == "initialize": result = {{"capabilities": {{"diagnosticProvider": True}}}}
+    if m.get("method") == "initialize": result = {"capabilities": {"diagnosticProvider": True}}
     if m.get("method") == "textDocument/diagnostic":
-        result = {{"kind": "full", "items": [{{"range": {{"start":{{"line":0,"character":0}}, "end":{{"line":0,"character":1}}}}, "message":"seen"}}]}}
-    body = json.dumps({{"jsonrpc":"2.0", "id":m["id"], "result":result}}).encode()
+        result = {"kind": "full", "items": [{"range": {"start":{"line":0,"character":0}, "end":{"line":0,"character":1}}, "message":"seen"}]}
+    body = json.dumps({"jsonrpc":"2.0", "id":m["id"], "result":result}).encode()
     sys.stdout.buffer.write(b"Content-Length: %d\r\n\r\n" % len(body) + body)
     sys.stdout.buffer.flush()
-)python",
-                                               open.local_endpoint().port()));
+)python");
                 content::manifest tree{{entry("a.py", "x = 1")}};
                 expect((co_await channel.call(jobs::sync_offer{"app", tree})).has_value());
                 expect((co_await channel.call(jobs::source_bytes{{blob("x = 1")}})).has_value());
@@ -1048,13 +1107,32 @@ while True:
                                                                               .demand = {.facts = {std::string{"diagnostics"}}}}};
                 std::vector<language::evaluated_unit> received;
                 auto receive = [&](language::evaluated_unit unit) -> void { received.push_back(std::move(unit)); };
-                auto first = co_await analysis_call(channel, io, request, record_checks{.unit = receive});
+                side.reported_memory = {};
+                auto report_memory = [&]() -> coroutine::task<> {
+                    co_await execution::schedule_after(io, std::chrono::milliseconds{25});
+                    side.reported_memory = {.resident = 0, .baseline = 0};
+                };
+                std::optional<transport::call_result<jobs::build_report>> completed;
+                auto forward = [&]() -> coroutine::task<> {
+                    completed.emplace(co_await analysis_call(channel, io, request, record_checks{.unit = receive}));
+                };
+                co_await execution::when_all(forward(), report_memory());
+                auto& first = *completed;
                 expect((first && first->analyzed && !first->analysis_error) >> fatal)
                     << (first ? first->analysis_error.value_or("") : std::get<jobs::failure>(first.error()).message);
                 expect(test::slurp(root / "execute/trees" / "app" / "beside" / "prepared") == "project-secret") << "the build ran in the execute role";
                 expect(!std::filesystem::exists(root / "cache/trees/app")) << "this process keeps no tree of its own";
-                expect(test::slurp(root / "observed") == "offline no-secret " + (root / "execute/trees/app/beside").string());
+                expect(test::slurp(root / "observed") == "no-secret " + (root / "execute/trees/app/beside").string());
                 expect(!received.empty() && received.back().shards.front().diagnostics.front().message == "seen");
+                const auto manifest = root / "execute/trees/app/beside.manifest";
+                std::filesystem::last_write_time(manifest, std::filesystem::file_time_type::clock::now() - std::chrono::hours{24 * 30});
+                expect((co_await channel.call(jobs::source_bytes{})).has_value());
+                expect(std::filesystem::exists(manifest) && std::filesystem::exists(root / "execute/trees/app/beside/prepared"))
+                    << "execute collection preserves the front's preparation and live language session";
+                side.reported_memory = {.reserved = 4096, .resident = 8192, .baseline = 4096};
+                auto combined = co_await front.status(0);
+                expect(combined.memory.reserved == 4096 && combined.memory.resident && *combined.memory.resident >= 8192);
+                side.reported_memory = {.resident = 0, .baseline = 0};
                 const auto opened = side.opens;
                 side.running = false;
                 auto stopped = co_await analysis_call(channel, io, request, record_checks{.unit = receive});
@@ -1071,7 +1149,7 @@ while True:
                 auto foreign = co_await analysis_call(channel, io, outside, record_checks{.unit = receive});
                 expect(foreign && foreign->analysis_error) << "an executable outside the startup inventory does not start here";
             };
-            beside(run_operation);
+            beside(run_operation, 8ull << 30);
         };
 
         "a hot directory keeps stage sessions across source changes and retires them together"_test = [] {
@@ -1305,7 +1383,7 @@ while True:
                     .executables = {{python, "python-object"}, {"/tools/compiler", "compiler-object"}, {"/tools/unrelated", "unrelated-object"}},
                     .inputs = {{.name = "sdk/native", .object = "sdk-object", .roots = {(root / "sdk").generic_string()}},
                                {.name = "sdk/headers", .object = "headers-object", .roots = {(root / "sdk/include").generic_string()}}}};
-                const auto execution = toolchain::select(runtime, {{"main", python}, {"command:index", python}, {"command:query", python}},
+                const auto execution = toolchain::select(runtime, {{"main", python}, {"command:query", python}},
                                                          {{"VALUE", "worker"}, {"OMP_NUM_THREADS", "1"}});
                 service.set_runtime(runtime);
                 test::spit(root / "configurations", R"({"a.cpp":"command-a.cpp","b.cpp":"command-b.cpp"})");
@@ -1329,8 +1407,7 @@ def publication(path):
                             "parameters":[], "qualifiers":[], "type_parameters":[], "template_arguments":[]}]}
 if len(sys.argv) > 1:
     with open(os.path.join(os.path.dirname(__file__), "commands"), "a") as log: log.write(" ".join(sys.argv[1:3]) + "\n")
-    if sys.argv[1] == "index": result = {"failed":[]}
-    elif sys.argv[2] == "project-files": result = {"result":{"files":[{"path":"a.cpp","translationUnit":True,"translationUnits":["a.cpp"],"configuration":{"a.cpp":configuration("a.cpp")}},{"path":"b.cpp","translationUnit":False,"translationUnits":[],"configuration":{"b.cpp":configuration("b.cpp")}}]},"stale":[]}
+    if sys.argv[2] == "project-files": result = {"result":{"files":[{"path":"a.cpp","translationUnit":True,"translationUnits":["a.cpp"],"configuration":{"a.cpp":configuration("a.cpp")}},{"path":"b.cpp","translationUnit":False,"translationUnits":[],"configuration":{"b.cpp":configuration("b.cpp")}}]},"stale":[]}
     elif sys.argv[2] == "semantic-contributions": result = {"result":[{"path":"a.cpp","contributions":[{"key":"records","kind":"records","file":"a.cpp","value":"published-a"}]}],"stale":[]}
     else: result = {"result":publication(sys.argv[3]),"stale":[]}
     print(json.dumps(result))
@@ -1347,6 +1424,9 @@ while True:
     if "id" not in m: continue
     result = None
     if m.get("method") == "initialize": result = {"capabilities": {"documentSymbolProvider": True}}
+    if m.get("method") == "clice/index":
+        with open(os.path.join(os.path.dirname(__file__), "commands"), "a") as log: log.write("index stdio\n")
+        result = {"failed":[]}
     if m.get("method") == "clice/semanticExport":
         if m["params"]["uri"].endswith("b.cpp") and os.path.exists(os.path.join(os.path.dirname(__file__), "delay")): time.sleep(10)
         result = publication(m["params"]["uri"].rsplit("/",1)[-1])
@@ -1381,8 +1461,8 @@ while True:
                                             .execution = {"semantic-request", "semantic-computation", "cpp"},
                                             .slot_id = "app/semantic-budget",
                                             .demand = {.facts = {std::string{"types"}}},
-                                            .commands = {{"index", {python, script.string(), "index"}}, {"query", {python, script.string(), "query"}}}}};
-                request.analysis.initialization = *rfl::json::read<rfl::Generic>(R"({"project":{}})");
+                                            .commands = {{"query", {python, script.string(), "query"}}}}};
+                request.analysis.initialization = *json::read<json::value>(R"({"project":{}})");
                 semantic::store stored{root / "semantic"};
                 std::vector<semantic::view_id> committed;
                 auto receive = [&](language::evaluated_unit unit) -> void {
@@ -1390,7 +1470,7 @@ while True:
                            unit.request.slot_id == unit.session.slot && unit.request.demand == request.analysis.demand &&
                            std::ranges::equal(unit.request.inputs, unit.session.inputs));
                     const auto& contribution = unit.shards.front().unit;
-                    const auto key = rfl::json::read<language::cpp::contribution_key>(unit.request.unit.name).value();
+                    const auto key = json::read<language::cpp::contribution_key>(unit.request.unit.name).value();
                     const auto& path = key.translation_unit;
                     expect(unit.request.unit.kind == semantic::unit_kind::group);
                     const auto source = std::ranges::find(tree.files, path, &content::entry::path);
@@ -1412,7 +1492,7 @@ while True:
                            reads.back().scope == "sdk/headers" && reads.back().key == "optional.h");
                     expect(unit.shards.front().unit.coverage.missing.empty() && unit.shards.front().unit.cacheable == (path == "b.cpp"))
                         << "an unbound external read keeps its facts but prevents result reuse";
-                    expect(rfl::json::write(unit).size() > constants::semantic_batch_bytes) << "one unit spans multiple bounded frames";
+                    expect(json::write(unit).size() > constants::semantic_batch_bytes) << "one unit spans multiple bounded frames";
                     semantic::view selected{.snapshots = {{"app", "work", "v1", tree.id().str()}}, .configuration = "cpp"};
                     committed.push_back(stored.publish_records(std::move(selected), std::move(unit.shards), {}));
                     return;
@@ -1422,7 +1502,7 @@ while True:
                     transport::raise_call_error(std::move(limited.error()));
                 expect(!limited->analysis_error && limited->analyzed && !limited->missing.empty() && limited->missing.size() == 1u &&
                        limited->missing.front().reason == "semantic node budget exhausted")
-                    << rfl::json::write(*limited);
+                    << json::write(*limited);
                 expect(limited->committed_units == 1u && committed.size() == 1u) << "node exhaustion publishes the completed first unit and defers the second";
                 request.analysis.budget.nodes = 2;
                 jobs::progress_log progress;
@@ -1430,7 +1510,7 @@ while True:
                 std::size_t seen = 0;
                 auto events = progress.since(seen);
                 expect(!events.empty() && events.back().execution == request.analysis.execution && events.back().stage == "analysis");
-                expect((recovered && recovered->analyzed && !recovered->analysis_error) >> fatal) << (recovered ? rfl::json::write(*recovered) : "no reply");
+                expect((recovered && recovered->analyzed && !recovered->analysis_error) >> fatal) << (recovered ? json::write(*recovered) : "no reply");
                 expect(recovered->committed_units == 2u && committed.size() == 3u);
                 for (const auto& id : committed) {
                     auto view = stored.load(id);
@@ -1438,7 +1518,7 @@ while True:
                 }
                 expect(test::slurp(root / "semantic-starts") == "start\n") << "a completed response exceeding the output budget keeps its session";
                 expect(test::slurp(root / "commands") ==
-                       "index --workspace\nquery project-files\nquery semantic-contributions\nquery semantic-export\nquery semantic-export\n")
+                       "index stdio\nquery project-files\nquery semantic-contributions\nquery semantic-export\nquery semantic-export\n")
                     << "one index sweep serves repeated evaluations of the installed epoch";
                 request.analysis.budget.units = 1;
                 auto partial = co_await analysis_call(channel, io, request, record_checks{.unit = receive});
@@ -1446,7 +1526,7 @@ while True:
                        partial->missing.size() == 1u && partial->missing.front().deferred &&
                        partial->missing.front().units ==
                            std::vector<std::string>{semantic::unit_identifier({"app", "cpp", "clice", "evaluate", semantic::unit_kind::group,
-                                                                               rfl::json::write(language::cpp::contribution_key{"b.cpp", "immediate"})})});
+                                                                               json::write(language::cpp::contribution_key{"b.cpp", "immediate"})})});
                 request.analysis.budget.units = 2;
                 test::spit(root / "delay", "delay second unit");
                 coroutine::stop_source stop;
@@ -1547,7 +1627,7 @@ while True:
                 evaluated.clear();
                 auto diagnostics = co_await analysis_call(channel, io, request, record_checks{.unit = collect});
                 expect((diagnostics && !diagnostics->analysis_error && evaluated.size() == 1u) >> fatal);
-                const auto immediate = rfl::json::read<language::cpp::contribution_key>(evaluated.front().request.unit.name).value();
+                const auto immediate = json::read<language::cpp::contribution_key>(evaluated.front().request.unit.name).value();
                 expect(evaluated.front().request.unit.kind == semantic::unit_kind::group && immediate.translation_unit == "b.cpp" &&
                        immediate.contribution == "immediate" && test::slurp(root / "commands") == commands_before_diagnostics)
                     << "immediate diagnostics use canonical contribution keys without running index or CLI queries";
@@ -1640,7 +1720,7 @@ int main(int argc, const char** argv) {
                 };
                 auto report = co_await analysis_call(channel, io, request, record_checks{.unit = receive, .model = fetch});
                 test::require(report.has_value() && report->analyzed && report->analysis_session.has_value(),
-                              report ? rfl::json::write(*report) : "analysis transport failed");
+                              report ? json::write(*report) : "analysis transport failed");
                 test::require(!units.empty() && !units.front().shards.empty(), "worker returned no F# shard");
                 const auto& shard = units.front().shards.front();
                 const auto result = std::ranges::find(shard.symbols, "result", &semantic::records::symbol::name);
@@ -1694,9 +1774,9 @@ int main(int argc, const char** argv) {
                 };
                 auto report = co_await analysis_call(channel, io, request, record_checks{.unit = receive, .model = fetch});
                 test::require(report.has_value(), "analysis transport failed");
-                test::require(report->analyzed && report->analysis_session.has_value(), rfl::json::write(*report));
+                test::require(report->analyzed && report->analysis_session.has_value(), json::write(*report));
                 test::require(!units.empty() && !units.front().shards.empty(), "worker returned no Kotlin shard");
-                const auto records = rfl::json::write(units.front().shards);
+                const auto records = json::write(units.front().shards);
                 test::require(records.contains("answer") && records.contains(source.contains("42") ? "kotlin.Int" : "kotlin.String"), records);
                 const auto& shard = units.front().shards.front();
                 const auto function = std::ranges::find(shard.symbols, "javaAnswer", &semantic::records::symbol::name);

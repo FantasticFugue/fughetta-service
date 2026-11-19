@@ -1,5 +1,6 @@
 export module server;
 import std;
+import json;
 import native;
 import coroutine;
 import protocol;
@@ -12,7 +13,6 @@ import durability;
 import usage;
 import package;
 import constants;
-import reflection;
 
 export namespace source_server {
     class service {
@@ -20,7 +20,8 @@ export namespace source_server {
         using socket = native::socket;
 
         service(cores::context<native::scheduler>& rt, std::filesystem::path storage, execution::thread_pool& pool)
-            : rt_(rt), storage_(std::move(storage)), lock_(storage_, "source"), pool_(pool), cores_(rt.size()), token_(jobs::source_token()) {}
+            : rt_(rt), storage_(std::move(storage)), lock_(storage_, "source"), pool_(pool), cores_(rt.size()), token_(jobs::source_token()),
+              package_bytes_(stored(storage_ / ".packages")) {}
 
         auto serve(native::scheduler& io, socket peer, std::size_t core) -> coroutine::task<> {
             transport::channel<socket> chan{peer};
@@ -144,14 +145,22 @@ export namespace source_server {
                         n += size;
             return n;
         }
-        // What the workspace stores: its node repositories and the packages exported from them.
-        auto stored_all() -> std::uint64_t {
+        // Source history lives in SQLite. Count the live files directly, including the WAL and shared memory.
+        auto stored_nodes() const -> std::uint64_t {
             std::uint64_t n = 0;
             std::error_code ec;
-            for (auto it = std::filesystem::directory_iterator(storage_ / ".nodes", ec); !ec && it != std::filesystem::directory_iterator(); it.increment(ec))
-                if (it->is_directory(ec) && !it->is_symlink(ec))
-                    n += stored(it->path());
-            return n + stored(storage_ / ".packages");
+            for (auto it = std::filesystem::directory_iterator(storage_ / ".nodes", ec); !ec && it != std::filesystem::directory_iterator(); it.increment(ec)) {
+                if (!std::filesystem::is_directory(it->symlink_status(ec)) || ec)
+                    continue;
+                for (auto name : {"repository.sqlite", "repository.sqlite-wal", "repository.sqlite-shm", "repository.sqlite-journal"}) {
+                    const auto path = it->path() / name;
+                    std::error_code error;
+                    if (std::filesystem::is_regular_file(std::filesystem::symlink_status(path, error)))
+                        if (auto size = std::filesystem::file_size(path, error); !error)
+                            n += size;
+                }
+            }
+            return n;
         }
 
         // While it lives, each write of `node` commits, with a storage limit, only while the workspace stores less than it. A replay commits
@@ -159,7 +168,7 @@ export namespace source_server {
         class confirmation final : public nodes::commit_check {
         public:
             confirmation(service& owner, nodes::local_node& node, const worlds::actor& actor, std::uint64_t storage_limit)
-                : owner_(owner), node_(node), actor_(actor), storage_limit_(storage_limit) {
+                : owner_(owner), node_(node), actor_(actor), storage_limit_(storage_limit), quota_(owner.quota_mutex_, std::defer_lock) {
                 node_.confirm_with(this);
             }
             confirmation(const confirmation&) = delete;
@@ -168,7 +177,9 @@ export namespace source_server {
             void check() override {
                 owner_.authorize(actor_);
                 if (storage_limit_) {
-                    if (auto used = owner_.stored_all(); used >= storage_limit_)
+                    if (!quota_.owns_lock())
+                        quota_.lock();
+                    if (auto used = owner_.stored_nodes() + owner_.package_bytes_; used >= storage_limit_)
                         nodes::fail(nodes::code::resource_limit, std::format("the workspace stores {} bytes of history (limit {}); history is kept, so only a "
                                                                              "higher storage limit or removing a project makes room",
                                                                              used, storage_limit_));
@@ -180,6 +191,7 @@ export namespace source_server {
             nodes::local_node& node_;
             const worlds::actor& actor_;
             std::uint64_t storage_limit_;
+            std::unique_lock<std::mutex> quota_;
         };
 
         // Packages live beside the repositories: `target` names one; an export writes the selected version into it, and a
@@ -194,9 +206,15 @@ export namespace source_server {
                 std::lock_guard busy{packages_mutex_};
                 // Nothing is moved or removed through a link out of the storage.
                 package::unlinked(storage_ / ".packages");
-                package::sweep(root.parent_path());
-                // A replacement a crash interrupted is finished first, so it is neither counted twice nor in the way.
-                package::recover(root);
+                auto sweep = [&] {
+                    package::sweep(root.parent_path());
+                    package::recover(root);
+                    package_bytes_ = stored(root.parent_path());
+                };
+                {
+                    std::lock_guard quota{quota_mutex_};
+                    sweep();
+                }
                 if (in.action == "export") {
                     // The staged package is measured as written, manifest and configuration included; the one it replaces is freed.
                     auto refuse = [&] {
@@ -206,16 +224,32 @@ export namespace source_server {
                     // The package this export replaces is freed by it. A new package is refused once the workspace is at its limit; a
                     // replacement only when it grows the workspace past it, so a smaller one is always possible.
                     bool replacing = std::filesystem::exists(std::filesystem::symlink_status(root));
-                    if (in.workspace_limit && !replacing && stored_all() >= in.workspace_limit)
-                        refuse();
+                    {
+                        std::lock_guard quota{quota_mutex_};
+                        if (in.workspace_limit && !replacing && stored_nodes() + package_bytes_ >= in.workspace_limit)
+                            refuse();
+                    }
                     durability::durable_directories(root.parent_path());
+                    std::unique_lock quota{quota_mutex_, std::defer_lock};
                     auto admit = [&](const std::filesystem::path& staged) {
-                        auto total = stored_all(), old = stored(root), fresh = stored(staged);
+                        quota.lock();
+                        auto total = stored_nodes() + package_bytes_, old = stored(root), fresh = stored(staged);
                         auto after = total - std::min(total, old);
-                        if (in.workspace_limit && after > in.workspace_limit && fresh > old)
+                        if (in.workspace_limit && after + fresh > in.workspace_limit && fresh > old)
                             refuse();
                     };
-                    auto kept = package::write(node, root, call.project, in.worldline, in.revision, in.force, in.configuration, admit);
+                    auto kept = [&] {
+                        try {
+                            auto manifest = package::write(node, root, call.project, in.worldline, in.revision, in.force, in.configuration, admit);
+                            package_bytes_ = stored(root.parent_path());
+                            return manifest;
+                        } catch (...) {
+                            if (!quota.owns_lock())
+                                quota.lock();
+                            package_bytes_ = stored(root.parent_path());
+                            throw;
+                        }
+                    }();
                     out.version = kept.version;
                     for (auto& f : kept.files)
                         out.files.push_back({.path = f.path, .kind = f.kind, .digest = f.digest, .size = f.size, .executable = f.executable});
@@ -281,7 +315,7 @@ export namespace source_server {
                     auto checked = repositories_.with(
                         origin,
                         [&](nodes::local_node& node) {
-                            return node.call({.action = "tree",
+                            return node.call({.action = "head",
                                               .worldline = request.actor.worldline,
                                               .run_id = request.actor.run,
                                               .execution_token = request.actor.execution_token});
@@ -317,7 +351,7 @@ export namespace source_server {
                             request.request.execution_token.clear();
                         }
                         if (request.request.action == "task_start")
-                            request.request.execution_identity = rfl::json::write(request.actor);
+                            request.request.execution_identity = json::write(request.actor);
                         request.request.capture = false;
                         // The gateway may name the caller's own operation ID for display; the engine keys on the scoped identity.
                         if (content::is_hash(request.request.operation)) {
@@ -359,5 +393,7 @@ export namespace source_server {
         execution::thread_pool& pool_;
         std::vector<per_core> cores_;
         std::string token_;
+        std::mutex quota_mutex_;
+        std::uint64_t package_bytes_;
     };
 } // namespace source_server

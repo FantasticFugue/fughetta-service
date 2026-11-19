@@ -17,12 +17,12 @@ export namespace posix {
     auto descriptor_bound() noexcept -> int;
     auto close_inherited(int bound) noexcept -> bool;
     // In a forked child: leave every network, loopback included, before exec.
-    auto isolate_network() noexcept -> bool;
     // A descriptor that becomes readable when the child exits, or -1 when the
     // exit has to be polled.
     auto exit_handle(int pid) -> int;
 
     auto sync_filesystem(int descriptor) noexcept -> bool;
+    auto try_clone_file(const std::filesystem::path& source, const std::filesystem::path& destination) -> bool;
     // Tells the service manager the lifecycle message, where it listens for one.
     void notify(std::string_view message);
 } // namespace posix

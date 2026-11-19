@@ -51,6 +51,7 @@ class Session(private val root: Path, private val adapter: LanguageAdapter) : Au
             buildJsonObject {
                 put("session", session); put("request", request)
                 putJsonArray("shards") { add(result.shard) }
+                put("receipts", JsonArray(emptyList()))
                 putJsonObject("producer_keys") {
                     result.producers.forEach { (read, modules) -> put(read, JsonArray(modules.map(::unitKey))) }
                 }

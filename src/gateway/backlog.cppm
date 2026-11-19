@@ -64,6 +64,16 @@ namespace tools {
         co_return co_await cores::call(rt_.get_scheduler(here), rt_.get_scheduler(0), submit_work{this, std::move(e), std::move(shared)});
     }
 
+    auto backlog::active(std::size_t here) -> coroutine::task<activity> {
+        auto read = [this]() -> coroutine::task<activity> {
+            auto running = running_ + analyzing_;
+            co_return activity{jobs_.size() - running, running};
+        };
+        if (here == 0)
+            co_return co_await read();
+        co_return co_await cores::call(rt_.get_scheduler(here), rt_.get_scheduler(0), read);
+    }
+
     auto backlog::list(std::size_t here) -> coroutine::task<std::vector<view>> {
         if (here == 0)
             co_return views();

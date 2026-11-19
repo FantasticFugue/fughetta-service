@@ -1,3 +1,5 @@
+module;
+#include <ada.h>
 export module http;
 import std;
 import coroutine;
@@ -201,13 +203,9 @@ export namespace web {
             t.path = raw.substr(0, q);
             if (q == std::string_view::npos)
                 return t;
-            for (auto part : std::views::split(raw.substr(q + 1), '&')) {
-                std::string_view kv{part.begin(), part.end()};
-                if (kv.empty())
-                    continue;
-                auto eq = kv.find('=');
-                t.query[decode(kv.substr(0, eq))] = eq == std::string_view::npos ? "" : decode(kv.substr(eq + 1));
-            }
+            const ada::url_search_params params{raw.substr(q + 1)};
+            for (const auto& [key, value] : params)
+                t.query.insert_or_assign(key, value);
             return t;
         }
 
@@ -227,23 +225,15 @@ export namespace web {
             return it == query.end() ? std::nullopt : std::optional<std::string_view>{it->second};
         }
         // A percent-encoded path segment, as written.
-        static auto unescape(std::string_view segment) -> std::string { return decode(segment); }
-
-    private:
-        static auto decode(std::string_view s) -> std::string {
-            std::string out;
-            for (std::size_t i = 0; i < s.size(); ++i) {
-                if (s[i] == '+')
-                    out += ' ';
-                else if (s[i] == '%' && i + 2 < s.size()) {
-                    unsigned v = 0;
-                    std::from_chars(s.data() + i + 1, s.data() + i + 3, v, 16);
-                    out += static_cast<char>(v);
-                    i += 2;
-                } else
-                    out += s[i];
-            }
-            return out;
+        static auto unescape(std::string_view segment) -> std::string {
+            const auto first = segment.find('%');
+            if (first == std::string_view::npos)
+                return std::string{segment};
+            for (auto i = first; i != std::string_view::npos; i = segment.find('%', i + 3))
+                if (segment.size() - i < 3 || !std::isxdigit(static_cast<unsigned char>(segment[i + 1])) ||
+                    !std::isxdigit(static_cast<unsigned char>(segment[i + 2])))
+                    throw std::invalid_argument("invalid percent-encoded path");
+            return ada::unicode::percent_decode(segment, first);
         }
     };
 } // namespace web

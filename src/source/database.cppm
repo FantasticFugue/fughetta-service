@@ -9,7 +9,7 @@ import codec;
 import kernel;
 import durability;
 import archive;
-import reflection;
+import json;
 import nodestore;
 
 namespace nodes {
@@ -17,15 +17,10 @@ namespace nodes {
 
     namespace {
         auto json_strings(const std::string& text) -> std::vector<std::string> {
-            auto parsed = rfl::json::read<std::vector<std::string>>(text);
+            auto parsed = json::read<std::vector<std::string>>(text);
             if (!parsed)
                 fail(nodes::code::storage_failure, "stored string array is unreadable");
             return *parsed;
-        }
-        auto file_record(std::uint64_t event, std::uint64_t ordinal, std::string_view payload) -> value {
-            auto stored = codec::decode(payload);
-            fields(stored, {"binary", "effect"});
-            return value::map{{"event", event}, {"ordinal", ordinal}, {"effect", stored.at("effect")}, {"binary", bytes{stored.at("binary").raw()}}};
         }
     } // namespace
 
@@ -160,7 +155,13 @@ namespace nodes {
                     out.frontier = heads;
                     return out;
                 }
-                return s.view(heads, in.action != "tree" && in.action != "stat", (in.action == "read" || in.action == "stat") ? in.target : std::string{});
+                auto view = s.view(heads, in.action != "tree" && in.action != "stat", (in.action == "read" || in.action == "stat") ? in.target : std::string{});
+                if (in.action == "tree" && found != s.roots.end()) {
+                    const auto id = s.root_line(in.worldline);
+                    if (id != s.project)
+                        view.base_version = s.version(string_list(s.get(id, "line").at("base")));
+                }
+                return view;
             }
             if (in.action == "receipt") {
                 if (!in.target.empty())
@@ -257,9 +258,9 @@ namespace nodes {
         if (!q.next())
             fail(nodes::code::missing_objects, "required causal proof is absent");
         ++self.causal_headers_read;
-        auto ancestors = decode_causal(q.data(4));
+        auto ancestors = decode_causal(q.data(4), index);
         value::array ranges;
-        for (auto [first, last] : ancestors.ranges)
+        for (auto [first, last] : ancestors.ranges())
             ranges.emplace_back(value::map{{"first", static_cast<std::uint64_t>(first)}, {"last", static_cast<std::uint64_t>(last)}});
         auto dependencies = json_strings(q.data(5));
         return value::map{{"index", static_cast<std::uint64_t>(index)},
@@ -284,6 +285,16 @@ namespace nodes {
 
     auto local_node::impl::causal_storage::records(const std::string& kind, const std::string& key) -> std::vector<value> {
         std::vector<value> out;
+        auto file_record = [&](std::uint64_t event, std::uint64_t ordinal, std::string_view payload) -> value {
+            auto stored = codec::decode(payload);
+            fields(stored, {"binary", "effect"});
+            const auto& binary = stored.at("binary");
+            const auto* digest = std::get_if<std::string>(&binary.data);
+            if (digest && (stored.at("effect").at("type").text() != "binary" || stored.at("effect").at("value").text() != *digest))
+                fail(nodes::code::storage_failure, "indexed binary payload reference differs");
+            return value::map{{"event", event}, {"ordinal", ordinal}, {"effect", stored.at("effect")},
+                              {"binary", bytes{digest ? self.read_chunked_blob(*digest) : binary.raw()}}};
+        };
         auto control_record = [](std::uint64_t event, std::uint64_t ordinal, const std::string& type, bool selected, value::array selections) {
             return value::map{{"event", event},
                               {"ordinal", ordinal},
@@ -483,7 +494,7 @@ namespace nodes {
     }
 
     auto local_node::impl::causal_storage::file_changed(const std::string& file, const causal_set& missing) -> bool {
-        for (auto [first, last] : missing.ranges) {
+        for (auto [first, last] : missing.ranges()) {
             if (first >= last)
                 continue;
             {
@@ -528,7 +539,7 @@ namespace nodes {
         auto parents = string_list(body.at("parents"));
         causal_set ancestors;
         for (auto& range : header.at("ancestors").list())
-            ancestors.ranges.emplace_back(range.at("first").number(), range.at("last").number());
+            ancestors.add_range(range.at("first").number(), range.at("last").number());
         auto after = parents;
         after.push_back(event_id);
         auto version_id = version(source.frontier(std::move(after)));
@@ -539,7 +550,7 @@ namespace nodes {
         q.number(1, index);
         q.text(2, event_id);
         q.text(3, line_name(body.at("line").text()));
-        q.text(4, rfl::json::write(parents));
+        q.text(4, json::write(parents));
         q.bind(5, encode_causal(ancestors));
         q.number(6, header.at("clock").number());
         q.text(7, header.at("author").text());
@@ -547,8 +558,8 @@ namespace nodes {
         q.text(9, body.at("caller_operation").text());
         q.text(10, body.at("tool").text());
         q.text(11, body.at("intent").text());
-        q.text(12, rfl::json::write(body.at("result").text()));
-        q.text(13, rfl::json::write(string_list(header.at("dependencies"))));
+        q.text(12, json::write(body.at("result").text()));
+        q.text(13, json::write(string_list(header.at("dependencies"))));
         q.number(14, header.at("effects").number());
         q.text(15, header.at("request_digest").text());
         q.text(16, header.at("effect_digest").text());
@@ -583,7 +594,11 @@ namespace nodes {
                 f.number(3, ordinal);
                 f.text(4, effect_id);
                 f.text(5, type);
-                f.bind(6, codec::encode(value::map{{"effect", effect}, {"binary", record.at("binary")}}));
+                const auto& binary = record.at("binary");
+                const bool chunked = chunked_payload(binary.raw());
+                if (chunked)
+                    state_bytes_written += retain_chunked_blob(effect.at("value").text(), binary.raw());
+                f.bind(6, codec::encode(value::map{{"effect", effect}, {"binary", chunked ? effect.at("value") : binary}}));
                 f.next();
             }
         }
@@ -716,12 +731,15 @@ namespace nodes {
         snapshot_events = 0;
         state_snapshot.clear();
         loaded_records = 0;
-        object_count = object_watermark = archive_bytes = 0;
+        object_count = object_watermark = 0;
         snapshot_ready = false;
         kernel_loaded = true;
         if (rebuild) {
             db->run("DELETE FROM events; DELETE FROM event_dependencies; DELETE FROM file_effects; DELETE FROM control_effects; DELETE FROM manifest_files; "
-                    "DELETE FROM manifest_paths; DELETE FROM blobs;");
+                    "DELETE FROM manifest_paths; DELETE FROM blobs; "
+                    "DELETE FROM blob_extents WHERE payload NOT IN (SELECT payload FROM object_payloads); "
+                    "DELETE FROM blob_payloads WHERE digest NOT IN (SELECT payload FROM object_payloads); "
+                    "DELETE FROM blob_chunks WHERE digest NOT IN (SELECT chunk FROM blob_extents);");
             // Revisions name frontiers; their manifests were derived and are gone until the archive replays them.
             std::vector<std::pair<std::string, std::string>> revisions;
             {
@@ -766,11 +784,10 @@ namespace nodes {
         } else
             replayed_events = 0;
         {
-            statement totals{*db, "SELECT COALESCE(MAX(rowid),0),COUNT(*),COALESCE(SUM(length(data)),0) FROM objects"};
+            statement totals{*db, "SELECT COALESCE(MAX(rowid),0),COUNT(*) FROM objects"};
             totals.next();
             object_watermark = totals.number(0);
             object_count = totals.number(1);
-            archive_bytes = totals.number(2);
         }
         snapshot.commit();
         if (rebuild && !read_only && !snapshot_ready)

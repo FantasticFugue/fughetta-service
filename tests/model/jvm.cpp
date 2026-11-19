@@ -3,10 +3,10 @@ import boost.ut;
 import support;
 import jvm;
 import jni;
-import artifact;
+import llvm;
 import knowledge;
 import language;
-import reflection;
+import json;
 import native;
 import coroutine;
 import channels;
@@ -27,8 +27,8 @@ namespace {
     const auto kotlin_cases = [] {
         "Kotlin source edits follow real JVM and JNI bindings through native execution"_test = [] {
             test::scratch scratch{"kotlin-jni-records"};
-            const auto inline_object = native_artifact::read(load(kotlin_files[13]));
-            auto optimized = native_artifact::records(inline_object, "app", "options", "native", "native", "inline.so", {});
+            const auto inline_object = llvm::read(load(kotlin_files[13]));
+            auto optimized = llvm::records(inline_object, "app", "options", "native", "native", "inline.so", {});
             const auto source_text = load(kotlin_files[14]);
             const auto split = source_text.find("extern");
             std::vector<channels::definition_body> bodies;
@@ -43,7 +43,7 @@ namespace {
             }
             expect(std::ranges::any_of(inline_object.locations, [](const auto& location) { return location.frames.size() > 1; }))
                 << "an inlined call has an inline frame";
-            native_artifact::associate(optimized, inline_object.locations, bodies, {{"inline.cpp", source_text}}, kotlin_files[14].parent_path());
+            llvm::associate(optimized, inline_object.locations, bodies, {{"inline.cpp", source_text}}, kotlin_files[14].parent_path());
             expect(std::ranges::any_of(optimized.relations, [](const auto& row) {
                 return row.from == "inline_leaf" && row.detail && row.detail->variant().visit([](const auto& detail) {
                     if constexpr (std::same_as<std::remove_cvref_t<decltype(detail)>, semantic::records::emission_detail>)
@@ -54,15 +54,15 @@ namespace {
             }));
             expect(std::ranges::any_of(optimized.relations, [](const auto& row) { return row.from == "optimized"; }));
             semantic::store store{scratch.dir};
-            const auto native_object = native_artifact::read(load(kotlin_files[6]));
+            const auto native_object = llvm::read(load(kotlin_files[6]));
             expect(std::ranges::any_of(native_object.symbols, [](const auto& symbol) { return symbol.name == "registered_twice" && !symbol.exported; }));
             expect(native_object.registrations.size() == 1_u && native_object.unresolved.empty());
-            const auto relocatable = native_artifact::read(load(kotlin_files[8]));
+            const auto relocatable = llvm::read(load(kotlin_files[8]));
             expect(std::ranges::any_of(relocatable.symbols, [](const auto& symbol) { return symbol.name == "registered_twice" && !symbol.imported; }));
             std::array<semantic::view_id, 2> versions;
             std::string run_id, run_context;
             for (std::size_t version = 0; version < 2; ++version) {
-                auto source = rfl::json::read<semantic::shard>(load(kotlin_files[2 + version])).value();
+                auto source = json::read<semantic::shard>(load(kotlin_files[2 + version])).value();
                 source.unit.id = semantic::unit_identifier(source.unit.recipe.unit);
                 auto own = [&](auto& rows) {
                     for (auto& row : rows)
@@ -101,9 +101,9 @@ namespace {
                     return relation.kind == "emits" && relation.ownership.origin.location && relation.ownership.origin.location->source &&
                            relation.ownership.origin.location->source->path == source_path;
                 }));
-                auto native = native_artifact::records(native_object, "app", "options", "native", "native", "libnative.so", {});
+                auto native = llvm::records(native_object, "app", "options", "native", "native", "libnative.so", {});
                 native.unit.channel_definitions = language::server<"native-artifact">::channels();
-                const auto core_call = std::ranges::find(native_object.calls, "registered_twice", &native_artifact::call::from);
+                const auto core_call = std::ranges::find(native_object.calls, "registered_twice", &llvm::call::from);
                 expect((core_call != native_object.calls.end()) >> fatal);
                 expect(std::ranges::any_of(native.relations, [&](const auto& relation) {
                     if (relation.kind != "calls")
@@ -204,7 +204,7 @@ namespace {
                 semantic::recipe binding{{"app", "jni", "jni", "evaluate", semantic::unit_kind::group, "imports"}, "options"};
                 auto bound = jni::resolve(binding, {{{"sample", {"native"}}}}, inputs);
                 expect(bound.relations.size() == 1_u && bound.diagnostics.empty());
-                expect(rfl::json::write(bound.relations).contains("jni_dynamic"));
+                expect(json::write(bound.relations).contains("jni_dynamic"));
                 expect(std::ranges::any_of(native.relations, [](const auto& relation) { return relation.kind == "calls"; }));
                 versions[version] = store.publish_records(combined->description, {bound}, {});
                 const auto ready = store.load(versions[version]);
@@ -269,12 +269,12 @@ namespace {
             expect(parameter->binder == klass->id && parameter->constraints.size() == 2_u);
             expect(std::ranges::any_of(shard.types,
                                        [](const auto& row) { return row.lower_bound.has_value() && std::ranges::contains(row.qualifiers, "wildcard"); }));
-            const auto annotations = rfl::json::write(klass->extensions.at("jvm.annotations"));
-            const auto decoded_annotations = rfl::from_generic<std::vector<jvm::annotation>>(klass->extensions.at("jvm.annotations")).value();
+            const auto annotations = json::write(klass->extensions.at("jvm.annotations"));
+            const auto decoded_annotations = json::from_value<std::vector<jvm::annotation>>(klass->extensions.at("jvm.annotations")).value();
             const auto details_annotation = std::ranges::find(decoded_annotations, "Lsample/Details;", &jvm::annotation::descriptor);
             expect((details_annotation != decoded_annotations.end()) >> fatal);
-            const auto text_value = rfl::from_generic<std::map<std::string, rfl::Generic>>(details_annotation->values.at("text")).value();
-            expect(rfl::from_generic<std::string>(text_value.at("value")).value() == std::string{"class\0", 6} + "😀");
+            const auto text_value = json::from_value<std::map<std::string, json::value>>(details_annotation->values.at("text")).value();
+            expect(json::from_value<std::string>(text_value.at("value")).value() == std::string{"class\0", 6} + "😀");
             expect(annotations.contains("Lsample/Details;") && annotations.contains("Lsample/Hidden;"));
             expect(annotations.contains("\"visible\":true") && annotations.contains("\"visible\":false"));
             expect(annotations.contains("\"value\":-7") && annotations.contains("\"value\":9223372036854775806"));
@@ -286,10 +286,10 @@ namespace {
             expect(std::ranges::any_of(shard.symbols, [](const auto& s) { return s.name == "nativeEntry" && std::ranges::contains(s.modifiers, "native"); }));
             const auto twice = std::ranges::find(shard.symbols, "twice", &semantic::records::symbol::name);
             expect((twice != shard.symbols.end()) >> fatal);
-            expect(rfl::json::write(twice->extensions.at("jvm.annotations")).contains("method"));
+            expect(json::write(twice->extensions.at("jvm.annotations")).contains("method"));
             const auto field = std::ranges::find(shard.symbols, "field", &semantic::records::symbol::name);
             expect((field != shard.symbols.end()) >> fatal);
-            expect(rfl::json::write(field->extensions.at("jvm.annotations")).contains("field"));
+            expect(json::write(field->extensions.at("jvm.annotations")).contains("field"));
             expect(std::ranges::count(shard.relations, twice->id, &semantic::records::relation::to) == 3);
             test::scratch scratch{"jvm-records"};
             semantic::store store{scratch.dir};
@@ -306,7 +306,7 @@ namespace {
             const auto references = view->query(
                 {.action = std::string{"references"}, .selector = semantic::selection{.entity = semantic::entity{selected.items.front().symbol_id}}});
             expect(references.references.size() == 3_u);
-            native_artifact::object library{.format = "elf", .arch = "x86_64"};
+            llvm::object library{.format = "elf", .arch = "x86_64"};
             const auto declarations = load(header);
             auto declared = [&](const std::string& name) {
                 auto at = declarations.find(name);
@@ -325,7 +325,7 @@ namespace {
                     expect(declared(name)) << "JNI encoding must match javac's generated header";
                     library.symbols.push_back({.name = name, .kind = "function", .binding = "Global", .exported = true});
                 }
-            auto native = native_artifact::records(library, "app", "options", "native", "native", "libsample.so", {});
+            auto native = llvm::records(library, "app", "options", "native", "native", "libsample.so", {});
             native.unit.channel_definitions = language::server<"native-artifact">::channels();
             const auto combined = store.publish_records(store.describe(id), {native}, {});
             const auto ready = store.load(combined);
@@ -335,28 +335,28 @@ namespace {
             semantic::recipe binding{{"app", "jni", "jni", "evaluate", semantic::unit_kind::group, "imports"}, "options"};
             auto bound = jni::resolve(binding, {{{"sample", {"native"}}}}, input);
             expect(bound.relations.size() == 3_u && bound.diagnostics.empty());
-            const auto details = rfl::json::write(bound.relations);
+            const auto details = json::write(bound.relations);
             expect(details.contains("\"class\"") && details.contains("\"receiver\"") && details.contains("_003bb"));
             for (const auto& type : {"JNIEnv*", "jclass", "jobject", "jstring", "jthrowable", "jintArray", "jobjectArray"})
                 expect(details.contains(std::string{"\"native_type\":\""} + type + "\""));
             expect(details.contains("\"array_dimensions\":2") && details.contains("\"element_descriptor\":\"I\""));
             const auto bindings = store.publish_records(store.describe(combined), {bound}, {});
             expect(store.load(bindings)->query({.action = std::string{"relations"}, .relations = {"binds"}}).relations.size() == 3_u);
-            native_artifact::object short_export{
+            llvm::object short_export{
                 .format = "elf",
                 .arch = "x86_64",
                 .symbols = {{.name = "Java_sample_Sample_nativeEntry", .kind = "function", .binding = "Global", .exported = true}}};
-            auto extra = native_artifact::records(short_export, "app", "options", "extra", "extra", "libextra.so", {});
+            auto extra = llvm::records(short_export, "app", "options", "extra", "extra", "libextra.so", {});
             auto extended = store.load(store.publish_records(store.describe(combined), {extra}, {}));
             std::vector<const semantic::shard*> alternatives;
             for (const auto& object : extended->pieces)
                 alternatives.push_back(object->materialized().get());
             auto preferred = jni::resolve(binding, {{{"sample", {"native", "extra"}}}}, alternatives);
             expect(preferred.relations.size() == 3_u && preferred.diagnostics.empty());
-            const auto preferred_details = rfl::json::write(preferred.relations);
+            const auto preferred_details = json::write(preferred.relations);
             expect(!preferred_details.contains("nativeEntry__J") && !preferred_details.contains("nativeEntry__I"))
                 << "short JNI export precedes descriptor-qualified exports";
-            auto duplicate = native_artifact::records(short_export, "app", "options", "duplicate", "duplicate", "libduplicate.so", {});
+            auto duplicate = llvm::records(short_export, "app", "options", "duplicate", "duplicate", "libduplicate.so", {});
             auto conflicting = store.load(store.publish_records(extended->description, {duplicate}, {}));
             alternatives.clear();
             for (const auto& object : conflicting->pieces)
@@ -461,11 +461,11 @@ namespace {
                 auto resolver = language::make_adapter(runtime.get_scheduler(), {.cwd = scratch.dir},
                                                        {.slot = "slot", .project = "app", .provider = "jni", .options = "options", .stage = "jni"}, {},
                                                        {.execution = "runtime"});
-                native_artifact::object spare_object{
+                llvm::object spare_object{
                     .format = "elf",
                     .arch = "x86_64",
                     .symbols = {{.name = "idle_function", .kind = "function", .binding = "Global", .size = 8, .exported = true}}};
-                auto spare = native_artifact::records(spare_object, "app", "options", "spare", "spare", "libspare.so", {});
+                auto spare = llvm::records(spare_object, "app", "options", "spare", "spare", "libspare.so", {});
                 spare.unit.channel_definitions = language::server<"native-artifact">::channels();
                 const auto original_channels = channels::outputs(spare.unit.channel_definitions, {&spare});
                 spare.symbols.front().extensions["native.size"] = std::int64_t{16};
@@ -491,7 +491,7 @@ namespace {
                     std::ranges::find_if(scoped->pieces, [](const auto& part) { return std::ranges::contains(part->unit.modules, "native"); });
                 expect((native_part != scoped->pieces.end()) >> fatal);
                 const auto native_group =
-                    std::ranges::find_if(groups, [&](const auto& unit) { return rfl::json::read<jni::group>(unit.name)->native == (*native_part)->unit.id; });
+                    std::ranges::find_if(groups, [&](const auto& unit) { return json::read<jni::group>(unit.name)->native == (*native_part)->unit.id; });
                 expect((native_group != groups.end()) >> fatal);
                 auto resolved = co_await resolver->evaluate({.execution = {"request", "computation", "jni"},
                                                              .slot_id = "slot",

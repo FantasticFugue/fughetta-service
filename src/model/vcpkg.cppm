@@ -1,6 +1,6 @@
 export module vcpkg;
 import std;
-import reflection;
+import json;
 import constants;
 export import provider;
 
@@ -8,10 +8,10 @@ export namespace builds {
     struct vcpkg_dependency {
         std::string name;
         std::vector<std::string> features;
-        rfl::Rename<"default-features", bool> defaults = true;
+        json::named<"default-features", bool> defaults = true;
         bool host = false;
         std::optional<std::string> platform;
-        rfl::Rename<"version>=", std::optional<std::string>> minimum;
+        json::named<"version>=", std::optional<std::string>> minimum;
     };
     using vcpkg_reference = std::variant<std::string, vcpkg_dependency>;
     struct vcpkg_feature {
@@ -21,18 +21,18 @@ export namespace builds {
     struct vcpkg_override {
         std::string name;
         std::optional<std::string> version;
-        rfl::Rename<"version-string", std::optional<std::string>> version_string;
-        rfl::Rename<"version-semver", std::optional<std::string>> version_semver;
-        rfl::Rename<"version-date", std::optional<std::string>> version_date;
-        rfl::Rename<"port-version", std::optional<std::uint32_t>> port_version;
+        json::named<"version-string", std::optional<std::string>> version_string;
+        json::named<"version-semver", std::optional<std::string>> version_semver;
+        json::named<"version-date", std::optional<std::string>> version_date;
+        json::named<"port-version", std::optional<std::uint32_t>> port_version;
     };
     // Only declarative registry selectors cross the publisher boundary.
     struct vcpkg_manifest {
         std::vector<vcpkg_reference> dependencies;
         std::map<std::string, vcpkg_feature> features;
-        rfl::Rename<"default-features", std::vector<std::string>> defaults;
+        json::named<"default-features", std::vector<std::string>> defaults;
         std::vector<vcpkg_override> overrides;
-        rfl::Rename<"builtin-baseline", std::optional<std::string>> baseline;
+        json::named<"builtin-baseline", std::optional<std::string>> baseline;
     };
     struct dependency_recipe {
         std::string executable;
@@ -97,13 +97,13 @@ export namespace builds {
         if (manifest.baseline.get() &&
             (manifest.baseline.get()->size() != 40 || manifest.baseline.get()->find_first_not_of("0123456789abcdef") != std::string::npos))
             throw std::invalid_argument("invalid requested dependency baseline");
-        if (rfl::json::write(manifest).size() > constants::dependency_manifest_bytes)
+        if (json::write(manifest).size() > constants::dependency_manifest_bytes)
             throw std::invalid_argument("dependency manifest exceeds size limit");
     }
     inline auto dependency_manifest(std::string_view text) -> vcpkg_manifest {
         if (text.size() > constants::dependency_manifest_bytes)
             throw std::invalid_argument("dependency manifest exceeds size limit");
-        auto raw = rfl::json::read<rfl::Generic>(text);
+        auto raw = json::read<json::value>(text);
         if (!raw)
             throw std::invalid_argument("invalid dependency manifest");
         auto object = raw->to_object();
@@ -112,7 +112,7 @@ export namespace builds {
         for (const auto& [name, value] : *object)
             if (name == "vcpkg-configuration")
                 throw std::invalid_argument("custom registries stay in the private cache");
-        auto parsed = rfl::json::read<vcpkg_manifest, rfl::DefaultIfMissing>(text);
+        auto parsed = json::read<vcpkg_manifest, json::defaults>(text);
         if (!parsed)
             throw std::invalid_argument("unsupported dependency manifest");
         validate(*parsed);

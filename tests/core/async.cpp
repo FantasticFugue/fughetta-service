@@ -224,8 +224,9 @@ namespace {
 
         "resource runners preserve an uncancellable caller token"_test = [] {
             loop_resource context;
-            auto possible =
-                cores::run(context, execution::then(execution::read_env(execution::get_stop_token), [](auto token) noexcept { return token.stop_possible(); }));
+            auto possible = cores::run(context, execution::read_env([](const auto& env) noexcept {
+                return execution::get_stop_token(env).stop_possible();
+            }));
             expect(possible.has_value() >> fatal);
             expect(!*possible);
         };

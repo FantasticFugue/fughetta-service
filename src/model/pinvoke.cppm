@@ -2,12 +2,12 @@ export module pinvoke;
 import std;
 import evaluation;
 import coroutine;
-import reflection;
+import json;
 import records;
 import channels;
 import objects;
 import clr;
-import artifact;
+import llvm;
 export import bridge;
 
 export namespace pinvoke {
@@ -104,14 +104,14 @@ export namespace pinvoke {
                         .library_selection = selection,
                         .entry_point = entry};
                     if (const auto policy = symbol.extensions.find("clr.pinvoke.marshalling"); policy != symbol.extensions.end())
-                        detail.marshalling = rfl::from_generic<semantic::records::import_marshalling>(policy->second).value();
+                        detail.marshalling = json::from_value<semantic::records::import_marshalling>(policy->second).value();
                     struct metadata {
                         std::uint32_t sequence = 0;
                         semantic::records::parameter_marshalling value;
                     };
                     std::map<std::uint32_t, semantic::records::parameter_marshalling> parameters;
                     if (const auto found = symbol.extensions.find("clr.pinvoke.parameters"); found != symbol.extensions.end()) {
-                        auto decoded = rfl::from_generic<std::vector<metadata>>(found->second).value();
+                        auto decoded = json::from_value<std::vector<metadata>>(found->second).value();
                         for (auto& parameter : decoded)
                             parameters.emplace(parameter.sequence, std::move(parameter.value));
                     }
@@ -212,7 +212,7 @@ export namespace language {
                     throw std::invalid_argument("P/Invoke library mappings require names and modules");
         }
         static auto launch(const options& value, const std::vector<builds::context>&) -> program {
-            return {.provider = "pinvoke", .initialization = rfl::to_generic(value)};
+            return {.provider = "pinvoke", .initialization = json::to_value(value)};
         }
     };
     static_assert(bridge<server<"pinvoke">>);

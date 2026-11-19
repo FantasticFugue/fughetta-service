@@ -1,0 +1,21 @@
+{
+  "server": {
+    "http_bind": "127.0.0.1",
+    "http_port": 8080,
+    "worker_bind": "127.0.0.1",
+    "worker_port": 9090,
+    "source": "127.0.0.1:9091",
+    "storage": "@STATE@",
+    "auth": { "mode": "token", "workspace": "default" }
+  },
+  "tools": {
+    "fughetta-llvm": "@PREFIX@/libexec/fughetta-service/llvm/fughetta-llvm@EXE@",
+    "fughetta-jvm": "@PREFIX@/libexec/fughetta-service/jvm/fughetta-jvm.jar",
+    "fughetta-kotlin": "@PREFIX@/libexec/fughetta-service/kotlin/fughetta-kotlin.jar",
+    "fughetta-clr": "@PREFIX@/libexec/fughetta-service/clr/fughetta-clr.dll",
+    "fughetta-fsharp": "@PREFIX@/libexec/fughetta-service/fsharp/fughetta-fsharp.dll",
+    "fughetta-gradle-model": "@PREFIX@/libexec/fughetta-service/fughetta-gradle-model",
+    "fughetta-msbuild-model": "@PREFIX@/libexec/fughetta-service/msbuild/fughetta-msbuild-model.dll",
+    "python-runtime": "@PREFIX@/libexec/fughetta-service/python/runtime.py"
+  }
+}

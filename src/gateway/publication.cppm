@@ -5,10 +5,116 @@ import registry;
 import knowledge;
 import protocol;
 import channels;
+import enrollment;
+import pybind;
+import constants;
 export import tool;
 
 export namespace publishing {
     using tools::tool_error;
+
+    auto python_test_updates(semantic::store& store, semantic::view& view, const semantic::snapshot& pin,
+                             const std::map<std::string, std::string>& files) -> std::vector<semantic::shard> {
+        const auto reports = store.python_tests(pin);
+        if (reports.empty())
+            return {};
+        std::vector<std::shared_ptr<const semantic::shard>> sources;
+        std::vector<semantic::unit_id> replaced;
+        for (const auto& [unit, objects] : view.units)
+            for (const auto& id : objects) {
+                const auto metadata = store.object_unit(id);
+                const auto& key = metadata.recipe.unit;
+                if (key.project != pin.project)
+                    continue;
+                if (key.provider == "ty")
+                    sources.push_back(store.object_records(id));
+                if (key.provider == "python-runtime" && metadata.recipe.options == "test-observations")
+                    replaced.push_back(unit);
+            }
+        for (const auto& unit : replaced)
+            view.units.erase(unit);
+        if (sources.empty())
+            return {};
+        std::vector<semantic::shard> updates;
+        for (const auto& report : reports)
+            if (auto shard = language::project_python_test(report.bytes, pin.project, report.name, report.digest, files, sources))
+                updates.push_back(std::move(*shard));
+        return updates;
+    }
+
+    auto publish_python_tests(storage::registry& registry, std::size_t core, const semantic::snapshot& pin,
+                              const std::string& configuration, const std::string& execution,
+                              const std::map<std::string, std::string>& expected, const std::vector<builds::exported_file>& exports,
+                              const content::manifest& snapshot) -> coroutine::task<std::vector<semantic::view_id>> {
+        std::vector<semantic::store::python_test_report> reports;
+        for (const auto& [name, path] : expected) {
+            const auto file = std::ranges::find(exports, name, &builds::exported_file::name);
+            if (file == exports.end() || !file->delivery_error.empty() || file->path != std::filesystem::path{path}.filename().generic_string() ||
+                !file->size || file->size > constants::semantic_object_bytes)
+                throw std::invalid_argument("test observation report unavailable: " + path);
+            std::string bytes;
+            while (bytes.size() < file->size) {
+                auto result = co_await registry.read_export(core, pin.project, {.digest = file->digest, .offset = bytes.size()});
+                if (result.parts.size() != 1)
+                    throw std::runtime_error("incomplete Python test observation report");
+                const auto& part = result.parts.front();
+                if (part.packed || part.offset != bytes.size() || part.total != file->size || part.bytes.empty() || part.bytes.size() > file->size - bytes.size())
+                    throw std::runtime_error("invalid Python test observation report part");
+                bytes.append(reinterpret_cast<const char*>(part.bytes.data()), part.bytes.size());
+            }
+            language::validate_python_test_report(bytes, execution);
+            reports.push_back({configuration + "/" + path, file->digest.str(), std::move(bytes)});
+        }
+        std::map<std::string, std::string> files;
+        for (const auto& file : snapshot.files)
+            files.emplace(file.path, file.digest.str());
+        co_return co_await registry.with_semantic(core, [pin, reports = std::move(reports), files = std::move(files)](semantic::store& store) {
+            for (const auto& report : reports)
+                store.remember_python_test(pin, report);
+            std::vector<semantic::view_id> views;
+            for (const auto& id : store.currents(pin.project, pin.worldline)) {
+                auto view = store.describe(id);
+                const auto& previous = semantic::snapshot_for(view.snapshots, pin.project);
+                if (previous.version != pin.version || previous.snapshot != pin.snapshot)
+                    continue;
+                const auto before = view.units.size();
+                auto updates = python_test_updates(store, view, pin, files);
+                if (updates.empty() && view.units.size() == before)
+                    continue;
+                auto published = store.publish_records(std::move(view), std::move(updates), {});
+                store.make_current(published);
+                views.push_back(std::move(published));
+            }
+            return views;
+        });
+    }
+
+    struct receipt_authority {
+        const enrollment::store* registry = nullptr;
+        std::string worker;
+
+        auto verify(const semantic::execution_receipt& claim, const semantic::execution_receipt& received) const -> std::string {
+            if (registry && claim.payload() == received.payload())
+                if (auto key = registry->verify(worker, received))
+                    return *key;
+            throw tool_error("invalid_execution_receipt", "Worker receipt does not match the submitted execution");
+        }
+
+        template <class Request> void artifacts(const Request& request, jobs::build_report& report) const {
+            report.artifact_audit.clear();
+            report.stage_views.clear();
+            auto claim = registry ? jobs::artifact_claim(report, request.snapshot.str(), jobs::artifact_recipe(request), registry->workspace_id(), worker)
+                                  : std::nullopt;
+            if (report.receipts.size() != static_cast<std::size_t>(claim.has_value()))
+                throw tool_error("invalid_execution_receipt", "Worker artifact manifest has an unexpected receipt count");
+            if (claim) {
+                auto& received = report.receipts.front();
+                auto key = verify(claim->receipt, received);
+                report.artifact_audit.push_back({std::move(received), std::move(key), std::move(claim->manifest)});
+            }
+            report.receipts.clear();
+        }
+    };
     struct committed {
         std::optional<language::session_state> session;
         std::set<semantic::unit_id> keys;
@@ -16,6 +122,7 @@ export namespace publishing {
         std::vector<semantic::shard> shards;
         std::vector<semantic::missing> missing;
         std::uint64_t reused = 0;
+        std::vector<semantic::shard_receipt> receipts;
     };
     struct bound {
 
@@ -32,6 +139,8 @@ export namespace publishing {
         reuse::channel_values input_channels;
         reuse::collection_values input_collections;
         std::vector<reuse::key> approved;
+        receipt_authority signer;
+        std::vector<semantic::artifact_receipt> artifacts;
         void receive(language::evaluated_unit unit);
         auto validate(jobs::reuse_request request) -> jobs::reuse_reply;
         auto read(jobs::shard_read request) -> coroutine::task<jobs::shard_piece>;
@@ -141,9 +250,21 @@ export namespace publishing {
                                                                     const auto operations = language::operations<Provider>();
                                                                     return std::ranges::contains(operations, unit.request.unit.operation);
                                                                 })) ||
-            !units->keys.insert(semantic::unit_identifier(unit.request.unit)).second)
+            units->keys.contains(semantic::unit_identifier(unit.request.unit)))
             throw tool_error("stale_analysis", "provider unit does not belong to the requested inputs");
-        units->session = session;
+        if (unit.receipts.size() != (signer.registry ? unit.shards.size() : 0))
+            throw tool_error("invalid_execution_receipt", "Worker semantic unit has an unexpected receipt count");
+        std::vector<semantic::shard_receipt> verified;
+        if (signer.registry) {
+            const auto workspace = signer.registry->workspace_id();
+            for (std::size_t index = 0; index < unit.shards.size(); ++index) {
+                auto claim = jobs::shard_claim(unit, unit.shards[index], workspace, signer.worker);
+                auto& received = unit.receipts[index];
+                auto key = signer.verify(claim, received);
+                verified.push_back({std::move(received), std::move(key), {}});
+            }
+        }
+        const auto key = semantic::unit_identifier(unit.request.unit);
         if (unit.reused) {
             if (!unit.shards.empty() ||
                 !std::ranges::contains(approved, reuse::key{*unit.reused, semantic::recipe_identifier(semantic::recipe{unit.request.unit, plan.options})}))
@@ -151,7 +272,9 @@ export namespace publishing {
             const auto candidate = std::ranges::find(plan.candidates, *unit.reused, &semantic::candidate::id);
             if (candidate == plan.candidates.end())
                 throw tool_error("invalid_worker_reply", "unknown reused contribution");
-            units->contributions[semantic::unit_identifier(unit.request.unit)] = candidate->shards;
+            units->session = session;
+            units->keys.insert(key);
+            units->contributions[key] = candidate->shards;
             ++units->reused;
             return;
         }
@@ -159,12 +282,24 @@ export namespace publishing {
             throw tool_error("invalid_worker_reply", "an evaluated unit requires its record shard");
         const auto channels =
             plan.registration ? plan.registration->channels : language::providers::dispatch(plan.provider, []<class Provider> { return Provider::channels(); });
+        const auto conventions = plan.registration
+                                     ? plan.registration->conventions
+                                     : language::providers::dispatch(plan.provider, []<class Provider> { return language::conventions<Provider>(); });
         for (auto& shard : unit.shards) {
             if (shard.unit.recipe != semantic::recipe{unit.request.unit, plan.options})
                 throw tool_error("invalid_worker_reply", "provider records belong to another unit recipe");
             shard.unit.channel_definitions = channels;
-            units->shards.push_back(std::move(shard));
+            shard.unit.conventions = conventions;
+            for (const auto& scope : shard.scopes)
+                for (const auto& edge : scope.lookup)
+                    if (std::ranges::none_of(conventions,
+                                             [&](const semantic::language_conventions& value) { return std::ranges::contains(value.scope_edges, edge.kind); }))
+                        throw tool_error("invalid_worker_reply", "provider wrote an undeclared scope edge kind: " + edge.kind);
         }
+        units->session = session;
+        units->keys.insert(key);
+        std::ranges::move(unit.shards, std::back_inserter(units->shards));
+        std::ranges::move(verified, std::back_inserter(units->receipts));
         return;
     }
     auto bound::serve(jobs::analysis_link inputs) -> coroutine::task<> {
@@ -192,8 +327,6 @@ export namespace publishing {
         const auto& pin = semantic::snapshot_for(snapshots, project);
         const auto& worldline = pin.worldline;
         const auto& version = pin.version;
-        if (units->keys.empty())
-            co_return std::nullopt;
         nodes::node_request registration{.action = "scope_register", .worldline = worldline, .revision = version};
         for (const auto& shard : units->shards)
             for (const auto& occurrence : shard.occurrences)
@@ -212,9 +345,10 @@ export namespace publishing {
             .snapshots = snapshots, .configuration = plan.configuration, .effective_profile = units->session->inputs, .units = units->contributions};
         selected.coverage.requested = plan.demand;
         selected.coverage.missing = units->missing;
+        selected.artifact_receipts = std::move(artifacts);
         co_return co_await files->with_semantic(
             core, [selected = std::move(selected), units = units, anchors = std::move(anchors), roots = roots](semantic::store& store) mutable {
-                return store.publish_records(std::move(selected), std::move(units->shards), anchors, roots);
+                return store.publish_records(std::move(selected), std::move(units->shards), anchors, roots, std::move(units->receipts));
             });
     }
 } // namespace publishing

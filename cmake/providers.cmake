@@ -6,7 +6,6 @@
 # names each one's main artifact; the tests and the install rules read them.
 
 set(FUGHETTA_CLR_PROVIDERS "${PROJECT_SOURCE_DIR}/providers/clr")
-set(FUGHETTA_CLR_EXPORTER "${FUGHETTA_CLR_PROVIDERS}/exporter/model.fsx")
 set(FUGHETTA_JVM_PROVIDERS "${PROJECT_SOURCE_DIR}/providers/jvm")
 set(FUGHETTA_JVM_EXPORTER "${FUGHETTA_JVM_PROVIDERS}/exporter/model.gradle")
 set(FUGHETTA_PROVIDERS)
@@ -29,13 +28,18 @@ if(DOTNET_TOOL)
   set(CLR_OUTPUT "${PROJECT_BINARY_DIR}/clr")
   set(FUGHETTA_PROVIDER_clr "${CLR_OUTPUT}/fughetta-clr/fughetta-clr.dll")
   set(FUGHETTA_PROVIDER_fsharp "${CLR_OUTPUT}/fughetta-fsharp/fughetta-fsharp.dll")
-  list(APPEND FUGHETTA_PROVIDERS clr fsharp)
+  set(FUGHETTA_CLR_EXPORTER "${CLR_OUTPUT}/fughetta-msbuild-model/fughetta-msbuild-model.dll")
+  set(FUGHETTA_PROVIDER_msbuild "${FUGHETTA_CLR_EXPORTER}")
+  list(APPEND FUGHETTA_PROVIDERS clr fsharp msbuild)
   file(MAKE_DIRECTORY "${CLR_OUTPUT}/tmp")
-  file(GLOB_RECURSE CLR_PROVIDER_SOURCES CONFIGURE_DEPENDS "${FUGHETTA_CLR_PROVIDERS}/host/*" "${FUGHETTA_CLR_PROVIDERS}/fsharp/*")
+  file(GLOB_RECURSE CLR_PROVIDER_SOURCES CONFIGURE_DEPENDS "${FUGHETTA_CLR_PROVIDERS}/host/*" "${FUGHETTA_CLR_PROVIDERS}/fsharp/*" "${FUGHETTA_CLR_PROVIDERS}/exporter/*")
   add_custom_command(OUTPUT "${CLR_OUTPUT}/built.stamp"
-    BYPRODUCTS "${FUGHETTA_PROVIDER_clr}" "${FUGHETTA_PROVIDER_fsharp}"
+    BYPRODUCTS "${FUGHETTA_PROVIDER_clr}" "${FUGHETTA_PROVIDER_fsharp}" "${FUGHETTA_CLR_EXPORTER}"
     COMMAND "${CMAKE_COMMAND}" -E env "TMPDIR=${CLR_OUTPUT}/tmp"
       "${DOTNET_TOOL}" build "${FUGHETTA_CLR_PROVIDERS}/fsharp/fughetta-fsharp.fsproj"
+      --nologo "-p:FughettaOutput=${CLR_OUTPUT}"
+    COMMAND "${CMAKE_COMMAND}" -E env "TMPDIR=${CLR_OUTPUT}/tmp"
+      "${DOTNET_TOOL}" build "${FUGHETTA_CLR_PROVIDERS}/exporter/fughetta-msbuild-model.fsproj"
       --nologo "-p:FughettaOutput=${CLR_OUTPUT}"
     COMMAND "${CMAKE_COMMAND}" -E touch "${CLR_OUTPUT}/built.stamp"
     DEPENDS ${CLR_PROVIDER_SOURCES} "${FUGHETTA_CLR_PROVIDERS}/Directory.Build.props" "${DOTNET_TOOL}"
@@ -89,22 +93,30 @@ endif()
 
 ## LLVM
 #
-# fughetta-native links LLVM's static libraries. It is a project of its own so
-# it builds against the libstdc++ or libc++ the LLVM package was built with,
-# not this build's toolchain file and flags. Only that project loads LLVM's
-# package. The LLVM beside the compiler is found first; LLVM_DIR names another.
+# fughetta-llvm links LLVM's static libraries. It is a project of its own,
+# compiled by the package's own driver, so it builds against the standard
+# library and runtime the package was built with (libstdc++ on Linux, the MSVC
+# STL and static CRT on Windows), not this build's toolchain file and flags.
+# Only that project loads LLVM's package. The LLVM beside the compiler is found
+# first; LLVM_DIR names another.
 
 find_path(LLVM_DIR LLVMConfig.cmake HINTS "${CLANG_PREFIX}/lib/cmake/llvm" PATH_SUFFIXES lib/cmake/llvm)
 if(LLVM_DIR)
-  set(NATIVE_OUTPUT "${PROJECT_BINARY_DIR}/native")
-  set(FUGHETTA_PROVIDER_native "${NATIVE_OUTPUT}/bin/fughetta-native${CMAKE_EXECUTABLE_SUFFIX}")
-  list(APPEND FUGHETTA_PROVIDERS native)
-  add_custom_command(OUTPUT "${FUGHETTA_PROVIDER_native}"
-    COMMAND "${CMAKE_COMMAND}" -S "${PROJECT_SOURCE_DIR}/providers/native/host" -B "${NATIVE_OUTPUT}/build"
-      -G "${CMAKE_GENERATOR}" "-DCMAKE_CXX_COMPILER=${CMAKE_CXX_COMPILER}" -DCMAKE_BUILD_TYPE=Release
-      "-DLLVM_DIR=${LLVM_DIR}" "-DCMAKE_RUNTIME_OUTPUT_DIRECTORY=${NATIVE_OUTPUT}/bin"
-    COMMAND "${CMAKE_COMMAND}" --build "${NATIVE_OUTPUT}/build"
-    DEPENDS "${PROJECT_SOURCE_DIR}/providers/native/host/CMakeLists.txt" "${PROJECT_SOURCE_DIR}/providers/native/host/fughetta-native.cpp"
+  cmake_path(SET LLVM_PREFIX NORMALIZE "${LLVM_DIR}/../../..")
+  find_program(LLVM_CXX_COMPILER NAMES ${CLANG_DRIVERS_${CMAKE_HOST_SYSTEM_NAME}} HINTS "${LLVM_PREFIX}/bin" NO_DEFAULT_PATH NAMES_PER_DIR REQUIRED)
+  set(LLVM_HOST_OPTIONS "-DCMAKE_CXX_COMPILER=${LLVM_CXX_COMPILER}")
+  if(WIN32)
+    list(APPEND LLVM_HOST_OPTIONS "-DCMAKE_PREFIX_PATH=${VCPKG_INSTALLED_DIR}/${VCPKG_TARGET_TRIPLET}")
+  endif()
+  set(LLVM_OUTPUT "${PROJECT_BINARY_DIR}/llvm")
+  set(FUGHETTA_PROVIDER_llvm "${LLVM_OUTPUT}/bin/fughetta-llvm${CMAKE_EXECUTABLE_SUFFIX}")
+  list(APPEND FUGHETTA_PROVIDERS llvm)
+  add_custom_command(OUTPUT "${FUGHETTA_PROVIDER_llvm}"
+    COMMAND "${CMAKE_COMMAND}" -S "${PROJECT_SOURCE_DIR}/providers/llvm/host" -B "${LLVM_OUTPUT}/build"
+      -G "${CMAKE_GENERATOR}" ${LLVM_HOST_OPTIONS} -DCMAKE_BUILD_TYPE=Release
+      "-DLLVM_DIR=${LLVM_DIR}" "-DCMAKE_RUNTIME_OUTPUT_DIRECTORY=${LLVM_OUTPUT}/bin"
+    COMMAND "${CMAKE_COMMAND}" --build "${LLVM_OUTPUT}/build"
+    DEPENDS "${PROJECT_SOURCE_DIR}/providers/llvm/host/CMakeLists.txt" "${PROJECT_SOURCE_DIR}/providers/llvm/host/fughetta-llvm.cpp"
     VERBATIM)
-  add_custom_target(native-provider ALL DEPENDS "${FUGHETTA_PROVIDER_native}")
+  add_custom_target(llvm-provider ALL DEPENDS "${FUGHETTA_PROVIDER_llvm}")
 endif()

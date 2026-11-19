@@ -2,7 +2,7 @@ export module ruff;
 import lsp;
 import std;
 import meta;
-import reflection;
+import json;
 import content;
 export import provider;
 
@@ -72,7 +72,7 @@ namespace language {
             toggle fix_violation;
         };
         struct settings {
-            std::map<std::string, rfl::Generic> configuration;
+            std::map<std::string, json::value> configuration;
             std::optional<std::string> configuration_preference;
             std::vector<std::string> exclude;
             lint linter;
@@ -209,7 +209,7 @@ namespace language {
         builds::validate_environment(o.env);
         auto& s = o.server;
         for (auto& [key, value] : s.configuration)
-            if (key.empty() || std::holds_alternative<std::nullopt_t>(value.get()))
+            if (key.empty() || std::holds_alternative<std::monostate>(value.get()))
                 throw std::invalid_argument("a ruff configuration key is a nonempty name with a value: " + key);
         if (s.configuration_preference && *s.configuration_preference != "editorFirst" && *s.configuration_preference != "filesystemFirst" &&
             *s.configuration_preference != "editorOnly")
@@ -231,14 +231,14 @@ namespace language {
     auto server<"ruff">::launch(const options& o, const std::vector<builds::context>&) -> program {
         auto& s = o.server;
         auto strings = [](const std::vector<std::string>& values) {
-            rfl::Generic::Array list;
+            json::array list;
             for (auto& value : values)
                 list.emplace_back(value);
             return list;
         };
-        rfl::Generic::Object settings, lint, format, actions;
+        json::object settings, lint, format, actions;
         if (!s.configuration.empty()) {
-            rfl::Generic::Object configuration;
+            json::object configuration;
             for (auto& [key, value] : s.configuration)
                 configuration[key] = value;
             settings["configuration"] = std::move(configuration);
@@ -246,13 +246,13 @@ namespace language {
         if (s.configuration_preference)
             settings["configurationPreference"] = *s.configuration_preference;
         if (s.line_length)
-            settings["lineLength"] = rfl::Generic{static_cast<std::int64_t>(*s.line_length)};
+            settings["lineLength"] = json::value{static_cast<std::int64_t>(*s.line_length)};
         if (s.fix_all)
-            settings["fixAll"] = rfl::Generic{*s.fix_all};
+            settings["fixAll"] = json::value{*s.fix_all};
         if (s.organize_imports)
-            settings["organizeImports"] = rfl::Generic{*s.organize_imports};
+            settings["organizeImports"] = json::value{*s.organize_imports};
         if (s.show_syntax_errors)
-            settings["showSyntaxErrors"] = rfl::Generic{*s.show_syntax_errors};
+            settings["showSyntaxErrors"] = json::value{*s.show_syntax_errors};
         if (!s.exclude.empty())
             settings["exclude"] = strings(s.exclude);
         if (s.linter.select)
@@ -262,19 +262,19 @@ namespace language {
         if (s.linter.ignore)
             lint["ignore"] = strings(*s.linter.ignore);
         if (s.linter.preview)
-            lint["preview"] = rfl::Generic{*s.linter.preview};
+            lint["preview"] = json::value{*s.linter.preview};
         if (!lint.empty())
             settings["lint"] = std::move(lint);
         if (s.formatter.preview)
-            format["preview"] = rfl::Generic{*s.formatter.preview};
+            format["preview"] = json::value{*s.formatter.preview};
         if (s.formatter.backend)
             format["backend"] = *s.formatter.backend;
         if (!format.empty())
             settings["format"] = std::move(format);
         for (auto [name, toggle] : {std::pair{"disableRuleComment", &s.actions.disable_rule_comment}, std::pair{"fixViolation", &s.actions.fix_violation}})
             if (toggle->enable) {
-                rfl::Generic::Object entry;
-                entry["enable"] = rfl::Generic{*toggle->enable};
+                json::object entry;
+                entry["enable"] = json::value{*toggle->enable};
                 actions[name] = std::move(entry);
             }
         if (!actions.empty())
@@ -283,7 +283,7 @@ namespace language {
             settings["logLevel"] = *s.log_level;
         if (s.log_file)
             settings["logFile"] = *s.log_file;
-        rfl::Generic::Object init;
+        json::object init;
         init["settings"] = std::move(settings);
         return {.argv = {o.executable, "server"}, .env = o.env, .initialization = std::move(init)};
     }

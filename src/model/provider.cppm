@@ -1,7 +1,7 @@
 export module provider;
 import std;
 import meta;
-import reflection;
+import json;
 import content;
 export import records;
 
@@ -221,7 +221,7 @@ export namespace builds {
         { T::read(text) } -> std::same_as<reading>;
     };
 
-    template <meta::fixed_string Name> using literal = rfl::Literal<rfl::internal::StringLiteral<sizeof(Name.chars)>{Name.chars}>;
+    template <meta::fixed_string Name> using literal = json::literal<Name>;
 
     void relative(std::string_view value, bool dot = false);
     void validate_environment(const environment& env);
@@ -249,7 +249,7 @@ export namespace language {
         std::string id, slot, project, provider, options, stage, snapshot;
         std::uint64_t epoch = 0;
         std::vector<semantic::input_object> inputs;
-        rfl::Literal<"created", "opening", "ready", "updating", "evaluating", "resolving", "failed", "closing", "closed"> phase;
+        json::literal<"created", "opening", "ready", "updating", "evaluating", "resolving", "failed", "closing", "closed"> phase;
     };
     struct evaluation_identity {
         std::string request_id, computation_id, stage_id;
@@ -271,6 +271,7 @@ export namespace language {
         std::vector<semantic::shard> shards;
         std::optional<semantic::candidate_id> reused;
         bool deferred = false;
+        std::vector<semantic::execution_receipt> receipts;
     };
 
     struct port {
@@ -295,6 +296,12 @@ export namespace language {
         else
             return {"evaluate", "resolve"};
     }
+    template <class Provider> auto conventions() -> std::vector<semantic::language_conventions> {
+        if constexpr (requires { Provider::conventions(); })
+            return Provider::conventions();
+        else
+            return {};
+    }
     struct input_validator {
         std::string_view type;
         bool (*validate)(const semantic::input_object&, std::span<const semantic::input_object>);
@@ -313,9 +320,11 @@ export namespace language {
         std::vector<std::string> emits;
         // The link domain whose artifacts this provider reads.
         std::optional<std::string> reads;
-        rfl::Generic configuration_schema;
+        json::value configuration_schema;
         std::vector<port> ports;
         std::vector<semantic::channel_definition> channels;
+        // How each language the provider reports spells visibility, value wrappers and scope edges.
+        std::vector<semantic::language_conventions> conventions;
         // The adapter's export surface; a session may supply a subset after negotiation.
         std::vector<semantic::fact_kind> facts;
         std::vector<std::string> operations{"evaluate", "resolve"};
@@ -335,7 +344,7 @@ export namespace language {
         std::vector<std::string> argv;
         builds::environment env;
         // Sent as the initialize request's initializationOptions.
-        rfl::Generic initialization;
+        json::value initialization;
         // Additional provider operations; each argv is resolved in the same worker slot.
         std::map<std::string, std::vector<std::string>> commands;
         // Auxiliary executable inputs selected by the provider, such as tsserver.

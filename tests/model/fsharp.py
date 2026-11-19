@@ -102,6 +102,7 @@ module Interop =
             request = {"execution": {"request_id": "request", "computation_id": "computation", "stage_id": "source"}, "slot_id": "slot",
                        "unit": key, "epoch": session["epoch"], "inputs": [], "demand": selected["coverage"]["requested"], "budget": {}, "retained_only": False}
             response = call("evaluate", {"request": request, "unit": selected})
+            assert response["receipts"] == []
             shard, = response["shards"]
             producer_keys = response["producer_keys"]
             assert set(producer_keys) == {read["key"] for read in shard["unit"]["observed_dependencies"]}

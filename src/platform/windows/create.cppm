@@ -10,6 +10,8 @@ import httpant.io;
 import winapi;
 
 namespace native_process {
+    auto standard_input() -> native_io::handle { return reinterpret_cast<native_io::handle>(::GetStdHandle(STD_INPUT_HANDLE)); }
+    auto standard_output() -> native_io::handle { return reinterpret_cast<native_io::handle>(::GetStdHandle(STD_OUTPUT_HANDLE)); }
     namespace {
         auto sample_threads() -> std::optional<std::map<DWORD, std::uint32_t>> {
             winapi::handle snapshot{::CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)};
@@ -180,9 +182,6 @@ namespace native_process {
     auto child::spawn(native_io::engine<concurrent::queue>& engine, const io::command& cmd) -> child {
         if (cmd.argv.empty() || cmd.argv.front().empty())
             throw std::invalid_argument("spawn: empty command");
-        // Analysis hosts that isolate the network are the POSIX ones; a Windows Worker serves both roles in one process.
-        if (cmd.offline)
-            throw std::invalid_argument("spawn: network isolation is not available on Windows");
         auto s = std::make_unique<state>(engine);
         s->job = winapi::handle{::CreateJobObjectW(nullptr, nullptr)};
         if (!s->job.value)

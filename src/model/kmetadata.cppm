@@ -1,7 +1,7 @@
 export module kmetadata;
 import std;
 import records;
-import reflection;
+import json;
 
 export namespace kotlin_metadata {
     struct identity {
@@ -219,10 +219,10 @@ export namespace kotlin_metadata {
                             std::string variance;
                             std::optional<semantic::type_id> type;
                         };
-                        auto projections = rfl::from_generic<std::vector<projection>>(found->second).value();
+                        auto projections = json::from_value<std::vector<projection>>(found->second).value();
                         for (auto& projection : projections)
                             optional_type(projection.type);
-                        found->second = rfl::to_generic(projections);
+                        found->second = json::to_value(projections);
                     }
                     out.types.push_back(std::move(value));
                 }
@@ -288,7 +288,7 @@ export namespace kotlin_metadata {
                         retain(target.identity);
                         auto origin = ownership;
                         origin.origin.location = target.location;
-                        const auto id = out.unit.id + ":metadata:" + value.id + ":" + rfl::json::write(key);
+                        const auto id = out.unit.id + ":metadata:" + value.id + ":" + json::write(key);
                         if (!already_declared)
                             out.occurrences.push_back(
                                 {.id = id, .ownership = origin, .symbol = binding->symbol, .location = target.location, .roles = {std::string{"definition"}}});

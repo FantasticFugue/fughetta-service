@@ -3,7 +3,7 @@ import utility;
 import constants;
 import std;
 import knowledge;
-import reflection;
+import json;
 import coroutine;
 import meta;
 import protocol;
@@ -39,28 +39,29 @@ export namespace tools {
             }
         };
         struct input {
-            rfl::Description<"Project; supplied by the execution context when absent", std::optional<std::string>> project;
-            rfl::Description<"Worldline; task binding when absent; explicit selection required without a task", std::optional<std::string>> worldline;
-            rfl::Description<"Version to query; the current one when absent", std::optional<std::string>> version;
-            rfl::Description<"Analysis configuration; the project's only one when absent", std::optional<std::string>> configuration;
-            rfl::Description<"scopes, symbols, definitions, references, relations, impact, diagnostics (default), inspect, plan, describe or schema",
+            json::described<"Project; supplied by the execution context when absent", std::optional<std::string>> project;
+            json::described<"Worldline; task binding when absent; explicit selection required without a task", std::optional<std::string>> worldline;
+            json::described<"Version to query; the current one when absent", std::optional<std::string>> version;
+            json::described<"Analysis configuration; the project's only one when absent", std::optional<std::string>> configuration;
+            json::described<"scopes, symbols, definitions, references, relations, impact, diagnostics (default), inspect, plan, describe or schema",
                              std::optional<semantic::tool_action>>
                 action;
-            rfl::Description<"Filter describe by provider ID; all registered providers when absent", std::optional<std::string>> provider;
+            json::described<"Filter describe by provider ID; all registered providers when absent", std::optional<std::string>> provider;
             std::optional<scope_filter> scope;
-            rfl::Description<"name selects a symbol prefix; entity identifies a declaration in a published view", std::optional<semantic::selection>> selector;
-            rfl::Description<"Continue a published immutable analysis view", std::optional<std::string>> view;
+            json::described<"name selects a symbol prefix; entity identifies a declaration in a published view", std::optional<semantic::selection>> selector;
+            json::described<"Continue a published immutable analysis view", std::optional<std::string>> view;
             std::optional<std::string> from_view, to_view;
             std::optional<std::vector<std::string>> outputs;
             std::optional<std::vector<std::string>> include;
+            json::described<"Include verified Worker execution receipts for this view", std::optional<bool>> execution_receipts;
             std::optional<std::uint64_t> limit;
             std::optional<std::string> cursor;
-            rfl::Description<"Resume the query retained by a partial result; budget may be overridden", std::optional<std::string>> continuation;
+            json::described<"Resume the query retained by a partial result; budget may be overridden", std::optional<std::string>> continuation;
             std::optional<std::vector<std::string>> relations;
-            rfl::Description<"Impact change kinds: declaration and/or body; both when omitted", std::optional<std::vector<std::string>>> changes;
-            std::optional<rfl::Literal<"outgoing", "incoming", "both">> direction;
+            json::described<"Impact change kinds: declaration and/or body; both when omitted", std::optional<std::vector<std::string>>> changes;
+            std::optional<json::literal<"outgoing", "incoming", "both">> direction;
             std::optional<std::uint64_t> depth;
-            rfl::Description<"Analysis time in milliseconds, document units and returned semantic nodes; view queries use nodes for type expansion",
+            json::described<"Analysis time in milliseconds, document units and returned semantic nodes; view queries use nodes for type expansion",
                              std::optional<semantic::budget>>
                 budget;
         };
@@ -71,7 +72,7 @@ export namespace tools {
             std::optional<std::string> environment, version, view;
             bool stale = false;
             bool analyzed = false;
-            std::optional<rfl::Generic> schema;
+            std::optional<json::value> schema;
             std::optional<std::vector<language::description>> providers;
             std::optional<language::graph> plan;
             semantic::snapshot_vector snapshots;
@@ -92,6 +93,8 @@ export namespace tools {
             std::optional<std::string> cursor, code, message;
             std::optional<std::string> continuation, next_view;
             std::string column_encoding = "unicode_scalar";
+            std::vector<semantic::shard_receipt> shard_receipts;
+            std::vector<semantic::artifact_receipt> artifact_receipts;
         };
         struct dependency_execution {
             std::map<std::string, semantic::snapshot> pins;
@@ -147,6 +150,27 @@ export namespace tools {
                 result.dependency = worlds::dependency_read{pin.project, pin.worldline, pin.version};
             return result;
         }
+        static void compact_coverage(semantic::coverage& coverage) {
+            std::set<std::string> scopes;
+            std::erase_if(coverage.available, [&](const auto& scope) { return !scopes.insert(json::write(scope)).second; });
+
+            std::map<std::string, std::size_t> groups;
+            auto entries = std::exchange(coverage.missing, {});
+            for (auto& entry : entries) {
+                auto key = json::write(std::tie(entry.scope, entry.reason, entry.phase, entry.deferred));
+                auto [found, inserted] = groups.try_emplace(std::move(key), coverage.missing.size());
+                if (inserted)
+                    coverage.missing.push_back(std::move(entry));
+                else {
+                    auto& units = coverage.missing[found->second].units;
+                    std::ranges::move(entry.units, std::back_inserter(units));
+                }
+            }
+            for (auto& entry : coverage.missing) {
+                std::ranges::sort(entry.units);
+                entry.units.erase(std::ranges::unique(entry.units).begin(), entry.units.end());
+            }
+        }
         static auto read_view(services& s, const std::string& project, const std::string& id, const input& in, const worlds::actor& actor)
             -> coroutine::task<output> {
             semantic::view description;
@@ -195,7 +219,7 @@ export namespace tools {
                                       .include = in.include.value_or(std::vector<std::string>{}),
                                       .relations = in.relations.value_or(std::vector<std::string>{}),
                                       .changes = in.changes.value().value_or(std::vector<std::string>{}),
-                                      .direction = in.direction.value_or(rfl::Literal<"outgoing", "incoming", "both">{}),
+                                      .direction = in.direction.value_or(json::literal<"outgoing", "incoming", "both">{}),
                                       .depth = in.depth.value_or(description.defaults.relation_depth),
                                       .limit = in.limit.value_or(description.defaults.fact_limit),
                                       .cursor = in.cursor,
@@ -218,11 +242,14 @@ export namespace tools {
             } catch (const std::invalid_argument& e) {
                 throw tool_error(nodes::code::invalid_record, e.what());
             }
+            const bool compiler_errors_only = !result.coverage.missing.empty() && std::ranges::all_of(result.coverage.missing, [](const auto& missing) {
+                return missing.reason == semantic::tentative_cpp_types;
+            });
             output out{.configuration = description.configuration,
                        .worldline = snapshot.worldline,
                        .version = snapshot.version,
                        .view = id,
-                       .stale = result.status == "partial",
+                       .stale = result.status == "partial" && !compiler_errors_only,
                        .snapshots = result.snapshots,
                        .status = result.status.str(),
                        .coverage = std::move(result.coverage),
@@ -243,16 +270,20 @@ export namespace tools {
                        .cursor = std::move(result.cursor),
                        .code = std::move(result.code),
                        .message = std::move(result.message)};
+            if (in.execution_receipts.value().value_or(false)) {
+                out.shard_receipts = std::move(description.receipts);
+                out.artifact_receipts = std::move(description.artifact_receipts);
+            }
             if (auto profile = std::ranges::find_if(
                     description.effective_profile,
                     [](const auto& value) { return value.kind == semantic::input_kind::project_model && value.name == "analysis/configuration"; });
                 profile != description.effective_profile.end())
                 out.environment = profile->object;
-            if (out.status == "partial" && ((!request.from_view && description.computation) ||
+            if (out.status == "partial" && !compiler_errors_only && ((!request.from_view && description.computation) ||
                                             std::ranges::all_of(out.coverage.missing, [](const auto& missing) { return missing.phase == "query"; }))) {
                 out.continuation = co_await s.files.with_semantic(s.core, [id, request, cursor = out.cursor](semantic::store& store) mutable {
                     request.cursor = std::move(cursor);
-                    return rfl::json::write(store.remember_query(id, std::move(request)));
+                    return json::write(store.remember_query(id, std::move(request)));
                 });
             }
             struct source_positions {
@@ -400,6 +431,7 @@ export namespace tools {
                             out.scopes.at(offsets.at(row.id)) = std::move(row);
                 }
             }
+            compact_coverage(out.coverage);
             co_return out;
         }
         struct restoration {
@@ -431,7 +463,7 @@ export namespace tools {
                         std::shared_ptr<dependency_execution> dependencies = {}, std::optional<language::dependency_computation> pinned = {})
             -> coroutine::task<output> {
             if (in.continuation.value()) {
-                auto token = rfl::json::read<semantic::continuation>(*in.continuation.value());
+                auto token = json::read<semantic::continuation>(*in.continuation.value());
                 if (!token)
                     throw tool_error(nodes::code::invalid_record, "invalid analysis continuation");
                 auto query = co_await s.files.with_semantic(s.core, [token = *token](semantic::store& store) { return store.resume(token); });
@@ -501,8 +533,8 @@ export namespace tools {
             if (action == "schema") {
                 static const auto schema = [] {
                     auto value = semantic::schemas().to_object().value();
-                    value["providers"] = rfl::to_generic(language::providers::describe());
-                    return rfl::Generic{std::move(value)};
+                    value["providers"] = json::to_value(language::providers::describe());
+                    return json::value{std::move(value)};
                 }();
                 co_return output{.schema = schema};
             }
@@ -590,7 +622,7 @@ export namespace tools {
                 const auto stage = language::resolve(profile.stages.at(id), graph.defaults);
                 fingerprints.emplace_back(id, language::fingerprint(stage, builds).str());
             }
-            out.environment = content::hash_of(rfl::json::write(std::tuple{fingerprints, graph.outputs})).str();
+            out.environment = content::hash_of(json::write(std::tuple{fingerprints, graph.outputs})).str();
             semantic::request query{.action = action, .selector = in.selector.value()};
             if (query.selector) {
                 try {
@@ -688,7 +720,7 @@ export namespace tools {
                     for (const auto& producer : producers)
                         if (const auto* dependency = std::get_if<language::project_input>(&producer)) {
                             const auto cache_key =
-                                rfl::json::write(std::tuple{dependency->project, dependency->worldline, dependency->configuration, dependency->output});
+                                json::write(std::tuple{dependency->project, dependency->worldline, dependency->configuration, dependency->output});
                             if (const auto pin = dependencies->pins.find(dependency->project);
                                 pin != dependencies->pins.end() &&
                                 (pin->second.worldline != dependency->worldline || (dependency->version && *dependency->version != pin->second.version)))
@@ -839,12 +871,18 @@ export namespace tools {
             std::erase_if(builds, [&](const auto& entry) { return !used_builds.contains(entry.first); });
             computation.toolchains = prepared.toolchains;
             auto units = std::move(prepared.stage_views);
+            std::map<std::string, std::string> runtime_sources;
+            if (!restored && std::ranges::any_of(profile.stages, [](const auto& stage) { return language::provider_of(stage.second.server) == "ty"; }))
+                for (const auto& file : source.files)
+                    runtime_sources.emplace(file.path, file.digest);
             out.view = co_await s.files.with_semantic(s.core, [selected_view = std::move(selected_view), units = std::move(units),
                                                                computation = std::move(computation), checkpoints = std::move(prepared.checkpoint_views),
-                                                               missing = std::move(prepared.missing)](semantic::store& store) mutable {
+                                                               missing = std::move(prepared.missing), runtime_sources = std::move(runtime_sources)](semantic::store& store) mutable {
                 std::set<semantic::unit_id> touched;
                 for (const auto& id : units) {
-                    const auto& unit = store.describe(id);
+                    auto unit = store.describe(id);
+                    std::ranges::move(unit.receipts, std::back_inserter(selected_view.receipts));
+                    std::ranges::move(unit.artifact_receipts, std::back_inserter(selected_view.artifact_receipts));
                     for (const auto& [owner, shards] : unit.units) {
                         selected_view.units[owner] = shards;
                         touched.insert(owner);
@@ -862,7 +900,10 @@ export namespace tools {
                 });
                 selected_view.coverage.missing.insert(selected_view.coverage.missing.end(), missing.begin(), missing.end());
                 selected_view.computation = computation;
-                auto view = store.publish(std::move(selected_view), {}, true);
+                auto observations = runtime_sources.empty() ? std::vector<semantic::shard>{} : publishing::python_test_updates(
+                    store, selected_view, semantic::snapshot_for(selected_view.snapshots, computation.project), runtime_sources);
+                auto view = observations.empty() ? store.publish(std::move(selected_view), {}, true)
+                                                : store.publish_records(std::move(selected_view), std::move(observations), {});
                 store.make_current(view);
                 return view;
             });
