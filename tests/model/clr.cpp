@@ -108,7 +108,7 @@ namespace {
                 return std::ranges::any_of(shard.relations, [&](const auto& edge) {
                     if (edge.kind != "emits" || edge.to != target || !edge.detail)
                         return false;
-                    const bool matches = edge.detail->variant().visit([&](const auto& detail) -> bool {
+                    const bool matches = edge.detail->visit([&](const auto& detail) -> bool {
                         if constexpr (std::same_as<std::decay_t<decltype(detail)>, semantic::records::emission_detail>)
                             return detail.evidence.str() == evidence;
                         else

@@ -45,7 +45,7 @@ namespace {
                 << "an inlined call has an inline frame";
             llvm::associate(optimized, inline_object.locations, bodies, {{"inline.cpp", source_text}}, kotlin_files[14].parent_path());
             expect(std::ranges::any_of(optimized.relations, [](const auto& row) {
-                return row.from == "inline_leaf" && row.detail && row.detail->variant().visit([](const auto& detail) {
+                return row.from == "inline_leaf" && row.detail && row.detail->visit([](const auto& detail) {
                     if constexpr (std::same_as<std::remove_cvref_t<decltype(detail)>, semantic::records::emission_detail>)
                         return detail.inline_depth.value_or(0) > 0;
                     else
