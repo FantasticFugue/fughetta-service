@@ -7,3 +7,6 @@ set(PLATFORM_DEFINITIONS WIN32_LEAN_AND_MEAN NOMINMAX _WIN32_WINNT=0x0A00 NTDDI_
 set(PLATFORM_LINK_OPTIONS "LINKER:/STACK:8388608")
 set(PLATFORM_LIBRARIES advapi32)
 set(HTTPANT_IO_BACKEND iocp CACHE STRING "Native I/O mechanism")
+# Gradle installs both launchers. The Windows launcher runs through cmd.exe.
+set(GRADLE_LAUNCHER gradle.bat)
+set(GRADLE_LAUNCH_PREFIX "$ENV{ComSpec}" /d /c call)

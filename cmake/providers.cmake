@@ -58,14 +58,16 @@ endif()
 # its home, daemon run files and temporary directory. FUGHETTA_GRADLE runs a
 # task of the providers' build that way; the tests run theirs with it too.
 
-find_program(GRADLE_TOOL gradle)
+find_program(GRADLE_TOOL NAMES "${GRADLE_LAUNCHER}")
 if(GRADLE_TOOL)
+  cmake_path(NATIVE_PATH GRADLE_TOOL GRADLE_NATIVE_TOOL)
+  set(GRADLE_COMMAND ${GRADLE_LAUNCH_PREFIX} "${GRADLE_NATIVE_TOOL}")
   set(JVM_OUTPUT "${PROJECT_BINARY_DIR}/jvm")
   set(GRADLE_ENV
     "JAVA_TOOL_OPTIONS=-Djava.io.tmpdir=${JVM_OUTPUT}/tmp -Dkotlin.daemon.options=runFilesPath=${JVM_OUTPUT}/daemon"
     "GRADLE_USER_HOME=${JVM_OUTPUT}/home")
   file(MAKE_DIRECTORY "${JVM_OUTPUT}/tmp" "${JVM_OUTPUT}/home" "${JVM_OUTPUT}/daemon")
-  execute_process(COMMAND "${CMAKE_COMMAND}" -E env ${GRADLE_ENV} "${GRADLE_TOOL}" --version
+  execute_process(COMMAND "${CMAKE_COMMAND}" -E env ${GRADLE_ENV} ${GRADLE_COMMAND} --version
     OUTPUT_VARIABLE GRADLE_VERSION_OUTPUT RESULT_VARIABLE GRADLE_VERSION_STATUS ERROR_VARIABLE GRADLE_VERSION_ERROR)
   string(REGEX MATCH "Gradle ([0-9]+\\.[0-9]+(\\.[0-9]+)?)" GRADLE_VERSION_MATCH "${GRADLE_VERSION_OUTPUT}")
   set(GRADLE_VERSION "${CMAKE_MATCH_1}")
@@ -73,7 +75,7 @@ if(GRADLE_TOOL)
     message(FATAL_ERROR "jvm-providers require Gradle 9.1 or later for JVM 25; set GRADLE_TOOL to that executable. ${GRADLE_TOOL} reported '${GRADLE_VERSION}': ${GRADLE_VERSION_ERROR}")
   endif()
   set(FUGHETTA_GRADLE "${CMAKE_COMMAND}" -E env ${GRADLE_ENV}
-    "${GRADLE_TOOL}" --no-daemon --console=plain
+    ${GRADLE_COMMAND} --no-daemon --console=plain
     --project-cache-dir "${JVM_OUTPUT}/gradle"
     "-Pkotlin.project.persistent.dir=${JVM_OUTPUT}/persistent"
     "-Pfughetta.buildDirectory=${JVM_OUTPUT}/output"
