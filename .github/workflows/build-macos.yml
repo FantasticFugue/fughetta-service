@@ -340,9 +340,11 @@ jobs:
           TEST_PATTERN: ${{ steps.settings.outputs.check_pattern }}
         run: |
           set -euo pipefail
-          arguments=()
-          if [[ -n "$TEST_PATTERN" ]]; then arguments=(-R "$TEST_PATTERN"); fi
-          ctest --preset "$PRESET" --test-dir "$BUILD_DIR" "${arguments[@]}"
+          if [[ -n "$TEST_PATTERN" ]]; then
+            ctest --preset "$PRESET" --test-dir "$BUILD_DIR" -R "$TEST_PATTERN"
+          else
+            ctest --preset "$PRESET" --test-dir "$BUILD_DIR"
+          fi
 
       - name: Retain test results
         if: steps.settings.outputs.retain_test_log == 'true'
