@@ -10,7 +10,7 @@ import zipfile
 import re
 
 def kotlin_flow(binary, gradle, exporter, java, host, helper, validator, compiler, work):
-    from managed import export, put, run, use_java_home
+    from managed import export, put, put_gradle_settings, run, use_java_home
     binary, java, host, helper, validator = [str(Path(value).resolve()) for value in (binary, java, host, helper, validator)]
     # The compiler may be an argv[0]-selected LLVM driver symlink.
     compiler = str(Path(compiler).absolute())
@@ -27,7 +27,7 @@ def kotlin_flow(binary, gradle, exporter, java, host, helper, validator, compile
             FUGHETTA_SDKS=json.dumps([dict(name="sdk/java", object="jdk", roots=[sdk])]))
         use_java_home(root)
         use_java_home(library_root)
-        put(root, "settings.gradle", "rootProject.name = 'sample'\n")
+        put_gradle_settings(root, "rootProject.name = 'sample'\n")
         put(root, "build.gradle", """
 plugins { id 'org.jetbrains.kotlin.jvm' version '2.4.21' }
 repositories { mavenCentral() }
@@ -42,7 +42,7 @@ tasks.register('verifyNative', JavaExec) {
 }
 """)
         # This is a binary library, built separately from the source model.
-        put(library_root, "settings.gradle", "rootProject.name = 'library'\n")
+        put_gradle_settings(library_root, "rootProject.name = 'library'\n")
         put(library_root, "build.gradle", """
 plugins { id 'org.jetbrains.kotlin.jvm' version '2.4.21' }
 repositories { mavenCentral() }

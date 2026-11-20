@@ -178,7 +178,8 @@ namespace {
                               "extern \"C\" int Java_sample_Bridge_nativeTwice(void*, void*, int input) { return native_twice(input); }\n";
         const std::string path = kotlin ? "src/main/kotlin/Main.kt" : "Library.fs";
         if (kotlin) {
-            files["settings.gradle"] = "rootProject.name = 'managed-e2e'\ninclude 'library'\n";
+            files["settings.gradle"] = "pluginManagement { repositories { mavenCentral(); gradlePluginPortal() } }\n"
+                                       "rootProject.name = 'managed-e2e'\ninclude 'library'\n";
             files["gradle.properties"] = "org.gradle.java.installations.fromEnv=FUGHETTA_TEST_JAVA_HOME\n"
                                          "org.gradle.java.installations.auto-detect=false\norg.gradle.java.installations.auto-download=false\n";
             files["build.gradle"] = "plugins { id 'org.jetbrains.kotlin.jvm' version '2.4.21'; id 'application' }\n"

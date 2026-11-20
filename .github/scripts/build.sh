@@ -10,8 +10,9 @@ attempts="${BUILD_ATTEMPTS:-6}"
 for ((attempt = 1; ; ++attempt)); do
   if cmake --build "$dir" --parallel "${BUILD_JOBS:?BUILD_JOBS is unset}" --target "$@" 2>&1 | tee "$log"; then
     exit 0
+  else
+    status=$?
   fi
-  status=$?
   if ((attempt >= attempts)); then
     echo "Stage $name still failing after $attempt attempts." >&2
     exit "$status"

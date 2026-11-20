@@ -23,6 +23,10 @@ def put(root, name, text):
     path.write_text(text, encoding="utf-8")
 
 
+def put_gradle_settings(root, settings):
+    put(root, "settings.gradle", "pluginManagement { repositories { mavenCentral(); gradlePluginPortal() } }\n" + settings)
+
+
 def use_java_home(root):
     put(root, "gradle.properties", "org.gradle.java.installations.fromEnv=JAVA_HOME\n"
         "org.gradle.java.installations.auto-detect=false\norg.gradle.java.installations.auto-download=false\n")
@@ -50,7 +54,7 @@ def export(root, kind, tool, exporter, projects=(), generated=(), prepare=True):
 
 
 def kotlin(root, tool):
-    put(root, "settings.gradle", "rootProject.name = 'managed-test'\ninclude 'library', 'app'\nincludeBuild 'one'\nincludeBuild 'two'\n")
+    put_gradle_settings(root, "rootProject.name = 'managed-test'\ninclude 'library', 'app'\nincludeBuild 'one'\nincludeBuild 'two'\n")
     put(root, "build.gradle", """
 plugins { id 'org.jetbrains.kotlin.jvm' version '2.4.21' apply false }
 subprojects {
@@ -71,7 +75,7 @@ project(':app') {
 }
 """)
     for name in ("one", "two"):
-        put(root, name + "/settings.gradle", "rootProject.name = '" + name + "'\n")
+        put_gradle_settings(root / name, "rootProject.name = '" + name + "'\n")
         put(root, name + "/build.gradle", """
 plugins { id 'org.jetbrains.kotlin.multiplatform' version '2.4.21' }
 group = 'sample'
