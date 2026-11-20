@@ -137,8 +137,10 @@ set(FUGHETTA_JAVAC "${Java_JAVAC_EXECUTABLE}")
 if(FUGHETTA_JAVAC)
   add_executable(jvm-test model/jvm.cpp)
   target_link_libraries(jvm-test PRIVATE testing)
-  add_test(NAME model.jvm COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/model/jvm.py"
-    "$<TARGET_FILE:jvm-test>" "${FUGHETTA_JAVAC}" "${CMAKE_BINARY_DIR}/jvm-tests")
+  add_executable(jvm-driver model/jvm_driver.cpp)
+  target_link_libraries(jvm-driver PRIVATE testing)
+  add_dependencies(jvm-driver jvm-test)
+  add_test(NAME model.jvm COMMAND jvm-driver "$<TARGET_FILE:jvm-test>" "${FUGHETTA_JAVAC}" "${CMAKE_BINARY_DIR}/jvm-tests")
   set_tests_properties(model.jvm PROPERTIES TIMEOUT 120)
 endif()
 
@@ -148,10 +150,13 @@ if(GRADLE_TOOL)
     "FUGHETTA_RECORD_VALIDATOR=$<TARGET_FILE:managed-test>;FUGHETTA_WORKER_TEST=$<TARGET_FILE:executor-test>")
   add_model_test(kotlin "${GRADLE_TOOL}" "${FUGHETTA_JVM_EXPORTER}")
   if(FUGHETTA_JAVAC AND TEST_MANAGED_HOSTS AND FUGHETTA_PROVIDER_llvm)
-    add_test(NAME model.kotlin-jni COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/model/jvm.py" --kotlin
+    add_executable(kotlin-jni-driver model/kotlin_jni_driver.cpp)
+    target_link_libraries(kotlin-jni-driver PRIVATE testing)
+    add_dependencies(kotlin-jni-driver jvm-test managed-test)
+    add_test(NAME model.kotlin-jni COMMAND kotlin-jni-driver
       "$<TARGET_FILE:jvm-test>" "${GRADLE_TOOL}" "${FUGHETTA_JVM_EXPORTER}" "${Java_JAVA_EXECUTABLE}"
       "${FUGHETTA_PROVIDER_jvm}" "${FUGHETTA_PROVIDER_kotlin}"
-      "$<TARGET_FILE:managed-test>" "${CMAKE_CXX_COMPILER}" "${CMAKE_BINARY_DIR}/jvm-tests")
+      "$<TARGET_FILE:managed-test>" "${CMAKE_CXX_COMPILER}" "${CMAKE_BINARY_DIR}/jvm-tests" "${FUGHETTA_PROVIDER_llvm}")
     set_tests_properties(model.kotlin-jni PROPERTIES TIMEOUT 600)
   endif()
 endif()
@@ -160,15 +165,21 @@ if(DOTNET_TOOL)
   add_executable(clr-test model/clr.cpp)
   target_link_libraries(clr-test PRIVATE testing)
   if(TEST_MANAGED_HOSTS AND FUGHETTA_PROVIDER_llvm)
-    add_test(NAME model.clr COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/model/clr.py"
+    add_executable(clr-driver model/clr_driver.cpp)
+    target_link_libraries(clr-driver PRIVATE testing)
+    add_dependencies(clr-driver clr-test managed-test)
+    add_test(NAME model.clr COMMAND clr-driver
       "${DOTNET_TOOL}" "${FUGHETTA_PROVIDER_clr}" "${FUGHETTA_PROVIDER_fsharp}" "$<TARGET_FILE:managed-test>"
       "$<TARGET_FILE:clr-test>" "${CMAKE_BINARY_DIR}/clr-tests"
-      --exporter "${FUGHETTA_CLR_EXPORTER}" --compiler "${CMAKE_CXX_COMPILER}")
+      "${FUGHETTA_CLR_EXPORTER}" "${CMAKE_CXX_COMPILER}" "${FUGHETTA_PROVIDER_llvm}")
     set_tests_properties(model.clr PROPERTIES TIMEOUT 300)
   endif()
-  add_test(NAME helper.fsharp COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/model/fsharp.py"
+  add_executable(fsharp-driver model/fsharp_driver.cpp)
+  target_link_libraries(fsharp-driver PRIVATE testing)
+  add_dependencies(fsharp-driver managed-test executor-test)
+  add_test(NAME helper.fsharp COMMAND fsharp-driver
     "${DOTNET_TOOL}" "${FUGHETTA_PROVIDER_clr}" "${FUGHETTA_PROVIDER_fsharp}" "$<TARGET_FILE:managed-test>"
-    --worker "$<TARGET_FILE:executor-test>" --work "${CMAKE_BINARY_DIR}/fsharp-tests" --exporter "${FUGHETTA_CLR_EXPORTER}")
+    "$<TARGET_FILE:executor-test>" "${CMAKE_BINARY_DIR}/fsharp-tests" "${FUGHETTA_CLR_EXPORTER}")
   set_tests_properties(helper.fsharp PROPERTIES TIMEOUT 300)
   add_model_test(fsharp "${DOTNET_TOOL}" "${FUGHETTA_CLR_EXPORTER}")
 endif()
