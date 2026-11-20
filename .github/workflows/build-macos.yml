@@ -2,7 +2,7 @@ name: build-macos
 
 on:
   push:
-    branches: [main, ci/native-build-20261120]
+    branches: [main, feat/worker-roles]
   workflow_dispatch:
 
 concurrency:
@@ -33,41 +33,7 @@ jobs:
 
       - name: Load build settings
         id: settings
-        run: |
-          set -euo pipefail
-          python - <<'PY'
-          import json, os
-          from pathlib import Path
-          from xml.etree import ElementTree
-          config = json.loads(Path(".github/ci.json").read_text())
-          minimum = json.loads(Path("CMakePresets.json").read_text())["cmakeMinimumRequired"]
-          config["toolchain"]["cmake"] = ".".join(str(minimum[p]) for p in ("major", "minor", "patch"))
-          clr = ElementTree.parse("providers/clr/Directory.Build.props")
-          framework = clr.findtext(".//TargetFramework").removeprefix("net")
-          sdk = clr.findtext(".//FughettaMinimumSdkVersion")
-          config["toolchain"]["dotnet"] = "\n".join(f"{v}.x" for v in dict.fromkeys((framework, sdk)))
-          jvm = dict(line.split("=", 1) for line in Path("providers/jvm/gradle.properties").read_text().splitlines()
-                     if "=" in line and not line.lstrip().startswith(("#", "!")))
-          config["toolchain"]["java"]["version"] = jvm["fughetta.javaVersion"]
-          runner = next(r for r in config["runners"] if r["id"] == os.environ["PLATFORM"])
-          profiles = config["profiles"]
-          check = runner.get("check") or {}
-          package = runner.get("package") or {}
-          out = {
-              "settings": json.dumps(config, separators=(",", ":")),
-              "check_preset": profiles["check"]["preset"],
-              "check_configure": check.get("configure", ""),
-              "check_targets": profiles["check"].get("targets", ""),
-              "check_pattern": check.get("test_pattern", ""),
-              "retain_test_log": "true" if check.get("retain_test_log") else "false",
-              "package_preset": profiles["package"]["preset"],
-              "package_configure": package.get("configure", ""),
-              "package_targets": package.get("targets", profiles["package"].get("targets", "")),
-          }
-          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
-              for key, value in out.items():
-                  f.write(f"{key}={value}\n")
-          PY
+        uses: ./.github/actions/build-settings
 
       - uses: actions/setup-dotnet@v5
         with:
@@ -114,7 +80,6 @@ jobs:
           FETCH_RETRIES: ${{ fromJSON(steps.settings.outputs.settings).download_retries }}
         run: |
           set -euo pipefail
-          python -m pip install --upgrade ninja
           archive="$CI_TOOLCHAIN_CACHE/cmake-$CMAKE_VERSION-macos-universal.tar.gz"
           mkdir -p "$(dirname "$archive")"
           if [[ ! -f "$archive" ]]; then
@@ -123,7 +88,7 @@ jobs:
           fi
           tar -xzf "$archive" -C "$RUNNER_TEMP"
           echo "$RUNNER_TEMP/cmake-$CMAKE_VERSION-macos-universal/CMake.app/Contents/bin" >> "$GITHUB_PATH"
-          brew install autoconf autoconf-archive automake libtool
+          brew install autoconf autoconf-archive automake coreutils libtool
 
       - name: Fetch clang
         env:
@@ -142,12 +107,25 @@ jobs:
           tar -xf "$archive" -C "$RUNNER_TEMP"
           runtime=$(find "$root" -name libc++.dylib | sed -n '1p')
           runtime_dir=$(dirname "${runtime:?LLVM archive lacks libc++.dylib}")
-          for library in "$runtime_dir/libc++.dylib" "$runtime_dir/libc++abi.dylib"; do
+          # Link and load the runtimes that ship with the selected compiler.
+          libcxx="$runtime_dir/libc++.dylib"
+          abi="$runtime_dir/libc++abi.dylib"
+          libcxx_id=$(otool -D "$libcxx" | sed -n '2p')
+          abi_id=$(otool -D "$abi" | sed -n '2p')
+          libcxx_name=${libcxx_id##*/}
+          abi_name=${abi_id##*/}
+          xcrun install_name_tool -id "@rpath/$libcxx_name" "$libcxx"
+          xcrun install_name_tool -id "@rpath/$abi_name" "$abi"
+          linked_abi=$(otool -L "$libcxx" | awk '$1 ~ /\/libc\+\+abi(\.[0-9]+)*\.dylib$/ { print $1; exit }')
+          if [[ -n "$linked_abi" && "$linked_abi" != "@rpath/$abi_name" ]]; then
+            xcrun install_name_tool -change "$linked_abi" "@rpath/$abi_name" "$libcxx"
+          fi
+          for library in "$libcxx" "$abi"; do
             unwinder=$(otool -L "$library" | awk '$1 ~ /\/libunwind(\.[0-9]+)*\.dylib$/ { print $1; exit }')
             if [[ -n "$unwinder" ]]; then
               xcrun install_name_tool -change "$unwinder" /usr/lib/libSystem.B.dylib "$library"
-              codesign --force --sign - "$library"
             fi
+            codesign --force --sign - "$library"
           done
           echo "CLANG_RUNTIME_DIR=$runtime_dir" >> "$GITHUB_ENV"
           echo "LDFLAGS=${LDFLAGS:+$LDFLAGS }-L\"$runtime_dir\" -Wl,-rpath,\"$runtime_dir\" -lc++abi" >> "$GITHUB_ENV"
@@ -170,12 +148,13 @@ jobs:
           restore-keys: vcpkg-packages-${{ runner.os }}-${{ runner.arch }}-${{ env.CLANG_ID }}-
 
       - name: Install vcpkg
+        env:
+          VCPKG_REVISION: ${{ steps.settings.outputs.vcpkg_revision }}
         run: |
           set -euo pipefail
           root="$RUNNER_TEMP/vcpkg"
-          baseline="$(python -c "import json; print(json.load(open('vcpkg-configuration.json'))['default-registry']['baseline'])")"
           git init -q "$root"
-          git -C "$root" fetch -q --no-tags https://github.com/microsoft/vcpkg.git "$baseline"
+          git -C "$root" fetch -q --no-tags https://github.com/microsoft/vcpkg.git "$VCPKG_REVISION"
           git -C "$root" checkout -q FETCH_HEAD
           "$root/bootstrap-vcpkg.sh" -disableMetrics
           echo "VCPKG_ROOT=$root" >> "$GITHUB_ENV"
@@ -193,7 +172,7 @@ jobs:
           paths_for() {
             for path in .ninja_deps .ninja_log build.ninja CMakeCache.txt CMakeFiles '*.cmake' \
                 '*.a' '*.exe' '*.lib' '*.pdb' '*-test' fughetta-service _deps clr jvm llvm tests \
-                vcpkg_installed vcpkg-triplets source-times.json; do
+                vcpkg_installed vcpkg-triplets source-mtimes.json; do
               printf '%s/%s\n' "$1" "$path"
             done
           }
@@ -347,7 +326,7 @@ jobs:
           fi
 
       - name: Retain test results
-        if: steps.settings.outputs.retain_test_log == 'true'
+        if: always() && steps.settings.outputs.retain_test_log == 'true'
         uses: actions/upload-artifact@v7
         with:
           name: tests-macos
@@ -435,8 +414,8 @@ jobs:
           BUILD_DIR: ${{ env.RELEASE_DIR }}
           PACKAGE_OUTPUT: ${{ env.PACKAGE_DIR }}
         run: |
-          python cmake/packaging/package.py --build "$BUILD_DIR" --output "$PACKAGE_OUTPUT" \
-            --build-number "$GITHUB_RUN_NUMBER" --worker-assets
+          cmake "-DBUILD_DIR=$BUILD_DIR" "-DOUTPUT_DIR=$PACKAGE_OUTPUT" \
+            "-DBUILD_NUMBER=$GITHUB_RUN_NUMBER" -DWORKER_ASSETS=ON -P cmake/packaging/package.cmake
 
       - name: Upload packages
         uses: actions/upload-artifact@v7

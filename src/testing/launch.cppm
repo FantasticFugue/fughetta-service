@@ -69,6 +69,7 @@ export namespace test {
             std::lock_guard guard{mutex_};
             return output_;
         }
+        auto pid() const noexcept -> int { return process_.pid(); }
         auto finished() -> bool { return result_.wait_for(std::chrono::seconds{0}) == std::future_status::ready; }
         auto wait(std::chrono::seconds timeout = std::chrono::seconds{10}) -> int {
             if (result_.wait_for(timeout) != std::future_status::ready) {
@@ -80,9 +81,9 @@ export namespace test {
             reaped_ = true;
             return result_.get();
         }
-        auto stop() -> int {
+        auto stop(std::chrono::seconds timeout = std::chrono::seconds{10}) -> int {
             process_.terminate();
-            return wait();
+            return wait(timeout);
         }
     };
 

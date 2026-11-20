@@ -29,8 +29,11 @@ export namespace test {
 
     struct scratch {
         std::filesystem::path dir;
-        explicit scratch(std::string_view name) : dir(std::filesystem::temp_directory_path() / std::format("test-{}-{}", name, std::random_device{}())) {
-            std::filesystem::create_directories(dir);
+        explicit scratch(std::string_view name, const std::filesystem::path& parent = std::filesystem::temp_directory_path()) {
+            std::filesystem::create_directories(parent);
+            do {
+                dir = parent / std::format("test-{}-{}", name, std::random_device{}());
+            } while (!std::filesystem::create_directory(dir));
         }
         scratch(const scratch&) = delete;
         ~scratch() {

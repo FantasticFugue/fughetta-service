@@ -18,68 +18,82 @@ runs:
         BUILD_DIR: ${{ inputs.directory }}
         TIMESTAMP_MODE: ${{ inputs.mode }}
       run: |
-        python - "$TIMESTAMP_MODE" "$BUILD_DIR" <<'PYTHON'
-        import json
-        import os
-        import shutil
-        import stat
-        import subprocess
-        import sys
-        from pathlib import Path
+        set -euo pipefail
+        if [[ "$RUNNER_OS" == "Windows" ]]; then
+          export TOUCH_TOOL="$(cygpath -m "$(command -v touch)")"
+        elif [[ "$RUNNER_OS" == "macOS" ]]; then
+          export TOUCH_TOOL=gtouch
+        else
+          export TOUCH_TOOL=touch
+        fi
+        node <<'JS_CACHE'
+        const fs = require('node:fs');
+        const path = require('node:path');
+        const { execFileSync } = require('node:child_process');
 
+        const git = (...args) => execFileSync('git', args, { encoding: 'utf8', maxBuffer: 16 * 1024 * 1024 });
+        const paths = (...args) => git(...args).split('\0').filter(Boolean);
+        const build = path.resolve(process.env.BUILD_DIR);
+        const workspace = fs.realpathSync(process.cwd());
+        const record = path.join(build, 'source-mtimes.json');
+        const revision = git('rev-parse', 'HEAD').trim();
+        const tracked = paths('ls-files', '-z');
 
-        def git(*args):
-            return subprocess.check_output(("git", *args))
+        function discard(reason) {
+          console.log(reason + ' Starting a fresh build.');
+          fs.rmSync(build, { recursive: true, force: true });
+        }
 
-
-        def paths(*args):
-            return {os.fsdecode(path) for path in git(*args).split(b"\0") if path}
-
-
-        mode, directory = sys.argv[1:]
-        build = Path(directory).resolve()
-        workspace = Path.cwd().resolve()
-        record = build / "source-times.json"
-        revision = git("rev-parse", "HEAD").decode().strip()
-        tracked = paths("ls-files", "-z")
-
-        if mode == "save":
-            timestamps = {}
-            for name in sorted(tracked):
-                info = Path(name).lstat()
-                if stat.S_ISREG(info.st_mode):
-                    timestamps[name] = info.st_mtime_ns
-            record.write_text(
-                json.dumps({"revision": revision, "workspace": str(workspace), "build": str(build), "times": timestamps}),
-                encoding="utf-8",
-            )
-        elif mode == "restore":
-            if not record.exists():
-                sys.exit(0)
-            snapshot = json.loads(record.read_text(encoding="utf-8"))
-            if snapshot["workspace"] != str(workspace) or snapshot["build"] != str(build):
-                print("The cached build uses different absolute paths. Starting a fresh build.")
-                shutil.rmtree(build)
-                sys.exit(0)
-            try:
-                changed = paths("diff", "--name-only", "--no-renames", "-z", snapshot["revision"], revision, "--")
-            except subprocess.CalledProcessError:
-                print("The cached source revision is no longer in the checkout. Starting a fresh build.")
-                shutil.rmtree(build)
-                sys.exit(0)
-            restored = 0
-            for name in tracked - changed:
-                timestamp = snapshot["times"].get(name)
-                if timestamp is not None:
-                    path = Path(name)
-                    info = path.lstat()
-                    if stat.S_ISREG(info.st_mode):
-                        os.utime(path, ns=(info.st_atime_ns, timestamp))
-                        restored += 1
-            print(f"Restored timestamps for {restored} unchanged source files. Ninja will evaluate {len(changed)} changed paths.")
-        else:
-            sys.exit(f"Unknown source timestamp mode: {mode}")
-        PYTHON
+        switch (process.env.TIMESTAMP_MODE) {
+        case 'save': {
+          const times = Object.create(null);
+          for (const name of tracked) {
+            const info = fs.lstatSync(name, { bigint: true });
+            if (info.isFile()) times[name] = info.mtimeNs.toString();
+          }
+          fs.writeFileSync(record, JSON.stringify({ revision, workspace, build, times }));
+          break;
+        }
+        case 'restore': {
+          if (!fs.existsSync(record)) break;
+          const snapshot = JSON.parse(fs.readFileSync(record, 'utf8'));
+          if (snapshot.workspace !== workspace || snapshot.build !== build) {
+            discard('The cached build uses different absolute paths.');
+            break;
+          }
+          let changed;
+          try {
+            changed = new Set(paths('diff', '--name-only', '--no-renames', '-z', snapshot.revision, revision, '--'));
+          } catch (error) {
+            if (typeof error.status !== 'number') throw error;
+            discard('The cached source revision is no longer in the checkout.');
+            break;
+          }
+          const batches = new Map();
+          for (const name of tracked) {
+            if (changed.has(name) || !Object.hasOwn(snapshot.times, name) || !fs.lstatSync(name).isFile()) continue;
+            const time = snapshot.times[name];
+            if (!batches.has(time)) batches.set(time, []);
+            batches.get(time).push(name);
+          }
+          // Ninja compares nanoseconds. Pass exact decimal seconds to GNU touch.
+          let restored = 0;
+          for (const [time, files] of batches) {
+            const digits = time.padStart(10, '0');
+            const date = '@' + digits.slice(0, -9) + '.' + digits.slice(-9);
+            for (let index = 0; index < files.length; index += 100) {
+              const batch = files.slice(index, index + 100);
+              execFileSync(process.env.TOUCH_TOOL, ['-m', '-d', date, '--', ...batch]);
+              restored += batch.length;
+            }
+          }
+          console.log('Restored timestamps for ' + restored + ' unchanged files. Ninja will evaluate ' + changed.size + ' changed paths.');
+          break;
+        }
+        default:
+          throw new Error('Unknown source timestamp mode: ' + process.env.TIMESTAMP_MODE);
+        }
+        JS_CACHE
 
     - if: inputs.mode == 'save'
       shell: bash

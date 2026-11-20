@@ -120,17 +120,13 @@ endfunction()
 add_compile_failure(duplicate "two tools share a name")
 add_compile_failure(naming "an MCP tool name is")
 
-## Scripted scenarios
-#
-# Python drivers that exercise the real binaries through the services. The
-# managed providers' scenarios run when cmake/providers.cmake built them.
+## Managed provider scenarios
 
-# Each provider's model exporter runs against the sample projects.
-function(add_model_test PROVIDER TOOL EXPORTER)
-  add_test(NAME model.${PROVIDER} COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/model/managed.py"
-    "${PROVIDER}" "${TOOL}" "${EXPORTER}" --work "${CMAKE_BINARY_DIR}/providers/tests" --validator "$<TARGET_FILE:managed-test>")
-  set_tests_properties(model.${PROVIDER} PROPERTIES TIMEOUT 300)
-endfunction()
+if(GRADLE_TOOL OR DOTNET_TOOL)
+  add_executable(managed-driver model/managed_driver.cpp)
+  target_link_libraries(managed-driver PRIVATE testing)
+  add_dependencies(managed-driver managed-test)
+endif()
 
 find_package(Java COMPONENTS Development QUIET)
 set(FUGHETTA_JAVAC "${Java_JAVAC_EXECUTABLE}")
@@ -148,7 +144,9 @@ if(GRADLE_TOOL)
   add_test(NAME helper.kotlin COMMAND ${FUGHETTA_GRADLE} test)
   set_tests_properties(helper.kotlin PROPERTIES TIMEOUT 300 ENVIRONMENT
     "FUGHETTA_RECORD_VALIDATOR=$<TARGET_FILE:managed-test>;FUGHETTA_WORKER_TEST=$<TARGET_FILE:executor-test>")
-  add_model_test(kotlin "${GRADLE_TOOL}" "${FUGHETTA_JVM_EXPORTER}")
+  add_test(NAME model.kotlin COMMAND managed-driver kotlin "${GRADLE_TOOL}" "${FUGHETTA_JVM_EXPORTER}"
+    --work "${CMAKE_BINARY_DIR}/providers/tests" --validator "$<TARGET_FILE:managed-test>" --java "${Java_JAVA_EXECUTABLE}")
+  set_tests_properties(model.kotlin PROPERTIES TIMEOUT 300)
   if(FUGHETTA_JAVAC AND TEST_MANAGED_HOSTS AND FUGHETTA_PROVIDER_llvm)
     add_executable(kotlin-jni-driver model/kotlin_jni_driver.cpp)
     target_link_libraries(kotlin-jni-driver PRIVATE testing)
@@ -181,7 +179,9 @@ if(DOTNET_TOOL)
     "${DOTNET_TOOL}" "${FUGHETTA_PROVIDER_clr}" "${FUGHETTA_PROVIDER_fsharp}" "$<TARGET_FILE:managed-test>"
     "$<TARGET_FILE:executor-test>" "${CMAKE_BINARY_DIR}/fsharp-tests" "${FUGHETTA_CLR_EXPORTER}")
   set_tests_properties(helper.fsharp PROPERTIES TIMEOUT 300)
-  add_model_test(fsharp "${DOTNET_TOOL}" "${FUGHETTA_CLR_EXPORTER}")
+  add_test(NAME model.fsharp COMMAND managed-driver fsharp "${DOTNET_TOOL}" "${FUGHETTA_CLR_EXPORTER}"
+    --work "${CMAKE_BINARY_DIR}/providers/tests" --validator "$<TARGET_FILE:managed-test>")
+  set_tests_properties(model.fsharp PROPERTIES TIMEOUT 300)
 endif()
 
 # The analysis suite runs the whole managed flow when both providers and a JDK
@@ -225,7 +225,9 @@ if(FUGHETTA_PROVIDER_llvm)
   if(NATIVE_RUSTC)
     list(APPEND NATIVE_TEST_OPTIONS --rustc "${NATIVE_RUSTC}")
   endif()
-  add_test(NAME model.llvm COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/model/llvm.py"
+  add_executable(llvm-test model/llvm.cpp)
+  target_link_libraries(llvm-test PRIVATE testing)
+  add_test(NAME model.llvm COMMAND llvm-test
     "${FUGHETTA_PROVIDER_llvm}" "${NATIVE_CLANG}" "${CMAKE_BINARY_DIR}/llvm-tests" ${NATIVE_TEST_OPTIONS})
 endif()
 
