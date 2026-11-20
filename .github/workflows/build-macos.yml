@@ -218,7 +218,10 @@ jobs:
 
       - name: Restore debug source timestamps
         if: steps.debug-cache.outputs.cache-matched-key != ''
-        run: python .github/scripts/source-times.py restore "$DEBUG_DIR"
+        uses: ./.github/actions/build-cache
+        with:
+          directory: ${{ env.DEBUG_DIR }}
+          mode: restore
 
       - name: Configure (check)
         env:
@@ -250,16 +253,21 @@ jobs:
           BUILD_JOBS: ${{ fromJSON(steps.settings.outputs.settings).compile_jobs }}
           BUILD_ATTEMPTS: ${{ fromJSON(steps.settings.outputs.settings).build_attempts }}
           RATE_LIMIT_WAIT: ${{ fromJSON(steps.settings.outputs.settings).rate_limit_wait_seconds }}
-        run: bash .github/scripts/build.sh "$DEBUG_DIR" check-service fughetta-service
+        uses: ./.github/actions/build-stage
+        with:
+          directory: ${{ env.DEBUG_DIR }}
+          stage: check-service
+          targets: fughetta-service
 
       - name: Store check build cache through service
         if: steps.debug-cache.outputs.cache-hit != 'true'
         env:
           GH_TOKEN: ${{ github.token }}
-          PREFIX: ${{ steps.keys.outputs.debug_prefix }}
-        run: |
-          python .github/scripts/source-times.py save "$DEBUG_DIR"
-          bash .github/scripts/prune-cache.sh "$GITHUB_REPOSITORY" "$PREFIX"
+        uses: ./.github/actions/build-cache
+        with:
+          directory: ${{ env.DEBUG_DIR }}
+          mode: save
+          prefix: ${{ steps.keys.outputs.debug_prefix }}
       - uses: actions/cache/save@v6
         if: steps.debug-cache.outputs.cache-hit != 'true'
         with:
@@ -271,16 +279,21 @@ jobs:
           BUILD_JOBS: ${{ fromJSON(steps.settings.outputs.settings).compile_jobs }}
           BUILD_ATTEMPTS: ${{ fromJSON(steps.settings.outputs.settings).build_attempts }}
           RATE_LIMIT_WAIT: ${{ fromJSON(steps.settings.outputs.settings).rate_limit_wait_seconds }}
-        run: bash .github/scripts/build.sh "$DEBUG_DIR" check-providers llvm-provider clr-providers jvm-providers
+        uses: ./.github/actions/build-stage
+        with:
+          directory: ${{ env.DEBUG_DIR }}
+          stage: check-providers
+          targets: llvm-provider clr-providers jvm-providers
 
       - name: Store check build cache through providers
         if: steps.debug-cache.outputs.cache-hit != 'true'
         env:
           GH_TOKEN: ${{ github.token }}
-          PREFIX: ${{ steps.keys.outputs.debug_prefix }}
-        run: |
-          python .github/scripts/source-times.py save "$DEBUG_DIR"
-          bash .github/scripts/prune-cache.sh "$GITHUB_REPOSITORY" "$PREFIX"
+        uses: ./.github/actions/build-cache
+        with:
+          directory: ${{ env.DEBUG_DIR }}
+          mode: save
+          prefix: ${{ steps.keys.outputs.debug_prefix }}
       - uses: actions/cache/save@v6
         if: steps.debug-cache.outputs.cache-hit != 'true'
         with:
@@ -292,16 +305,21 @@ jobs:
           BUILD_JOBS: ${{ fromJSON(steps.settings.outputs.settings).compile_jobs }}
           BUILD_ATTEMPTS: ${{ fromJSON(steps.settings.outputs.settings).build_attempts }}
           RATE_LIMIT_WAIT: ${{ fromJSON(steps.settings.outputs.settings).rate_limit_wait_seconds }}
-        run: bash .github/scripts/build.sh "$DEBUG_DIR" check-tests all
+        uses: ./.github/actions/build-stage
+        with:
+          directory: ${{ env.DEBUG_DIR }}
+          stage: check-tests
+          targets: all
 
       - name: Store check build cache through tests
         if: steps.debug-cache.outputs.cache-hit != 'true'
         env:
           GH_TOKEN: ${{ github.token }}
-          PREFIX: ${{ steps.keys.outputs.debug_prefix }}
-        run: |
-          python .github/scripts/source-times.py save "$DEBUG_DIR"
-          bash .github/scripts/prune-cache.sh "$GITHUB_REPOSITORY" "$PREFIX"
+        uses: ./.github/actions/build-cache
+        with:
+          directory: ${{ env.DEBUG_DIR }}
+          mode: save
+          prefix: ${{ steps.keys.outputs.debug_prefix }}
       - uses: actions/cache/save@v6
         if: steps.debug-cache.outputs.cache-hit != 'true'
         with:
@@ -343,7 +361,10 @@ jobs:
 
       - name: Restore release source timestamps
         if: steps.release-cache.outputs.cache-matched-key != ''
-        run: python .github/scripts/source-times.py restore "$RELEASE_DIR"
+        uses: ./.github/actions/build-cache
+        with:
+          directory: ${{ env.RELEASE_DIR }}
+          mode: restore
 
       - name: Configure (package)
         env:
@@ -360,16 +381,21 @@ jobs:
           BUILD_JOBS: ${{ fromJSON(steps.settings.outputs.settings).compile_jobs }}
           BUILD_ATTEMPTS: ${{ fromJSON(steps.settings.outputs.settings).build_attempts }}
           RATE_LIMIT_WAIT: ${{ fromJSON(steps.settings.outputs.settings).rate_limit_wait_seconds }}
-        run: bash .github/scripts/build.sh "$RELEASE_DIR" package-service fughetta-service
+        uses: ./.github/actions/build-stage
+        with:
+          directory: ${{ env.RELEASE_DIR }}
+          stage: package-service
+          targets: fughetta-service
 
       - name: Store package build cache through service
         if: steps.release-cache.outputs.cache-hit != 'true'
         env:
           GH_TOKEN: ${{ github.token }}
-          PREFIX: ${{ steps.keys.outputs.release_prefix }}
-        run: |
-          python .github/scripts/source-times.py save "$RELEASE_DIR"
-          bash .github/scripts/prune-cache.sh "$GITHUB_REPOSITORY" "$PREFIX"
+        uses: ./.github/actions/build-cache
+        with:
+          directory: ${{ env.RELEASE_DIR }}
+          mode: save
+          prefix: ${{ steps.keys.outputs.release_prefix }}
       - uses: actions/cache/save@v6
         if: steps.release-cache.outputs.cache-hit != 'true'
         with:
@@ -381,16 +407,21 @@ jobs:
           BUILD_JOBS: ${{ fromJSON(steps.settings.outputs.settings).compile_jobs }}
           BUILD_ATTEMPTS: ${{ fromJSON(steps.settings.outputs.settings).build_attempts }}
           RATE_LIMIT_WAIT: ${{ fromJSON(steps.settings.outputs.settings).rate_limit_wait_seconds }}
-        run: bash .github/scripts/build.sh "$RELEASE_DIR" package-providers llvm-provider clr-providers jvm-providers
+        uses: ./.github/actions/build-stage
+        with:
+          directory: ${{ env.RELEASE_DIR }}
+          stage: package-providers
+          targets: llvm-provider clr-providers jvm-providers
 
       - name: Store package build cache through providers
         if: steps.release-cache.outputs.cache-hit != 'true'
         env:
           GH_TOKEN: ${{ github.token }}
-          PREFIX: ${{ steps.keys.outputs.release_prefix }}
-        run: |
-          python .github/scripts/source-times.py save "$RELEASE_DIR"
-          bash .github/scripts/prune-cache.sh "$GITHUB_REPOSITORY" "$PREFIX"
+        uses: ./.github/actions/build-cache
+        with:
+          directory: ${{ env.RELEASE_DIR }}
+          mode: save
+          prefix: ${{ steps.keys.outputs.release_prefix }}
       - uses: actions/cache/save@v6
         if: steps.release-cache.outputs.cache-hit != 'true'
         with:

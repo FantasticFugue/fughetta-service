@@ -1,0 +1,44 @@
+name: Build native targets
+description: Build a CMake stage and retry transient compiler or dependency failures.
+inputs:
+  directory:
+    description: CMake build directory
+    required: true
+  stage:
+    description: Stage name for the build log
+    required: true
+  targets:
+    description: Space-separated CMake targets
+    required: true
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      env:
+        BUILD_DIR: ${{ inputs.directory }}
+        STAGE: ${{ inputs.stage }}
+        BUILD_TARGETS: ${{ inputs.targets }}
+      run: |
+        set -uo pipefail
+        read -r -a targets <<< "$BUILD_TARGETS"
+        log="$RUNNER_TEMP/build-$STAGE.log"
+        attempts="${BUILD_ATTEMPTS:-6}"
+        for ((attempt = 1; ; ++attempt)); do
+          if cmake --build "$BUILD_DIR" --parallel "${BUILD_JOBS:?BUILD_JOBS is unset}" --target "${targets[@]}" 2>&1 | tee "$log"; then
+            exit 0
+          else
+            status=$?
+          fi
+          if ((attempt >= attempts)); then
+            echo "Stage $STAGE still failing after $attempt attempts." >&2
+            exit "$status"
+          fi
+          if grep -Fq 'PLEASE submit a bug report to https://github.com/llvm/llvm-project/issues/' "$log"; then
+            echo "Clang crashed during $STAGE; retrying (attempt $attempt)."
+          elif grep -Fq 'Received status code 429 from server: Too Many Requests' "$log"; then
+            echo "A package repository rate-limited during $STAGE; waiting before retrying."
+            sleep "${RATE_LIMIT_WAIT:-30}"
+          else
+            exit "$status"
+          fi
+        done
