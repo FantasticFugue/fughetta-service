@@ -120,14 +120,11 @@ namespace {
         worker_config.env["JAVA_TOOL_OPTIONS"] =
             "-Djava.io.tmpdir=" + (tmp.dir / "temp").string() + " -Dkotlin.daemon.options=runFilesPath=" + (tmp.dir / "daemon").string();
         std::filesystem::create_directories(tmp.dir / "temp");
-        // The worker needs the dependency modules already resolved when building its JVM provider.
+        // Reuse downloaded modules when available. The prepare task also works with a fresh Gradle home.
         const auto gradle_home = tmp.dir / "gradle";
         worker_config.env["GRADLE_USER_HOME"] = gradle_home.string();
         std::filesystem::create_directories(gradle_home);
-        if (kotlin) {
-            const auto* cache = std::getenv("TEST_GRADLE_MODULES");
-            if (!cache)
-                throw std::runtime_error("TEST_GRADLE_MODULES must name the JVM provider's Gradle dependency cache");
+        if (const auto* cache = std::getenv("TEST_GRADLE_MODULES"); kotlin && cache && std::filesystem::is_directory(cache)) {
             const auto modules = gradle_home / "caches" / "modules-2";
             std::filesystem::create_directories(modules);
             for (const auto& entry : std::filesystem::directory_iterator(cache))
