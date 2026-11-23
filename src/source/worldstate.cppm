@@ -518,7 +518,7 @@ namespace nodes {
         check_execution(in);
         check_scope_leases(in, prior);
         if (in.action == "apply") {
-            out.reach = claim_scopes(in, heads);
+            out.reach = claim_scopes(in, heads, event);
             statement reach{*db, "UPDATE receipts SET reach=?1 WHERE id=?2"};
             reach.text(1, out.reach);
             reach.text(2, out.receipt);

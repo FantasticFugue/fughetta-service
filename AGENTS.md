@@ -20,7 +20,13 @@ the head of its main branch by `FetchContent` in `cmake/dependencies.cmake` and
 built as a subproject, so its module BMIs are compiled by this build's compiler;
 the manifest lists its dependencies too. `FetchContent` stays until httpant has
 a vcpkg port. A local checkout replaces the fetched one through
-`FETCHCONTENT_SOURCE_DIR_HTTPANT`. `cmake/platform/<system>.cmake` describes
+`FETCHCONTENT_SOURCE_DIR_HTTPANT`. The tree-sitter grammars that the `syntax`
+module parses with are fetched the same way: C++ from the head of the
+`FantasticFugue/tree-sitter-cpp` fork, the others pinned to tested commits.
+Only their checked-in `parser.c` and `scanner.c` are compiled; the grammars are
+never regenerated. A local checkout replaces one through
+`FETCHCONTENT_SOURCE_DIR_<NAME>`, for example
+`FETCHCONTENT_SOURCE_DIR_TREE_SITTER_CPP`. `cmake/platform/<system>.cmake` describes
 each target system: its platform units, its I/O backend (epoll on Linux, io_uring for deployment,
 IOCP on Windows, kqueue on macOS) and its service-manager template;
 `tests/platform/<system>.cmake` adds that system's tests. Platform choices go in

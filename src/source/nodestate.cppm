@@ -213,7 +213,7 @@ export namespace nodes {
         void check_scope_leases(const node_request& in, const std::vector<std::string>& prior);
         // Takes or renews the caller's implicit leases for a committed apply
         // and names how far its text edits reach.
-        auto claim_scopes(const node_request& in, const std::vector<std::string>& heads) -> std::string;
+        auto claim_scopes(const node_request& in, const std::vector<std::string>& heads, const std::string& event) -> std::string;
 
         auto promotion(const node_request& in, bool include_text = true) -> std::vector<source_difference>;
 
