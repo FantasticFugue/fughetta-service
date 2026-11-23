@@ -20,6 +20,7 @@ import channels;
 export import templates;
 export import publication;
 import native;
+import syntax;
 
 export import :execution;
 
@@ -28,7 +29,7 @@ export namespace tools {
         : tool<"language", "Query scopes, symbols, definitions, references or diagnostics for a worldline version; schema reads semantic contracts. "
                            "Analysis is prepared automatically within the call when missing or stale. Inspecting a callable returns its signature, "
                            "one-hop type surface, input producers and result consumers. inspect returns and registers body text so a later worldline "
-                           "apply locks the enclosing function and reports its reach."> {
+                           "apply locks the enclosing function and reports its reach. Without analysis configuration, inspect returns a syntax outline."> {
         struct scope_filter {
             std::optional<std::vector<std::string>> modules, files, contexts, projects;
             auto extent() const -> semantic::extent {
@@ -67,6 +68,10 @@ export namespace tools {
                              std::optional<semantic::budget>>
                 budget;
         };
+        struct outline_item {
+            std::string name, kind;
+            semantic::place source;
+        };
         struct output {
             builds::timings timings;
             std::uint64_t reused_units = 0;
@@ -81,6 +86,7 @@ export namespace tools {
             std::string status = "complete";
             semantic::coverage coverage;
             std::vector<semantic::item> items;
+            std::optional<std::vector<outline_item>> outline;
             std::vector<semantic::records::symbol> symbols, producers, consumers;
             std::vector<semantic::records::type> types;
             std::vector<semantic::records::typed_range> typed_ranges;
@@ -530,6 +536,95 @@ export namespace tools {
             return {};
         }
 
+        static auto syntax_query(const input& in, const std::map<std::string, language::configuration>& profiles) -> bool {
+            if (in.action.value().value_or(semantic::tool_action::make<"diagnostics">()).str() != "inspect" ||
+                in.configuration.value() || in.outputs || in.cursor || (in.include && !in.include->empty()) || (in.selector.value() && in.selector.value()->entity))
+                return false;
+            const auto filters = in.scope.value_or(scope_filter{}).extent();
+            const auto name = in.selector.value() ? in.selector.value()->name : std::nullopt;
+            if (!filters.modules.empty() || !filters.contexts.empty() || (name && name->module))
+                return false;
+            if (profiles.empty())
+                return true;
+
+            auto files = filters.files;
+            if (name && name->path)
+                files = {*name->path};
+            if (files.empty())
+                return false;
+
+            std::set<std::string_view> families;
+            for (const auto& path : files) {
+                const auto family = syntax::outline_provider_family(path);
+                if (family.empty())
+                    return false;
+                families.insert(family);
+            }
+            return std::ranges::none_of(profiles, [&](const auto& profile) {
+                return std::ranges::any_of(profile.second.stages, [&](const auto& stage) {
+                    const auto provider = language::describe_provider(stage.second.server).id;
+                    return provider == "typescript" ? families.contains("typescript")
+                                                     : (provider == "ty" || provider == "ruff") && families.contains("python");
+                });
+            });
+        }
+
+        static auto syntax_outline(services& s, const std::string& project, const input& in, const worlds::actor& actor)
+            -> coroutine::task<output> {
+            const auto line = execution_line(actor, in.worldline.value());
+            const auto snapshot = co_await selected(s, project, line, in.version.value().value_or(""), actor);
+            const auto filters = in.scope.value_or(scope_filter{}).extent();
+            if (in.selector.value()) {
+                try {
+                    semantic::validate(*in.selector.value());
+                } catch (const std::invalid_argument& error) {
+                    throw tool_error(nodes::code::invalid_record, error.what());
+                }
+            }
+            const auto name = in.selector.value() ? in.selector.value()->name : std::nullopt;
+            output out{.worldline = line, .version = snapshot.version, .outline = std::vector<outline_item>{}};
+            const auto budget = in.budget.value().value_or(semantic::budget{});
+            const auto limit = std::min(in.limit.value_or(semantic::query_defaults{}.fact_limit),
+                                        budget.nodes.value_or(std::numeric_limits<std::uint64_t>::max()));
+            const auto started = std::chrono::steady_clock::now();
+            std::uint64_t bytes = 0, units = 0;
+            for (const auto& file : snapshot.files) {
+                if (file.kind != "text" || !syntax::supports(file.path) ||
+                    (!filters.files.empty() && !std::ranges::contains(filters.files, file.path)) ||
+                    (!filters.projects.empty() && !std::ranges::contains(filters.projects, project)) ||
+                    (name && name->path && *name->path != file.path))
+                    continue;
+                if (out.outline->size() >= limit || (budget.units && units >= *budget.units) ||
+                    file.size > constants::semantic_object_bytes - bytes ||
+                    (budget.milliseconds &&
+                     std::cmp_greater_equal(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - started).count(),
+                                            *budget.milliseconds))) {
+                    out.status = "partial";
+                    out.message = "Narrow the source scope or increase the outline budget to inspect more declarations";
+                    break;
+                }
+                bytes += file.size;
+                ++units;
+                auto fetched = co_await node_call(s, project, {.action = "read", .worldline = line, .revision = snapshot.version, .target = file.path},
+                                                  actor, true);
+                const auto entry = std::ranges::find(fetched.files, file.path, &nodes::file_view::path);
+                if (entry == fetched.files.end())
+                    continue;
+                auto parsed = syntax::parsed_file{entry->path, entry->text}.analyze(true);
+                for (auto& scope : parsed.scopes) {
+                    if (name && (!scope.name.starts_with(name->text) || (name->kind && name->kind->view() != scope.kind)))
+                        continue;
+                    if (out.outline->size() == limit) {
+                        out.status = "partial";
+                        out.message = "Narrow the source scope or increase the outline budget to inspect more declarations";
+                        co_return out;
+                    }
+                    out.outline->push_back({std::move(scope.name), std::move(scope.kind), {file.path, scope.begin, scope.end}});
+                }
+            }
+            co_return out;
+        }
+
         static auto run(services& s, mcp::call_context context, input in, mcp::notifier& note, worlds::actor actor, std::optional<restoration> restored = {},
                         std::shared_ptr<dependency_execution> dependencies = {}, std::optional<language::dependency_computation> pinned = {})
             -> coroutine::task<output> {
@@ -654,6 +749,8 @@ export namespace tools {
                 computation.project = pinned->project;
             } else {
                 auto settings = config::resolve(*s.snapshot(), project);
+                if (syntax_query(in, settings.analysis))
+                    co_return co_await syntax_outline(s, project, in, actor);
                 if (name.empty()) {
                     if (settings.analysis.size() != 1)
                         throw tool_error(nodes::code::invalid_record,

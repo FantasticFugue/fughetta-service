@@ -60,7 +60,7 @@ add_implementation(toolchain toolchain generator)
 # language — compiler frontends, VM metadata and cross-language bindings.
 add_layer(languages)
 add_modules(languages languages bridge clice clr csharp evaluation fsharp helper jni jvm kmetadata kotlin llvm lsp
-  pinvoke pybind ruff rust scala ty typescript)
+  pinvoke pybind ruff rust scala syntax ty typescript)
 
 # session: the facet registries that aggregate toolchains and languages (build,
 # language, profiles), the semantic graph (semantic, indexing, nodes,
@@ -109,7 +109,9 @@ target_link_libraries(platform PUBLIC core)
 target_link_libraries(io PUBLIC platform httpant::httpant httpant::tls PRIVATE unofficial-sodium::sodium c-ares::cares ada::ada)
 target_link_libraries(model PUBLIC io PRIVATE unofficial-sodium::sodium zstd::libzstd)
 target_link_libraries(toolchain PUBLIC model)
-target_link_libraries(languages PUBLIC model PRIVATE ada::ada libzip::zip)
+target_link_libraries(languages PUBLIC model PRIVATE ada::ada libzip::zip unofficial::tree-sitter::tree-sitter
+  tree-sitter-cpp tree-sitter-rust tree-sitter-python tree-sitter-javascript tree-sitter-typescript tree-sitter-tsx
+  tree-sitter-kotlin tree-sitter-java tree-sitter-c-sharp tree-sitter-scala tree-sitter-fsharp tree-sitter-fsharp-signature)
 target_link_libraries(session PUBLIC model toolchain languages PRIVATE unofficial::sqlite3::sqlite3)
 target_link_libraries(gateway PUBLIC session PRIVATE unofficial-sodium::sodium)
 target_link_libraries(source PUBLIC session PRIVATE unofficial::sqlite3::sqlite3 roaring::roaring)

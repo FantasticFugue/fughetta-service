@@ -11,6 +11,7 @@ import durability;
 import archive;
 import json;
 import nodestore;
+import syntax;
 
 namespace nodes {
     using namespace persistence;
@@ -384,6 +385,21 @@ namespace nodes {
         return out;
     }
 
+    static auto directives_changed(const source_file& before, const syntax::outline& before_syntax,
+                                   const source_file& after, const syntax::outline& after_syntax,
+                                   std::span<const std::pair<std::uint64_t, std::uint64_t>> deleted,
+                                   std::span<const std::pair<std::uint64_t, std::uint64_t>> inserted) -> bool {
+        // A change outside the directive's text can expose it or turn it into a comment.
+        if (!std::ranges::equal(before_syntax.directives, after_syntax.directives, [&](const auto& old_range, const auto& new_range) {
+                return before.at(old_range.first) == after.at(new_range.first) && before.at(old_range.second - 1) == after.at(new_range.second - 1);
+            }))
+            return true;
+        auto overlaps = [](const auto& parsed, auto spans) {
+            return std::ranges::any_of(spans, [&](const auto& span) { return parsed.touches_directive(span.first, span.second); });
+        };
+        return overlaps(before_syntax, deleted) || overlaps(after_syntax, inserted);
+    }
+
     auto local_node::impl::classify_scopes(const node_request& in) -> node_reply {
         if (in.target.empty())
             fail(nodes::code::invalid_record, "scope_classify requires a base revision in target");
@@ -495,12 +511,24 @@ namespace nodes {
                 }
             }
 
-            // Without a syntax tree no text change can be proven comment-only, and a file
-            // without registered references has no known bodies.
-            mark_non_comment();
-            if (references.empty()) {
-                mark_declaration();
-                continue;
+            if (references.empty() || result.comment_or_whitespace_only || syntax::tracks_directives(after.path)) {
+                const syntax::parsed_file before_syntax{before.path, before.content()}, after_syntax{after.path, after.content()};
+                if (result.comment_or_whitespace_only && !before_syntax.comment_or_whitespace_only(after_syntax))
+                    mark_non_comment();
+                const auto before_analysis = before_syntax.analyze(references.empty());
+                const auto after_analysis = after_syntax.analyze(references.empty());
+                if (directives_changed(before, before_analysis, after, after_analysis, deleted_spans, inserted_spans))
+                    mark_declaration();
+
+                if (references.empty()) {
+                    auto inside_bodies = [](const syntax::outline& analysis, const auto& spans) {
+                        return std::ranges::all_of(spans, [&](const auto& span) { return analysis.inside_body(span.first, span.second); });
+                    };
+                    result.sealed_body_only = false;
+                    if (!inside_bodies(before_analysis, deleted_spans) || !inside_bodies(after_analysis, inserted_spans))
+                        mark_declaration();
+                    continue;
+                }
             }
 
             struct live_body {
@@ -914,7 +942,7 @@ namespace nodes {
             }
         }
     }
-    auto local_node::impl::claim_scopes(const node_request& in, const std::vector<std::string>& heads) -> std::string {
+    auto local_node::impl::claim_scopes(const node_request& in, const std::vector<std::string>& heads, const std::string& event) -> std::string {
         if (in.edits.empty())
             return {};
         const bool implicit = in.leases.empty() && !in.lease_owner.empty();
@@ -925,10 +953,18 @@ namespace nodes {
         static const std::set<std::string, std::less<>> broad{"translation_unit", "module", "namespace"};
         auto observed = source.projection(in.expected);
         auto after = source.projection(heads);
+        // Classify only this contribution, even if the committed frontier contains other edits.
+        auto written = heads.size() == 1 ? after : source.projection({event});
         auto references = scope_references();
         std::erase_if(references, [&](const auto& r) { return r.at("line").text() != in.worldline; });
         auto records = scope_leases();
+        struct file_syntax {
+            syntax::outline observed;
+            bool directive_changed = false;
+        };
+        std::unordered_map<std::string, file_syntax> syntax_by_file;
         bool claimed = false;
+        bool syntax_body = false;
         bool ffi_touched = false;
         for (const auto& edit : in.edits) {
             if (edit.kind != nodes::edit_kind::edit)
@@ -947,11 +983,13 @@ namespace nodes {
             const auto& file = held ? *held : *selected;
             const auto begin = edit.offset, end = edit.offset + edit.count;
             bool in_body = false;
+            bool registered = false;
             std::string_view snapped;
             std::optional<semantic::place> range;
             for (const auto& r : references) {
                 if (r.at("file").text() != file.id)
                     continue;
+                registered = true;
                 auto found = anchored(r, file);
                 if (!found)
                     continue;
@@ -971,6 +1009,44 @@ namespace nodes {
                     snapped = r.at("scope").text();
                     range = found;
                 }
+            }
+            const bool check_directives = syntax::tracks_directives(file.path);
+            if (file.kind == "text" && (!registered || (in_body && check_directives))) {
+                auto [entry, inserted] = syntax_by_file.try_emplace(file.id);
+                auto& parsed = entry->second;
+                if (inserted) {
+                    parsed.observed = syntax::parsed_file{file.path, file.content()}.analyze(!registered);
+                    const source_file* stub = nullptr;
+                    if (check_directives) {
+                        if (auto found = written->files.find(file.id); found != written->files.end())
+                            stub = found->second.get();
+                        else if (auto hidden = written->hidden.find(file.id); hidden != written->hidden.end())
+                            stub = hidden->second.get();
+                    }
+                    if (stub && stub->digest != file.digest) {
+                        const auto updated = materialize(*written, *stub);
+                        const auto& next = updated ? *updated : *stub;
+                        const auto next_analysis = syntax::parsed_file{next.path, next.content()}.analyze(false);
+                        if (!parsed.observed.directives.empty() || !next_analysis.directives.empty())
+                            parsed.directive_changed = directives_changed(file, parsed.observed, next, next_analysis,
+                                                                          missing_intervals(file, next), missing_intervals(next, file));
+                    }
+                }
+                if (!registered) {
+                    in_body = parsed.observed.inside_body(begin, end);
+                    syntax_body = syntax_body || in_body;
+                    if (implicit) {
+                        for (const auto& scope : parsed.observed.scopes) {
+                            if (broad.contains(scope.kind) || scope.begin > begin || scope.end < end)
+                                continue;
+                            if (!range || scope.end - scope.begin < range->end - range->begin) {
+                                snapped = scope.id;
+                                range = semantic::place{file.path, scope.begin, scope.end};
+                            }
+                        }
+                    }
+                }
+                in_body = in_body && !parsed.directive_changed;
             }
             body_only = body_only && in_body;
             if (!implicit)
@@ -1055,7 +1131,7 @@ namespace nodes {
         if (ffi_touched)
             return "ffi_boundary_touched";
         if (body_only)
-            return "body_only";
+            return syntax_body ? "syntax_body_only" : "body_only";
         return "declaration_touched";
     }
 } // namespace nodes

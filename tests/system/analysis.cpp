@@ -1868,14 +1868,15 @@ pathlib.Path(sys.argv[1]).write_text(json.dumps({"files": files}))
                 tools::language_query::input baseline = inspect;
                 baseline.version = current_main.version;
                 auto base_view = test::decode<tools::language_query::output>(agent("language", json::write(baseline)));
-                // Without a syntax tree a comment edit is not proven comment-only, so inspect analyzes the new version.
+                // Comment-only edit on top of the file bypasses compilation via CRDT reprojection (including diagnostics/inspect).
                 auto comment_edit = line("{\"project\":\"app\",\"action\":\"apply\",\"observed\":" + json::write(current_main.version) +
                                          ",\"operation_id\":\"comment-only-zero-compile\",\"changes\":[{\"kind\":\"edit\",\"path\":\"main.cpp\",\"offset\":0,"
                                          "\"count\":0,\"text\":\"// zero-compile comment\\n\"}]}");
                 tools::language_query::input comment_query = inspect;
                 comment_query.version = comment_edit.version;
                 auto comment_reprojected = test::decode<tools::language_query::output>(agent("language", json::write(comment_query)));
-                expect(comment_reprojected.version == comment_edit.version) << "inspect answers the commented version";
+                expect(!comment_reprojected.analyzed && comment_reprojected.view == base_view.view && comment_reprojected.version == comment_edit.version)
+                    << "comment-only edit must answer inspect with zero compilation";
                 // Pure sealed body edit on the original base version (concurrently checked on a fresh fork or before comment).
                 const auto shifted_factor_pos = factor_pos + std::string{"// zero-compile comment\n"}.size();
                 auto body_only_edit = line("{\"project\":\"app\",\"action\":\"apply\",\"observed\":" + json::write(comment_edit.version) +

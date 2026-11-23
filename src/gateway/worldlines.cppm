@@ -390,9 +390,10 @@ export namespace tools {
         : tool<"worldline", "Work in an explicit worldline: list, inspect, read, compare, diff, promote, fork, apply, receipt, history, reverse or redo. "
                             "Concurrent edits within a worldline converge; worldlines never merge. Writes name the observed version; "
                             "a replace change swaps old_text, unique within the file, an offset window or a language scope reference, "
-                            "for new_text without offsets. An apply without leases locks the nearest enclosing registered scope, "
-                            "falling back to the edited text. Reach is body_only for registered function bodies, "
-                            "ffi_boundary_touched for changes to a registered FFI boundary, or declaration_touched. "
+                            "for new_text without offsets. An apply without leases locks the nearest enclosing registered or syntax scope, "
+                            "falling back to the edited text. Reach is body_only for registered function bodies, syntax_body_only for syntax "
+                            "estimates, ffi_boundary_touched for changes to a registered FFI boundary, or declaration_touched. "
+                            "For syntax_body_only, use semantic analysis to check callers because body edits can change inferred types or callable behavior. "
                             "Repeat an operation_id with identical input to recover its recorded result."> {
         struct input {
             json::described<"Project; supplied by the execution context when absent", std::optional<std::string>> project;
@@ -448,7 +449,7 @@ export namespace tools {
         };
         struct output {
             std::optional<std::string> worldline, version, written_version, base_version, path, digest, kind, data_base64, receipt, operation_id, text;
-            // Apply reach uses the observed revision.
+            // Apply reach uses the observed revision. syntax_body_only leaves caller impact open.
             std::optional<std::string> reach;
             std::optional<std::uint64_t> size, offset, count, total_scalars, next_offset;
             std::optional<bool> executable, replayed, truncated, unchanged;

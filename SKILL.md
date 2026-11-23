@@ -38,6 +38,12 @@ describes; pass that version on as `observed`.
    - `body_only`: every edit stayed inside a function body that `language`
      returned. Run `language(diagnostics)` for the edited files and check
      callers when the edit can change inferred types or callable behavior.
+   - `syntax_body_only`: Tree-sitter located the edits inside a function body in
+     the observed version. Check callers with semantic queries and run the
+     relevant tests before narrowing validation. A body edit can change an
+     inferred TS/JS return type, turn a Python function into a generator with
+     `yield`, or change the `Send`/`Sync` traits of a Rust opaque return
+     type or future. A syntax-tree location does not prove a sealed body.
    - `declaration_touched`: the batch changed a signature, a declaration or
      text outside any known body. Run
      `language(impact, changes: ["declaration"])` on the new version and fix

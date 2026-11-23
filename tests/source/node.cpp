@@ -16,6 +16,7 @@ import engine;
 import storage;
 import support;
 import durability;
+import syntax;
 
 namespace {
     using namespace boost::ut;
@@ -774,6 +775,196 @@ namespace {
             boundary.expected = state.frontier;
             expect(good(node, boundary).reach == "declaration_touched");
         };
+        "cold-start C++ leases protect disjoint function scopes"_test = [] {
+            peers workspace;
+            const std::string path = "math.cppm";
+            const std::string original = "export module math;\n// π 🧮\nexport int first() { return 1; }\n\nexport int second() { return 2; }\n";
+            const auto base = workspace.seed(path, original);
+            auto offset = [&](std::string_view marker) {
+                return nodes::scalar_count(std::string_view{original}.substr(0, original.find(marker)));
+            };
+            auto edit = [&](nodes::local_node& caller, std::string_view operation, std::string owner, std::uint64_t at, std::string replacement) {
+                return attempt(caller, {.action = "apply",
+                                        .lease_owner = std::move(owner),
+                                        .operation = op(operation),
+                                        .expected = base.frontier,
+                                        .edits = {{.kind = nodes::edit_kind::edit, .path = path, .text = std::move(replacement), .offset = at, .count = 1}}});
+            };
+            const auto a = edit(workspace.a, "syntax-first", "run-a", offset("1;"), "3");
+            const auto b = edit(*workspace.b, "syntax-second", "run-b", offset("2;"), "4");
+            expect(a.code == "ok" && a.reach == "syntax_body_only") << a.reason << a.reach;
+            expect(b.code == "ok" && b.reach == "syntax_body_only") << b.reason << b.reach;
+
+            const auto classified = good(workspace.a, {.action = "scope_classify", .revision = a.version, .target = base.version});
+            expect(classified.classification && classified.classification->body_only && !classified.classification->sealed_body_only);
+
+            const auto leases = good(workspace.a, {.action = "scope_list"}).leases;
+            expect(leases.size() == 2u);
+            auto check_lease = [&](std::string_view owner, std::string_view name, std::string_view signature, std::string_view suffix) {
+                const auto first = offset(signature);
+                const auto last = offset(suffix) + 4;
+                const auto id = std::format("syntax:function:{}", name);
+                const auto lease = std::ranges::find(leases, id, &nodes::scope_lease::scope);
+                expect(fatal(lease != leases.end())) << id;
+                expect(lease->owner == owner && lease->implicit && lease->begin == first && lease->end == last);
+            };
+            check_lease("run-a", "first", "int first", "1; }");
+            check_lease("run-b", "second", "int second", "2; }");
+            expect(edit(*workspace.b, "syntax-overlap", "run-b", offset("1;"), "5").code == "scope_conflict");
+        };
+        "C++ CST distinguishes module comments from raw strings and macro spelling"_test = [] {
+            peers workspace;
+            const std::string path = "message.cppm";
+            const std::string original = "export module message;\n#define VERSION 1\nexport auto message = R\"(// fake comment)\";\n";
+            auto base = workspace.seed(path, original);
+            auto comment_only = [&](std::string_view operation, std::size_t at, std::size_t count, std::string replacement) {
+                const auto changed = change(workspace.a, std::string{operation}, base.frontier,
+                                            {.kind = nodes::edit_kind::edit, .path = path, .text = std::move(replacement), .offset = at, .count = count});
+                const auto classified = good(workspace.a, {.action = "scope_classify", .revision = changed.version, .target = base.version});
+                base = changed;
+                return classified.classification && classified.classification->comment_or_whitespace_only;
+            };
+            const std::string comments = "// module header\n/* interface */\n\n";
+            expect(comment_only("syntax-module-comments", 0, 0, comments));
+            expect(!comment_only("syntax-raw-string", comments.size() + original.find("fake"), 4, "real"));
+            expect(!comment_only("syntax-macro-whitespace", comments.size() + original.find("VERSION") + 7, 1, "  "));
+        };
+        "C++ syntax errors cannot enable comment-only reuse"_test = [] {
+            peers workspace;
+            const std::string path = "operator.cpp";
+            const std::string source = "int f(int a, int b) { return a - -b; }\n";
+            const auto base = workspace.seed(path, source);
+            const auto changed = change(workspace.a, "merge-minus-tokens", base.frontier,
+                                        {.kind = nodes::edit_kind::edit, .path = path, .offset = source.find("- -") + 1, .count = 1});
+            const auto classified = good(workspace.a, {.action = "scope_classify", .revision = changed.version, .target = base.version});
+            expect(classified.classification && !classified.classification->comment_or_whitespace_only && !classified.classification->sealed_body_only);
+        };
+        "C++ token comparison rejects a valid change from unary minus to decrement"_test = [] {
+            peers workspace;
+            const std::string path = "operator.cpp";
+            const std::string source = "int f(int y) { int x = - -y; return x; }\n";
+            const auto base = workspace.seed(path, source);
+            const auto changed = change(workspace.a, "prefix-decrement", base.frontier,
+                                        {.kind = nodes::edit_kind::edit, .path = path, .text = "--", .offset = source.find("- -"), .count = 3});
+            const auto classified = good(workspace.a, {.action = "scope_classify", .revision = changed.version, .target = base.version});
+            expect(classified.classification && classified.classification->body_only && !classified.classification->comment_or_whitespace_only);
+        };
+        "C++ directives inside a function affect declaration reach with or without sealed bodies"_test = [] {
+            peers workspace;
+            const std::string path = "macro.cpp";
+            const std::string source = "int f() {\n  return 1;\n}\nint tail;\n";
+            const std::string directive = "#define int long\n";
+            const auto offset = source.find("  return");
+            const auto base = workspace.seed(path, source);
+            const auto inserted = change(workspace.a, "directive-insert", base.frontier,
+                                         {.kind = nodes::edit_kind::edit, .path = path, .text = directive, .offset = offset});
+            const auto cold = good(workspace.a, {.action = "scope_classify", .revision = inserted.version, .target = base.version});
+            expect(inserted.reach == "declaration_touched" && cold.classification && !cold.classification->body_only);
+
+            good(workspace.a, {.action = "scope_register",
+                               .revision = base.version,
+                               .body_ranges = {{"sym:f", {path, source.find('{'), source.find('}') + 1}}},
+                               .scope_hints = {.sealed_bodies = {"sym:f"}}});
+            const auto commented = change(workspace.a, "directive-comment", inserted.frontier,
+                                          {.kind = nodes::edit_kind::edit, .path = path, .text = "//", .offset = offset});
+            const auto registered = good(workspace.a, {.action = "scope_classify", .revision = commented.version, .target = inserted.version});
+            expect(commented.reach == "declaration_touched" && registered.classification &&
+                   !registered.classification->body_only && !registered.classification->sealed_body_only);
+        };
+        "C++ header guards preserve body-only reach for edits in conditional branches"_test = [] {
+            peers workspace;
+            const std::string path = "guarded.hpp";
+            const std::string source =
+                "#ifndef GUARDED_HPP\n#define GUARDED_HPP\n"
+                "inline int f() {\n#if FEATURE\n  return 1;\n#elif OTHER\n  return 2;\n#else\n  return 3;\n#endif\n}\n"
+                "#endif\n";
+            const auto base = workspace.seed(path, source);
+            const auto body_offset = source.find("3;");
+            const auto cold = change(workspace.a, "guarded-cold-body", base.frontier,
+                                     {.kind = nodes::edit_kind::edit, .path = path, .text = "4", .offset = body_offset, .count = 1});
+            const auto cold_class = good(workspace.a, {.action = "scope_classify", .revision = cold.version, .target = base.version});
+            expect(cold.reach == "syntax_body_only" && cold_class.classification && cold_class.classification->body_only &&
+                   !cold_class.classification->sealed_body_only);
+
+            good(workspace.a, {.action = "scope_register",
+                               .revision = cold.version,
+                               .body_ranges = {{"sym:f", {path, source.find('{'), source.find('}') + 1}}},
+                               .scope_hints = {.sealed_bodies = {"sym:f"}}});
+            const auto sealed = change(workspace.a, "guarded-sealed-body", cold.frontier,
+                                       {.kind = nodes::edit_kind::edit, .path = path, .text = "5", .offset = body_offset, .count = 1});
+            const auto sealed_class = good(workspace.a, {.action = "scope_classify", .revision = sealed.version, .target = cold.version});
+            expect(sealed.reach == "body_only" && sealed_class.classification && sealed_class.classification->sealed_body_only);
+
+            const auto guard = change(workspace.a, "guarded-macro-name", sealed.frontier,
+                                      {.kind = nodes::edit_kind::edit, .path = path, .text = "X", .offset = source.find("GUARDED_HPP"), .count = 1});
+            const auto guard_class = good(workspace.a, {.action = "scope_classify", .revision = guard.version, .target = sealed.version});
+            expect(guard.reach == "declaration_touched" && guard_class.classification && !guard_class.classification->body_only);
+
+            const auto endif = change(workspace.a, "guarded-endif", guard.frontier,
+                                      {.kind = nodes::edit_kind::edit, .path = path, .offset = source.find("#endif"), .count = 6});
+            const auto endif_class = good(workspace.a, {.action = "scope_classify", .revision = endif.version, .target = guard.version});
+            expect(endif.reach == "declaration_touched" && endif_class.classification &&
+                   !endif_class.classification->body_only && !endif_class.classification->sealed_body_only);
+        };
+        "language grammars provide cold scopes and preserve meaningful source during comment reuse"_test = [] {
+            struct example {
+                std::string path, source;
+                std::string_view changed_code, replacement;
+                std::string_view scope = "syntax:function:calculate";
+            };
+            const example examples[]{
+                {"calculate.rs", "fn calculate() -> i32 { /* old /* nested */ */ let _s = r#\"// alpha\"#; 41 }\n", "alpha", "omega"},
+                {"calculate.py", "def calculate():\n    # old note\n    value = 41  # type: int\n    return value\n", "type: int", "type: str"},
+                {"calculate.js", "function calculate() { // old note\n  const pattern = /[//]alpha/; return 41;\n}\n", "alpha", "omega"},
+                {"calculate.ts", "function calculate(): number { // old note\n  const url = `http://alpha/${41}`; return 41;\n}\n", "alpha", "omega"},
+                {"calculate.tsx", "const calculate = () => { // old note\n  return <div title=\"alpha\">{41}</div>;\n};\n", "alpha", "omega"},
+                {"calculate.kt", "fun calculate(): Int { /* old /* nested */ */ return 41 }\n", "Int", "Any"},
+                {"Calculate.java", "class Calculate { int calculate() { // old note\n return 41; } }\n", "int calculate", "long calculate"},
+                {"Calculate.cs", "class Calculate { int calculate() { // old note\n return 41; } }\n", "int calculate", "long calculate"},
+                {"Calculate.scala", "object Calculate { def calculate(): Int = { // old note\n  41\n} }\n", "Int", "Long"},
+                {"Calculate.fs", "module Calculate\nlet calculate x =\n    (* old (* nested *) *) x + 41 + x\n", "x +", "x -", "syntax:binding:calculate"}};
+            for (const auto& sample : examples) {
+                peers workspace;
+                const auto base = workspace.seed(sample.path, sample.source);
+                auto apply = [&](std::string_view operation, const nodes::node_reply& previous, std::size_t offset, std::size_t count,
+                                 std::string replacement) {
+                    return good(workspace.a, {.action = "apply",
+                                              .lease_owner = "syntax-agent",
+                                              .operation = op(operation),
+                                              .expected = previous.frontier,
+                                              .edits = {{.kind = nodes::edit_kind::edit, .path = sample.path, .text = std::move(replacement),
+                                                         .offset = offset, .count = count}}});
+                };
+                const auto body = apply("cold-function-body", base, sample.source.rfind("41"), 2, "42");
+                const auto scope = good(workspace.a, {.action = "scope_list"});
+                const auto classification = good(workspace.a, {.action = "scope_classify", .revision = body.version, .target = base.version});
+                expect(body.reach == "syntax_body_only" && classification.classification && classification.classification->body_only &&
+                       !classification.classification->sealed_body_only) << sample.path;
+                expect(fatal(scope.leases.size() == 1u)) << sample.path;
+                expect(scope.leases.front().scope == sample.scope) << sample.path;
+
+                const std::string new_comment = "new prose";
+                const auto prose = apply("rewrite-comment", body, sample.source.find("old"), 3, new_comment);
+                const auto prose_class = good(workspace.a, {.action = "scope_classify", .revision = prose.version, .target = body.version});
+                expect(prose_class.classification && prose_class.classification->comment_or_whitespace_only) << sample.path;
+
+                const auto code = text(good(workspace.a, {.action = "read", .revision = prose.version, .target = sample.path}), sample.path);
+                const auto code_offset = code.find(sample.changed_code);
+                expect(fatal(code_offset != std::string::npos)) << sample.path;
+                const auto edited = apply("change-meaningful-source", prose, code_offset, sample.changed_code.size(), std::string{sample.replacement});
+                const auto edited_class = good(workspace.a, {.action = "scope_classify", .revision = edited.version, .target = prose.version});
+                expect(edited_class.classification && !edited_class.classification->comment_or_whitespace_only) << sample.path;
+            }
+        };
+        "F# signature grammar parses an outline and compares signature comments"_test = [] {
+            const syntax::parsed_file before{"Calculate.fsi", "module Calculate\n// Before\nval calculate: int -> int\n"};
+            const syntax::parsed_file after{"Calculate.fsi", "module Calculate\n// After\nval calculate: int -> int\n"};
+            const auto outline = after.analyze(true);
+            expect(before.comment_or_whitespace_only(after) && outline.bodies.empty() &&
+                   std::ranges::any_of(outline.scopes, [](const auto& scope) {
+                       return scope.kind == "module" && scope.name == "Calculate";
+                   }));
+        };
         "scope_classify proves sealed body edits and reprojects CRDT places without analysis"_test = [] {
             test::scratch tmp{"scope-classify"};
             nodes::local_node node{tmp.dir / "a"};
@@ -882,7 +1073,7 @@ namespace {
                             .edits = {{.kind = nodes::edit_kind::edit, .path = "jni.cpp", .text = "a", .offset = 32, .count = 2},
                                       {.kind = nodes::edit_kind::edit, .path = "jni.cpp", .text = "b", .offset = 34, .count = 1}}})
                        .code == nodes::code::invalid_record);
-            // Without a syntax tree a comment edit is not proven comment-only.
+            // Comment/whitespace-only edit in a C++ header is classified as comment_or_whitespace_only.
             auto commented = good(
                 node,
                 {.action = "apply",
@@ -890,7 +1081,7 @@ namespace {
                  .expected = multi.frontier,
                  .edits = {{.kind = nodes::edit_kind::edit, .path = "hdr.hpp", .text = "// doc note\n", .offset = 12, .count = 0}}});
             auto comment_class = good(node, {.action = "scope_classify", .revision = commented.version, .target = multi.version});
-            expect(comment_class.classification && !comment_class.classification->comment_or_whitespace_only);
+            expect(comment_class.classification && comment_class.classification->comment_or_whitespace_only);
             // Changing a preprocessor directive is NOT comment_or_whitespace_only.
             auto pp_edit = good(
                 node,
