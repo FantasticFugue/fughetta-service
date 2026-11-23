@@ -163,16 +163,16 @@ above available at configuration time, then run:
 ```sh
 cmake --preset release
 cmake --build --preset release --target fughetta-service llvm-provider clr-providers jvm-providers --parallel 2
-python3 cmake/packaging/package.py --build build/release --output dist --version 0.1.0
+cmake -DBUILD_DIR=build/release -DOUTPUT_DIR=dist -DVERSION=0.1.0 -P cmake/packaging/package.cmake
 ```
 
 Linux packaging uses `dpkg-deb`, `dpkg-shlibdeps`, and `patchelf`. Windows packaging
-runs natively with Python, CMake, WiX and its `WixToolset.Util.wixext` extension;
+uses CMake, WiX and its `WixToolset.Util.wixext` extension;
 set `CLANG_ROOT` to the compiler installation for `llvm-objdump`. On macOS, add
-`--release-url https://github.com/OWNER/REPO/releases/download/TAG` so the generated
-formula points to the archive's published location. `--runtime-search PATH` adds
+`-DRELEASE_URL=https://github.com/OWNER/REPO/releases/download/TAG` so the generated
+formula points to the archive's published location. `-DRUNTIME_SEARCH=PATH` adds
 a native library search directory. Temporary package files stay under the build
-directory; the output directory receives the package and, on macOS, its formula.
+directory.
 
 ## Service lifecycle and workspace boundary
 

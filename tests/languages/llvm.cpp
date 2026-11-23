@@ -174,8 +174,7 @@ int main(int argc, const char** argv) {
             else
                 test::require(false, "unknown option " + std::string{option});
         }
-        fs::create_directories(work);
-        test::scratch temporary{"native"};
+        test::scratch temporary{"native", fs::absolute(work)};
         verify(temporary.dir, host, compiler, lld_link, rustc);
         std::cout << "ELF, Mach-O, COFF and Rust artifacts read\n";
         return 0;

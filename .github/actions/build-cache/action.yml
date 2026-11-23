@@ -1,0 +1,109 @@
+name: Manage native build cache
+description: Restore source timestamps or record them before replacing the staged cache.
+inputs:
+  directory:
+    description: CMake build directory
+    required: true
+  mode:
+    description: Restore or save source timestamps
+    required: true
+  prefix:
+    description: Cache key prefix to prune when saving
+    default: ''
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      env:
+        BUILD_DIR: ${{ inputs.directory }}
+        TIMESTAMP_MODE: ${{ inputs.mode }}
+      run: |
+        set -euo pipefail
+        if [[ "$RUNNER_OS" == "Windows" ]]; then
+          export TOUCH_TOOL="$(cygpath -m "$(command -v touch)")"
+        elif [[ "$RUNNER_OS" == "macOS" ]]; then
+          export TOUCH_TOOL=gtouch
+        else
+          export TOUCH_TOOL=touch
+        fi
+        node <<'JS_CACHE'
+        const fs = require('node:fs');
+        const path = require('node:path');
+        const { execFileSync } = require('node:child_process');
+
+        const git = (...args) => execFileSync('git', args, { encoding: 'utf8', maxBuffer: 16 * 1024 * 1024 });
+        const paths = (...args) => git(...args).split('\0').filter(Boolean);
+        const build = path.resolve(process.env.BUILD_DIR);
+        const workspace = fs.realpathSync(process.cwd());
+        const record = path.join(build, 'source-mtimes.json');
+        const revision = git('rev-parse', 'HEAD').trim();
+        const tracked = paths('ls-files', '-z');
+
+        function discard(reason) {
+          console.log(reason + ' Starting a fresh build.');
+          fs.rmSync(build, { recursive: true, force: true });
+        }
+
+        switch (process.env.TIMESTAMP_MODE) {
+        case 'save': {
+          const times = Object.create(null);
+          for (const name of tracked) {
+            const info = fs.lstatSync(name, { bigint: true });
+            if (info.isFile()) times[name] = info.mtimeNs.toString();
+          }
+          fs.writeFileSync(record, JSON.stringify({ revision, workspace, build, times }));
+          break;
+        }
+        case 'restore': {
+          if (!fs.existsSync(record)) break;
+          const snapshot = JSON.parse(fs.readFileSync(record, 'utf8'));
+          if (snapshot.workspace !== workspace || snapshot.build !== build) {
+            discard('The cached build uses different absolute paths.');
+            break;
+          }
+          let changed;
+          try {
+            changed = new Set(paths('diff', '--name-only', '--no-renames', '-z', snapshot.revision, revision, '--'));
+          } catch (error) {
+            if (typeof error.status !== 'number') throw error;
+            discard('The cached source revision is no longer in the checkout.');
+            break;
+          }
+          const batches = new Map();
+          for (const name of tracked) {
+            if (changed.has(name) || !Object.hasOwn(snapshot.times, name) || !fs.lstatSync(name).isFile()) continue;
+            const time = snapshot.times[name];
+            if (!batches.has(time)) batches.set(time, []);
+            batches.get(time).push(name);
+          }
+          // Ninja compares nanoseconds. Pass exact decimal seconds to GNU touch.
+          let restored = 0;
+          for (const [time, files] of batches) {
+            const digits = time.padStart(10, '0');
+            const date = '@' + digits.slice(0, -9) + '.' + digits.slice(-9);
+            for (let index = 0; index < files.length; index += 100) {
+              const batch = files.slice(index, index + 100);
+              execFileSync(process.env.TOUCH_TOOL, ['-m', '-d', date, '--', ...batch]);
+              restored += batch.length;
+            }
+          }
+          console.log('Restored timestamps for ' + restored + ' unchanged files. Ninja will evaluate ' + changed.size + ' changed paths.');
+          break;
+        }
+        default:
+          throw new Error('Unknown source timestamp mode: ' + process.env.TIMESTAMP_MODE);
+        }
+        JS_CACHE
+
+    - if: inputs.mode == 'save'
+      shell: bash
+      env:
+        CACHE_PREFIX: ${{ inputs.prefix }}
+      run: |
+        set -euo pipefail
+        gh api "repos/$GITHUB_REPOSITORY/actions/caches?per_page=100" --paginate \
+          --jq ".actions_caches[] | select(.key | startswith(\"$CACHE_PREFIX\")) | .id" |
+        while read -r id; do
+          [ -n "$id" ] || continue
+          gh api -X DELETE "repos/$GITHUB_REPOSITORY/actions/caches/$id" >/dev/null || true
+        done

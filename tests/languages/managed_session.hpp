@@ -1,5 +1,7 @@
 #pragma once
 
+#include "gradle.hpp"
+
 import launch;
 import helper;
 import runner;
@@ -111,6 +113,7 @@ namespace managed_test {
         }
 
         auto run(std::vector<std::string> argv, fs::path cwd) -> coroutine::task<std::string> {
+            wrap_gradle(argv);
             const auto output = cwd / ".driver-stdout";
             io::command command{.argv = std::move(argv), .cwd = std::move(cwd), .env = env, .standard_output = output};
             const auto name = command.argv.front();

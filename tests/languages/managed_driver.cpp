@@ -1,3 +1,5 @@
+#include "gradle.hpp"
+
 // Drives model export for the managed providers against sample projects, then
 // asserts the exported model. Ported from the removed tests/model/managed.py. Standard output
 // of every child goes to a file so the validated stdout stays separate from stderr.
@@ -24,6 +26,7 @@ namespace {
     };
 
     auto run(std::vector<std::string> argv, const fs::path& cwd) -> outcome {
+        managed_test::wrap_gradle(argv);
         auto out = cwd / std::format("stdout-{}.txt", sequence++);
         auto command = test::command(argv.front(), cwd, std::vector<std::string>(argv.begin() + 1, argv.end()));
         command.env = child_env;

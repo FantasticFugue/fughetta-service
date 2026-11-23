@@ -1,13 +1,12 @@
 {
   "toolchain": {
     "llvm": "23.1.5",
-    "ninja": "1.13.2",
     "python": "3.x",
     "java": {"distribution": "temurin"},
     "gradle": "current"
   },
   "compile_jobs": 2,
-  "build_attempts": 6,
+  "build_attempts": 10,
   "download_retries": 3,
   "rate_limit_wait_seconds": 30,
   "profiles": {

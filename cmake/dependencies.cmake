@@ -23,7 +23,7 @@ set(HTTPANT_ENABLE_IO ON)
 set(HTTPANT_ENABLE_TLS ON)
 FetchContent_Declare(httpant
   GIT_REPOSITORY https://github.com/tsurumi-yizhou/httpant.git
-  GIT_TAG main
+  GIT_TAG ci/windows-stdexec-module-20261120
   GIT_SHALLOW TRUE
   EXCLUDE_FROM_ALL)
 FetchContent_MakeAvailable(httpant)
