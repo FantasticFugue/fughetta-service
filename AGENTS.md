@@ -83,8 +83,8 @@ and the module registrations in `CMakeLists.txt` must agree.
 
 ## What is not here any more
 
-The front ends (console, admin, landing and the component
-library) are
-their own repositories beside this one; see `README.md`. Frontend work does not
-belong here. An API change a front end needs is a change to `/api/v1` or `/mcp`,
-recorded in that front end's own repository.
+The customer and operator UIs share the `console` repository. That repository
+also owns the hosted gateway and the `fugadmin` CLI and MCP server. The public
+site and component library live in `landing` and `components`. For frontend
+changes that need a Core API update, document the `/api/v1` or `/mcp` change
+in the consuming frontend repository.

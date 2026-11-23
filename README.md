@@ -16,16 +16,15 @@ inspect syntax, build and test a fixed revision, and retrieve its outputs. Sourc
 of deduplicated, cached jobs.
 
 The `fughetta-service` executable runs a gateway process that manages one
-source process and a worker pool for one workspace. The hosted platform places
-`cloud-gateway` in front of each workspace for accounts, sign-in, and billing.
+source process and a worker pool for one workspace. The Console Worker serves
+the hosted gateway for accounts, sign-in, billing, and workspace routing.
 
-The front ends are separate repositories beside this one, each a static app on
-the component library `@fantasticfugue/components` (`../components`):
+The front ends are static apps in separate repositories and share the
+`@fantasticfugue/components-vue` package:
 
 | Repository | What it is |
 | --- | --- |
-| `console` | The customers' console: workspaces, projects, settings, history, insights |
-| `admin` | The operators' console: users, workspaces and the gateway across every tenant |
+| `console` | Customer workspace UI and the `/admin` operator UI for managing users, workspaces, and the hosted gateway |
 | `landing` | Marketing pages, docs, blog, pricing and legal, prerendered |
 
 ## Dependencies and build
@@ -181,8 +180,8 @@ The service admits and schedules jobs within the workspace budget, owns source a
 Worker processes, and handles cancellation and shutdown. A self-hosted service runs
 directly in the environment supplied by the operator. Core and Worker roles use
 the isolation supplied by their deployment. For managed environments,
-`cloud-gateway` coordinates placement and the Linux Host Executor role supplies
-isolation and hard quotas.
+the Console Worker coordinates placement and the Linux [Host Executor](#host-executor)
+enforces isolation and hard quotas.
 
 ### Native lifecycle design
 
@@ -401,7 +400,7 @@ up to ten seconds before terminating a remaining child. Linux child processes
 also terminate when their parent dies.
 
 To run the Core and Web Console as native processes on one machine, follow the
-[Console self-hosting guide](../console/README.md#single-machine-self-hosting).
+[Console self-hosting guide](../fughetta-console/README.md#single-machine-self-hosting).
 The launcher initializes a token-authenticated Core and uses the service's
 native process orchestration.
 
@@ -413,8 +412,9 @@ stream with a comment keepalive every 15 seconds, so proxies with idle
 limits (Cloudflare closes after 100 seconds) keep long builds open; progress
 notifications are added when the call includes a `progressToken`. Other requests
 get a single JSON body.
-Workspace subscriptions use `GET /api/v1/events`; the event contract and shared
-validation record are in the [hosted gateway guide](../cloud-gateway/README.md#workspace-events).
+Workspace subscriptions use `GET /api/v1/events` to receive server-sent events.
+The Console Worker relays these subscriptions through
+`GET /w/{workspace}/api/v1/events`.
 `--help` prints the public commands. The `--role` arguments are internal process
 entry points used by the supervisor and process tests.
 
@@ -425,8 +425,8 @@ with the hosted gateway. The gateway sends the secret as
 It replaces the client's authorization and caller headers with its own.
 Core API requests use the gateway's caller headers and must include a matching
 `x-fughetta-workspace`, including requests with the host role. Set the secret
-in an owner-only Core configuration file. See the gateway's
-[core configuration](../cloud-gateway/README.md#cells-where-each-core-listens).
+in an owner-only Core configuration file. The [Host Executor configuration](#host-executor)
+describes the corresponding secret for managed environments.
 
 The gateway resolves a run through `POST /api/v1/executions/identity`, which
 returns `x-fughetta-execution: scoped` on success. For task MCP requests it sends
@@ -443,7 +443,7 @@ configuration when the Core uses trusted mode.
 `native::context` and `runtime::context` select `concurrent::queue` from the
 `mpmc` core module for native submissions and blocking file work. Native TCP,
 UDP, file, scheduler, and process types use the same choice. The installed
-package exports this module for cloud-gateway. HTTP session queues retain
+package exports this module. HTTP session queues retain
 httpant's unsynchronized local default because one context thread owns them.
 
 The queue uses a bounded Vyukov MPMC ring with 4,096 cells. Producers and
@@ -459,12 +459,12 @@ The `websocket` stream presents opaque bytes to the existing jobs channel,
 splits output into 16 KiB binary messages, handles ping/pong and close, and
 waits for transport writes to apply backpressure. `resolver` drives cancellable
 c-ares queries on the native scheduler. `httpant.tls` wraps `web::stream` over a
-native socket and bounds pending ciphertext at 128 KiB; cloud-gateway uses
-these modules for its public tunnels and sends `close_notify` after a normal end. Certificate rejection uses
+native socket and bounds pending ciphertext at 128 KiB. Native TLS sessions
+send `close_notify` after a normal end. Certificate rejection uses
 `http::tls::verification_failure`; the local `tls` module retains URL parsing. Tree coordination state is released after its last active
 or waiting build; Core scheduling retains at most 256 worker-reported slots per
-Worker. The hosted transport and its deployment limits are documented in the
-gateway's [Worker tunnel entry](../cloud-gateway/README.md#worker-tunnels).
+Worker. See [Connect a self-hosted Worker](#connect-a-self-hosted-worker) for
+enrollment and tunnel configuration.
 
 ## Clients and hosts
 
@@ -724,8 +724,7 @@ exponential backoff with jitter; `reconnect_attempts` defaults to 30 and accepts
 protocol mismatch are retried the same way, since the identity stays valid.
 Credential refusal and revocation stop the Worker with exit status 2.
 Reconnection does not replay interrupted jobs. Register again after
-revocation. Local validation and remaining
-limits are recorded in the gateway's [verification entry](../cloud-gateway/README.md#verification).
+revocation.
 
 ## C++, Python, TypeScript and Bun toolchains
 
@@ -1943,7 +1942,7 @@ Worldline history to identify the contribution for `reverse`.
 
 The Console exposes component-specific editors. Local executable versions,
 behavioral acceptance, and remaining deployment limits are recorded once in the
-[toolchain acceptance record](../console/DEPLOYMENT.md#c-and-python-toolchains--october-27-2026).
+[toolchain acceptance record](../fughetta-console/DEPLOYMENT.md#c-and-python-toolchains--october-27-2026).
 
 ### Named source checkpoints
 
@@ -2004,8 +2003,9 @@ Status separates `desired` from `applied` and reports `starting`, `ready`,
 `pending`, or `draining`. Accepted work finishes before internal processes are
 rebuilt. New work receives 503 while draining; status reads, job inspection,
 cancellation, and CORS preflight remain available. The main process retains its
-PID and loads the persisted budget for the next process group. See the hosted
-[runtime budget controls](../cloud-gateway/README.md#runtime-budgets).
+PID and loads the persisted budget for the next process group. Hosted operators
+manage workspace runtime budgets through the Console's `/admin` UI or
+[`fugadmin`](../fughetta-console/fugadmin/README.md).
 
 The top-level `tools` map supplies executable paths and readable tool resources
 to workers, including helper JARs, assemblies and model-export scripts. Automatic
@@ -2169,9 +2169,9 @@ on October 24, 2026. The associated gateway `units` and `core` suites passed,
 as did 51 Console slug and workspace-retirement tests.
 
 `jobs::protocol_version` hashes message codes, not message fields.
-Current transport, identity, and lifecycle evidence is maintained in the
-gateway's [verification entry](../cloud-gateway/README.md#verification).
-Production Core provisioning remains deployment work.
+These checks record the October 24 test runs. See the
+[workspace deployment guide](../DEPLOY.md#production-resources) for the current
+provisioning configuration.
 
 ### Exported operation files
 
