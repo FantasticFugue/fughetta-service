@@ -220,14 +220,15 @@ namespace nodes {
         }
         std::size_t created = 0;
         std::set<std::string> touched;
+        std::map<std::string, std::vector<std::pair<std::uint64_t, std::uint64_t>>> edited_spans;
         // A file is placed only on a path that is free once the batch is done: one this batch empties, or one nobody holds.
         std::set<std::string> freed, placed;
         for (auto& e : in.edits) {
-            if (!e.document.empty() && e.kind != "edit" && e.kind != "write" && e.kind != "binary")
+            if (!e.document.empty() && e.kind != nodes::edit_kind::edit && e.kind != nodes::edit_kind::write && e.kind != nodes::edit_kind::binary)
                 fail(nodes::code::invalid_record, "only a content change names a file identity");
-            if (e.kind == "remove" || e.kind == "move" || e.kind == "recreate" || e.kind == "binary_recreate")
+            if (e.kind == nodes::edit_kind::remove || e.kind == nodes::edit_kind::move || e.kind == nodes::edit_kind::recreate || e.kind == nodes::edit_kind::binary_recreate)
                 freed.insert(e.path);
-            else if (e.kind == "directory_move")
+            else if (e.kind == nodes::edit_kind::directory_move)
                 for (auto it = state.paths.lower_bound(e.path + "/"); it != state.paths.end() && it->first.starts_with(e.path + "/"); ++it)
                     freed.insert(it->first);
         }
@@ -241,10 +242,21 @@ namespace nodes {
         };
         for (auto& e : in.edits) {
             checked_path(e.path);
-            if (!touched.insert(e.path).second)
-                fail(nodes::code::invalid_record, "multiple edits of one path require separate observed batches");
-            const bool recreate = e.kind == "recreate" || e.kind == "binary_recreate";
-            if (e.kind == "create" || e.kind == "binary_create" || recreate) {
+            if (e.kind == nodes::edit_kind::edit) {
+                if (touched.contains(e.path))
+                    fail(nodes::code::invalid_record, "multiple edits of one path require separate observed batches");
+                auto& spans = edited_spans[e.path];
+                const auto begin = e.offset, end = e.offset + e.count;
+                for (const auto& [prev_begin, prev_end] : spans)
+                    if (begin <= prev_end && prev_begin <= end)
+                        fail(nodes::code::invalid_record, "overlapping or adjacent edits of one path require separate observed batches");
+                spans.emplace_back(begin, end);
+            } else {
+                if (edited_spans.contains(e.path) || !touched.insert(e.path).second)
+                    fail(nodes::code::invalid_record, "multiple edits of one path require separate observed batches");
+            }
+            const bool recreate = e.kind == nodes::edit_kind::recreate || e.kind == nodes::edit_kind::binary_recreate;
+            if (e.kind == nodes::edit_kind::create || e.kind == nodes::edit_kind::binary_create || recreate) {
                 if (recreate) {
                     if (in.tool != "execute.capture/1")
                         fail(nodes::code::invalid_record, "recreate belongs to worktree capture");
@@ -255,13 +267,13 @@ namespace nodes {
                 property(file, "path", e.path);
                 property(file, "presence", true);
                 property(file, "mode", e.executable);
-                if (e.kind == "binary_create" || e.kind == "binary_recreate")
+                if (e.kind == nodes::edit_kind::binary_create || e.kind == nodes::edit_kind::binary_recreate)
                     property(file, "binary", digest_of(unhex(e.text)));
                 else
                     insert(file, {}, {}, e.text);
                 continue;
             }
-            if (e.kind == "directory_move") {
+            if (e.kind == nodes::edit_kind::directory_move) {
                 checked_path(e.target);
                 bool found = false;
                 std::vector<std::pair<std::string, std::string>> moved;
@@ -293,7 +305,7 @@ namespace nodes {
                     selected = hidden->second.get();
                 }
             }
-            const bool needs_runs = e.kind == "edit" || e.kind == "write";
+            const bool needs_runs = e.kind == nodes::edit_kind::edit || e.kind == nodes::edit_kind::write;
             if (!selected) {
                 if (needs_runs) {
                     // A version manifest names content, not character runs: materialize the file this edit anchors into.
@@ -306,25 +318,25 @@ namespace nodes {
                 selected = held.get();
             }
             auto& file = *selected;
-            if (in.tool == "execute.capture/1" && (e.kind == "write" || e.kind == "binary") && e.executable != file.executable)
+            if (in.tool == "execute.capture/1" && (e.kind == nodes::edit_kind::write || e.kind == nodes::edit_kind::binary) && e.executable != file.executable)
                 property(file.id, "mode", e.executable);
-            if (e.kind == "move") {
+            if (e.kind == nodes::edit_kind::move) {
                 checked_path(e.target);
                 // A move never replaces a file; a concurrent move onto one path stays a recorded path conflict.
                 claim(e.target);
                 property(file.id, "path", e.target);
-            } else if (e.kind == "remove")
+            } else if (e.kind == nodes::edit_kind::remove)
                 property(file.id, "presence", false);
-            else if (e.kind == "mode")
+            else if (e.kind == nodes::edit_kind::mode)
                 property(file.id, "mode", e.executable);
-            else if (e.kind == "binary") {
+            else if (e.kind == nodes::edit_kind::binary) {
                 if (file.kind != "binary")
                     fail(nodes::code::invalid_record, "binary replacement requires a binary document");
                 property(file.id, "binary", digest_of(unhex(e.text)));
-            } else if (e.kind == "edit" || e.kind == "write") {
+            } else if (e.kind == nodes::edit_kind::edit || e.kind == nodes::edit_kind::write) {
                 if (file.kind != "text")
                     fail(nodes::code::invalid_record, "text edit requires a text document");
-                auto offset = e.kind == "write" ? 0 : e.offset, count = e.kind == "write" ? file.size() : e.count;
+                auto offset = e.kind == nodes::edit_kind::write ? 0 : e.offset, count = e.kind == nodes::edit_kind::write ? file.size() : e.count;
                 if (offset > file.size() || count > file.size() - offset)
                     fail(nodes::code::invalid_record, "text edit outside observed source");
                 auto left = offset ? file.at(offset - 1) : element{};
@@ -426,7 +438,7 @@ namespace nodes {
         if (in.action != "fork") {
             std::vector<std::string> required;
             for (auto& edit : in.edits)
-                if (edit.kind == "binary" || edit.kind == "binary_create" || edit.kind == "binary_recreate")
+                if (edit.kind == nodes::edit_kind::binary || edit.kind == nodes::edit_kind::binary_create || edit.kind == nodes::edit_kind::binary_recreate)
                     required.push_back(blob(unhex(edit.text)));
             if (in.action == "promote") {
                 required.insert(required.end(), in.source.begin(), in.source.end());
@@ -483,11 +495,11 @@ namespace nodes {
                 }
             };
             for (auto& e : in.edits) {
-                if (e.kind == "create" || e.kind == "binary_create")
+                if (e.kind == nodes::edit_kind::create || e.kind == nodes::edit_kind::binary_create)
                     check_destination(e.path);
-                else if (e.kind == "move")
+                else if (e.kind == nodes::edit_kind::move)
                     check_destination(e.target);
-                else if (e.kind == "directory_move") {
+                else if (e.kind == nodes::edit_kind::directory_move) {
                     auto prefix = e.path + "/";
                     for (auto it = observed->paths.lower_bound(prefix); it != observed->paths.end() && it->first.starts_with(prefix); ++it)
                         check_destination(e.target + it->first.substr(e.path.size()));

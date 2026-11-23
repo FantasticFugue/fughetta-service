@@ -6,6 +6,11 @@ import java.nio.file.Path
 import java.util.ServiceLoader
 
 fun main(args: Array<String>) {
+    if (args.firstOrNull() == "--gradle") {
+        require(args.size == 6) { "expected --gradle <installation> <user-home> <slot-state> <idle-ms> <jvm-cpu-option>" }
+        serveGradle(Path.of(args[1]), Path.of(args[2]), Path.of(args[3]), args[4].toInt(), args[5])
+        return
+    }
     require(args.size == 2 && args[0] == "--adapter") { "expected --adapter <language-adapter.jar>" }
     val jar = Path.of(args[1]).toAbsolutePath().normalize()
     require(Files.isRegularFile(jar)) { "language adapter does not exist: $jar" }

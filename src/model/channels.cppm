@@ -203,22 +203,7 @@ export namespace channels {
                 continue;
             const auto& type = *found->second;
             out.push_back(type);
-            for (const auto* list : {&type.arguments, &type.constraints, &type.elements, &type.type_parameters})
-                pending.insert(pending.end(), list->begin(), list->end());
-            for (const auto* child : {&type.receiver, &type.return_type, &type.lower_bound, &type.upper_bound})
-                if (*child)
-                    pending.push_back(**child);
-            for (const auto& group : type.parameter_groups)
-                for (const auto& parameter : group.parameters)
-                    pending.push_back(parameter.type);
-            auto arguments = [&](this auto&& self, const auto& values) -> void {
-                for (const auto& argument : values) {
-                    if (argument.type)
-                        pending.push_back(*argument.type);
-                    self(argument.elements);
-                }
-            };
-            arguments(type.application_arguments);
+            semantic::records::each_type_reference(type, [&](const auto& child) { pending.push_back(child); });
         }
         return out;
     }
@@ -281,5 +266,79 @@ export namespace channels {
         if (output == shard.unit.output_channels.end())
             throw std::invalid_argument("semantic unit did not publish channel " + name);
         return {.kind = kind, .project = project, .key = port, .value = output->value, .producer = shard.unit.id, .channel = name};
+    }
+
+    // A body range that encompasses the symbol's declared name is a whole declaration, not a function body.
+    inline auto is_body_range(const semantic::records::occurrence& row) -> bool {
+        if (!row.body || row.body->end <= row.body->begin + 1)
+            return false;
+        if (row.selection && row.selection->path == row.body->path && row.body->begin <= row.selection->begin && row.selection->end <= row.body->end)
+            return false;
+        return std::ranges::contains(row.roles, semantic::role::make<"definition">());
+    }
+
+    // Conservative soundness check: edits strictly inside a sealed body cannot change any external declaration,
+    // type signature, template instantiation, constexpr value, or cross-TU interface.
+    inline auto is_sealed_body(const semantic::records::symbol& symbol, const semantic::records::occurrence& row,
+                               const std::map<semantic::type_id, const semantic::records::type*>& types) -> bool {
+        if (!is_body_range(row))
+            return false;
+        const auto kind = symbol.kind.str();
+        if (kind != "function" && kind != "method" && kind != "constructor" && kind != "destructor")
+            return false;
+        const std::string_view path = row.body->path;
+        static constexpr std::array<std::string_view, 13> interface_suffixes{
+            ".h", ".hh", ".hpp", ".hxx", ".h++", ".ipp", ".tpp", ".inl", ".cppm", ".ixx", ".mpp", ".fsi", ".d.ts"};
+        if (std::ranges::any_of(interface_suffixes, [&](std::string_view suffix) { return path.ends_with(suffix); }))
+            return false;
+        static constexpr std::array<std::string_view, 8> penetrating_modifiers{
+            "inline", "constexpr", "consteval", "template", "generic", "macro", "const", "extern_inline"};
+        for (const auto& modifier : symbol.modifiers)
+            if (std::ranges::contains(penetrating_modifiers, std::string_view{modifier}))
+                return false;
+        auto has_deduced_spelling = [](const std::optional<std::string>& spelling) {
+            return spelling && (spelling->contains("auto") || spelling->contains("decltype") || spelling->contains("impl "));
+        };
+        if (symbol.type) {
+            if (const auto found = types.find(*symbol.type); found != types.end()) {
+                const auto& type = *found->second;
+                if (!type.type_parameters.empty() || has_deduced_spelling(type.name))
+                    return false;
+                if (type.return_type) {
+                    if (const auto ret = types.find(*type.return_type); ret != types.end() && has_deduced_spelling(ret->second->name))
+                        return false;
+                }
+            }
+        }
+        return true;
+    }
+
+    // Detects cross-language FFI contract endpoints (JNI, P/Invoke, pybind / C ABI exports) whose signature
+    // changes break cross-language bindings and warrant immediate zero-compile warnings.
+    inline auto is_ffi_boundary(const semantic::records::symbol& symbol) -> bool {
+        if (symbol.kind != semantic::symbol_kind::make<"function">() && symbol.kind != semantic::symbol_kind::make<"method">())
+            return false;
+        auto ext_str = [&](std::string_view key) -> std::string {
+            if (auto it = symbol.extensions.find(std::string{key}); it != symbol.extensions.end())
+                return json::from_value<std::string>(it->second).value_or(std::string{});
+            return {};
+        };
+        const bool is_external = std::ranges::contains(symbol.modifiers, "external");
+        const bool is_native = std::ranges::contains(symbol.modifiers, "native");
+        const bool is_pinvoke = std::ranges::contains(symbol.modifiers, "pinvoke");
+        if (is_pinvoke || !ext_str("clr.pinvoke.entry_point").empty())
+            return true;
+        if ((symbol.domain == "kotlin" && is_external) || ((is_external || is_native) && (symbol.domain == "scala" || !ext_str("jvm.class").empty())))
+            return true;
+        const auto linkage = ext_str("native.linkage_name");
+        const std::string_view effective_name = linkage.empty() ? std::string_view{symbol.name} : std::string_view{linkage};
+        if (effective_name.starts_with("Java_"))
+            return true;
+        if (symbol.language == "rust" &&
+            (std::ranges::contains(symbol.modifiers, "no_mangle") || std::ranges::contains(symbol.modifiers, "export_name")))
+            return true;
+        if (!ext_str("native.jni_registrations").empty())
+            return true;
+        return false;
     }
 } // namespace channels

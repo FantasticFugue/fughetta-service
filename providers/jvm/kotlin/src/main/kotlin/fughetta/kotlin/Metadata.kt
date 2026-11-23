@@ -7,13 +7,15 @@ import org.jetbrains.kotlin.metadata.jvm.JvmProtoBuf
 import org.jetbrains.kotlin.metadata.jvm.deserialization.JvmProtoBufUtil
 import org.jetbrains.kotlin.load.kotlin.FileBasedKotlinClass
 import org.jetbrains.kotlin.load.kotlin.KotlinJvmBinaryClass
-import org.jetbrains.kotlin.load.kotlin.header.KotlinClassHeader
 import org.jetbrains.kotlin.name.ClassId
 import org.jetbrains.kotlin.name.Name
 import org.jetbrains.kotlin.descriptors.SourceElement
+import org.jetbrains.org.objectweb.asm.ClassReader
 import java.nio.file.Files
 import java.nio.file.Path
+import java.util.zip.ZipEntry
 import java.util.zip.ZipFile
+import java.util.zip.ZipInputStream
 
 /** Decodes the installed compiler's metadata without loading target classes. */
 object Metadata {
@@ -21,7 +23,7 @@ object Metadata {
                               val data: MutableList<String> = mutableListOf(), val strings: MutableList<String> = mutableListOf())
     private data class Binary(val owner: String, val header: Header, val methods: List<Method>, val fields: List<Pair<String, String>>)
     private data class Method(val name: String, val descriptor: String, val annotations: MutableSet<String> = mutableSetOf())
-    private fun binary(bytes: ByteArray): Binary? {
+    private fun binary(bytes: ByteArray, owner: String): Binary? {
         val klass = FileBasedKotlinClass.create(bytes, MetadataVersion.INSTANCE) { id, version, header, inner ->
             object : FileBasedKotlinClass(id, version, header, inner) {
                 override fun getFileContents(): ByteArray = bytes
@@ -51,8 +53,6 @@ object Metadata {
                 return null
             }
         }, bytes)
-        val id = klass.classId
-        val owner = (if (id.packageFqName.isRoot) "" else id.packageFqName.asString().replace('.', '/') + "/") + id.relativeClassName.asString().replace('.', '$')
         val value = klass.classHeader
         return Binary(owner, Header(value.kind.id, value.multifileClassName.orEmpty(), value.packageName.orEmpty(),
             value.data.orEmpty().toMutableList(), value.strings.orEmpty().toMutableList()), methods, fields)
@@ -71,31 +71,59 @@ object Metadata {
 
     fun read(path: Path, javaRelease: Int): JsonObject = readMany(listOf(path), javaRelease)
 
-    fun readMany(paths: List<Path>, javaRelease: Int): JsonObject {
-        val binaries = paths.flatMap { path -> when {
-            Files.isDirectory(path) -> Files.walk(path).use { files -> files.filter { Files.isRegularFile(it) && it.toString().endsWith(".class") }
-                .sorted().map { binary(Files.readAllBytes(it)) }.toList().filterNotNull() }
-            Files.newInputStream(path).use { it.readNBytes(4).contentEquals(byteArrayOf(0xca.toByte(), 0xfe.toByte(), 0xba.toByte(), 0xbe.toByte())) } -> listOfNotNull(binary(Files.readAllBytes(path)))
-            else -> ZipFile(path.toFile()).use { archive ->
-                val selected = linkedMapOf<String, Pair<Int, java.util.zip.ZipEntry>>()
-                archive.entries().asSequence().filter { it.name.endsWith(".class") }.forEach { entry ->
-                    var name = entry.name
-                    var release = 0
-                    if (name.startsWith("META-INF/versions/")) {
-                        require(javaRelease > 0) { "multi-release JAR requires an explicit java_release" }
-                        val relative = name.removePrefix("META-INF/versions/")
-                        release = relative.substringBefore('/').toInt()
-                        name = relative.substringAfter('/')
-                        if (release > javaRelease) return@forEach
-                    }
-                    if ((selected[name]?.first ?: -1) <= release) selected[name] = release to entry
+    private fun <T> readArchive(
+        entries: Sequence<ZipEntry>, javaRelease: Int, capture: (ZipEntry) -> T, readBytes: (T) -> ByteArray,
+        allowNested: Boolean = true, accept: (ByteArray) -> Unit,
+    ) {
+        val selected = sortedMapOf<String, Pair<Int, T>>()
+        for (entry in entries) {
+            var name = entry.name
+            if (allowNested && (name == "classes.jar" || (name.startsWith("libs/") && name.endsWith(".jar")))) {
+                ZipInputStream(readBytes(capture(entry)).inputStream()).use { nested ->
+                    readArchive(generateSequence { nested.nextEntry }, javaRelease, { nested.readBytes() }, { it },
+                        allowNested = false, accept = accept)
                 }
-                selected.toSortedMap().values.mapNotNull { (_, entry) -> archive.getInputStream(entry).use { binary(it.readBytes()) } }
+                continue
             }
-        } }
-        val index = binaries.associateBy { it.owner }
+            if (!name.endsWith(".class")) continue
+            var release = 0
+            if (name.startsWith("META-INF/versions/")) {
+                require(javaRelease > 0) { "multi-release JAR requires an explicit java_release" }
+                val relative = name.removePrefix("META-INF/versions/")
+                release = relative.substringBefore('/').toInt()
+                name = relative.substringAfter('/')
+                if (release > javaRelease) continue
+            }
+            if ((selected[name]?.first ?: -1) <= release) selected[name] = release to capture(entry)
+        }
+        selected.values.forEach { (_, data) -> accept(readBytes(data)) }
+    }
+
+    fun readMany(paths: List<Path>, javaRelease: Int): JsonObject {
+        val owners = mutableSetOf<String>()
+        val binaries = sortedMapOf<String, Binary>()
+        var duplicate: String? = null
+        fun accept(bytes: ByteArray) {
+            val owner = ClassReader(bytes).className
+            if (owners.add(owner)) binary(bytes, owner)?.let { binaries[owner] = it }
+            else duplicate = duplicate?.let { minOf(it, owner) } ?: owner
+        }
+        val classMagic = byteArrayOf(0xca.toByte(), 0xfe.toByte(), 0xba.toByte(), 0xbe.toByte())
+        for (path in paths) when {
+            Files.isDirectory(path) -> Files.walk(path).use { files ->
+                files.filter { Files.isRegularFile(it) && it.toString().endsWith(".class") }
+                    .forEach { accept(Files.readAllBytes(it)) }
+            }
+            Files.newInputStream(path).use { it.readNBytes(4).contentEquals(classMagic) } -> accept(Files.readAllBytes(path))
+            else -> ZipFile(path.toFile()).use { archive ->
+                readArchive(archive.entries().asSequence(), javaRelease, { it }, { entry ->
+                    archive.getInputStream(entry).use { it.readBytes() }
+                }, accept = ::accept)
+            }
+        }
+        require(duplicate == null) { "duplicate JVM class in artifact: $duplicate" }
         return buildJsonObject {
-            putJsonArray("classes") { binaries.forEach { add(Decoder(it, index).read()) } }
+            putJsonArray("classes") { binaries.values.forEach { add(Decoder(it, binaries).read()) } }
         }
     }
 

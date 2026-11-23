@@ -31,7 +31,7 @@ namespace {
             expect(larger.threads == 10_u && larger.workers == 2_u && larger.jobs == 6_u);
             expect(config::parse("{}", larger).runtime == larger);
             expect(config::parse(R"({"runtime":{"threads":6,"jobs":1,"workers":0}})", larger).runtime.workers == 0_u);
-            expect(config::parse(R"({"server":{"auth":{"mode":"trusted","workspace":"ws"}}})", larger).runtime == allocation::budget{});
+            expect(config::parse(R"({"server":{"auth":{"mode":"trusted","workspace":"ws","front_token":"sk_front"}}})", larger).runtime == allocation::budget{});
         };
         "worker dependency publisher requires an absolute exclusive destination"_test = [] {
             for (const auto* text : {R"({"dependency_publish":""})", R"({"dependency_publish":"relative"})",
@@ -49,6 +49,15 @@ namespace {
             expect(throws<std::invalid_argument>([] { config::parse_worker(R"({"backend":{"max_memory_bytes":0}})"); }));
             expect(throws<std::invalid_argument>([] { config::parse_worker(R"({"backend":{"max_cpu_seconds":0}})"); }));
             expect(throws<std::invalid_argument>([] { config::parse_worker(R"({"execute_stdio":true})"); }));
+            // A managed Worker takes the SDK manifests this configuration names, and saving keeps them.
+            auto mapped = config::parse(R"({"sdk_manifests":{"sdk/dotnet":{"manifest":"sdk/11.0.100/.version","roots":["/toolchains/dotnet"]}}})");
+            expect(mapped.sdk_manifests.at("sdk/dotnet").manifest == "sdk/11.0.100/.version" &&
+                   mapped.sdk_manifests.at("sdk/dotnet").roots == std::vector<std::string>{"/toolchains/dotnet"});
+            expect(config::parse(config::write(mapped)).sdk_manifests.at("sdk/dotnet").roots == mapped.sdk_manifests.at("sdk/dotnet").roots)
+                << "the configuration a service writes keeps its SDK manifests";
+            constexpr std::string_view invalid = R"({"sdk_manifests":{"sdk/../dotnet":{"manifest":"release","roots":["/toolchains/dotnet"]}}})";
+            expect(throws<std::invalid_argument>([&] { config::parse(invalid); }));
+            expect(throws<std::invalid_argument>([&] { config::parse_worker(invalid); }));
         };
         "source limits and language profiles resolve independently"_test = [] {
             auto d = document();
@@ -211,15 +220,14 @@ namespace {
             config::store store{config::document{}, file};
             auto good = std::string(64, 'a');
             auto server = store.current()->server;
-            server.auth.tokens = {{.name = "agent", .hash = good, .role = "member"}};
+            server.auth.tokens = {{.name = "agent", .hash = good, .role = config::token_role::member}};
             store.put_server(server, 0);
             auto before = store.current();
             auto saved = test::slurp(file);
             for (auto token : std::vector<config::token>{{.name = "", .hash = good},
                                                          {.name = "../x", .hash = good},
                                                          {.name = "short", .hash = "abc"},
-                                                         {.name = "upper", .hash = std::string(64, 'A')},
-                                                         {.name = "operator", .hash = good, .role = "operator"}}) {
+                                                         {.name = "upper", .hash = std::string(64, 'A')}}) {
                 auto changed = before->server;
                 changed.auth.tokens.push_back(token);
                 expect(throws<std::invalid_argument>([&] { store.put_server(changed, before->revisions.server); })) << token.name;
@@ -227,9 +235,8 @@ namespace {
             auto twice = before->server;
             twice.auth.tokens.push_back({.name = "agent", .hash = std::string(64, 'b')});
             expect(throws<std::invalid_argument>([&] { store.put_server(twice, before->revisions.server); }));
-            auto mode = before->server;
-            mode.auth.mode = "supabase";
-            expect(throws<std::invalid_argument>([&] { store.put_server(mode, before->revisions.server); }));
+            expect(throws<std::invalid_argument>([] { config::parse_as<config::auth>(R"({"mode":"supabase"})", "auth"); }));
+            expect(throws<std::invalid_argument>([] { config::parse_as<config::token>(R"({"role":"operator"})", "token"); }));
             expect(store.current() == before) << "a refused save keeps the published snapshot";
             expect(test::slurp(file) == saved) << "a refused save keeps the file";
         };

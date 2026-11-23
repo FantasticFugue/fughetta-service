@@ -79,9 +79,10 @@ namespace nodes {
             ~cache_boundary() { state.trim_kernel(); }
         } cache{s};
         try {
-            static const std::set<std::string> reads{"identity",     "inspect",   "tree",       "head",         "stat",       "read",
-                                                     "compare",      "diff",      "history",    "receipt",      "worldlines", "content",
-                                                     "contribution", "mail_list", "scope_list", "scope_locate", "references", "reference_history"};
+            static const std::set<std::string> reads{"identity",     "inspect",   "tree",       "head",         "stat",           "read",
+                                                     "compare",      "diff",      "history",    "receipt",      "worldlines",     "content",
+                                                     "contribution", "mail_list", "scope_list", "scope_locate", "scope_classify", "references",
+                                                     "reference_history", "task_lookup"};
             if (s.read_only && !reads.contains(in.action))
                 fail(nodes::code::policy_denied, "source reader does not accept mutations");
             std::optional<read_snapshot> snapshot;
@@ -98,6 +99,8 @@ namespace nodes {
                 return initialize(in.genesis_nonce);
             if (s.project.empty())
                 fail("wrong_project", "initialize a project first");
+            if (in.action == "task_lookup")
+                return s.execution_reply(s.execution_record(in.execution_token), true);
             if (in.action.starts_with("task_"))
                 return s.task_call(in);
             s.check_execution(in);
@@ -105,6 +108,8 @@ namespace nodes {
                 return s.register_scopes(in);
             if (in.action == "scope_locate")
                 return s.locate_scopes(in);
+            if (in.action == "scope_classify")
+                return s.classify_scopes(in);
             if (in.action.starts_with("scope_"))
                 return s.scope_call(in);
             if (!s.has_object(s.project)) {

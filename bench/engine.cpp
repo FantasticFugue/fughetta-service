@@ -5,6 +5,7 @@ import content;
 import codec;
 import engine;
 import archive;
+import nodes;
 
 namespace {
     using clock_type = std::chrono::steady_clock;
@@ -28,6 +29,9 @@ namespace {
     struct input_manifest {
         std::uint64_t schema = 1;
         std::vector<input_file> files;
+    };
+    struct frozen_summary {
+        std::uint64_t files = 0, bytes = 0;
     };
     auto elapsed(clock_type::time_point start) -> double { return std::chrono::duration<double>(clock_type::now() - start).count(); }
     auto operation(std::string name) -> std::string { return content::hash_of(name).str(); }
@@ -102,17 +106,17 @@ namespace {
         output.state_bytes_decoded = work.state_bytes_decoded;
         output.causal_scope = work.causal_scope;
     }
-    auto work(const std::string& mode, const std::filesystem::path& root, const std::filesystem::path& inputs) -> measured {
+    auto work(const std::string& mode, const std::filesystem::path& root, const std::filesystem::path& inputs, std::uint64_t batches, std::uint64_t edits) -> measured {
         if (std::filesystem::exists(root / "a/repository.sqlite"))
             throw std::runtime_error("workload repository already exists; refusing to overwrite it");
         auto start = clock_type::now();
-        nodes::local_node a{root / "a"};
-        call(a, {.action = "initialize", .genesis_nonce = read(root / "nonce.hex")});
+        nodes::local_node node{root / "a"};
+        call(node, {.action = "initialize", .genesis_nonce = read(root / "nonce.hex")});
         measured output{.mode = mode};
         std::vector<double> timings;
         std::vector<std::string> head;
         std::vector<std::string> paths;
-        if (mode == "w1") {
+        if (mode == "project") {
             auto parsed = json::read<input_manifest>(read(inputs / "node-evaluation-project.json"));
             if (!parsed)
                 throw std::runtime_error(parsed.error().what());
@@ -122,61 +126,62 @@ namespace {
                 if (bytes.size() != file.bytes || content::hash_of(bytes) != file.sha256)
                     throw std::runtime_error("frozen source input differs");
                 paths.push_back(file.path);
-                initial.push_back({.kind = "create", .path = file.path, .text = std::move(bytes)});
+                initial.push_back({.kind = nodes::edit_kind::create, .path = file.path, .text = std::move(bytes)});
             }
-            auto first = call(a, {.action = "apply", .operation = operation("w1-import"), .edits = std::move(initial), .tool = "evaluation.edit/1"});
+            auto first = call(node, {.action = "apply", .operation = operation("project-import"), .edits = std::move(initial), .tool = "evaluation.edit/1"});
             head = first.frontier;
-            for (std::uint64_t i = 0; i < 1000; ++i) {
+            for (std::uint64_t i = 0; i < edits; ++i) {
                 auto began = clock_type::now();
-                auto reply = call(a, {.action = "apply",
-                                      .operation = operation("w1-batch-" + std::to_string(i)),
-                                      .expected = head,
-                                      .edits = {{.kind = "edit", .path = paths[i % paths.size()], .text = std::format("// dc-eval-{:06}\n", i)}},
-                                      .intent = intent(i),
-                                      .result = result(i),
-                                      .tool = "evaluation.edit/1"});
+                auto reply = call(node, {.action = "apply",
+                                         .operation = operation("project-batch-" + std::to_string(i)),
+                                         .expected = head,
+                                         .edits = {{.kind = nodes::edit_kind::edit, .path = paths[i % paths.size()], .text = std::format("// edit-{:06}\n", i)}},
+                                         .intent = intent(i),
+                                         .result = result(i),
+                                         .tool = "evaluation.edit/1"});
                 timings.push_back(elapsed(began) * 1000);
                 head = reply.frontier;
                 output.receipt = reply.receipt;
                 if (i % 100 == 99)
-                    std::cerr << "w1 " << i + 1 << "/1000 " << elapsed(start) << " s\n";
+                    std::cerr << "project " << i + 1 << "/" << edits << " " << elapsed(start) << " s\n";
             }
         } else {
             auto bytes = repeated("0123456789abcdef\n", 4096);
-            for (std::uint64_t batch = 0; batch < 100; ++batch) {
+            for (std::uint64_t batch = 0; batch < batches; ++batch) {
                 std::vector<nodes::edit> initial;
                 for (std::uint64_t j = 0; j < 100; ++j)
-                    initial.push_back({.kind = "create", .path = std::format("scale/{:05}.txt", batch * 100 + j), .text = bytes});
-                head = call(a, {.action = "apply",
-                                .operation = operation("w2-import-" + std::to_string(batch)),
-                                .expected = head,
-                                .edits = std::move(initial),
-                                .tool = "evaluation.edit/1"})
+                    initial.push_back({.kind = nodes::edit_kind::create, .path = std::format("scale/{:05}.txt", batch * 100 + j), .text = bytes});
+                head = call(node, {.action = "apply",
+                                   .operation = operation("scale-import-" + std::to_string(batch)),
+                                   .expected = head,
+                                   .edits = std::move(initial),
+                                   .tool = "evaluation.edit/1"})
                            .frontier;
             }
-            for (std::uint64_t i = 0; i < 10000; ++i) {
+            const auto span = std::min<std::uint64_t>(batches * 100, 100);
+            for (std::uint64_t i = 0; i < edits; ++i) {
                 auto began = clock_type::now();
-                auto reply = call(a, {.action = "apply",
-                                      .operation = operation("w2-batch-" + std::to_string(i)),
-                                      .expected = head,
-                                      .edits = {{.kind = "edit",
-                                                 .path = std::format("scale/{:05}.txt", i % 100),
-                                                 .text = content::hash_of(std::to_string(i)).str().substr(0, 16),
-                                                 .count = 16}},
-                                      .intent = intent(i),
-                                      .result = result(i),
-                                      .tool = "evaluation.edit/1"});
+                auto reply = call(node, {.action = "apply",
+                                         .operation = operation("scale-batch-" + std::to_string(i)),
+                                         .expected = head,
+                                         .edits = {{.kind = nodes::edit_kind::edit,
+                                                    .path = std::format("scale/{:05}.txt", i % span),
+                                                    .text = content::hash_of(std::to_string(i)).str().substr(0, 16),
+                                                    .count = 16}},
+                                         .intent = intent(i),
+                                         .result = result(i),
+                                         .tool = "evaluation.edit/1"});
                 timings.push_back(elapsed(began) * 1000);
                 head = reply.frontier;
                 output.receipt = reply.receipt;
                 if (i % 100 == 99)
-                    std::cerr << "w2 " << i + 1 << "/10000 " << elapsed(start) << " s\n";
+                    std::cerr << "scale " << i + 1 << "/" << edits << " " << elapsed(start) << " s\n";
             }
         }
         std::ofstream raw_timings(root / "latencies-ms.json");
         raw_timings << json::write(timings);
         raw_timings.close();
-        summarize(output, a);
+        summarize(output, node);
         output.seconds = elapsed(start);
         output.storage_bytes = disk(root / "a");
         output.peak_rss_kib = peak();
@@ -185,18 +190,56 @@ namespace {
         output.p95_ms = timings[static_cast<std::size_t>(std::ceil(timings.size() * 0.95)) - 1];
         return output;
     }
+    // Stores the source tree beside a manifest of file sizes and digests for the project workload.
+    auto freeze(const std::filesystem::path& source, const std::filesystem::path& out) -> void {
+        input_manifest manifest;
+        const auto frozen = out / "node-evaluation-source";
+        for (const auto& entry : std::filesystem::recursive_directory_iterator(source)) {
+            if (!entry.is_regular_file())
+                continue;
+            auto bytes = read(entry.path());
+            auto path = std::filesystem::relative(entry.path(), source).generic_string();
+            const auto target = frozen / path;
+            std::filesystem::create_directories(target.parent_path());
+            nodes::archive::files io;
+            io.write(target, bytes);
+            manifest.files.push_back({std::move(path), bytes.size(), content::hash_of(bytes).str()});
+        }
+        std::ranges::sort(manifest.files, {}, &input_file::path);
+        std::filesystem::create_directories(out);
+        nodes::archive::files io;
+        io.write(out / "node-evaluation-project.json", json::write(manifest));
+        std::uint64_t bytes = 0;
+        for (const auto& file : manifest.files)
+            bytes += file.bytes;
+        std::cout << json::write(frozen_summary{manifest.files.size(), bytes}) << '\n';
+    }
+    auto argument(char** argv, int index, int argc, std::uint64_t fallback) -> std::uint64_t {
+        return argc > index ? std::stoull(argv[index]) : fallback;
+    }
 } // namespace
 
 int main(int argc, char** argv) {
     try {
         if (argc < 3)
-            throw std::invalid_argument("node-benchmark MODE REPOSITORY [INPUTS]");
-        std::string mode = argv[1];
+            throw std::invalid_argument(
+                "usage: engine-bench project REPOSITORY INPUTS [EDITS] | scale REPOSITORY [BATCHES] [EDITS] | open REPOSITORY | audit REPOSITORY | freeze SOURCE OUTPUT");
+        const std::string mode = argv[1];
+        if (mode == "freeze") {
+            if (argc < 4)
+                throw std::invalid_argument("engine-bench freeze SOURCE OUTPUT");
+            freeze(argv[2], argv[3]);
+            return 0;
+        }
         std::filesystem::path root = argv[2];
         measured output{.mode = mode};
         auto began = clock_type::now();
-        if (mode == "w1" || mode == "w2")
-            output = work(mode, root, argc > 3 ? argv[3] : "build/debug");
+        if (mode == "project") {
+            if (argc < 4)
+                throw std::invalid_argument("engine-bench project REPOSITORY INPUTS [EDITS]");
+            output = work(mode, root, argv[3], 0, argument(argv, 4, argc, 1000));
+        } else if (mode == "scale")
+            output = work(mode, root, {}, argument(argv, 3, argc, 100), argument(argv, 4, argc, 10000));
         else if (mode == "open" || mode == "audit") {
             nodes::local_node node{root, mode == "audit"};
             summarize(output, node);
@@ -208,7 +251,7 @@ int main(int argc, char** argv) {
         std::cout << json::write(output) << '\n';
         return 0;
     } catch (const std::exception& e) {
-        std::cerr << "node-benchmark: " << e.what() << '\n';
+        std::cerr << "engine-bench: " << e.what() << '\n';
         return 1;
     }
 }

@@ -12,7 +12,6 @@
         "nghttp3",
         "libsodium",
         "pugixml",
-        "simdjson",
         "sqlite3",
         "stdexec",
         "wolfssl",

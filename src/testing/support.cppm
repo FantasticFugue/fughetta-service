@@ -5,6 +5,7 @@ import async;
 import coroutine;
 import http;
 import protocol;
+import toolchain;
 
 export namespace test {
     inline auto shell() -> std::string {
@@ -54,6 +55,13 @@ export namespace test {
         for (auto [name, variable] : {std::pair{"cc", "TEST_CC"}, std::pair{"python", "TEST_PYTHON"}, std::pair{"bazel", "TEST_BAZEL"}})
             if (auto value = std::getenv(variable); value && *value)
                 out[name] = value;
+        return out;
+    }
+
+    inline auto capabilities(const std::vector<std::string>& tools) -> toolchain::catalog {
+        toolchain::catalog out;
+        for (const auto& tool : tools)
+            out.tools.push_back(toolchain::installation(tool));
         return out;
     }
 

@@ -10,6 +10,6 @@ export namespace backend {
         return {.argv = {executable.string(), "--role", "worker", file.string()},
                 .cwd = root, .env = std::move(env),
                 .max_memory_bytes = limits.max_memory_bytes, .max_cpu_seconds = limits.max_cpu_seconds,
-                .interactive = true};
+                .stdio = io::process_stdio::asynchronous};
     }
 } // namespace backend

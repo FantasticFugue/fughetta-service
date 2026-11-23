@@ -80,15 +80,6 @@ export namespace nodes::persistence {
                 sqlite3_bind_text(handle, n, data.data(), static_cast<int>(data.size()), SQLITE_TRANSIENT) != SQLITE_OK)
                 fail(nodes::code::storage_failure, "cannot bind object key");
         }
-        void borrow_blob(int n, std::string_view data) {
-            if (data.size() > static_cast<std::size_t>(std::numeric_limits<int>::max()) ||
-                sqlite3_bind_blob(handle, n, data.data(), static_cast<int>(data.size()), SQLITE_STATIC) != SQLITE_OK)
-                fail(nodes::code::storage_failure, "cannot bind stored bytes");
-        }
-        void borrow_text(int n, std::string_view data) {
-            if (sqlite3_bind_text(handle, n, data.data(), static_cast<int>(data.size()), SQLITE_STATIC) != SQLITE_OK)
-                fail(nodes::code::storage_failure, "cannot bind stored key");
-        }
         void number(int n, std::uint64_t v) {
             if (v > static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max()) ||
                 sqlite3_bind_int64(handle, n, static_cast<sqlite3_int64>(v)) != SQLITE_OK)

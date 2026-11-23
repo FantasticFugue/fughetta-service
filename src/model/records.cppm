@@ -48,9 +48,37 @@ export namespace semantic {
     using retention_roots = std::shared_ptr<retained_objects>;
     using slot_id = std::string;
 
-    using type_kind = std::string;
-    using symbol_kind = std::string;
-    using relation_kind = std::string;
+    // Core code uses the known spellings in make(); providers can also publish their own names.
+    template <meta::fixed_string Default, meta::fixed_string... Core> class spelled_kind {
+        std::string spelling_{Default.view()};
+
+    public:
+        using wire_type = std::string;
+        spelled_kind() = default;
+        spelled_kind(std::string spelling) : spelling_(std::move(spelling)) {}
+        spelled_kind(std::string_view spelling) : spelling_(spelling) {}
+        spelled_kind(const char* spelling) : spelling_(spelling) {}
+
+        template <meta::fixed_string Name> static auto make() -> spelled_kind {
+            static_assert(Name == Default || ((Name == Core) || ...), "unknown core kind");
+            return spelled_kind{Name.view()};
+        }
+        auto view() const -> std::string_view { return spelling_; }
+        operator std::string_view() const { return view(); }
+        auto str() const -> const std::string& { return spelling_; }
+        auto operator<=>(const spelled_kind&) const = default;
+        auto operator==(const spelled_kind&) const -> bool = default;
+        auto operator==(std::string_view spelling) const -> bool { return view() == spelling; }
+        auto operator==(const char* spelling) const -> bool { return view() == spelling; }
+        auto operator==(const std::string& spelling) const -> bool { return view() == spelling; }
+    };
+
+    using type_kind = spelled_kind<"unknown", "alias", "application", "array", "error", "flexible", "function", "intersection", "named",
+                                     "nullable", "parameter", "pointer", "primitive", "reference", "tuple", "unresolved">;
+    using symbol_kind = spelled_kind<"other", "attribute", "character", "comment", "concept", "constructor", "destructor", "directive", "enum_member",
+                                       "event", "field", "function", "header", "keyword", "label", "macro", "method", "module", "namespace", "number",
+                                       "operator", "parameter", "property", "string", "type", "variable", "class", "struct", "record">;
+    using relation_kind = spelled_kind<"calls", "aliases", "binds", "emits", "implements", "imports", "inherits", "instantiates", "overrides", "unsafe_cast">;
     using scope_kind = json::literal<"other", "translation_unit", "module", "namespace", "type", "function", "block", "loop", "if", "switch", "catch", "lambda",
                                     "initializer", "template">;
     using role = json::literal<"declaration", "definition", "reference", "call", "import", "implicit", "type", "qualifier", "read", "write">;
@@ -248,6 +276,25 @@ export namespace semantic {
             std::vector<application_argument> application_arguments;
             extensions extensions;
         };
+        template <class Visit> void each_type_reference(const type& value, Visit&& visit) {
+            for (const auto* list : {&value.arguments, &value.constraints, &value.elements, &value.type_parameters})
+                for (const auto& id : *list)
+                    visit(id);
+            for (const auto* child : {&value.receiver, &value.return_type, &value.lower_bound, &value.upper_bound})
+                if (*child)
+                    visit(**child);
+            for (const auto& group : value.parameter_groups)
+                for (const auto& parameter : group.parameters)
+                    visit(parameter.type);
+            auto arguments = [&](this auto&& self, const std::vector<application_argument>& values) -> void {
+                for (const auto& argument : values) {
+                    if (argument.type)
+                        visit(*argument.type);
+                    self(argument.elements);
+                }
+            };
+            arguments(value.application_arguments);
+        }
         struct symbol {
             symbol_id id;
             ownership ownership;
@@ -422,7 +469,7 @@ export namespace semantic {
         };
     } // namespace records
 
-    enum class input_kind { source, file, artifact, sdk, generated, project_model, runtime, tool, channel, provider };
+    enum class input_kind { source, file, artifact, sdk, generated, project_model, tool, environment, channel, provider, platform, package };
     struct input_object {
         input_kind kind = input_kind::file;
         std::string name, object;
@@ -430,6 +477,7 @@ export namespace semantic {
         std::string type;
         friend auto operator==(const input_object&, const input_object&) -> bool = default;
     };
+    using process_inputs = std::map<unit_id, std::vector<input_object>>;
     using input_vector = std::map<std::string, std::vector<input_object>>;
     struct file_set {
         // Project-relative file names and recursive directory selections in a source manifest.
@@ -482,9 +530,9 @@ export namespace semantic {
         std::vector<std::string> scope_edges;
         // Type and symbol keys belong to their type domain and symbol language.
         // Relation keys belong to the unit that publishes the relation.
-        std::map<std::string, type_kind> type_traits;
-        std::map<std::string, symbol_kind> symbol_traits;
-        std::map<std::string, relation_kind> relation_traits;
+        std::map<std::string, type_kind, std::less<>> type_traits;
+        std::map<std::string, symbol_kind, std::less<>> symbol_traits;
+        std::map<std::string, relation_kind, std::less<>> relation_traits;
         std::optional<std::vector<std::string>> escape_types, unsafe_casts;
         friend auto operator==(const language_conventions&, const language_conventions&) -> bool = default;
     };
@@ -601,7 +649,9 @@ export namespace semantic {
         std::optional<selection> selector;
         std::optional<resolution_target> target;
         extent scope;
-        std::vector<std::string> include, relations, changes;
+        std::vector<std::string> include;
+        std::vector<relation_kind> relations;
+        std::vector<std::string> changes;
         json::literal<"outgoing", "incoming", "both"> direction;
         std::uint64_t depth = 1, limit = 50;
         std::optional<std::string> cursor, continuation;

@@ -742,8 +742,12 @@ set(VCPKG_ENV_PASSTHROUGH_UNTRACKED PROBE_LEDGER)
         "a fork reuses its parent build directories after a worker restarts"_test = [] {
             test::scratch tmp{"executor-retained-tree"};
             std::optional<content::hash> parent_snapshot;
-            auto run_operation = [&](auto& channel, const auto& root) -> coroutine::task<> {
+            auto run_operation = [&](auto& channel, const auto& root, replica::service& service, ctx&) -> coroutine::task<> {
                 const bool child = parent_snapshot.has_value();
+                service.set_runtime({.id = child ? "second-installation" : "first-installation",
+                                     .platform = "platform",
+                                     .executables = {{toolchain::tool_path(test::shell()), "shell-object"},
+                                                     {"/tools/unrelated", child ? "second-tool" : "first-tool"}}});
                 const auto text = child ? "child" : "parent";
                 content::manifest tree{{entry("source.txt", text)}};
                 const auto offer = co_await channel.call(jobs::sync_offer{"app", tree});
@@ -1065,8 +1069,7 @@ set(VCPKG_ENV_PASSTHROUGH_UNTRACKED PROBE_LEDGER)
             static constexpr auto run_operation = [](auto& channel, const auto& root, replica::service& front, execute_beside& side,
                                                      ctx& io) -> coroutine::task<> {
                 const std::string python = std::getenv("TEST_PYTHON") ? std::getenv("TEST_PYTHON") : "/usr/bin/python3";
-                front.set_runtime(
-                    {.id = "lsp-runtime", .execution = "lsp-runtime-object", .platform = "platform-object", .executables = {{python, "python-object"}}});
+                front.set_runtime({.id = "lsp-runtime", .platform = "platform-object", .executables = {{python, "python-object"}}});
                 auto script = root / "language.py";
                 test::spit(script, R"python(
 import json, os, sys
@@ -1122,7 +1125,7 @@ while True:
                     << (first ? first->analysis_error.value_or("") : std::get<jobs::failure>(first.error()).message);
                 expect(test::slurp(root / "execute/trees" / "app" / "beside" / "prepared") == "project-secret") << "the build ran in the execute role";
                 expect(!std::filesystem::exists(root / "cache/trees/app")) << "this process keeps no tree of its own";
-                expect(test::slurp(root / "observed") == "no-secret " + (root / "execute/trees/app/beside").string());
+                expect(test::slurp(root / "observed") == "no-secret " + (root / "execute/trees/app/beside").make_preferred().string());
                 expect(!received.empty() && received.back().shards.front().diagnostics.front().message == "seen");
                 const auto manifest = root / "execute/trees/app/beside.manifest";
                 std::filesystem::last_write_time(manifest, std::filesystem::file_time_type::clock::now() - std::chrono::hours{24 * 30});
@@ -1156,7 +1159,6 @@ while True:
             static constexpr auto run_operation = [](auto& channel, const auto& root, replica::service& service, ctx& io) -> coroutine::task<> {
                 const std::string python = std::getenv("TEST_PYTHON") ? std::getenv("TEST_PYTHON") : "/usr/bin/python3";
                 toolchain::identity runtime{.id = "lsp-runtime",
-                                            .execution = "lsp-runtime-object",
                                             .platform = "platform-object",
                                             .executables = {{python, "python-object"}, {"/tools/unrelated", "unrelated-object"}}};
                 service.set_runtime(runtime);
@@ -1331,7 +1333,6 @@ while True:
                 const auto& evaluated = received.back();
                 const semantic::recipe recipe{evaluated.request.unit, evaluated.session.options};
                 auto saved_unit = evaluated.shards.front().unit;
-                saved_unit.direct_inputs = evaluated.session.inputs;
                 saved_unit.coverage = {.requested = sibling.analysis.demand, .available = {sibling.analysis.demand}};
                 sibling.analysis.candidates = {{.id = "saved-python-unit", .recipe = recipe, .units = {saved_unit}, .nodes = 1}};
                 auto validate = [&](jobs::reuse_request input) -> jobs::reuse_reply {
@@ -1341,7 +1342,7 @@ while True:
                     reuse::channel_values channels;
                     const auto validators =
                         language::providers::dispatch(input.session.provider, []<class Provider> { return language::input_validators<Provider>(); });
-                    reuse::environment current{sources, input.inputs, channels, "app", validators};
+                    reuse::environment current{sources, input.inputs, channels, "app", validators, {}, std::move(input.processes)};
                     jobs::reuse_reply reply;
                     for (const auto& candidate : sibling.analysis.candidates)
                         if (reuse::accept(candidate, input.session, sibling.analysis.demand, current))
@@ -1378,13 +1379,10 @@ while True:
                 const std::string python = std::getenv("TEST_PYTHON") ? std::getenv("TEST_PYTHON") : "/usr/bin/python3";
                 toolchain::identity runtime{
                     .id = "worker-runtime",
-                    .execution = "runtime-object",
                     .platform = "platform-object",
                     .executables = {{python, "python-object"}, {"/tools/compiler", "compiler-object"}, {"/tools/unrelated", "unrelated-object"}},
                     .inputs = {{.name = "sdk/native", .object = "sdk-object", .roots = {(root / "sdk").generic_string()}},
                                {.name = "sdk/headers", .object = "headers-object", .roots = {(root / "sdk/include").generic_string()}}}};
-                const auto execution = toolchain::select(runtime, {{"main", python}, {"command:query", python}},
-                                                         {{"VALUE", "worker"}, {"OMP_NUM_THREADS", "1"}});
                 service.set_runtime(runtime);
                 test::spit(root / "configurations", R"({"a.cpp":"command-a.cpp","b.cpp":"command-b.cpp"})");
                 auto script = root / "semantic.py";
@@ -1406,7 +1404,7 @@ def publication(path):
                   "types":[{"id":"int", "kind":"primitive", "name":"int" + "é" * 600000, "arguments":[],
                             "parameters":[], "qualifiers":[], "type_parameters":[], "template_arguments":[]}]}
 if len(sys.argv) > 1:
-    with open(os.path.join(os.path.dirname(__file__), "commands"), "a") as log: log.write(" ".join(sys.argv[1:3]) + "\n")
+    with open(os.path.join(os.path.dirname(__file__), "commands"), "a", newline="\n") as log: log.write(" ".join(sys.argv[1:3]) + "\n")
     if sys.argv[2] == "project-files": result = {"result":{"files":[{"path":"a.cpp","translationUnit":True,"translationUnits":["a.cpp"],"configuration":{"a.cpp":configuration("a.cpp")}},{"path":"b.cpp","translationUnit":False,"translationUnits":[],"configuration":{"b.cpp":configuration("b.cpp")}}]},"stale":[]}
     elif sys.argv[2] == "semantic-contributions": result = {"result":[{"path":"a.cpp","contributions":[{"key":"records","kind":"records","file":"a.cpp","value":"published-a"}]}],"stale":[]}
     else: result = {"result":publication(sys.argv[3]),"stale":[]}
@@ -1423,13 +1421,16 @@ while True:
     m = json.loads(sys.stdin.buffer.read(length))
     if "id" not in m: continue
     result = None
-    if m.get("method") == "initialize": result = {"capabilities": {"documentSymbolProvider": True}}
+    if m.get("method") == "initialize": result = {"capabilities": {"documentSymbolProvider": True, "diagnosticProvider": {"interFileDependencies": False, "workspaceDiagnostics": False}}}
     if m.get("method") == "clice/index":
-        with open(os.path.join(os.path.dirname(__file__), "commands"), "a") as log: log.write("index stdio\n")
+        with open(os.path.join(os.path.dirname(__file__), "commands"), "a", newline="\n") as log: log.write("index stdio\n")
         result = {"failed":[]}
     if m.get("method") == "clice/semanticExport":
         if m["params"]["uri"].endswith("b.cpp") and os.path.exists(os.path.join(os.path.dirname(__file__), "delay")): time.sleep(10)
         result = publication(m["params"]["uri"].rsplit("/",1)[-1])
+    if m.get("method") == "textDocument/diagnostic":
+        with open(os.path.join(os.path.dirname(__file__), "commands"), "a") as log: log.write("diagnostic " + m["params"]["textDocument"]["uri"].rsplit("/",1)[-1] + "\n")
+        result = {"kind": "full", "items": [{"range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 1}}, "severity": 1, "message": "reported"}]}
     body = json.dumps({"jsonrpc":"2.0", "id":m["id"], "result":result}).replace("column_encoding", "columnEncoding").replace("template_arguments", "templateArguments").replace("type_parameters", "typeParameters").encode()
     sys.stdout.buffer.write(b"Content-Length: %d\r\n\r\n" % len(body) + body)
     sys.stdout.buffer.flush()
@@ -1474,13 +1475,18 @@ while True:
                     const auto& path = key.translation_unit;
                     expect(unit.request.unit.kind == semantic::unit_kind::group);
                     const auto source = std::ranges::find(tree.files, path, &content::entry::path);
-                    std::vector<semantic::input_object> inputs{{semantic::input_kind::runtime, "toolchain", execution},
-                                                               {semantic::input_kind::provider, path, "command-" + path, "clice/configuration"},
+                    std::vector<semantic::input_object> inputs{{semantic::input_kind::provider, path, "command-" + path, "clice/configuration"},
                                                                {semantic::input_kind::tool, "/tools/compiler", "compiler-object"}};
                     if (key.contribution == "immediate")
                         inputs.insert(inputs.begin(), {semantic::input_kind::file, path, source->digest.str()});
                     else
                         inputs.push_back({semantic::input_kind::provider, unit.request.unit.name, "published-a", "clice/contribution"});
+                    inputs.push_back({semantic::input_kind::tool, toolchain::tool_path(python), "python-object"});
+                    for (const auto& [name, value] : std::map<std::string, std::string>{{"VALUE", "worker"},
+                                                                                   {"OMP_NUM_THREADS", "1"},
+                                                                                   {"JAVA_TOOL_OPTIONS", "-XX:ActiveProcessorCount=1"},
+                                                                                   {"DOTNET_PROCESSOR_COUNT", "1"}})
+                        inputs.push_back({semantic::input_kind::environment, name, content::hash_of(value).str()});
                     expect(std::ranges::equal(contribution.direct_inputs, inputs));
                     const auto& reads = contribution.observed_dependencies;
                     expect(reads.size() == (path == "a.cpp" ? 5u : 4u) >> fatal);
@@ -1497,6 +1503,22 @@ while True:
                     committed.push_back(stored.publish_records(std::move(selected), std::move(unit.shards), {}));
                     return;
                 };
+                // A demand that names its files compiles them without a workspace sweep, before this session has any index.
+                auto scoped_request = request;
+                scoped_request.analysis.demand.files = {"b.cpp"};
+                scoped_request.analysis.budget = {.units = 2, .nodes = 2};
+                scoped_request.analysis.execution = {"scoped-request", "scoped-computation", "cpp"};
+                std::size_t scoped_units = 0;
+                auto scoped = co_await analysis_call(channel, io, scoped_request, record_checks{.unit = [&](language::evaluated_unit unit) {
+                    ++scoped_units;
+                    const auto key = json::read<language::cpp::contribution_key>(unit.request.unit.name).value();
+                    expect(key.translation_unit == "b.cpp" && key.contribution == "immediate") << "a scoped demand compiles its own document";
+                    expect(unit.shards.front().unit.coverage.missing.empty()) << "facts of the demanded file are complete";
+                }});
+                expect((scoped && scoped->analyzed && !scoped->analysis_error) >> fatal);
+                expect(scoped_units == 1u && scoped->committed_units == 1u) << "only the file the demand names is analysed";
+                expect(test::slurp(root / "commands") == "query project-files\n")
+                    << "a scoped demand reads the file inventory without an index sweep, a contribution query or a semantic export";
                 auto limited = co_await analysis_call(channel, io, request, record_checks{.unit = receive});
                 if (!limited)
                     transport::raise_call_error(std::move(limited.error()));
@@ -1518,7 +1540,8 @@ while True:
                 }
                 expect(test::slurp(root / "semantic-starts") == "start\n") << "a completed response exceeding the output budget keeps its session";
                 expect(test::slurp(root / "commands") ==
-                       "index stdio\nquery project-files\nquery semantic-contributions\nquery semantic-export\nquery semantic-export\n")
+                       "query project-files\nindex stdio\nquery project-files\nquery semantic-contributions\nquery semantic-export\nquery "
+                       "semantic-export\n")
                     << "one index sweep serves repeated evaluations of the installed epoch";
                 request.analysis.budget.units = 1;
                 auto partial = co_await analysis_call(channel, io, request, record_checks{.unit = receive});
@@ -1568,7 +1591,7 @@ while True:
                     reuse::channel_values channels;
                     const auto validators =
                         language::providers::dispatch(input.session.provider, []<class Provider> { return language::input_validators<Provider>(); });
-                    reuse::environment current{sources, input.inputs, channels, "app", validators};
+                    reuse::environment current{sources, input.inputs, channels, "app", validators, {}, std::move(input.processes)};
                     jobs::reuse_reply reply;
                     for (const auto& candidate : request.analysis.candidates)
                         if (reuse::accept(candidate, input.session, request.analysis.demand, current))
@@ -1627,10 +1650,26 @@ while True:
                 evaluated.clear();
                 auto diagnostics = co_await analysis_call(channel, io, request, record_checks{.unit = collect});
                 expect((diagnostics && !diagnostics->analysis_error && evaluated.size() == 1u) >> fatal);
-                const auto immediate = json::read<language::cpp::contribution_key>(evaluated.front().request.unit.name).value();
-                expect(evaluated.front().request.unit.kind == semantic::unit_kind::group && immediate.translation_unit == "b.cpp" &&
-                       immediate.contribution == "immediate" && test::slurp(root / "commands") == commands_before_diagnostics)
-                    << "immediate diagnostics use canonical contribution keys without running index or CLI queries";
+                expect(evaluated.front().request.unit.kind == semantic::unit_kind::file && evaluated.front().request.unit.name == "b.cpp" &&
+                       test::slurp(root / "commands") == commands_before_diagnostics + "diagnostic b.cpp\n")
+                    << "diagnostics are the file unit's own report, without an index or an export";
+                const auto& reported = evaluated.front().shards.front();
+                expect(reported.unit.coverage.requested.facts == std::vector<semantic::fact_kind>{std::string{"diagnostics"}});
+                expect(reported.unit.coverage.available.size() == 1u &&
+                       reported.unit.coverage.available.front().facts == std::vector<semantic::fact_kind>{std::string{"diagnostics"}} &&
+                       reported.unit.coverage.missing.empty())
+                    << "a pull report declares diagnostics and nothing else";
+                expect(reported.symbols.empty() && reported.occurrences.empty() && reported.relations.empty())
+                    << "a diagnostic answer has no export";
+                expect(!reported.unit.cacheable) << "the diagnostic pull supplies no compiler observations";
+                expect(std::ranges::any_of(reported.unit.direct_inputs, [&](const auto& input) {
+                    return input.kind == semantic::input_kind::source && input.name == "app" && input.object == tree.id().str();
+                })) << "the unit binds the whole source snapshot the answer belongs to";
+                expect((reported.diagnostics.size() == 1u) >> fatal);
+                expect((reported.diagnostics.front().location.source.has_value()) >> fatal);
+                expect(reported.diagnostics.front().location.source->path == "b.cpp" && reported.diagnostics.front().location.source->begin == 0u &&
+                       reported.diagnostics.front().location.source->end == 1u && reported.diagnostics.front().message == "reported")
+                    << "the report's own range places the diagnostic";
             };
             exercise(run_operation);
         };

@@ -26,14 +26,13 @@ the component library `@fantasticfugue/components` (`../components`):
 | --- | --- |
 | `console` | The customers' console: workspaces, projects, settings, history, insights |
 | `admin` | The operators' console: users, workspaces and the gateway across every tenant |
-| `agent-cloud` | A coding agent as an installable web app, working on a synced copy of a worldline |
 | `landing` | Marketing pages, docs, blog, pricing and legal, prerendered |
 
 ## Dependencies and build
 
 Requires CMake 4.5+, Ninja, vcpkg, and clang 23 or later. Linux and macOS compile against libc++;
 Windows uses upstream clang-cl with the MSVC STL and the Windows SDK of a Visual Studio installation.
-The service defaults to `uring` on Linux (kernel 6.1 or later), `iocp` on Windows, and `kqueue` on
+The service defaults to `epoll` on Linux during development (deployments select `uring`, kernel 6.1 or later), `iocp` on Windows, and `kqueue` on
 macOS. Select another mechanism with `-DHTTPANT_IO_BACKEND=NAME` when configuring the service.
 The manifest installs liburing on Linux.
 httpant is fetched from the head of its main branch with `FetchContent` until
@@ -67,11 +66,11 @@ cmake --build --preset debug --target fughetta-service
 To run the HTTP front suite from a regular developer shell:
 
 ```sh
-cmake --build --preset debug --target front-test
-python3 tests/run.py --test-dir build/debug -- -R '^front$' --output-on-failure
+cmake --build --preset debug --target gateway.front-test
+ctest --preset debug -R '^gateway\.front$'
 ```
 
-The test entry runs CTest as the current user; no cgroup delegation or sudo is required.
+Run CTest as the current user.
 
 The debug preset builds with address and undefined-behavior sanitizers.
 `CLANG_SANITIZER` selects the sanitizers, with their matching runtimes, and
@@ -180,9 +179,10 @@ directory; the output directory receives the package and, on macOS, its formula.
 One workspace shares an execution environment across its projects and repositories.
 The service admits and schedules jobs within the workspace budget, owns source and
 Worker processes, and handles cancellation and shutdown. A self-hosted service runs
-directly in the environment supplied by the operator. In the cloud, `cloud-gateway`
-manages workspace placement and its Host Executor backend supplies trusted isolation
-and hard quotas around each environment.
+directly in the environment supplied by the operator. Core and Worker roles use
+the isolation supplied by their deployment. For managed environments,
+`cloud-gateway` coordinates placement and the Linux Host Executor role supplies
+isolation and hard quotas.
 
 ### Native lifecycle design
 
@@ -201,9 +201,8 @@ Each process has one direct restart owner. On bare hosts and within VMs, the
 native service manager owns the service. In containers, run it as the foreground
 main process, send SIGTERM, allow twenty seconds, and let the container runtime
 own restarts; do not also run a native manager in that container. The service
-owns its source and worker children. Cloud-gateway coordinates environment
-recovery without racing the direct owner. Provisioning remains outside this
-repository; see the [gateway environment design](../cloud-gateway/README.md#workspace-environment-control-design).
+owns its source and worker children. The cloud gateway coordinates environment
+recovery with the Host Executor, which owns containerd provisioning on the host.
 
 #### Instance registration and operation
 
@@ -263,6 +262,126 @@ Native references: [systemd notifications](https://www.freedesktop.org/software/
 [SCM state transitions](https://learn.microsoft.com/en-us/windows/win32/services/service-status-transitions),
 and [launchd hosting](https://developer.apple.com/library/archive/documentation/MacOSX/Conceptual/BPSystemStartup/Chapters/CreatingLaunchdJobs.html).
 
+## Host Executor
+
+Run the Host Executor as a privileged Linux service with an owner-only JSON
+configuration file.
+
+```sh
+fughetta-service --role host /etc/fughetta/host.json
+```
+
+Set the following fields inside `host`.
+
+- `host_id` identifies the static host entry in the cloud gateway.
+  `capacity` advertises `cpu_millis`, `memory_bytes`, and `storage_bytes`.
+  The gateway reserves capacity for the workspace's Core and overflow lanes.
+- `bind` and `port` default to `127.0.0.1` and `8090`. Use a loopback
+  or private IP address reachable through the gateway's private network.
+  Set `token` to the host API bearer secret and `front_token` to the separate
+  bearer secret the gateway sends to provisioned Cores.
+- `socket` defaults to `/run/containerd/containerd.sock`. Set `name_space`
+  to a reserved containerd namespace and `storage` to a dedicated directory
+  for journals, volume images, and workspace Worker credentials.
+- `rootfs` names the base filesystem directory. `toolchain_root` and
+  `work_root` bound the toolchain and work volume paths the gateway can
+  request. Each work volume uses its own empty mount point within
+  `work_root`. Set optional `shared_cache` to a host directory and `tools`
+  to a map of tool names to absolute paths inside the container.
+- `volume_devices` bounds attached work volume device paths and defaults to
+  `/dev/disk/by-id/`. Keep this directory and its device links under host
+  administrator control.
+- `isolation` has `runtimes`, `exclusive`, and `devices`. The runtime list
+  names the installed shims. An exclusive host binds its placement to one
+  workspace and that workspace's overflow Worker. Each device requested by a
+  workload must be in the host list.
+- `mapped_id` defaults to 65534 and maps workload root to an unprivileged host
+  UID and GID. `pids` defaults to 512. `timeout_seconds` limits individual
+  host utilities and defaults to 60. `operation_timeout_seconds` limits each
+  provisioning attempt and defaults to 300.
+
+The executor uses cgroup v2 for CPU, memory, swap, PID, and device policy. It
+builds an OCI spec with isolated namespaces, a seccomp policy, empty capability
+sets, and a read-only root filesystem. A `sandbox` selects
+`io.containerd.runsc.v1` and a `vm` selects `io.containerd.kata.v2` when
+offered. A shared-kernel `container` requires `io.containerd.runc.v2` on an
+exclusive host. A VM placement on an exclusive host may use runc when Kata is
+absent because the dedicated host supplies the workspace boundary.
+
+Install `/usr/local/bin/fughetta-service` and its runtime dependencies in the
+base filesystem. Build the service inside the root filesystem with
+`HTTPANT_IO_BACKEND=epoll` or `asio` for the OCI seccomp policy. Include
+mount targets `/proc`, `/dev`, `/etc/hosts`, `/work`,
+`/opt/fug/toolchain` and, when configured, `/opt/fug/shared`. The toolchain
+and shared cache mount read-only. The executor preallocates an ext4 image at
+the requested `storage_bytes` limit, with at least 16 MiB including filesystem
+overhead, and mounts it read-write at `/work`. It uses `fallocate`,
+`mkfs.ext4`, `mount`, `umount`, `ip` and `nft`. Stop removes the
+container and unmounts the volume before releasing its durable writer
+reservation. The image and workspace data persist.
+
+A start operation can supply `work_volume` with `device` and `size_bytes`.
+For a Hetzner Volume, use its `/dev/disk/by-id/scsi-0HC_Volume_<id>` path.
+The host waits up to `timeout_seconds` for the block device and uses its full
+capacity for `/work`, less filesystem overhead. The device must meet both
+`size_bytes` and the environment's `storage_bytes` limit. The host uses
+`blkid` to identify signatures, creates ext4 on blank devices, and mounts
+existing ext4 filesystems with their data intact. Other signatures and a
+device mounted for another environment return 409. Stop and destroy unmount
+the device and preserve its data. Start with the same volume on a replacement
+host to reopen the workspace.
+
+`network: none` supplies loopback. `network: private` adds a veth link and
+nftables rules. Only IPv4 TCP destinations from the host or operation
+`egress` lists are available for new outbound connections. Use `host:port`
+entries. The executor resolves names when starting and publishes their
+addresses in the workload's hosts file. Set `network_prefix` to the first
+two octets of a nonoverlapping private /16, defaulting to `10.203`. Use host
+IPv4 forwarding for routed gateway traffic, overflow Workers and destinations
+beyond the local veth peer. Set `gateway_sources` to the gateway IPv4
+addresses and route the workspace prefix through the host. The Core's HTTP and
+personal Worker listeners accept those gateway sources and the local host.
+Enable `remote_worker_enrollment` to enroll personal Workers. The paired
+overflow Worker and claimed pool Workers can reach their Core's native
+execution listener through its private redirect.
+
+`GET /healthz` answers 200. All other requests require
+`Authorization: Bearer <host token>`. `POST /v1/operations` accepts the
+`start_stop` operation record for either lane and returns its observation.
+When the answer would exceed 90 seconds, it returns 202 with
+`{"operation_id": "..."}` and provisioning continues. Poll
+`GET /v1/operations/{operation_id}` for the observation or 202 while the
+operation runs. Unknown IDs return 404, invalid requests return 400, missing or
+wrong tokens return 401, and journal conflicts return 409. Replaying a
+completed operation returns its recorded observation. Reposting an unchanged
+operation that failed retries its durable intent. `GET /v1/inventory`
+returns the host ID, capacity, latest environment observations, and a `warm`
+list with each available Worker's environment ID, profile, and state. A
+running environment with a block device reports its `work_volume` path and
+actual device size in bytes.
+
+The controller chooses pool sizes and sends pool operations for Worker
+profiles. `warm` starts a Worker with a private scratch volume, empty egress,
+and no workspace, Core endpoint, or credentials. `claim` attaches the volume
+at the workspace hot-slot path and opens egress to the Core's numeric IPv4 TCP
+endpoint. The host then publishes the workspace credential and Core address
+to the waiting Worker through its read-only handoff mount. The same task
+continues as the workspace's managed Worker. A second assignment returns
+409. `destroy` stops the Worker and removes its container, volume, and
+network. The journal retains completed observations for replay.
+
+Pool IDs use `warm-` followed by 64 lowercase hexadecimal digits. Operation
+IDs append `-1` for warm, `-2` for claim or unclaimed destroy, and `-3` for
+claimed destroy. A claimed Worker leaves the pool as soon as the host records
+the claim.
+
+Run the `host.api`, `host.oci`, `host.containerd`, and `host.volume` CTest
+suites on a Linux test host. The containerd suite uses noninteractive sudo
+and the local runc runtime to exercise mounts, quotas, egress, fencing, and
+admission of a claimed Worker by a native Core. The volume suite also uses a
+loop device to check data persistence and filesystem preservation. OCI unit
+tests cover runsc and Kata selection.
+
 ## Run
 
 For self-hosting, set `server.auth.mode` to `"token"` in your configuration;
@@ -286,24 +405,40 @@ To run the Core and Web Console as native processes on one machine, follow the
 The launcher initializes a token-authenticated Core and uses the service's
 native process orchestration.
 
-The checked-in configuration listens at `127.0.0.1:18100`. Connect an HTTP MCP
-client to `http://127.0.0.1:18100/mcp` with `Authorization: Bearer <token>`.
-REST routes use the same token under `/api/v1`; `/healthz` is public.
+For a token-authenticated Core listening at `127.0.0.1:18100`, connect an HTTP
+MCP client to `http://127.0.0.1:18100/mcp` with `Authorization: Bearer <token>`.
+REST routes use the same token under `/api/v1`; `/healthz` is public. A
+`tools/call` whose `Accept` includes `text/event-stream` is answered as an SSE
+stream with a comment keepalive every 15 seconds, so proxies with idle
+limits (Cloudflare closes after 100 seconds) keep long builds open; progress
+notifications are added when the call includes a `progressToken`. Other requests
+get a single JSON body.
 Workspace subscriptions use `GET /api/v1/events`; the event contract and shared
 validation record are in the [hosted gateway guide](../cloud-gateway/README.md#workspace-events).
 `--help` prints the public commands. The `--role` arguments are internal process
 entry points used by the supervisor and process tests.
 
-Hosted cores use `server.auth.mode: "trusted"` and must set
-`server.auth.workspace` to their immutable workspace ID. Every authenticated
-request must carry the matching `x-fughetta-workspace`, including requests with
-the host role. See the gateway's [core configuration](../cloud-gateway/README.md#cells-where-each-core-listens).
+Hosted cores set `server.auth.mode` to `"trusted"`, `server.auth.workspace` to
+their immutable workspace ID, and `server.auth.front_token` to a secret shared
+with the hosted gateway. The gateway sends the secret as
+`Authorization: Bearer <front_token>` on every request except `GET /healthz`.
+It replaces the client's authorization and caller headers with its own.
+Core API requests use the gateway's caller headers and must include a matching
+`x-fughetta-workspace`, including requests with the host role. Set the secret
+in an owner-only Core configuration file. See the gateway's
+[core configuration](../cloud-gateway/README.md#cells-where-each-core-listens).
 
-A registered Worker speaks plain TCP to its `gateway` endpoint (`host:port`).
-On a self-hosted machine that endpoint is the loopback relay run by `fug worker`,
-which holds TLS, DNS, and OAuth and relays each connection over the public
-`/w/{workspace}/workers/tunnel` WebSocket. The managed workers continue to use
-their loopback TCP endpoints.
+The gateway resolves a run through `POST /api/v1/executions/identity`, which
+returns `x-fughetta-execution: scoped` on success. For task MCP requests it sends
+the run credential in `x-fughetta-execution` alongside the front bearer and
+workspace caller headers. The Core checks the credential against the source on
+each request and binds tool calls to the resolved run, project, and worldline.
+
+`fug worker` connects to the public `/w/{workspace}/workers/tunnel` WebSocket
+and relays the local Worker process over loopback TCP. A Core operator can
+connect a Worker directly on the private network by setting `gateway` to
+`ws://127.0.0.1:9091/workers/tunnel` and set `front_token` in its private
+configuration when the Core uses trusted mode.
 
 `native::context` and `runtime::context` select `concurrent::queue` from the
 `mpmc` core module for native submissions and blocking file work. Native TCP,
@@ -397,6 +532,87 @@ inputs. Build results and the retained build history at `GET /api/v1/builds`
 expose `artifact_receipts` with the public key, signed payload fields, signature
 and manifest.
 
+## Public semantic shards
+
+A Core can reuse public records through a shared trust domain. A unit qualifies
+when its provider records a complete input set before evaluation. Every input
+must be a digested tool, SDK, platform input, or public package. Workspace
+sources, files, build artifacts, generated files, project models, and observed
+dependencies on workspace records rule out publication. The published records
+must form a closed graph, including their symbol and type references. An
+eligible unit submitted with a verified receipt from a Worker enrolled with
+the publishing Core can be uploaded after its workspace view is stored.
+
+The JVM reader can evaluate an installed SDK archive or class file with
+`jvm-artifact` options such as
+`{"module":"java.logging","sdk":"jdk","sdk_archive":"jmods/java.logging.jmod"}`.
+Configure that SDK on the Worker using `sdk_manifests` and omit the stage's build
+and semantic input bindings. The reader hashes the archive before evaluation
+and records the digest of the embedded reader. A hit supplies the records
+without parsing the archive. SDK archives produce one shard per unit.
+
+The cache looks up `index/<key_digest>` with one GET. The key is the SHA-256 of a
+compact JSON array containing the public shard domain, stage, provider,
+operation, unit kind and name, recipe options digest, and complete public
+input set sorted by kind, name, and digest. A valid index points to
+`shards/<shard_id>`, the compressed encoded shard. The publisher signs this
+fixed-order compact JSON array with Ed25519:
+
+```text
+["fughetta/public-shard", key_digest, shard_id, shard_digest, input_set, publisher]
+```
+
+`shard_digest` hashes the compressed bytes. Publisher keys and signatures use
+lowercase hexadecimal. R2 requests use path-style URLs, with the bucket
+name before the object key, and AWS Signature Version 4 for authenticated
+requests. Both PUTs use conditional creation, with the shard written first. A Core verifies the configured publisher, the key and input
+set, and the shard bytes before importing the records through workspace
+publication.
+
+Add `public_shards` at the top level of the service configuration to enable the
+feature:
+
+```json
+{
+  "public_shards": {
+    "endpoint": "https://ACCOUNT_ID.r2.cloudflarestorage.com",
+    "bucket": "fughetta-public-shards",
+    "trusted_publishers": ["PUBLISHER_ED25519_PUBLIC_KEY_HEX"],
+    "shared_cache": "/opt/fug/shared",
+    "cache_bytes": 1073741824
+  }
+}
+```
+
+Reads try the optional read-only `shared_cache`, the Core cache, then R2.
+The Core cache defaults to `.public-shards` under state. Use `cache_root`
+to choose its directory and `cache_bytes` to set its least-recently-used
+eviction limit. A limit of zero disables Core-local caching. Omitting
+`endpoint` and `bucket` enables filesystem-only reads. Failed verification
+and misses fall through to local evaluation.
+
+Create a dedicated bucket in Cloudflare's **R2 Object Storage** dashboard.
+In **Manage API Tokens**, create a bucket-scoped **Object Read** token for
+consumer Cores and a bucket-scoped **Object Read & Write** token for the
+publisher. Set `FUG_R2_READ_ACCESS_KEY_ID` and
+`FUG_R2_READ_SECRET_ACCESS_KEY` in consumer Core and operator environments.
+The publisher uses `FUG_R2_ACCESS_KEY_ID` and `FUG_R2_SECRET_ACCESS_KEY` and
+adds `"publish": {"secret_key_env": "FUG_PUBLIC_SHARD_SEED"}` to its
+`public_shards` configuration. Set `FUG_PUBLIC_SHARD_SEED` to the publisher's
+32-byte Ed25519 seed in hexadecimal and distribute its corresponding public
+key through `trusted_publishers`. Use a dedicated publishing Core with
+operator-controlled registered Workers and install the publishing SDK on
+those Workers. [Cloudflare R2 token procedure](https://developers.cloudflare.com/r2/api/tokens/)
+
+To prefill a directory before mounting it read-only, pass the desired index
+keys or shard IDs to the service CLI. An index key fetches and verifies both
+objects. A shard ID fills only the content-addressed shard, so its signed
+index must also be available for lookup.
+
+```sh
+fughetta-service public-cache-fill config.json /var/cache/fughetta/shared KEY [KEY ...]
+```
+
 ## Connect a self-hosted Worker
 
 The execution machine runs the Worker through `fug`, the Fughetta CLI:
@@ -433,7 +649,9 @@ include both roles and their tracked subprocesses.
 
 `worker_backend` in the service configuration (`backend` in a Worker file) accepts
 `max_memory_bytes` and `max_cpu_seconds` as optional process limits for the execute
-child. The Worker runs both roles in the deployment environment that already hosts it.
+child. Both Worker roles run in the isolation boundary supplied by their
+deployment. The Linux Host Executor supplies that boundary for managed overflow
+Workers.
 
 Exit status 2 means the Core refused the identity (revoked, unknown, or for
 another Workspace); `fug` does not restart a Worker that exits with it.
@@ -442,15 +660,21 @@ The Core uses a separate private listener for registered Workers:
 
 ```json
 "server": {
-  "auth": { "mode": "trusted", "workspace": "workspace-immutable-id" },
+  "auth": { "mode": "trusted", "workspace": "workspace-immutable-id", "front_token": "<shared-secret>" },
   "remote_worker_bind": "127.0.0.1",
   "remote_worker_port": 9091,
   "remote_worker_enrollment": false
 }
 ```
 
-Point the gateway's private Worker address at this listener. Enable
-`remote_worker_enrollment` on the Core and tunnels on the gateway to register
+Use a separate Source port if it binds to the same address. Set
+`remote_worker_port` to `0` to disable the tunnel listener. Point the gateway's
+private Worker address at this listener and forward
+`GET /workers/tunnel` with the `fughetta-worker.v1` WebSocket subprotocol.
+The Core refuses upgrades with an `Origin` header. Binary frames transport
+the Worker session in 16 KiB outbound chunks. The Core uses ping and pong
+frames and closes a tunnel after 90 seconds of inactivity.
+Enable `remote_worker_enrollment` on the Core and tunnels on the gateway to register
 and admit remote identities. Turning `remote_worker_enrollment` off refuses new
 registration and admission while retaining the registry and existing sessions. The managed listener and its
 shared token remain separate.
@@ -470,7 +694,8 @@ storage snapshots and full source recovery still require a deployment drill.
 
 Core logs record registration, revocation, and authenticated
 Worker connection metadata without credential material. `GET /api/v1/workers` is member-readable
-and includes offline and revoked identities. Owners rename with
+and includes offline and revoked identities. Connected Workers report
+`compute_threads`, the execution job budget `parallel`, and `max_inflight`. Owners rename with
 `POST /api/v1/workers/{worker_id}/rename` and revoke with
 `DELETE /api/v1/workers/{worker_id}`. Revocation removes dispatch eligibility
 immediately and shuts down active sessions. Execution results and build ledger
@@ -795,8 +1020,22 @@ and rejects missing or mismatched bindings. `generated` declares outputs of
 `generate` with type `generated_sources`; every declared port is required by
 `model` and `compile`. A discovered Gradle generated source root must exist and
 belong to a bound generated input. Gradle task lists are `prepare_tasks`,
-`generate_tasks`, `compile_tasks`; MSBuild uses `projects`, `properties` and
-`generate_targets`. Final compilation outputs are declared in `artifacts`.
+`generate_tasks`, `compile_tasks` and `test_tasks`. MSBuild uses `projects`,
+`properties` and `generate_targets`. C# runs Roslyn analyzers and generators in the execute role. Bound
+`generated_sources` can supply files from `CompilerGeneratedFilesOutputPath`.
+The helper uses current generator output for the compilation whenever the
+model supplies the generator. Final compilation outputs are declared in `artifacts`.
+
+Bind a graph task to the Gradle builder's `test` operation to run tests in the
+slot's managed Gradle session. It runs the Gradle `test` task by default. Set
+`test_tasks` to use project-specific tasks such as `integrationTest` or `run`,
+and use `after` to order any required build or setup tasks. Gradle `Test` tasks
+contribute their native JUnit XML, including results reused by Gradle and tests
+run in included builds. Test compilation failures retain the build failure and
+have no test tally when no test task produced a report. When `android_variant` is set,
+aggregate `assemble` and `test` selectors use that variant's assemble and unit
+test tasks, including project-qualified selectors. Specific task names select
+the tasks to run.
 
 Adjacent Gradle preparation/model steps with the same declared batch prefix,
 working directory and environment run in one managed Gradle process. Their typed
@@ -804,6 +1043,25 @@ tasks, receipts and outputs retain their original identities; the process result
 `tasks` lists all participating tasks, sharing its elapsed time, failure and log.
 Generated-output and independent-report steps form batch boundaries. Each model
 export still checks the dependency receipt against the current resolution.
+
+The execute Worker keeps a Gradle Tooling API session and its daemon in the build
+slot when `gradle` points to an installed Gradle distribution and `java` and
+`fughetta-jvm` are mapped. Typed Gradle stages reuse that session across builds of
+the slot while their build environment remains the same. Each slot has its own
+daemon registry and Kotlin compiles inside the Gradle daemon. The daemon stays
+in the Worker's process group on POSIX and job object on Windows. Slots share the Gradle caches in the configured `GRADLE_USER_HOME`, which defaults
+to the execute Worker's `gradle` directory. The Worker reclaims idle sessions under
+memory pressure and closes them when a slot is retired or the Worker stops.
+Requests with a per-command CPU limit run as individual Gradle processes.
+
+Set `model_source_dirs` on a Gradle builder when the contents of files under
+those project-relative directories are used only by compilation and source
+analysis, and the model and dependency resolution are determined by the other
+tracked inputs. A warm Worker reuses the model and dependency receipt when a new
+snapshot only changes the contents of existing `.kt` or `.java` files there.
+Build scripts, dependencies and source inventories trigger preparation on change.
+Projects with `prepare_tasks` or generated inputs prepare their model on each new
+snapshot. Compile tasks always consume the requested snapshot.
 
 Both exporters write `model.json`, using the `projectmodel` C++ contract:
 `schema`, `producer`, `producer_version`, and ordered `units`. Units contain
@@ -852,7 +1110,8 @@ starts, and the worker reads them after the step, failed or not:
 
 | Protocol | Written by | Gives |
 | --- | --- | --- |
-| `junit` | CTest (`--output-junit`), pytest (`--junit-xml`), Bun (`--reporter=junit`) | total, failed, failed test names |
+| `junit` | CTest (`--output-junit`), pytest (`--junit-xml`), Bun (`--reporter=junit`), Gradle `Test` | total, failed, failed test names |
+| `libtest` | Cargo's built-in test harness and rustdoc | total, failed, skipped, failed and skipped test names |
 | `bep` | `bazel test` (`--build_event_json_file`) | the same, from each target's test summary |
 | `codequality` | ty and Ruff (`--output-format gitlab`) | diagnostics with file, line, column, and severity |
 
@@ -1125,12 +1384,12 @@ conventions onto its shards and refuses a shard whose scope records use an
 undeclared edge kind. External registrations supply `conventions` in their
 registration. Providers can use the shared kind names or emit language-specific
 symbol, type and relation kinds as `<language>:<name>`. Query filters match
-the kind as published. When a custom kind shares core query behavior, the
+the published kind and its declared core kind. When a custom kind shares core query behavior, the
 provider declares it in `symbol_traits`, `type_traits` or `relation_traits`.
-For example, a provider with language `cpp` can map `record` to `type` in
-`symbol_traits`. A `cpp:record` remains selectable by that name and is treated
-as a type for producer and consumer discovery. Relation traits control which
-edges impact analysis follows.
+The F# provider publishes `fsharp:record` and maps it to `type` for symbol
+selection and producer and consumer discovery. Its `fsharp:curried_signature`
+preserves the parameter groups in a callable that `inspect` can expand.
+Relation traits control which edges impact analysis follows.
 
 `typed_ranges` record what the compiler knows but the source does not spell:
 local bindings and lambda parameters without a written type (C++ `auto`,
@@ -1608,48 +1867,53 @@ their stored declaration anchors and count toward the node budget.
 survives gateway/worker restarts and is reclaimed independently of query views
 under the shard budget.
 
-Workers report a runtime fingerprint before accepting work. It hashes provider-default
-and configured executable contents, the platform, effective worker environment, distribution
-package manifests, and recognized Java/Android SDK release manifests. Standalone
-worker configuration can supply
+Workers report a capability inventory and an installation ID before accepting
+work. Configure distinct installations as `tools: {"java@17": "/opt/jdk-17/bin/java", "java@21": "/opt/jdk-21/bin/java"}`.
+The Worker reads the JDK's `release` file and binds the selected installation's
+`JAVA_HOME`. Discovering the same installation under several names for one tool
+produces one instance. The configured instance ID takes precedence.
+Projects express constraints in `requires.tools` and `requires.sdks`,
+for example `{"tools":["java>=17,<18"],"sdks":[{"name":"native","version":"^2"}]}`.
+Use `${tool:java}` and `${sdk:native}` to refer to the selected paths. Standalone Worker
+configuration can supply
 `sdk_manifests: {"native": {"manifest": "/opt/sdk/release.json", "roots": ["/opt/sdk"]}}`
 for other managed SDKs. Each manifest identifies the immutable contents of its
-installed directory. A binding may list several spellings of that directory,
+installed directory. An SDK key has one or more slash-delimited name segments
+and can end in `@version`. Use its logical name in `requires.sdks` and
+`${sdk:name}`. A configured binding owns its installed root. For a binding named
+`jdk`, the Worker reads the installed `release` file and supplies `JAVA_HOME`.
+A binding may list several spellings of that directory,
 including symlinks, but all must resolve to the same real directory. Different
 bindings must have distinct canonical roots; nested roots use the provider host
 contract above. This also applies to automatically detected Java/Android bindings. `ANDROID_HOME` and
 `ANDROID_SDK_ROOT` describe one SDK and must resolve to the same directory. Android package
 manifests contribute to the enclosing SDK identity. The manifest identifies the
 SDK in semantic dependencies; installed roots bind it locally without rereading
-individual SDK headers. Executables, the platform, system
-packages and process environment form a separate execution identity. C++ units
-select the clice programs and their effective process environment, then bind
-clice's exported compiler-tool records and actual SDK reads to the worker's
-installation observations. clice passes those records through its existing
-PCH/module artifacts and saved TU exports; it owns C++ caching and invalidation.
-The same exports carry consumed CDB command identities. When they match clice's
-current build-command inventory, Fughetta uses those records in place of the whole
-preparation artifact, retaining actual generated-file reads as dependencies.
-Fughetta uses the exported inputs to reuse contributions across workers,
-worldlines and stages. An unrelated tool or unread SDK manifest can therefore
-change while a persisted TU is reused. Incomplete tool records or executables
-without an installation observation make that TU ineligible for reuse.
-Other LSP providers select their launcher, operation programs and configured
-auxiliary executables (including TypeScript tsserver). Their SDK inputs remain at
-installation scope because these providers do not export external read records.
-System packages remain a shared platform input for every provider. Native artifact units select the
-installed host together with the platform, system packages and effective process environment.
-Changes to unrelated installed tools therefore preserve those units. Selection
-uses the worker's existing installation observations; a tool without an observation
-makes the resulting unit ineligible for reuse.
+individual SDK headers. A semantic unit records the content digest of each tool
+it uses under that tool's normalized path. Process environment inputs record a
+digest per variable supplied to those processes. In-process readers record the
+artifacts or semantic collections they read. An executable without an
+installation digest makes the affected unit ineligible for reuse.
+C++ contributions record the clice processes and bind the exported compiler
+and SDK reads to the Worker's installation observations. clice stores those
+reads with its PCH, module artifacts, and saved TU exports. Diagnostic pulls
+which omit compiler observations are evaluated each time. The exports also
+report the compilation database commands each contribution used. When those
+match clice's current inventory, Fughetta records the command inputs and the
+generated files read by that contribution.
+LSP providers keep their existing SDK inputs at installation scope. Directory
+recipes include the platform and the digests of the executables selected by
+their build steps. Changing an unused tool leaves a unit's recorded inputs and
+reuse key unchanged.
 Custom executables must be mapped in `tools`; missing or
 unreadable executables are omitted from advertised capabilities. SDK releases
 and tools must remain immutable while the
 worker is connected; restart the worker after updating them. Project and step
 environment overrides are included in the computation key.
 
-Build and language computations use source content and the selected runtime,
-independently of caller, worldline, or version. Every caller has its own audit
+The gateway schedules build and language computations by source content and
+the selected installation, independently of caller, worldline, or version.
+Every caller has its own audit
 record, including cache/shared execution status; only actual executions consume
 execution quota. Test and run calls each execute their runtime steps. Push-only
 diagnostics without a matching document version return `stale: true` and are
@@ -1815,17 +2079,16 @@ for these synthetic replies.
 | 237,061 | 485.322 → 145.240 µs |
 | 954,682 | 1,030.786 → 546.305 µs |
 
-The shared JSON codec now uses simdjson DOM for full-document validation
-and a simdjson builder for typed serialization. The project's C++23
-field traversal drives JSON, XML and Schema generation. Explicit field
-names live in the field types. Plain aggregate fields use names resolved
-by Clang at compile time. Dynamic JSON uses an owning value with
-insertion-ordered object members. JSON output
-preserves the existing spelling of floating-point values and Unicode
-control escapes used in content identities.
+The shared JSON codec uses yyjson for full-document validation and
+serialization. The vcpkg port enables yyjson's fast floating-point
+conversion by default. yyjson 0.13.0 has no SIMD build option.
+The project's C++23 field traversal drives JSON, XML and Schema
+generation. Explicit field names live in the field types. Plain aggregate
+fields use names resolved by Clang at compile time. Dynamic JSON uses an
+owning value with insertion-ordered object members.
 
-The following single-core Clang 23 `-O3` comparison measures the previous
-JSON backend and the current codec on the same typed synthetic records.
+This historical single-core Clang 23 `-O3` comparison measured the
+migration to the simdjson backend on typed synthetic records.
 
 | JSON bytes | Full read before → after | Write before → after |
 | ---: | ---: | ---: |
@@ -1885,8 +2148,8 @@ and source history; `src/worker/` executes build and analysis tasks. Shared doma
 in `src/model/`, execution helpers in `src/core/`, and I/O and platform providers
 in `src/io/` and `src/platform/`. Tests live in `tests/`.
 
-Development rules are in [AGENTS.md](AGENTS.md). Clients that sync files, `fug`
-and `agent-cloud`, use `POST /api/v1/projects/{project}/worldline`.
+Development rules are in [AGENTS.md](AGENTS.md). Clients that sync files, such as `fug`,
+use `POST /api/v1/projects/{project}/worldline`.
 The route uses `tools::worldline::input` from `src/gateway/tools.cppm`.
 
 Debug and Release builds, service test suites, and CLI Worker connections

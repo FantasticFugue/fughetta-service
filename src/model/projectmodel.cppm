@@ -156,15 +156,32 @@ export namespace projectmodel {
                 }
             return false;
         };
+        auto csharp_analyzer = [](std::string_view argument) {
+            const auto begin = argument.find_first_not_of(" \t\"");
+            if (begin == argument.npos)
+                return false;
+            argument.remove_prefix(begin);
+            if (argument.starts_with('@'))
+                return true;
+            if (argument.empty() || (argument.front() != '/' && argument.front() != '-'))
+                return false;
+            auto option = std::string{argument.substr(1, argument.find(':') - 1)};
+            std::erase(option, '"');
+            std::ranges::transform(option, option.begin(), [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
+            return option == "analyzer" || option == "a";
+        };
         return std::ranges::any_of(model.units, [&](const unit& unit) {
             if (const auto found = unit.extensions.find("type_providers"); found != unit.extensions.end() && found->second.to_bool().value_or(false))
                 return true;
-            if (std::ranges::any_of(unit.compiler_arguments, passed))
+            if (std::ranges::any_of(unit.compiler_arguments, passed) ||
+                (unit.language == "csharp" && std::ranges::any_of(unit.compiler_arguments, csharp_analyzer)))
                 return true;
-            return std::ranges::any_of(unit.references, [](const reference& ref) {
-                return ref.visit([](const auto& value) {
+            return std::ranges::any_of(unit.references, [csharp = unit.language == "csharp"](const reference& ref) {
+                return ref.visit([csharp](const auto& value) {
                     if (value.role != "plugin")
                         return false;
+                    if (csharp)
+                        return true;
                     if constexpr (requires { value.object; })
                         return !builtin_plugin(value.object.name);
                     return true;

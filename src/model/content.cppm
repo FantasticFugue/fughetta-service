@@ -37,6 +37,16 @@ export namespace content {
             crypto_sign_seed_keypair(public_.data(), secret_.data(), seed.data());
             sodium_memzero(seed.data(), seed.size());
         }
+        enum class encoding { hex_seed };
+        receipt_key(std::string_view text, encoding) {
+            if (sodium_init() < 0)
+                throw std::runtime_error("cryptographic initialization failed");
+            std::array<unsigned char, crypto_sign_SEEDBYTES> seed{};
+            if (!decode(text, seed))
+                throw std::invalid_argument("publisher key must be a hexadecimal Ed25519 seed");
+            crypto_sign_seed_keypair(public_.data(), secret_.data(), seed.data());
+            sodium_memzero(seed.data(), seed.size());
+        }
         receipt_key(const receipt_key&) = delete;
         auto operator=(const receipt_key&) -> receipt_key& = delete;
         ~receipt_key() { sodium_memzero(secret_.data(), secret_.size()); }
@@ -54,6 +64,18 @@ export namespace content {
                    crypto_sign_verify_detached(bytes.data(), reinterpret_cast<const unsigned char*>(message.data()), message.size(), public_key.data()) == 0;
         }
     };
+
+    inline auto hmac_sha256(std::string_view key, std::string_view text) -> std::array<unsigned char, 32> {
+        if (sodium_init() < 0)
+            throw std::runtime_error("cryptographic initialization failed");
+        crypto_auth_hmacsha256_state state{};
+        crypto_auth_hmacsha256_init(&state, reinterpret_cast<const unsigned char*>(key.data()), key.size());
+        crypto_auth_hmacsha256_update(&state, reinterpret_cast<const unsigned char*>(text.data()), text.size());
+        std::array<unsigned char, 32> out{};
+        crypto_auth_hmacsha256_final(&state, out.data());
+        sodium_memzero(&state, sizeof(state));
+        return out;
+    }
 
     class sha256 {
     public:

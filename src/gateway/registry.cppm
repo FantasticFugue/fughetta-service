@@ -14,6 +14,7 @@ import async;
 import native;
 import delivery;
 import projectmodel;
+import publiccache;
 import constants;
 
 export namespace storage {
@@ -26,8 +27,15 @@ export namespace storage {
     class registry {
     public:
         registry(cores::context<native::scheduler>& rt, std::filesystem::path storage, const config::slots& config, execution::thread_pool& pool,
-                 net::ip::tcp::endpoint source)
-            : rt_(rt), storage_(std::move(storage)), lock_(storage_, "storage"), config_(config), pool_(pool), source_(source) {}
+                 net::ip::tcp::endpoint source, const std::optional<config::public_shard_settings>& public_shards = {})
+            : rt_(rt), storage_(std::move(storage)), lock_(storage_, "storage"), config_(config), pool_(pool), source_(source) {
+            if (public_shards)
+                public_cache_.emplace(*public_shards, storage_);
+        }
+
+        auto shard_cache() -> public_shards::cache* { return public_cache_ ? &*public_cache_ : nullptr; }
+        auto disk_pool() -> execution::thread_pool& { return pool_; }
+        auto scheduler(std::size_t core) -> native::scheduler& { return rt_.get_scheduler(core); }
 
         std::function<void()> changed;
 
@@ -375,6 +383,7 @@ export namespace storage {
         durability::dir_lock lock_;
         const config::slots& config_;
         execution::thread_pool& pool_;
+        std::optional<public_shards::cache> public_cache_;
         net::ip::tcp::endpoint source_;
         coroutine::mutex ledger_lock_;
         std::vector<std::function<void(usage::ledger&)>> pending_;

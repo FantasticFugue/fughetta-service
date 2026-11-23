@@ -1,4 +1,5 @@
 export module storage;
+import utility;
 import constants;
 import std;
 import json;
@@ -14,9 +15,11 @@ import async;
 import native;
 
 export namespace storage {
-    struct stale_blob : std::runtime_error {
+    struct stale_blob : std::runtime_error, util::retained_exception {
         explicit stale_blob(std::string_view hash) : std::runtime_error(std::format("blob {} is no longer in the project (files changed during sync)", hash)) {}
+        auto retain() const noexcept -> std::exception_ptr override;
     };
+    auto stale_blob::retain() const noexcept -> std::exception_ptr { return util::copy_current_exception(*this); }
 
     class project_files {
     public:
@@ -100,7 +103,7 @@ export namespace storage {
                             throw;
                         binary = true;
                     }
-                edits.push_back({.kind = binary ? "binary_create" : "create",
+                edits.push_back({.kind = binary ? nodes::edit_kind::binary_create : nodes::edit_kind::create,
                                  .path = entry.path,
                                  .text = binary ? nodes::hex(bytes) : std::move(bytes),
                                  .executable = entry.executable});

@@ -149,15 +149,23 @@ export namespace json {
             static_assert(((Name == Names) || ...), "unknown literal");
             return literal{Name.view()};
         }
-        constexpr literal(std::string_view text) {
+        static constexpr auto from_name(std::string_view text) -> std::optional<literal> {
             const auto found = std::ranges::find(names, text);
             if (found == names.end())
-                throw std::invalid_argument("invalid JSON literal " + std::string{text});
-            index_ = static_cast<std::size_t>(found - names.begin());
+                return std::nullopt;
+            literal value;
+            value.index_ = static_cast<std::size_t>(found - names.begin());
+            return value;
         }
-        literal(const std::string& text) : literal(std::string_view{text}) {}
-        literal(const char* text) : literal(std::string_view{text}) {}
-        auto view() const -> std::string_view { return names[index_]; }
+        constexpr literal(std::string_view text) {
+            if (const auto value = from_name(text))
+                index_ = value->index_;
+            else
+                throw std::invalid_argument("invalid JSON literal " + std::string{text});
+        }
+        constexpr literal(const std::string& text) : literal(std::string_view{text}) {}
+        constexpr literal(const char* text) : literal(std::string_view{text}) {}
+        constexpr auto view() const -> std::string_view { return names[index_]; }
         auto str() const -> std::string { return std::string{view()}; }
         auto name() const -> std::string { return str(); }
         auto value() const -> std::size_t { return index_; }

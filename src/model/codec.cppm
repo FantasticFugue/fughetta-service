@@ -1,6 +1,7 @@
 module;
 #include <sodium.h>
 export module codec;
+import utility;
 import std;
 import content;
 
@@ -20,13 +21,15 @@ export namespace nodes {
         inline constexpr std::string_view identity_conflict = "identity_conflict";
     } // namespace code
 
-    struct error : std::runtime_error {
+    struct error : std::runtime_error, util::retained_exception {
         std::string code;
         std::vector<std::string> missing;
         std::vector<std::string> conflicts;
         error(std::string_view c, std::string message) : std::runtime_error(std::move(message)), code(c) {}
         ~error() override;
+        auto retain() const noexcept -> std::exception_ptr override;
     };
+    auto error::retain() const noexcept -> std::exception_ptr { return util::copy_current_exception(*this); }
 
     error::~error() = default;
 

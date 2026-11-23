@@ -15,8 +15,8 @@ describes; pass that version on as `observed`.
 
 1. **Navigate with `language`.**
    `inspect` with a symbol name or `symbol_id` returns its signature, the
-   one-hop type surface of its parameters and result, the producers and
-   consumers of those types, its definition coordinates, and the body text as
+   one-hop type surface, producers for its parameters and receiver, consumers
+   for its result, its definition coordinates, and the body text as
    `source`. Do not `rg` or read whole files to find a definition.
    `definitions` and `references` locate uses; `relations` follows `calls`,
    `binds` and `emits` across languages.
@@ -36,12 +36,14 @@ describes; pass that version on as `observed`.
 3. **Check by `reach`.**
    The apply reply reports `reach`:
    - `body_only`: every edit stayed inside a function body that `language`
-     returned. Run `language(diagnostics)` on the new `version` for the edited
-     files only.
+     returned. Run `language(diagnostics)` for the edited files and check
+     callers when the edit can change inferred types or callable behavior.
    - `declaration_touched`: the batch changed a signature, a declaration or
      text outside any known body. Run
      `language(impact, changes: ["declaration"])` on the new version and fix
      the callers it lists before building.
+   - `ffi_boundary_touched`: check the binding and its callers on both sides
+     of the language boundary.
 
 Repeat an `operation_id` with identical input to recover the recorded result
 of an interrupted write; use a new one for different input.

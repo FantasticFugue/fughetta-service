@@ -137,16 +137,16 @@ namespace {
             };
             expect(call(alice, {.action = "initialize"}).code == "ok");
             auto operation = content::hash_of("shared-operation-id").str();
-            auto seed = call(alice, {.action = "apply", .operation = operation, .edits = {{.kind = std::string{"create"}, .path = "x", .text = "ab"}}});
+            auto seed = call(alice, {.action = "apply", .operation = operation, .edits = {{.kind = nodes::edit_kind::create, .path = "x", .text = "ab"}}});
             expect((seed.code == "ok") >> fatal) << seed.reason;
             expect(seed.operation == operation) << "the caller sees its own operation ID";
             auto other = call(bob, {.action = "apply",
                                     .operation = operation,
                                     .expected = seed.frontier,
-                                    .edits = {{.kind = std::string{"edit"}, .path = "x", .text = "c", .offset = 2}}});
+                                    .edits = {{.kind = nodes::edit_kind::edit, .path = "x", .text = "c", .offset = 2}}});
             expect((other.code == "ok") >> fatal) << other.reason;
             expect(!other.replayed && other.receipt != seed.receipt) << "the same ID from another caller is a new operation";
-            auto again = call(alice, {.action = "apply", .operation = operation, .edits = {{.kind = std::string{"create"}, .path = "x", .text = "ab"}}});
+            auto again = call(alice, {.action = "apply", .operation = operation, .edits = {{.kind = nodes::edit_kind::create, .path = "x", .text = "ab"}}});
             expect(again.replayed && again.receipt == seed.receipt);
             auto history = call(alice, {.action = "history"});
             std::set<std::string> actors;
@@ -157,7 +157,7 @@ namespace {
             expect(actors == std::set<std::string>{"token:alice", "token:bob"});
             auto token = alice;
             token.caller = "renamed-token";
-            auto retried = call(token, {.action = "apply", .operation = operation, .edits = {{.kind = std::string{"create"}, .path = "x", .text = "ab"}}});
+            auto retried = call(token, {.action = "apply", .operation = operation, .edits = {{.kind = nodes::edit_kind::create, .path = "x", .text = "ab"}}});
             expect(retried.replayed && retried.receipt == seed.receipt) << "another credential of the same user replays";
             auto by_receipt = call(bob, {.action = "receipt", .target = other.receipt});
             expect(by_receipt.operation == operation);

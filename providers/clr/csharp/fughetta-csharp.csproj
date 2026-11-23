@@ -1,0 +1,17 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <AssemblyName>fughetta-csharp</AssemblyName>
+    <EnableDefaultItems>false</EnableDefaultItems>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <RoslynAssemblyPath>$(MSBuildToolsPath)/Roslyn/bincore</RoslynAssemblyPath>
+    <RoslynAssemblyPath Condition="!Exists('$(RoslynAssemblyPath)/Microsoft.CodeAnalysis.CSharp.dll')">$(MSBuildToolsPath)</RoslynAssemblyPath>
+  </PropertyGroup>
+  <ItemGroup>
+    <Compile Include="*.cs" />
+    <ProjectReference Include="../host/fughetta-clr.fsproj" Private="false" />
+    <Reference Include="FSharp.Core" HintPath="$(MSBuildToolsPath)/FSharp/FSharp.Core.dll" Private="false" />
+    <Reference Include="Microsoft.CodeAnalysis" HintPath="$(RoslynAssemblyPath)/Microsoft.CodeAnalysis.dll" />
+    <Reference Include="Microsoft.CodeAnalysis.CSharp" HintPath="$(RoslynAssemblyPath)/Microsoft.CodeAnalysis.CSharp.dll" />
+  </ItemGroup>
+</Project>

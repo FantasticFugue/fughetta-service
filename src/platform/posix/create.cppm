@@ -55,6 +55,8 @@ namespace native_process {
                 }
             }
             finished();
+            if (lifeline >= 0)
+                ::close(lifeline);
             engine->cancel_file(out);
             ::close(out);
             if (exit >= 0) {
@@ -68,6 +70,7 @@ namespace native_process {
         // A conversation is one socket for both directions, so the engine's stream operations apply to it.
         bool conversation;
         int exit;
+        int lifeline = -1;
         bool reaped = false;
         auto reap() noexcept -> int {
             stop_observing();
@@ -90,15 +93,54 @@ namespace native_process {
     };
 
     namespace {
+        struct owner_pipe {
+            int ends[2]{-1, -1};
+            explicit owner_pipe(bool enabled) {
+                if (!enabled)
+                    return;
+                if (::pipe(ends) < 0)
+                    throw std::system_error(errno, std::system_category(), "child group lifeline");
+                ::fcntl(ends[0], F_SETFD, FD_CLOEXEC);
+                ::fcntl(ends[1], F_SETFD, FD_CLOEXEC);
+            }
+            ~owner_pipe() {
+                for (int fd : ends)
+                    if (fd >= 0)
+                        ::close(fd);
+            }
+        };
+
+        // The owner holds the only writable end. A watcher in the child's process group
+        // survives the child's parent-death signal long enough to kill the full group.
+        auto watch_owner(int fd, int descriptor_bound) noexcept -> bool {
+            const auto group = ::getpid();
+            const auto watcher = ::fork();
+            if (watcher != 0)
+                return watcher > 0;
+            if (::dup2(fd, STDIN_FILENO) < 0 || !posix::close_inherited(descriptor_bound)) {
+                ::kill(-group, SIGKILL);
+                ::_exit(126);
+            }
+            ::close(STDOUT_FILENO);
+            ::close(STDERR_FILENO);
+            char byte;
+            while (::read(STDIN_FILENO, &byte, 1) < 0 && errno == EINTR) {
+            }
+            ::kill(-group, SIGKILL);
+            ::_exit(0);
+        }
+
         [[noreturn]] void exec_child(char** args, char** envp, const char* dir, int out, int in, int file, const io::command& cmd, int parent,
-                                     int descriptor_bound) {
+                                     int descriptor_bound, int lifeline) {
             if (!posix::follow_parent(parent))
                 ::_exit(126);
             ::setpgid(0, 0);
+            if (lifeline >= 0 && !watch_owner(lifeline, descriptor_bound))
+                ::_exit(126);
             ::dup2(in, 0);
             ::dup2(file >= 0 ? file : out, 1);
             // A conversation keeps stdout for replies and discards its diagnostics, as on Windows.
-            if (cmd.interactive) {
+            if (cmd.stdio != io::process_stdio::captured) {
                 int null = ::open("/dev/null", O_WRONLY);
                 if (null < 0 || ::dup2(null, 2) < 0)
                     ::_exit(126);
@@ -151,8 +193,10 @@ namespace native_process {
         char** envp = cmd.env ? env.data() : posix::environment();
         auto dir = cmd.cwd.string();
 
+        owner_pipe owner{cmd.kill_group_on_owner_exit};
+        const bool interactive = cmd.stdio != io::process_stdio::captured;
         int out[2];
-        if (cmd.interactive ? ::socketpair(AF_UNIX, SOCK_STREAM, 0, out) < 0 : ::pipe(out) < 0)
+        if (interactive ? ::socketpair(AF_UNIX, SOCK_STREAM, 0, out) < 0 : ::pipe(out) < 0)
             throw std::system_error(errno, std::system_category(), "child output");
         ::fcntl(out[0], F_SETFD, FD_CLOEXEC);
         ::fcntl(out[1], F_SETFD, FD_CLOEXEC);
@@ -164,7 +208,7 @@ namespace native_process {
             ::close(out[1]);
             throw std::system_error(error, std::system_category(), "nonblocking child output");
         }
-        int in = cmd.interactive ? out[1] : ::open("/dev/null", O_RDONLY | O_CLOEXEC);
+        int in = interactive ? out[1] : ::open("/dev/null", O_RDONLY | O_CLOEXEC);
         if (in < 0) {
             auto err = errno;
             ::close(out[0]);
@@ -178,7 +222,7 @@ namespace native_process {
                 auto err = errno;
                 ::close(out[0]);
                 ::close(out[1]);
-                if (!cmd.interactive)
+                if (!interactive)
                     ::close(in);
                 throw std::system_error(err, std::system_category(), "open child standard output");
             }
@@ -190,17 +234,17 @@ namespace native_process {
             auto err = errno;
             ::close(out[0]);
             ::close(out[1]);
-            if (!cmd.interactive)
+            if (!interactive)
                 ::close(in);
             if (file >= 0)
                 ::close(file);
             throw std::system_error(err, std::system_category(), "fork");
         }
         if (pid == 0)
-            exec_child(args.data(), envp, dir.c_str(), out[1], in, file, cmd, parent, bound);
+            exec_child(args.data(), envp, dir.c_str(), out[1], in, file, cmd, parent, bound, owner.ends[0]);
         ::setpgid(pid, pid);
         ::close(out[1]);
-        if (!cmd.interactive)
+        if (!interactive)
             ::close(in);
         if (file >= 0)
             ::close(file);
@@ -213,7 +257,8 @@ namespace native_process {
             ::close(out[0]);
             throw;
         }
-        auto state = std::make_unique<child::state>(&engine, pid, out[0], cmd.interactive, pidfd);
+        auto state = std::make_unique<child::state>(&engine, pid, out[0], interactive, pidfd);
+        state->lifeline = std::exchange(owner.ends[1], -1);
         if (cmd.processes) {
             state->observed = std::make_shared<observation>();
             state->observed->pid = pid;

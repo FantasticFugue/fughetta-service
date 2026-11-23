@@ -1,8 +1,10 @@
 export module provider;
+import utility;
 import std;
 import meta;
 import json;
 import content;
+import toolchain;
 export import records;
 
 // What every build system and language server shares, and the templates each one specializes by name. The set of
@@ -22,6 +24,7 @@ export namespace builds {
             std::optional<std::string> arch;
             friend auto operator==(const platform&, const platform&) -> bool = default;
         } platform;
+        std::vector<toolchain::sdk_constraint> sdks;
         friend auto operator==(const requirements&, const requirements&) -> bool = default;
     };
     struct limits {
@@ -40,6 +43,7 @@ export namespace builds {
     struct report {
         std::string protocol;
         std::string file;
+        bool directory = false;
         friend auto operator==(const report&, const report&) -> bool = default;
     };
     // `${tree}` is the build tree, `${tool:name}` a mapped tool, `${jobs}` the parallel jobs the runner allows and `${reports}` the
@@ -75,6 +79,10 @@ export namespace builds {
         // these leading argv entries, the directory and environment agree.
         // Remaining argv entries are ordered tasks for that same build instance.
         std::optional<std::size_t> batch_prefix;
+        // A model step may be reused when only the contents of existing sources here change.
+        std::optional<std::vector<std::string>> model_source_dirs;
+        bool gradle = false;
+        bool cargo = false;
     };
     struct invocation {
         step command;
@@ -93,7 +101,7 @@ export namespace builds {
                 auto& previous = out.back();
                 auto& command = previous.command;
                 if (standalone(command) && standalone(step) && command.batch_prefix == step.batch_prefix && command.cwd == step.cwd &&
-                    command.env == step.env && command.preparation == step.preparation &&
+                    command.env == step.env && command.preparation == step.preparation && command.gradle == step.gradle && command.cargo == step.cargo &&
                     std::equal(command.argv.begin(), command.argv.begin() + *command.batch_prefix, step.argv.begin())) {
                     command.argv.insert(command.argv.end(), step.argv.begin() + *step.batch_prefix, step.argv.end());
                     for (const auto& input : step.inputs)
@@ -203,10 +211,14 @@ export namespace builds {
         std::string severity;
         std::string message;
     };
+    // Every case the run named, how many of those failed, and how many it skipped instead of running: a JUnit writer marks a
+    // case it did not start with a <skipped> element, so a total with no failures no longer reads as a run that covered it.
     struct tally {
         std::uint32_t total = 0;
         std::uint32_t failed = 0;
+        std::uint32_t skipped = 0;
         std::vector<std::string> failed_tests;
+        std::vector<std::string> skipped_tests;
     };
     struct reading {
         std::vector<finding> diagnostics;
@@ -237,9 +249,11 @@ export namespace builds {
 } // namespace builds
 
 export namespace language {
-    struct resolution_error : std::invalid_argument {
+    struct resolution_error : std::invalid_argument, util::retained_exception {
         using std::invalid_argument::invalid_argument;
+        auto retain() const noexcept -> std::exception_ptr override;
     };
+    auto resolution_error::retain() const noexcept -> std::exception_ptr { return util::copy_current_exception(*this); }
 
     struct document {
         std::string path, language, text;
@@ -274,8 +288,10 @@ export namespace language {
         std::vector<semantic::execution_receipt> receipts;
     };
 
+    enum class port_direction : std::uint8_t { input, output, unspecified = 255 };
     struct port {
-        std::string name, type, direction;
+        std::string name, type;
+        port_direction direction = port_direction::unspecified;
         bool required = false, multiple = false;
         std::vector<semantic::fact_kind> facts;
     };
@@ -283,7 +299,8 @@ export namespace language {
         return {{.name = "declarations", .projections = {std::string{"symbols"}, std::string{"types"}}},
                 {.name = "definition_bodies",
                  .projections = {std::string{"definition_bodies"}},
-                 .symbol_kinds = {std::string{"function"}, std::string{"method"}, std::string{"constructor"}, std::string{"destructor"}}}};
+                 .symbol_kinds = {semantic::symbol_kind::make<"function">(), semantic::symbol_kind::make<"method">(),
+                                  semantic::symbol_kind::make<"constructor">(), semantic::symbol_kind::make<"destructor">()}}};
     }
     // The symbols, types and occurrences a binding resolver reads from one unit.
     // Source providers whose declarations bind across languages publish it too.
@@ -313,9 +330,11 @@ export namespace language {
             return {};
     }
     enum class adapter_kind { lsp, clice, helper, reader };
+    using provider_role = json::literal<"source-analysis", "artifact-reader", "relation-resolver">;
     struct description {
         std::string id;
-        std::vector<std::string> roles, languages;
+        std::vector<provider_role> roles;
+        std::vector<std::string> languages;
         // The link domains this provider's declarations are built into.
         std::vector<std::string> emits;
         // The link domain whose artifacts this provider reads.
@@ -396,13 +415,13 @@ export namespace language {
         { T::to::linkage } -> std::convertible_to<std::string_view>;
     } && !requires { typename T::emits; } && !requires { typename T::domain; };
     namespace roles {
-        inline constexpr std::string_view frontend = "source-analysis", reader = "artifact-reader", bridge = "relation-resolver";
+        inline constexpr auto frontend = provider_role::make<"source-analysis">();
+        inline constexpr auto reader = provider_role::make<"artifact-reader">();
+        inline constexpr auto bridge = provider_role::make<"relation-resolver">();
     }
     template <class T>
         requires frontend<T> || domain_reader<T> || bridge<T>
-    constexpr std::string_view role = frontend<T>        ? roles::frontend
-                                      : domain_reader<T> ? roles::reader
-                                                         : roles::bridge;
+    constexpr provider_role role = frontend<T> ? roles::frontend : domain_reader<T> ? roles::reader : roles::bridge;
 
     template <class... Domains> auto domain_names(std::tuple<Domains...>*) -> std::vector<std::string> { return {std::string{Domains::name}...}; }
     template <frontend T> auto emitted() -> std::vector<std::string> { return domain_names(static_cast<typename T::emits*>(nullptr)); }
@@ -470,9 +489,10 @@ namespace builds {
                 throw std::invalid_argument("invalid build environment variable");
     }
     void validate(const requirements& needs) {
-        for (auto& tool : needs.tools)
-            if (tool.empty())
-                throw std::invalid_argument("requires.tools contains an empty name");
+        for (const auto& tool : needs.tools)
+            toolchain::require_tool(tool);
+        for (const auto& sdk : needs.sdks)
+            toolchain::require_sdk(sdk);
         if ((needs.platform.os && needs.platform.os->empty()) || (needs.platform.arch && needs.platform.arch->empty()))
             throw std::invalid_argument("platform requirement is empty");
     }
@@ -481,6 +501,9 @@ namespace builds {
         for (auto& tool : from.tools)
             if (!std::ranges::contains(into.tools, tool))
                 into.tools.push_back(tool);
+        for (const auto& sdk : from.sdks)
+            if (!std::ranges::contains(into.sdks, sdk))
+                into.sdks.push_back(sdk);
         auto merge = [](auto& a, const auto& b) {
             if (a && b && a != b)
                 throw std::invalid_argument("build tasks require conflicting platforms");
@@ -518,7 +541,7 @@ namespace builds {
         auto project_path(std::string_view executable) -> bool { return executable.find_first_of("/\\") != std::string_view::npos; }
     } // namespace
     void tool_name(std::string_view name) {
-        if (name.empty() || !std::ranges::all_of(name, [](unsigned char c) { return std::isalnum(c) || c == '_' || c == '-' || c == '.' || c == '+'; }))
+        if (!toolchain::valid_name(name))
             throw std::invalid_argument("invalid tool name: " + std::string{name});
     }
     auto tools(const std::vector<std::string>& executables) -> requirements {

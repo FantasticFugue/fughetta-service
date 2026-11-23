@@ -402,7 +402,7 @@ export namespace package {
                                   .project_limit = in.project_limit};
         for (auto& f : kept.files) {
             auto& bytes = blobs.at(f.digest);
-            files.edits.push_back({.kind = f.kind == "text" ? "create" : "binary_create",
+            files.edits.push_back({.kind = f.kind == "text" ? nodes::edit_kind::create : nodes::edit_kind::binary_create,
                                    .path = f.path,
                                    .text = f.kind == "text" ? bytes : nodes::hex(bytes),
                                    .executable = f.executable});

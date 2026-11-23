@@ -56,7 +56,7 @@ namespace {
             c = std::make_unique<nodes::local_node>(tmp.dir / "a");
         }
         auto seed(std::string path = "x", std::string source = "abcd") -> nodes::node_reply {
-            return good(a, {.action = "apply", .operation = op("seed"), .edits = {{.kind = std::string{"create"}, .path = path, .text = source}}});
+            return good(a, {.action = "apply", .operation = op("seed"), .edits = {{.kind = nodes::edit_kind::create, .path = path, .text = source}}});
         }
     };
 
@@ -76,7 +76,7 @@ namespace {
             for (auto& byte : asset)
                 byte = static_cast<char>(generator() & 0xff);
             auto original = change(node, "chunked-original", {},
-                                   {.kind = std::string{"binary_create"}, .path = "asset.bin", .text = nodes::hex(asset)});
+                                   {.kind = nodes::edit_kind::binary_create, .path = "asset.bin", .text = nodes::hex(asset)});
 
             sqlite3* raw = nullptr;
             expect((sqlite3_open_v2((root / "repository.sqlite").string().c_str(), &raw, SQLITE_OPEN_READONLY, nullptr) == SQLITE_OK) >> fatal);
@@ -97,7 +97,7 @@ namespace {
             for (auto& byte : std::span{asset}.subspan(offset, 4096))
                 byte ^= 0x5a;
             auto updated = change(node, "chunked-update", original.frontier,
-                                  {.kind = std::string{"binary"}, .path = "asset.bin", .text = nodes::hex(asset)});
+                                  {.kind = nodes::edit_kind::binary, .path = "asset.bin", .text = nodes::hex(asset)});
             const auto payload_growth = scalar(bytes) - first_payload;
             const auto page_growth = (scalar("PRAGMA page_count") - first_pages) * scalar("PRAGMA page_size");
             std::cout << "Added compressed chunk bytes: " << payload_growth << ", SQLite page growth: " << page_growth << " bytes\n";
@@ -133,7 +133,7 @@ namespace {
                 good(node, {.action = "initialize"});
                 auto a = good(node, {.action = "apply",
                                      .operation = op("release-source"),
-                                     .edits = {{.kind = std::string{"create"}, .path = "app", .text = "one", .executable = true}}});
+                                     .edits = {{.kind = nodes::edit_kind::create, .path = "app", .text = "one", .executable = true}}});
                 first = a.version;
                 nodes::node_request tag{.action = "reference",
                                         .reference = nodes::reference_input{.name = "v1.0.0", .attestations = {{"review", "", "Approved"}}},
@@ -147,7 +147,7 @@ namespace {
                 auto b = good(node, {.action = "apply",
                                      .operation = op("next-source"),
                                      .expected = a.frontier,
-                                     .edits = {{.kind = std::string{"write"}, .path = "app", .text = "two"}}});
+                                     .edits = {{.kind = nodes::edit_kind::write, .path = "app", .text = "two"}}});
                 second = b.version;
                 expect(good(node, tag).replayed);
                 expect(text(good(node, {.action = "read", .revision = "@v1.0.0", .target = "app"}), "app") == "one");
@@ -269,7 +269,7 @@ namespace {
                 current = good(cold, {.action = "apply",
                                       .operation = op("demand-unicode-" + std::to_string(i)),
                                       .expected = before.frontier,
-                                      .edits = {{.kind = std::string{"edit"}, .path = "x", .text = inserted, .offset = offset, .count = count}}});
+                                      .edits = {{.kind = nodes::edit_kind::edit, .path = "x", .text = inserted, .offset = offset, .count = count}}});
                 auto work = cold.statistics();
                 expect(work.projected_files - stats.projected_files <= 1u);
                 expect(work.file_histories_read - stats.file_histories_read <= 1u);
@@ -289,14 +289,14 @@ namespace {
             {
                 nodes::local_node node{tmp.dir / "a"};
                 good(node, {.action = "initialize"});
-                std::vector<nodes::edit> files{{.kind = std::string{"create"}, .path = "target", .text = "a"}};
+                std::vector<nodes::edit> files{{.kind = nodes::edit_kind::create, .path = "target", .text = "a"}};
                 for (int i = 0; i < 64; ++i)
-                    files.push_back({.kind = std::string{"create"}, .path = "unrelated/" + std::to_string(i), .text = std::string(1024, 'u')});
+                    files.push_back({.kind = nodes::edit_kind::create, .path = "unrelated/" + std::to_string(i), .text = std::string(1024, 'u')});
                 frontier = good(node, {.action = "apply", .operation = op("append-tail-seed"), .edits = std::move(files)}).frontier;
             }
             nodes::local_node cold{tmp.dir / "a"};
             auto before = cold.statistics();
-            auto edited = change(cold, "append-tail-edit", frontier, {.kind = std::string{"edit"}, .path = "target", .text = "z"});
+            auto edited = change(cold, "append-tail-edit", frontier, {.kind = nodes::edit_kind::edit, .path = "target", .text = "z"});
             auto after = cold.statistics();
             expect(after.projected_files - before.projected_files == 1u) << "projected " << before.projected_files << " -> " << after.projected_files;
 
@@ -312,13 +312,13 @@ namespace {
             {
                 nodes::local_node node{tmp.dir / "a"};
                 good(node, {.action = "initialize"});
-                head = change(node, "metadata-seed", {}, {.kind = std::string{"create"}, .path = "x", .text = std::string(8192, 'a')}).frontier;
+                head = change(node, "metadata-seed", {}, {.kind = nodes::edit_kind::create, .path = "x", .text = std::string(8192, 'a')}).frontier;
             }
             nodes::local_node cold{tmp.dir / "a"};
-            auto mode = change(cold, "metadata-mode", head, {.kind = std::string{"mode"}, .path = "x", .executable = true});
+            auto mode = change(cold, "metadata-mode", head, {.kind = nodes::edit_kind::mode, .path = "x", .executable = true});
             auto before = cold.statistics();
-            auto moved = change(cold, "metadata-move", mode.frontier, {.kind = std::string{"move"}, .path = "x", .target = "y"});
-            auto removed = change(cold, "metadata-remove", moved.frontier, {.kind = std::string{"remove"}, .path = "y"});
+            auto moved = change(cold, "metadata-move", mode.frontier, {.kind = nodes::edit_kind::move, .path = "x", .target = "y"});
+            auto removed = change(cold, "metadata-remove", moved.frontier, {.kind = nodes::edit_kind::remove, .path = "y"});
             auto after = cold.statistics();
             expect(after.file_payloads_read == before.file_payloads_read);
             expect(after.file_histories_read == before.file_histories_read);
@@ -333,8 +333,8 @@ namespace {
             {
                 nodes::local_node node{tmp.dir / "a"};
                 good(node, {.action = "initialize"});
-                auto seed = change(node, "history-control-seed", {}, {.kind = std::string{"create"}, .path = "x", .text = "ab"});
-                auto edited = change(node, "history-control-edit", seed.frontier, {.kind = std::string{"edit"}, .path = "x", .text = "X", .offset = 1});
+                auto seed = change(node, "history-control-seed", {}, {.kind = nodes::edit_kind::create, .path = "x", .text = "ab"});
+                auto edited = change(node, "history-control-edit", seed.frontier, {.kind = nodes::edit_kind::edit, .path = "x", .text = "X", .offset = 1});
                 version = edited.version;
                 restored =
                     good(node,
@@ -350,12 +350,12 @@ namespace {
             peers p;
             std::vector<nodes::edit> files;
             for (int i = 0; i < 64; ++i)
-                files.push_back({.kind = std::string{"create"}, .path = std::to_string(i), .text = "v"});
+                files.push_back({.kind = nodes::edit_kind::create, .path = std::to_string(i), .text = "v"});
             auto seed = good(p.a, {.action = "apply", .operation = op("delta-seed"), .edits = std::move(files)});
             nodes::local_node cold{p.tmp.dir / "a"};
             expect(text(inspect(cold), "0") == "v");
-            auto local = change(p.a, "delta-local", seed.frontier, {.kind = std::string{"edit"}, .path = "0", .text = "A", .offset = 1});
-            auto remote = change(*p.b, "delta-remote", seed.frontier, {.kind = std::string{"edit"}, .path = "1", .text = "B", .offset = 1});
+            auto local = change(p.a, "delta-local", seed.frontier, {.kind = nodes::edit_kind::edit, .path = "0", .text = "A", .offset = 1});
+            auto remote = change(*p.b, "delta-remote", seed.frontier, {.kind = nodes::edit_kind::edit, .path = "1", .text = "B", .offset = 1});
             auto before = cold.statistics();
             auto merged = inspect(cold);
             auto after = cold.statistics();
@@ -370,8 +370,8 @@ namespace {
         "cold concurrent branches and contribution reversal retain the complete renderer result"_test = [] {
             peers p;
             auto seed = p.seed("x", "a😀bcé");
-            auto a = change(p.a, "demand-branch-a", seed.frontier, {.kind = std::string{"edit"}, .path = "x", .text = "审", .offset = 1});
-            auto b = change(*p.b, "demand-branch-b", seed.frontier, {.kind = std::string{"edit"}, .path = "x", .text = "尾", .offset = 5});
+            auto a = change(p.a, "demand-branch-a", seed.frontier, {.kind = nodes::edit_kind::edit, .path = "x", .text = "审", .offset = 1});
+            auto b = change(*p.b, "demand-branch-b", seed.frontier, {.kind = nodes::edit_kind::edit, .path = "x", .text = "尾", .offset = 5});
             nodes::local_node cold{p.tmp.dir / "a"};
             auto merged = inspect(cold);
             expect(merged.conflicts.empty());
@@ -392,11 +392,11 @@ namespace {
             {
                 nodes::local_node node{tmp.dir / "a"};
                 good(node, {.action = "initialize"});
-                auto seed = change(node, "equal-seed", {}, {.kind = std::string{"create"}, .path = "x", .text = "a"});
+                auto seed = change(node, "equal-seed", {}, {.kind = nodes::edit_kind::create, .path = "x", .text = "a"});
                 auto fork = good(node, {.action = "fork", .worldline = "branch", .operation = op("equal-fork"), .source = seed.frontier});
                 branch = fork.frontier;
-                auto changed = change(node, "equal-change", seed.frontier, {.kind = std::string{"write"}, .path = "x", .text = "b"});
-                auto restored = change(node, "equal-restore", changed.frontier, {.kind = std::string{"write"}, .path = "x", .text = "a"});
+                auto changed = change(node, "equal-change", seed.frontier, {.kind = nodes::edit_kind::write, .path = "x", .text = "b"});
+                auto restored = change(node, "equal-restore", changed.frontier, {.kind = nodes::edit_kind::write, .path = "x", .text = "a"});
                 main = restored.frontier;
             }
             nodes::local_node cold{tmp.dir / "a"};
@@ -404,8 +404,8 @@ namespace {
                                  .worldline = "branch",
                                  .operation = op("equal-branch-edit"),
                                  .expected = branch,
-                                 .edits = {{.kind = std::string{"edit"}, .path = "x", .text = "Q", .offset = 1}}});
-            auto m = change(cold, "equal-main-edit", main, {.kind = std::string{"edit"}, .path = "x", .text = "W", .offset = 1});
+                                 .edits = {{.kind = nodes::edit_kind::edit, .path = "x", .text = "Q", .offset = 1}}});
+            auto m = change(cold, "equal-main-edit", main, {.kind = nodes::edit_kind::edit, .path = "x", .text = "W", .offset = 1});
             expect(text(good(cold, {.action = "read", .worldline = "branch", .target = "x"}), "x") == "aQ");
             expect(text(inspect(cold), "x") == "aW");
             nodes::local_node complete{tmp.dir / "a", true};
@@ -418,45 +418,45 @@ namespace {
             good(node, {.action = "initialize"});
             auto seed = good(node, {.action = "apply",
                                     .operation = op("placing-seed"),
-                                    .edits = {{.kind = std::string{"create"}, .path = "a", .text = "A"},
-                                              {.kind = std::string{"create"}, .path = "b", .text = "B"},
-                                              {.kind = std::string{"create"}, .path = "c", .text = "C"},
-                                              {.kind = std::string{"create"}, .path = "d/e", .text = "E"}}});
+                                    .edits = {{.kind = nodes::edit_kind::create, .path = "a", .text = "A"},
+                                              {.kind = nodes::edit_kind::create, .path = "b", .text = "B"},
+                                              {.kind = nodes::edit_kind::create, .path = "c", .text = "C"},
+                                              {.kind = nodes::edit_kind::create, .path = "d/e", .text = "E"}}});
             auto onto = attempt(
                 node,
-                {.action = "apply", .operation = op("onto"), .expected = seed.frontier, .edits = {{.kind = std::string{"move"}, .path = "a", .target = "b"}}});
+                {.action = "apply", .operation = op("onto"), .expected = seed.frontier, .edits = {{.kind = nodes::edit_kind::move, .path = "a", .target = "b"}}});
             expect(onto.code == "source_conflict") << onto.reason;
             auto both = attempt(
                 node, {.action = "apply",
                        .operation = op("both"),
                        .expected = seed.frontier,
-                       .edits = {{.kind = std::string{"move"}, .path = "a", .target = "z"}, {.kind = std::string{"move"}, .path = "c", .target = "z"}}});
+                       .edits = {{.kind = nodes::edit_kind::move, .path = "a", .target = "z"}, {.kind = nodes::edit_kind::move, .path = "c", .target = "z"}}});
             expect(both.code == "source_conflict") << "two files of one batch never land on one path: " << both.reason;
             auto created = attempt(
                 node, {.action = "apply",
                        .operation = op("created"),
                        .expected = seed.frontier,
-                       .edits = {{.kind = std::string{"create"}, .path = "z", .text = "Z"}, {.kind = std::string{"move"}, .path = "a", .target = "z"}}});
+                       .edits = {{.kind = nodes::edit_kind::create, .path = "z", .text = "Z"}, {.kind = nodes::edit_kind::move, .path = "a", .target = "z"}}});
             expect(created.code == "source_conflict") << created.reason;
             auto inward = attempt(node, {.action = "apply",
                                          .operation = op("inward"),
                                          .expected = seed.frontier,
-                                         .edits = {{.kind = std::string{"directory_move"}, .path = "d", .target = "x"},
-                                                   {.kind = std::string{"move"}, .path = "a", .target = "x/e"}}});
+                                         .edits = {{.kind = nodes::edit_kind::directory_move, .path = "d", .target = "x"},
+                                                   {.kind = nodes::edit_kind::move, .path = "a", .target = "x/e"}}});
             expect(inward.code == "source_conflict") << inward.reason;
             auto parent = attempt(node, {.action = "apply",
                                          .operation = op("parent"),
                                          .expected = seed.frontier,
-                                         .edits = {{.kind = std::string{"create"}, .path = "z/child", .text = "child"},
-                                                   {.kind = std::string{"create"}, .path = "z", .text = "parent"}}});
+                                         .edits = {{.kind = nodes::edit_kind::create, .path = "z/child", .text = "child"},
+                                                   {.kind = nodes::edit_kind::create, .path = "z", .text = "parent"}}});
             expect(parent.code == "source_conflict") << parent.reason;
             auto swapped = good(node, {.action = "apply",
                                        .operation = op("swapped"),
                                        .expected = seed.frontier,
-                                       .edits = {{.kind = std::string{"remove"}, .path = "b"},
-                                                 {.kind = std::string{"move"}, .path = "a", .target = "b"},
-                                                 {.kind = std::string{"create"}, .path = "z-one", .text = "sibling"},
-                                                 {.kind = std::string{"create"}, .path = "z/two", .text = "child"}}});
+                                       .edits = {{.kind = nodes::edit_kind::remove, .path = "b"},
+                                                 {.kind = nodes::edit_kind::move, .path = "a", .target = "b"},
+                                                 {.kind = nodes::edit_kind::create, .path = "z-one", .text = "sibling"},
+                                                 {.kind = nodes::edit_kind::create, .path = "z/two", .text = "child"}}});
             expect(text(good(node, {.action = "inspect"}), "b") == "A") << "a path the batch empties takes another file";
             expect(inspect(node).frontier == swapped.frontier);
         };
@@ -475,26 +475,26 @@ namespace {
             good(node, {.action = "initialize"});
             auto seed = good(node, {.action = "apply",
                                     .operation = op("limit-seed"),
-                                    .edits = {{.kind = std::string{"create"}, .path = "a", .text = std::string(60, 'a')}},
+                                    .edits = {{.kind = nodes::edit_kind::create, .path = "a", .text = std::string(60, 'a')}},
                                     .file_limit = 64,
                                     .project_limit = 100});
             auto grown = attempt(node, {.action = "apply",
                                         .operation = op("grown"),
                                         .expected = seed.frontier,
-                                        .edits = {{.kind = std::string{"edit"}, .path = "a", .text = std::string(5, 'g'), .offset = 0}},
+                                        .edits = {{.kind = nodes::edit_kind::edit, .path = "a", .text = std::string(5, 'g'), .offset = 0}},
                                         .file_limit = 64,
                                         .project_limit = 100});
             expect(grown.code == "resource_limit") << grown.reason;
             auto dropped = good(node, {.action = "apply",
                                        .operation = op("dropped"),
                                        .expected = seed.frontier,
-                                       .edits = {{.kind = std::string{"remove"}, .path = "a"}},
+                                       .edits = {{.kind = nodes::edit_kind::remove, .path = "a"}},
                                        .file_limit = 64,
                                        .project_limit = 100});
             auto other = good(node, {.action = "apply",
                                      .operation = op("other"),
                                      .expected = dropped.frontier,
-                                     .edits = {{.kind = std::string{"create"}, .path = "b", .text = std::string(60, 'b')}},
+                                     .edits = {{.kind = nodes::edit_kind::create, .path = "b", .text = std::string(60, 'b')}},
                                      .file_limit = 64,
                                      .project_limit = 100});
             auto restored = attempt(node, {.action = "reverse",
@@ -507,7 +507,7 @@ namespace {
             auto shrunk = good(node, {.action = "apply",
                                       .operation = op("shrunk"),
                                       .expected = other.frontier,
-                                      .edits = {{.kind = std::string{"edit"}, .path = "b", .text = "", .offset = 0, .count = 30}},
+                                      .edits = {{.kind = nodes::edit_kind::edit, .path = "b", .text = "", .offset = 0, .count = 30}},
                                       .file_limit = 10,
                                       .project_limit = 10});
             expect(text(good(node, {.action = "inspect"}), "b").size() == 30u) << "a file or project already past its limit may still shrink";
@@ -517,10 +517,10 @@ namespace {
             peers p;
             auto seed = p.seed();
             auto length = nodes::codec::collection_limit + 1024;
-            auto long_text = change(*p.b, "long-create", seed.frontier, {.kind = std::string{"create"}, .path = "long", .text = std::string(length, 'a')});
+            auto long_text = change(*p.b, "long-create", seed.frontier, {.kind = nodes::edit_kind::create, .path = "long", .text = std::string(length, 'a')});
             auto middle =
-                change(*p.b, "long-middle", long_text.frontier, {.kind = std::string{"edit"}, .path = "long", .text = "m", .offset = 10, .count = 10});
-            auto rewritten = change(*p.b, "long-rewrite", middle.frontier, {.kind = std::string{"write"}, .path = "long", .text = std::string(length, 'b')});
+                change(*p.b, "long-middle", long_text.frontier, {.kind = nodes::edit_kind::edit, .path = "long", .text = "m", .offset = 10, .count = 10});
+            auto rewritten = change(*p.b, "long-rewrite", middle.frontier, {.kind = nodes::edit_kind::write, .path = "long", .text = std::string(length, 'b')});
             expect(text(good(*p.b, {.action = "inspect"}), "long") == std::string(length, 'b'));
             auto reversed =
                 good(*p.b, {.action = "reverse", .operation = op("long-reverse"), .expected = rewritten.frontier, .target = rewritten.frontier.front()});
@@ -535,17 +535,17 @@ namespace {
             test::scratch tmp{"shared-line"};
             nodes::local_node node{tmp.dir / "a"};
             good(node, {.action = "initialize"});
-            auto seed = change(node, "shared-seed", {}, {.kind = std::string{"create"}, .path = "x", .text = "abcd"});
+            auto seed = change(node, "shared-seed", {}, {.kind = nodes::edit_kind::create, .path = "x", .text = "abcd"});
             auto first = good(node, {.action = "apply",
                                      .operation = op("shared-first"),
                                      .actor = "alice",
                                      .expected = seed.frontier,
-                                     .edits = {{.kind = std::string{"edit"}, .path = "x", .text = "1", .offset = 1}}});
+                                     .edits = {{.kind = nodes::edit_kind::edit, .path = "x", .text = "1", .offset = 1}}});
             auto second = good(node, {.action = "apply",
                                       .operation = op("shared-second"),
                                       .actor = "bob",
                                       .expected = seed.frontier,
-                                      .edits = {{.kind = std::string{"edit"}, .path = "x", .text = "2", .offset = 3}}});
+                                      .edits = {{.kind = nodes::edit_kind::edit, .path = "x", .text = "2", .offset = 3}}});
             expect(second.frontier.size() == 2u);
             expect(std::ranges::contains(second.frontier, first.frontier.front()));
             expect(text(inspect(node), "x") == "a1bc2d");
@@ -559,14 +559,14 @@ namespace {
             test::scratch tmp{"line-boundary"};
             nodes::local_node node{tmp.dir / "a"};
             good(node, {.action = "initialize"});
-            auto seed = change(node, "boundary-seed", {}, {.kind = std::string{"create"}, .path = "x", .text = "a"});
+            auto seed = change(node, "boundary-seed", {}, {.kind = nodes::edit_kind::create, .path = "x", .text = "a"});
             auto fork = good(node, {.action = "fork", .worldline = "branch", .operation = op("boundary-fork"), .source = seed.frontier});
             auto branch = good(node, {.action = "apply",
                                       .worldline = "branch",
                                       .operation = op("boundary-branch"),
                                       .expected = fork.frontier,
-                                      .edits = {{.kind = std::string{"write"}, .path = "x", .text = "b"}}});
-            auto main = change(node, "boundary-main", seed.frontier, {.kind = std::string{"write"}, .path = "x", .text = "m"});
+                                      .edits = {{.kind = nodes::edit_kind::write, .path = "x", .text = "b"}}});
+            auto main = change(node, "boundary-main", seed.frontier, {.kind = nodes::edit_kind::write, .path = "x", .text = "m"});
             auto read = attempt(node, {.action = "read", .source = branch.frontier, .target = "x"});
             expect(read.code == "worldline_boundary") << read.code;
             auto mixed = attempt(
@@ -577,7 +577,7 @@ namespace {
             auto missing = attempt(node, {.action = "apply",
                                           .worldline = "absent",
                                           .operation = op("boundary-absent"),
-                                          .edits = {{.kind = std::string{"create"}, .path = "y", .text = "y"}}});
+                                          .edits = {{.kind = nodes::edit_kind::create, .path = "y", .text = "y"}}});
             expect(missing.code == "invalid_record") << missing.code;
             expect(attempt(node, {.action = "fork", .worldline = "branch", .operation = op("boundary-again"), .source = seed.frontier}).code ==
                    nodes::code::source_conflict);
@@ -588,16 +588,16 @@ namespace {
             good(node, {.action = "initialize"});
             auto base = good(
                 node,
-                {.action = "apply", .operation = op("declaration-seed"), .edits = {{.kind = std::string{"create"}, .path = "a.cpp", .text = "int run();\n"}}});
+                {.action = "apply", .operation = op("declaration-seed"), .edits = {{.kind = nodes::edit_kind::create, .path = "a.cpp", .text = "int run();\n"}}});
             auto original = good(node, {.action = "scope_register", .revision = base.version, .declaration_ranges = {{"run", {"a.cpp", 4, 7}}}});
             auto renamed = good(node, {.action = "apply",
                                        .operation = op("declaration-move"),
                                        .expected = base.frontier,
-                                       .edits = {{.kind = std::string{"move"}, .path = "a.cpp", .target = "src/a.cpp"}}});
+                                       .edits = {{.kind = nodes::edit_kind::move, .path = "a.cpp", .target = "src/a.cpp"}}});
             auto changed = good(node, {.action = "apply",
                                        .operation = op("declaration-insert"),
                                        .expected = renamed.frontier,
-                                       .edits = {{.kind = std::string{"edit"}, .path = "src/a.cpp", .text = "// 🌍\n", .offset = 0}}});
+                                       .edits = {{.kind = nodes::edit_kind::edit, .path = "src/a.cpp", .text = "// 🌍\n", .offset = 0}}});
             auto moved = good(node, {.action = "scope_register", .revision = changed.version, .declaration_ranges = {{"run", {"src/a.cpp", 9, 12}}}});
             expect(original.declaration_anchors.at("run") == moved.declaration_anchors.at("run"));
             auto pinned = good(node, {.action = "scope_register", .revision = base.version, .declaration_ranges = {{"run", {"a.cpp", 4, 7}}}});
@@ -607,9 +607,9 @@ namespace {
             test::scratch tmp{"scope-batch"};
             nodes::local_node node{tmp.dir / "a"};
             good(node, {.action = "initialize"});
-            std::vector<nodes::edit> seed{{.kind = std::string{"create"}, .path = "x", .text = "abcdefghij"}};
+            std::vector<nodes::edit> seed{{.kind = nodes::edit_kind::create, .path = "x", .text = "abcdefghij"}};
             for (unsigned i = 0; i < 9; ++i)
-                seed.push_back({.kind = std::string{"create"}, .path = "spare/" + std::to_string(i), .text = "spare"});
+                seed.push_back({.kind = nodes::edit_kind::create, .path = "spare/" + std::to_string(i), .text = "spare"});
             auto base = good(node, {.action = "apply", .operation = op("scope-seed"), .edits = std::move(seed)});
             auto references = good(node, {.action = "scope_register",
                                           .revision = base.version,
@@ -629,25 +629,25 @@ namespace {
                         .leases = {first, second},
                         .operation = op("unrelated"),
                         .expected = base.frontier,
-                        .edits = {{.kind = std::string{"edit"}, .path = "spare/0", .text = "!", .offset = 1}}});
+                        .edits = {{.kind = nodes::edit_kind::edit, .path = "spare/0", .text = "!", .offset = 1}}});
             auto refused = attempt(node, {.action = "apply",
                                           .lease_owner = "run-b",
                                           .operation = op("intruder"),
                                           .expected = base.frontier,
-                                          .edits = {{.kind = std::string{"edit"}, .path = "x", .text = "!", .offset = 1, .count = 1}}});
+                                          .edits = {{.kind = nodes::edit_kind::edit, .path = "x", .text = "!", .offset = 1, .count = 1}}});
             expect(refused.code == "scope_conflict");
             auto edited = good(node, {.action = "apply",
                                       .lease_owner = "run-a",
                                       .leases = {first, second},
                                       .operation = op("edit-first"),
                                       .expected = base.frontier,
-                                      .edits = {{.kind = std::string{"edit"}, .path = "x", .text = "B", .offset = 1, .count = 1}}});
+                                      .edits = {{.kind = nodes::edit_kind::edit, .path = "x", .text = "B", .offset = 1, .count = 1}}});
             good(node, {.action = "apply",
                         .lease_owner = "run-a",
                         .leases = {first, second},
                         .operation = op("edit-second"),
                         .expected = edited.frontier,
-                        .edits = {{.kind = std::string{"edit"}, .path = "x", .text = "G", .offset = 6, .count = 1}}});
+                        .edits = {{.kind = nodes::edit_kind::edit, .path = "x", .text = "G", .offset = 6, .count = 1}}});
             expect(text(good(node, {.action = "read", .target = "x"}), "x") == "aBcdefGhij");
             good(node, {.action = "scope_release", .lease_owner = "run-a", .lease_token = first});
             expect(attempt(node, {.action = "apply",
@@ -655,7 +655,7 @@ namespace {
                                   .leases = {first},
                                   .operation = op("unrelated-expired"),
                                   .expected = edited.frontier,
-                                  .edits = {{.kind = std::string{"edit"}, .path = "spare/0", .text = "!", .offset = 1}}})
+                                  .edits = {{.kind = nodes::edit_kind::edit, .path = "spare/0", .text = "!", .offset = 1}}})
                        .code == "scope_expired");
             expect(attempt(node, {.action = "scope_acquire", .lease_owner = "run-a", .operation = op("both-scopes"), .scope_refs = refs}).code ==
                    "scope_expired");
@@ -666,7 +666,7 @@ namespace {
             nodes::local_node node{tmp.dir / "a"};
             good(node, {.action = "initialize"});
             auto state =
-                good(node, {.action = "apply", .operation = op("path-seed"), .edits = {{.kind = std::string{"create"}, .path = "dir/x", .text = "text"}}});
+                good(node, {.action = "apply", .operation = op("path-seed"), .edits = {{.kind = nodes::edit_kind::create, .path = "dir/x", .text = "text"}}});
             auto held = good(node, {.action = "scope_acquire",
                                     .lease_owner = "owner",
                                     .operation = op("path-lease"),
@@ -685,16 +685,16 @@ namespace {
                                       .expected = state.frontier,
                                       .edits = {std::move(edit)}});
             };
-            auto sibling = apply("sibling", {.kind = std::string{"create"}, .path = "target-other/x", .text = "free"});
+            auto sibling = apply("sibling", {.kind = nodes::edit_kind::create, .path = "target-other/x", .text = "free"});
             expect(sibling.code == "ok");
             state = sibling;
-            expect(apply("ancestor", {.kind = std::string{"directory_move"}, .path = "dir", .target = "elsewhere"}).code == "scope_conflict");
-            expect(apply("destination", {.kind = std::string{"move"}, .path = "target-other/x", .target = "target/x"}).code == "scope_conflict");
-            auto moved = apply("owner-move", {.kind = std::string{"directory_move"}, .path = "dir", .target = "target"}, true);
+            expect(apply("ancestor", {.kind = nodes::edit_kind::directory_move, .path = "dir", .target = "elsewhere"}).code == "scope_conflict");
+            expect(apply("destination", {.kind = nodes::edit_kind::move, .path = "target-other/x", .target = "target/x"}).code == "scope_conflict");
+            auto moved = apply("owner-move", {.kind = nodes::edit_kind::directory_move, .path = "dir", .target = "target"}, true);
             expect(moved.code == "ok");
             state = moved;
-            expect(apply("moved-file", {.kind = std::string{"edit"}, .path = "target/x", .text = "!", .offset = 1}).code == "scope_conflict");
-            auto edited = apply("owner-edit", {.kind = std::string{"edit"}, .path = "target/x", .text = "!", .offset = 1}, true);
+            expect(apply("moved-file", {.kind = nodes::edit_kind::edit, .path = "target/x", .text = "!", .offset = 1}).code == "scope_conflict");
+            auto edited = apply("owner-edit", {.kind = nodes::edit_kind::edit, .path = "target/x", .text = "!", .offset = 1}, true);
             expect(edited.code == "ok");
             expect(text(good(node, {.action = "read", .target = "target/x"}), "target/x") == "t!ext");
         };
@@ -705,7 +705,7 @@ namespace {
             good(node, {.action = "initialize"});
             auto state = good(
                 node,
-                {.action = "apply", .operation = op("implicit-seed"), .edits = {{.kind = std::string{"create"}, .path = "x", .text = "aaaa{1111}bbbb{2222}"}}});
+                {.action = "apply", .operation = op("implicit-seed"), .edits = {{.kind = nodes::edit_kind::create, .path = "x", .text = "aaaa{1111}bbbb{2222}"}}});
             nodes::node_request registration{
                 .action = "scope_register",
                 .revision = state.version,
@@ -721,7 +721,7 @@ namespace {
                                    .lease_owner = std::move(owner),
                                    .operation = op("implicit-" + std::to_string(++step)),
                                    .expected = state.frontier,
-                                   .edits = {{.kind = std::string{"edit"}, .path = "x", .text = std::string{replacement}, .offset = offset, .count = 1}}});
+                                   .edits = {{.kind = nodes::edit_kind::edit, .path = "x", .text = std::string{replacement}, .offset = offset, .count = 1}}});
                 if (out.code == "ok")
                     state = out;
                 return out;
@@ -756,7 +756,7 @@ namespace {
             expect(attempt(node, {.action = "apply",
                                   .operation = op("implicit-ownerless"),
                                   .expected = state.frontier,
-                                  .edits = {{.kind = std::string{"write"}, .path = "x", .text = "free"}}})
+                                  .edits = {{.kind = nodes::edit_kind::write, .path = "x", .text = "free"}}})
                        .code == "scope_conflict");
             // Text right after a body's closing brace is outside it, and a
             // replay answers with the recorded reach.
@@ -764,7 +764,7 @@ namespace {
                                          .lease_owner = "run-a",
                                          .operation = op("implicit-boundary"),
                                          .expected = state.frontier,
-                                         .edits = {{.kind = std::string{"edit"}, .path = "x", .text = "Y", .offset = 10, .count = 0}}};
+                                         .edits = {{.kind = nodes::edit_kind::edit, .path = "x", .text = "Y", .offset = 10, .count = 0}}};
             state = good(node, boundary);
             expect(state.reach == "declaration_touched");
             auto replayed = good(node, boundary);
@@ -774,11 +774,149 @@ namespace {
             boundary.expected = state.frontier;
             expect(good(node, boundary).reach == "declaration_touched");
         };
+        "scope_classify proves sealed body edits and reprojects CRDT places without analysis"_test = [] {
+            test::scratch tmp{"scope-classify"};
+            nodes::local_node node{tmp.dir / "a"};
+            good(node, {.action = "initialize"});
+            auto base = good(
+                node,
+                {.action = "apply",
+                 .operation = op("classify-seed"),
+                 .edits = {{.kind = nodes::edit_kind::create, .path = "a.cpp", .text = "int f(){return 1;}\nint g(){return 2;}\n"},
+                           {.kind = nodes::edit_kind::create, .path = "u.cpp", .text = "int h(){return 3;}\n"}}});
+            // Register body A ("f") as sealed and body B ("g") as unsealed.
+            good(node,
+                 {.action = "scope_register",
+                  .revision = base.version,
+                  .body_ranges = {{"sym:f", {"a.cpp", 7, 18}}, {"sym:g", {"a.cpp", 26, 37}}},
+                  .scope_hints = {.sealed_bodies = {"sym:f"}}});
+            // Edit strictly inside sealed body f (multi-line expansion shifts g down).
+            auto inside_sealed = good(
+                node,
+                {.action = "apply",
+                 .operation = op("classify-sealed"),
+                 .expected = base.frontier,
+                 .edits = {{.kind = nodes::edit_kind::edit, .path = "a.cpp", .text = "\n  int k = 42;\n  return k;\n", .offset = 8, .count = 9}}});
+            auto classified = good(
+                node,
+                {.action = "scope_classify",
+                 .revision = inside_sealed.version,
+                 .target = base.version,
+                 .scope_hints = {.reproject_places = {{"a.cpp", 7, 18}, {"a.cpp", 23, 24}, {"a.cpp", 26, 37}, {"u.cpp", 4, 5}}}});
+            expect(fatal(classified.classification.has_value()));
+            expect(classified.classification->body_only && classified.classification->sealed_body_only);
+            expect(classified.classification->touched_files == std::vector<std::string>{"a.cpp"});
+            expect(classified.classification->touched_symbols == std::vector<std::string>{"sym:f"});
+            expect(fatal(classified.reprojected.size() == 4u));
+            auto new_text = text(good(node, {.action = "read", .revision = inside_sealed.version, .target = "a.cpp"}), "a.cpp");
+            const auto slice = [](const std::string& s, const semantic::place& p) { return s.substr(p.begin, p.end - p.begin); };
+            expect(classified.reprojected[0] && slice(new_text, *classified.reprojected[0]) == "{\n  int k = 42;\n  return k;\n}");
+            expect(classified.reprojected[1] && slice(new_text, *classified.reprojected[1]) == "g");
+            expect(classified.reprojected[2] && slice(new_text, *classified.reprojected[2]) == "{return 2;}");
+            expect(classified.reprojected[3] && classified.reprojected[3]->path == "u.cpp" && classified.reprojected[3]->begin == 4u &&
+                   classified.reprojected[3]->end == 5u);
+
+            // Editing unsealed body g keeps body_only=true but drops sealed_body_only=false.
+            const auto g_body = *classified.reprojected[2];
+            auto inside_unsealed = good(
+                node,
+                {.action = "apply",
+                 .operation = op("classify-unsealed"),
+                 .expected = inside_sealed.frontier,
+                 .edits = {{.kind = nodes::edit_kind::edit, .path = "a.cpp", .text = "return 9;", .offset = g_body.begin + 1, .count = 9}}});
+            auto unsealed_class = good(node, {.action = "scope_classify", .revision = inside_unsealed.version, .target = base.version});
+            expect(unsealed_class.classification && unsealed_class.classification->body_only && !unsealed_class.classification->sealed_body_only);
+
+            // CRDT reversal of the unsealed edit restores net sealed_body_only=true!
+            auto reversed = good(
+                node,
+                {.action = "reverse", .operation = op("classify-reverse"), .expected = inside_unsealed.frontier, .target = inside_unsealed.frontier.front()});
+            auto restored_class = good(node, {.action = "scope_classify", .revision = reversed.version, .target = base.version});
+            expect(restored_class.classification && restored_class.classification->body_only && restored_class.classification->sealed_body_only);
+
+            // Editing outside any body (declaration signature) marks both flags false.
+            auto decl_edit = good(
+                node,
+                {.action = "apply",
+                 .operation = op("classify-decl"),
+                 .expected = reversed.frontier,
+                 .edits = {{.kind = nodes::edit_kind::edit, .path = "a.cpp", .text = "long", .offset = 0, .count = 3}}});
+            auto decl_class = good(node, {.action = "scope_classify", .revision = decl_edit.version, .target = base.version});
+            expect(decl_class.classification && !decl_class.classification->body_only && !decl_class.classification->sealed_body_only);
+        };
+        "multi-hunk disjoint edits, comment-only edits and FFI boundary warnings work without compilation"_test = [] {
+            test::scratch tmp{"scope-advanced"};
+            nodes::local_node node{tmp.dir / "a"};
+            good(node, {.action = "initialize"});
+            auto base = good(
+                node,
+                {.action = "apply",
+                 .operation = op("adv-seed"),
+                 .edits = {{.kind = nodes::edit_kind::create,
+                            .path = "jni.cpp",
+                            .text = "extern \"C\" int Java_pkg_App_f(){return 1;}\nint g(){return 2;}\n"},
+                           {.kind = nodes::edit_kind::create, .path = "hdr.hpp", .text = "#define K 1\nint api(int x);\n"}}});
+            // Register both bodies as sealed and the JNI declaration as an FFI boundary.
+            good(node,
+                 {.action = "scope_register",
+                  .revision = base.version,
+                  .body_ranges = {{"sym:jni_f", {"jni.cpp", 31, 42}}, {"sym:g", {"jni.cpp", 50, 61}}},
+                  .scope_hints = {.sealed_bodies = {"sym:jni_f", "sym:g"}, .ffi_boundaries = {{"sym:jni_f", {"jni.cpp", 15, 29}}}}});
+            // Single batch with two strictly disjoint body edits stays body_only & sealed_body_only.
+            auto multi = good(
+                node,
+                {.action = "apply",
+                 .operation = op("adv-multi"),
+                 .expected = base.frontier,
+                 .edits = {{.kind = nodes::edit_kind::edit, .path = "jni.cpp", .text = "return 10;", .offset = 32, .count = 9},
+                           {.kind = nodes::edit_kind::edit, .path = "jni.cpp", .text = "return 20;", .offset = 51, .count = 9}}});
+            expect(multi.reach == "body_only") << multi.reach;
+            auto multi_class = good(node, {.action = "scope_classify", .revision = multi.version, .target = base.version});
+            expect(multi_class.classification && multi_class.classification->body_only && multi_class.classification->sealed_body_only &&
+                   !multi_class.classification->ffi_boundary_touched && !multi_class.classification->comment_or_whitespace_only);
+            // Adjacent/overlapping edits on the same path in one batch are still rejected.
+            expect(attempt(node,
+                           {.action = "apply",
+                            .operation = op("adv-overlap"),
+                            .expected = multi.frontier,
+                            .edits = {{.kind = nodes::edit_kind::edit, .path = "jni.cpp", .text = "a", .offset = 32, .count = 2},
+                                      {.kind = nodes::edit_kind::edit, .path = "jni.cpp", .text = "b", .offset = 34, .count = 1}}})
+                       .code == nodes::code::invalid_record);
+            // Without a syntax tree a comment edit is not proven comment-only.
+            auto commented = good(
+                node,
+                {.action = "apply",
+                 .operation = op("adv-comment"),
+                 .expected = multi.frontier,
+                 .edits = {{.kind = nodes::edit_kind::edit, .path = "hdr.hpp", .text = "// doc note\n", .offset = 12, .count = 0}}});
+            auto comment_class = good(node, {.action = "scope_classify", .revision = commented.version, .target = multi.version});
+            expect(comment_class.classification && !comment_class.classification->comment_or_whitespace_only);
+            // Changing a preprocessor directive is NOT comment_or_whitespace_only.
+            auto pp_edit = good(
+                node,
+                {.action = "apply",
+                 .operation = op("adv-pp"),
+                 .expected = commented.frontier,
+                 .edits = {{.kind = nodes::edit_kind::edit, .path = "hdr.hpp", .text = "2", .offset = 10, .count = 1}}});
+            auto pp_class = good(node, {.action = "scope_classify", .revision = pp_edit.version, .target = commented.version});
+            expect(pp_class.classification && !pp_class.classification->comment_or_whitespace_only);
+            // Touching the JNI FFI contract name triggers immediate zero-compile ffi_boundary_touched.
+            auto ffi_break = good(
+                node,
+                {.action = "apply",
+                 .operation = op("adv-ffi"),
+                 .expected = pp_edit.frontier,
+                 .edits = {{.kind = nodes::edit_kind::edit, .path = "jni.cpp", .text = "Java_pkg_App_h", .offset = 15, .count = 14}}});
+            expect(ffi_break.reach == "ffi_boundary_touched") << ffi_break.reach;
+            auto ffi_class = good(node, {.action = "scope_classify", .revision = ffi_break.version, .target = pp_edit.version});
+            expect(ffi_class.classification && ffi_class.classification->ffi_boundary_touched &&
+                   ffi_class.classification->touched_ffi_symbols == std::vector<std::string>{"sym:jni_f"});
+        };
         "task revocation fences delayed source writes and fork binding is atomic"_test = [] {
             test::scratch tmp{"task-source"};
             nodes::local_node node{tmp.dir / "a"};
             good(node, {.action = "initialize"});
-            auto base = change(node, "task-seed", {}, {.kind = std::string{"create"}, .path = "x", .text = "text"});
+            auto base = change(node, "task-seed", {}, {.kind = nodes::edit_kind::create, .path = "x", .text = "text"});
             good(node, {.action = "task_create", .operation = op("task-create"), .task_id = "task", .execution_owner = "owner"});
             auto started = good(
                 node, {.action = "task_start", .operation = op("task-start"), .task_id = "task", .execution_identity = "identity", .execution_owner = "owner"});
@@ -795,7 +933,7 @@ namespace {
                                         .leases = {lease.leases[0].token},
                                         .operation = op("delayed"),
                                         .expected = base.frontier,
-                                        .edits = {{.kind = std::string{"write"}, .path = "x", .text = "late"}},
+                                        .edits = {{.kind = nodes::edit_kind::write, .path = "x", .text = "late"}},
                                         .run_id = run.run,
                                         .execution_token = run.token};
             good(node, {.action = "task_stop", .task_id = "task", .run_id = run.run, .execution_owner = "owner"});
@@ -819,7 +957,7 @@ namespace {
                 {
                     nodes::local_node seed{tmp.dir / "a"};
                     good(seed, {.action = "initialize"});
-                    auto result = change(seed, "demand-damaged-seed", {}, {.kind = std::string{"create"}, .path = "x", .text = "a😀bc"});
+                    auto result = change(seed, "demand-damaged-seed", {}, {.kind = nodes::edit_kind::create, .path = "x", .text = "a😀bc"});
                     head = result.frontier;
                     receipt = result.receipt;
                 }
@@ -837,7 +975,7 @@ namespace {
                     auto rejected = attempt(damaged, {.action = "apply",
                                                       .operation = op("demand-damaged-edit"),
                                                       .expected = head,
-                                                      .edits = {{.kind = std::string{"edit"}, .path = "x", .text = "z", .offset = 1}}});
+                                                      .edits = {{.kind = nodes::edit_kind::edit, .path = "x", .text = "z", .offset = 1}}});
                     expect(rejected.code == "invalid_record" || rejected.code == "missing_objects" || rejected.code == "storage_failure" ||
                            rejected.code == "outcome_unknown")
                         << rejected.code;
@@ -847,7 +985,7 @@ namespace {
                 expect(text(inspect(audit), "x") == "a😀bc");
                 expect(good(audit, {.action = "receipt", .target = receipt}).receipt == receipt);
                 nodes::local_node repaired{tmp.dir / "a"};
-                auto edited = change(repaired, "demand-repaired-edit", head, {.kind = std::string{"edit"}, .path = "x", .text = "z", .offset = 1});
+                auto edited = change(repaired, "demand-repaired-edit", head, {.kind = nodes::edit_kind::edit, .path = "x", .text = "z", .offset = 1});
                 expect(!edited.receipt.empty());
                 expect(text(inspect(repaired), "x") == "az😀bc");
             }
@@ -858,12 +996,12 @@ namespace {
             good(node, {.action = "initialize"});
             std::vector<nodes::edit> files;
             for (int i = 0; i < 24; ++i)
-                files.push_back({.kind = std::string{"create"}, .path = std::to_string(i), .text = "a😀bc"});
+                files.push_back({.kind = nodes::edit_kind::create, .path = std::to_string(i), .text = "a😀bc"});
             auto current = good(node, {.action = "apply", .operation = op("demand-cache-seed"), .edits = std::move(files)});
             auto before = node.statistics();
             for (int i = 0; i < 24; ++i)
                 current = change(node, "demand-cache-" + std::to_string(i), current.frontier,
-                                 {.kind = std::string{"edit"}, .path = std::to_string(i), .text = "z", .offset = 1});
+                                 {.kind = nodes::edit_kind::edit, .path = std::to_string(i), .text = "z", .offset = 1});
             expect(node.statistics().cache_evictions > before.cache_evictions);
             nodes::local_node complete{tmp.dir / "a", true};
             expect(inspect(node).source_digest == inspect(complete).source_digest);
@@ -875,10 +1013,10 @@ namespace {
             good(node, {.action = "initialize"});
             std::vector<nodes::edit> files;
             for (int i = 0; i < 512; ++i)
-                files.push_back({.kind = std::string{"create"}, .path = std::format("files/{:03}.txt", i), .text = std::string(1024, 'x')});
+                files.push_back({.kind = nodes::edit_kind::create, .path = std::format("files/{:03}.txt", i), .text = std::string(1024, 'x')});
             auto seeded = good(node, {.action = "apply", .operation = op("incremental-seed"), .edits = std::move(files)});
             auto before = node.statistics();
-            auto changed = change(node, "incremental-one", seeded.frontier, {.kind = std::string{"edit"}, .path = "files/001.txt", .text = "z"});
+            auto changed = change(node, "incremental-one", seeded.frontier, {.kind = nodes::edit_kind::edit, .path = "files/001.txt", .text = "z"});
             auto after = node.statistics();
             expect(after.projected_files - before.projected_files == 1u);
             // One changed file writes one manifest row and one path row, never the whole manifest.
@@ -887,11 +1025,11 @@ namespace {
             expect(after.state_bytes_written - before.state_bytes_written < 512u * 1024u);
             std::vector<nodes::edit> batch;
             for (int i = 3; i < 19; ++i)
-                batch.push_back({.kind = std::string{"edit"}, .path = std::format("files/{:03}.txt", i), .text = "batch"});
-            batch.push_back({.kind = std::string{"remove"}, .path = "files/000.txt"});
-            batch.push_back({.kind = std::string{"remove"}, .path = "files/002.txt"});
+                batch.push_back({.kind = nodes::edit_kind::edit, .path = std::format("files/{:03}.txt", i), .text = "batch"});
+            batch.push_back({.kind = nodes::edit_kind::remove, .path = "files/000.txt"});
+            batch.push_back({.kind = nodes::edit_kind::remove, .path = "files/002.txt"});
             for (int i = 0; i < 8; ++i)
-                batch.push_back({.kind = std::string{"create"}, .path = std::format("new/{:03}.txt", i), .text = "new"});
+                batch.push_back({.kind = nodes::edit_kind::create, .path = std::format("new/{:03}.txt", i), .text = "new"});
             changed = good(node, {.action = "apply", .operation = op("incremental-batch"), .expected = changed.frontier, .edits = std::move(batch)});
             nodes::local_node cold{tmp.dir / "a"};
             auto opened = cold.statistics();
@@ -913,7 +1051,7 @@ namespace {
             good(node, {.action = "initialize"});
             std::vector<nodes::edit> files;
             for (int i = 0; i < 128; ++i)
-                files.push_back({.kind = std::string{"create"}, .path = std::format("files/{:03}.txt", i), .text = std::format("v0-{}", i)});
+                files.push_back({.kind = nodes::edit_kind::create, .path = std::format("files/{:03}.txt", i), .text = std::format("v0-{}", i)});
             auto current = good(node, {.action = "apply", .operation = op("chain-seed"), .edits = std::move(files)});
             std::string old_version;
             std::uint64_t written_total = 0;
@@ -921,7 +1059,7 @@ namespace {
                 auto before = node.statistics();
                 auto path = std::format("files/{:03}.txt", i % 128);
                 current =
-                    change(node, "chain-" + std::to_string(i), current.frontier, {.kind = std::string{"write"}, .path = path, .text = std::format("v1-{}", i)});
+                    change(node, "chain-" + std::to_string(i), current.frontier, {.kind = nodes::edit_kind::write, .path = path, .text = std::format("v1-{}", i)});
                 auto after = node.statistics();
                 auto written = after.manifest_rows_written - before.manifest_rows_written;
                 written_total += written;
@@ -946,9 +1084,9 @@ namespace {
             test::scratch tmp{"manifest-move"};
             nodes::local_node node{tmp.dir / "a"};
             good(node, {.action = "initialize"});
-            auto seed = change(node, "move-seed", {}, {.kind = std::string{"create"}, .path = "x", .text = "a"});
-            auto moved = change(node, "move-move", seed.frontier, {.kind = std::string{"move"}, .path = "x", .target = "y"});
-            auto edited = change(node, "move-edit", moved.frontier, {.kind = std::string{"write"}, .path = "y", .text = "bb"});
+            auto seed = change(node, "move-seed", {}, {.kind = nodes::edit_kind::create, .path = "x", .text = "a"});
+            auto moved = change(node, "move-move", seed.frontier, {.kind = nodes::edit_kind::move, .path = "x", .target = "y"});
+            auto edited = change(node, "move-edit", moved.frontier, {.kind = nodes::edit_kind::write, .path = "y", .text = "bb"});
             expect(text(good(node, {.action = "read", .revision = edited.version, .target = "y"}), "y") == "bb");
             expect(text(good(node, {.action = "read", .revision = moved.version, .target = "y"}), "y") == "a");
             expect(good(node, {.action = "read", .revision = edited.version, .target = "x"}).files.empty());
@@ -958,8 +1096,8 @@ namespace {
         "conflicted versions keep the manifest fast path"_test = [] {
             peers p;
             auto seed = p.seed();
-            change(p.a, "conflict-a", seed.frontier, {.kind = std::string{"edit"}, .path = "x", .text = "A", .offset = 1, .count = 0});
-            change(*p.b, "conflict-b", seed.frontier, {.kind = std::string{"edit"}, .path = "x", .text = "B", .offset = 1, .count = 0});
+            change(p.a, "conflict-a", seed.frontier, {.kind = nodes::edit_kind::edit, .path = "x", .text = "A", .offset = 1, .count = 0});
+            change(*p.b, "conflict-b", seed.frontier, {.kind = nodes::edit_kind::edit, .path = "x", .text = "B", .offset = 1, .count = 0});
             auto merged = inspect(p.a);
             expect(!merged.conflicts.empty());
             auto before = p.a.statistics();
@@ -977,7 +1115,7 @@ namespace {
             {
                 nodes::local_node node{tmp.dir / "a"};
                 good(node, {.action = "initialize"});
-                head = change(node, "kill-seed", {}, {.kind = std::string{"create"}, .path = "x", .text = "before"}).frontier;
+                head = change(node, "kill-seed", {}, {.kind = nodes::edit_kind::create, .path = "x", .text = "before"}).frontier;
             }
             for (const std::string boundary : {"before_commit", "after_commit"}) {
                 auto child = fork();
@@ -988,7 +1126,7 @@ namespace {
                                      .operation = op("kill-" + boundary),
                                      .owner = node.node_id(),
                                      .expected = head,
-                                     .edits = {{.kind = std::string{"write"}, .path = "x", .text = "after"}}});
+                                     .edits = {{.kind = nodes::edit_kind::write, .path = "x", .text = "after"}}});
                     _Exit(2);
                 }
                 int status = 0;
@@ -1028,7 +1166,7 @@ namespace {
             {
                 nodes::local_node node{tmp.dir / "a"};
                 good(node, {.action = "initialize"});
-                digest = change(node, "size-seed", {}, {.kind = std::string{"create"}, .path = "x", .text = "abc"}).source_digest;
+                digest = change(node, "size-seed", {}, {.kind = nodes::edit_kind::create, .path = "x", .text = "abc"}).source_digest;
             }
             {
                 sqlite3* raw = nullptr;
@@ -1054,7 +1192,7 @@ namespace {
             {
                 nodes::local_node node{tmp.dir / "a"};
                 good(node, {.action = "initialize"});
-                auto seeded = change(node, "integrity-seed", {}, {.kind = std::string{"create"}, .path = "x", .text = "verified"});
+                auto seeded = change(node, "integrity-seed", {}, {.kind = nodes::edit_kind::create, .path = "x", .text = "verified"});
                 digest = seeded.source_digest;
                 receipt = seeded.receipt;
             }
@@ -1083,11 +1221,11 @@ namespace {
         "incremental state retains offline CRDT anchors"_test = [] {
             peers p;
             auto seed = p.seed();
-            auto a = change(p.a, "snapshot-a", seed.frontier, {.kind = std::string{"edit"}, .path = "x", .text = "A", .offset = 1});
+            auto a = change(p.a, "snapshot-a", seed.frontier, {.kind = nodes::edit_kind::edit, .path = "x", .text = "A", .offset = 1});
             auto saved = good(p.a, {.action = "identity"});
             expect(saved.snapshot_events == 2u);
             expect(!saved.state_snapshot.empty());
-            auto tail = change(p.a, "snapshot-tail", a.frontier, {.kind = std::string{"edit"}, .path = "x", .text = "T", .offset = 4});
+            auto tail = change(p.a, "snapshot-tail", a.frontier, {.kind = nodes::edit_kind::edit, .path = "x", .text = "T", .offset = 4});
             nodes::local_node reopened{p.tmp.dir / "a"};
             auto restored = good(reopened, {.action = "identity"});
             expect(restored.snapshot_events == 3u);
@@ -1101,7 +1239,7 @@ namespace {
             expect(tree.files.size() == 1u);
             expect(tree.files.front().text.empty());
 
-            change(*p.b, "snapshot-offline", seed.frontier, {.kind = std::string{"edit"}, .path = "x", .text = "B", .offset = 2});
+            change(*p.b, "snapshot-offline", seed.frontier, {.kind = nodes::edit_kind::edit, .path = "x", .text = "B", .offset = 2});
             auto merged = inspect(reopened);
             expect(merged.conflicts.empty());
             auto reversed =
@@ -1136,7 +1274,7 @@ namespace {
             auto rejected = attempt(p.a, {.action = "apply",
                                           .operation = op("oversized-result"),
                                           .expected = seed.frontier,
-                                          .edits = {{.kind = std::string{"edit"}, .path = "x", .text = "never accepted"}},
+                                          .edits = {{.kind = nodes::edit_kind::edit, .path = "x", .text = "never accepted"}},
                                           .result = std::string(nodes::codec::record_limit, 'x')});
             expect(rejected.code == "resource_limit");
             expect(inspect(p.a).frontier == seed.frontier);
@@ -1151,8 +1289,8 @@ namespace {
                         continue;
                     peers p;
                     auto seed = p.seed();
-                    auto a = change(p.a, "a", seed.frontier, {.kind = std::string{"edit"}, .path = "x", .text = inserted, .offset = 1, .count = count});
-                    change(*p.b, "b", seed.frontier, {.kind = std::string{"edit"}, .path = "x", .text = "BB", .offset = 3});
+                    auto a = change(p.a, "a", seed.frontier, {.kind = nodes::edit_kind::edit, .path = "x", .text = inserted, .offset = 1, .count = count});
+                    change(*p.b, "b", seed.frontier, {.kind = nodes::edit_kind::edit, .path = "x", .text = "BB", .offset = 3});
                     auto merged = inspect(p.a);
                     auto expected = "a" + inserted + (count ? "cBBd" : "bcBBd");
                     expect(text(merged, "x") == expected);
@@ -1167,8 +1305,8 @@ namespace {
             {
                 peers p;
                 auto seed = p.seed("x", "a😀éb");
-                auto a = change(p.a, "a", seed.frontier, {.kind = std::string{"edit"}, .path = "x", .offset = 1, .count = 1});
-                change(*p.b, "b", seed.frontier, {.kind = std::string{"edit"}, .path = "x", .text = "Ω", .offset = 3});
+                auto a = change(p.a, "a", seed.frontier, {.kind = nodes::edit_kind::edit, .path = "x", .offset = 1, .count = 1});
+                change(*p.b, "b", seed.frontier, {.kind = nodes::edit_kind::edit, .path = "x", .text = "Ω", .offset = 3});
                 auto merged = inspect(p.a);
                 expect(text(merged, "x") == "aéΩb");
                 auto reversed = good(p.a, {.action = "reverse", .operation = op("reverse"), .expected = merged.frontier, .target = a.frontier.front()});
@@ -1179,8 +1317,8 @@ namespace {
             {
                 peers p;
                 auto seed = p.seed("x", "😀é");
-                auto a = change(p.a, "a", seed.frontier, {.kind = std::string{"write"}, .path = "x", .text = "替换"});
-                change(*p.b, "b", seed.frontier, {.kind = std::string{"mode"}, .path = "x", .executable = true});
+                auto a = change(p.a, "a", seed.frontier, {.kind = nodes::edit_kind::write, .path = "x", .text = "替换"});
+                change(*p.b, "b", seed.frontier, {.kind = nodes::edit_kind::mode, .path = "x", .executable = true});
                 auto merged = inspect(p.a);
                 expect(text(merged, "x") == "替换");
                 auto reversed = good(p.a, {.action = "reverse", .operation = op("reverse"), .expected = merged.frontier, .target = a.frontier.front()});
@@ -1202,7 +1340,7 @@ namespace {
             expect(before.source_digest == after.source_digest);
             expect(before.version != after.version);
             expect(evidence.result == "Actual observation");
-            change(*p.b, "unrelated", seed.frontier, {.kind = std::string{"edit"}, .path = "x", .text = "B", .offset = 3});
+            change(*p.b, "unrelated", seed.frontier, {.kind = nodes::edit_kind::edit, .path = "x", .text = "B", .offset = 3});
             auto fixed = good(p.a, {.action = "inspect", .source = seed.frontier});
             expect(fixed.version == before.version);
             expect(fixed.source_digest == before.source_digest);
@@ -1216,9 +1354,9 @@ namespace {
                                      .worldline = "experiment",
                                      .operation = op("promotion-edit"),
                                      .expected = fork.frontier,
-                                     .edits = {{.kind = std::string{"write"}, .path = "x", .text = "experiment"},
-                                               {.kind = std::string{"binary_create"}, .path = "asset", .text = "00ff", .executable = true}}});
-            auto independent = change(p.a, "promotion-independent", seed.frontier, {.kind = std::string{"create"}, .path = "local", .text = "retained"});
+                                     .edits = {{.kind = nodes::edit_kind::write, .path = "x", .text = "experiment"},
+                                               {.kind = nodes::edit_kind::binary_create, .path = "asset", .text = "00ff", .executable = true}}});
+            auto independent = change(p.a, "promotion-independent", seed.frontier, {.kind = nodes::edit_kind::create, .path = "local", .text = "retained"});
             auto diff = good(p.a, {.action = "diff", .worldline = "main", .expected = edited.frontier, .target = "experiment"});
             expect(diff.changes.size() == 3u);
             nodes::node_request request{.action = "promote",
@@ -1247,7 +1385,7 @@ namespace {
                                         .worldline = "experiment",
                                         .operation = op("promotion-diverge"),
                                         .expected = edited.frontier,
-                                        .edits = {{.kind = std::string{"write"}, .path = "x", .text = "different"}}});
+                                        .edits = {{.kind = nodes::edit_kind::write, .path = "x", .text = "different"}}});
             request.operation = op("promotion-conflict");
             request.expected = promoted.frontier;
             request.source = divergent.frontier;
@@ -1260,7 +1398,7 @@ namespace {
             auto changed = good(p.a, {.action = "apply",
                                       .operation = op("observed"),
                                       .expected = seed.frontier,
-                                      .edits = {{.kind = std::string{"edit"}, .path = "x", .text = "AA", .offset = 1}},
+                                      .edits = {{.kind = nodes::edit_kind::edit, .path = "x", .text = "AA", .offset = 1}},
                                       .intent = "Add the selected contribution",
                                       .result = "Retained actual result",
                                       .tool = "editor.replace/7"});
@@ -1292,10 +1430,10 @@ namespace {
             nodes::node_request request{.action = "apply",
                                         .operation = op("first"),
                                         .expected = seed.frontier,
-                                        .edits = {{.kind = std::string{"edit"}, .path = "x", .text = "A", .offset = 1}},
+                                        .edits = {{.kind = nodes::edit_kind::edit, .path = "x", .text = "A", .offset = 1}},
                                         .result = "original result"};
             auto first = good(p.a, request);
-            change(p.a, "later", first.frontier, {.kind = std::string{"edit"}, .path = "x", .text = "B", .offset = 4});
+            change(p.a, "later", first.frontier, {.kind = nodes::edit_kind::edit, .path = "x", .text = "B", .offset = 4});
             auto retry = good(p.a, request);
             expect(retry.replayed);
             expect(retry.receipt == first.receipt);
@@ -1311,7 +1449,7 @@ namespace {
             peers p;
             auto seed = p.seed();
             nodes::node_request in{
-                .action = "apply", .operation = op("invalid"), .expected = seed.frontier, .edits = {{.kind = std::string{"edit"}, .path = "x", .offset = 50}}};
+                .action = "apply", .operation = op("invalid"), .expected = seed.frontier, .edits = {{.kind = nodes::edit_kind::edit, .path = "x", .offset = 50}}};
             expect(attempt(p.a, in).code == "invalid_record");
             in.edits.front().offset = 1;
             in.edits.front().text = "changed";
@@ -1324,18 +1462,18 @@ namespace {
             nodes::node_request lost{.action = "apply",
                                      .operation = op("lost"),
                                      .expected = seed.frontier,
-                                     .edits = {{.kind = std::string{"edit"}, .path = "x", .text = "A", .offset = 1}}};
+                                     .edits = {{.kind = nodes::edit_kind::edit, .path = "x", .text = "A", .offset = 1}}};
             expect(good(p.a, {.action = "abandon", .operation = lost.operation}).receipt.empty());
             expect(attempt(p.a, lost).code == "identity_conflict");
             expect(good(p.a, {.action = "abandon", .operation = lost.operation}).receipt.empty());
             expect(attempt(p.a, {.action = "receipt", .operation = lost.operation}).code == "identity_conflict");
             expect(inspect(p.a).frontier == seed.frontier);
-            auto ran = change(p.a, "ran", seed.frontier, {.kind = std::string{"edit"}, .path = "x", .text = "B", .offset = 1});
+            auto ran = change(p.a, "ran", seed.frontier, {.kind = nodes::edit_kind::edit, .path = "x", .text = "B", .offset = 1});
             expect(good(p.a, {.action = "abandon", .operation = op("ran")}).receipt == ran.receipt);
             expect(good(p.a, {.action = "apply",
                               .operation = op("ran"),
                               .expected = seed.frontier,
-                              .edits = {{.kind = std::string{"edit"}, .path = "x", .text = "B", .offset = 1}}})
+                              .edits = {{.kind = nodes::edit_kind::edit, .path = "x", .text = "B", .offset = 1}}})
                        .replayed);
         };
         "R04-R05 file and directory moves preserve another author's text"_test = [] {
@@ -1343,11 +1481,11 @@ namespace {
                 peers p;
                 auto seed = good(p.a, {.action = "apply",
                                        .operation = op("seed"),
-                                       .edits = {{.kind = std::string{"create"}, .path = "src/a", .text = "abcd"},
-                                                 {.kind = std::string{"create"}, .path = "src/b", .text = "second"}}});
+                                       .edits = {{.kind = nodes::edit_kind::create, .path = "src/a", .text = "abcd"},
+                                                 {.kind = nodes::edit_kind::create, .path = "src/b", .text = "second"}}});
                 auto a = change(p.a, "move", seed.frontier,
-                                {.kind = directory ? "directory_move" : "move", .path = directory ? "src" : "src/a", .target = directory ? "lib" : "lib/a"});
-                change(*p.b, "edit", seed.frontier, {.kind = std::string{"edit"}, .path = "src/a", .text = "BB", .offset = 3});
+                                {.kind = directory ? nodes::edit_kind::directory_move : nodes::edit_kind::move, .path = directory ? "src" : "src/a", .target = directory ? "lib" : "lib/a"});
+                change(*p.b, "edit", seed.frontier, {.kind = nodes::edit_kind::edit, .path = "src/a", .text = "BB", .offset = 3});
                 auto merged = inspect(p.a);
                 expect(text(merged, "lib/a") == "abcBBd");
                 auto reversed = good(p.a, {.action = "reverse", .operation = op("reverse"), .expected = merged.frontier, .target = a.frontier.front()});
@@ -1364,8 +1502,8 @@ namespace {
                         continue;
                     peers p;
                     auto seed = p.seed();
-                    auto a = change(p.a, "a", seed.frontier, {.kind = std::string{"edit"}, .path = "x", .text = inserted, .offset = 1, .count = count});
-                    change(*p.b, "b", a.frontier, {.kind = std::string{"edit"}, .path = "x", .text = "BB", .offset = 3 + inserted.size() - count});
+                    auto a = change(p.a, "a", seed.frontier, {.kind = nodes::edit_kind::edit, .path = "x", .text = inserted, .offset = 1, .count = count});
+                    change(*p.b, "b", a.frontier, {.kind = nodes::edit_kind::edit, .path = "x", .text = "BB", .offset = 3 + inserted.size() - count});
                     auto merged = inspect(p.a);
                     auto before = text(merged, "x");
                     auto reversed = good(p.a, {.action = "reverse", .operation = op("reverse"), .expected = merged.frontier, .target = a.frontier.front()});
@@ -1379,8 +1517,8 @@ namespace {
             auto seed = p.seed();
             // One writer identity stands in for three callers: each reads before the other publishes, so each removal is a
             // contribution of its own over the seed. Two removals of *different* characters reverse independently.
-            auto a = change(p.a, "a", seed.frontier, {.kind = std::string{"edit"}, .path = "x", .offset = 1, .count = 1});
-            auto b = change(*p.b, "b", seed.frontier, {.kind = std::string{"edit"}, .path = "x", .offset = 2, .count = 1});
+            auto a = change(p.a, "a", seed.frontier, {.kind = nodes::edit_kind::edit, .path = "x", .offset = 1, .count = 1});
+            auto b = change(*p.b, "b", seed.frontier, {.kind = nodes::edit_kind::edit, .path = "x", .offset = 2, .count = 1});
             expect(a.receipt != b.receipt) << "each removal is its own contribution";
             auto merged = good(p.a, {.action = "inspect"});
             expect(merged.frontier.size() == 2u) << "both removals are the current frontier";
@@ -1394,8 +1532,8 @@ namespace {
         "R07b one character removed twice stays a recorded conflict"_test = [] {
             peers p;
             auto seed = p.seed();
-            change(p.a, "a", seed.frontier, {.kind = std::string{"edit"}, .path = "x", .offset = 1, .count = 1});
-            change(*p.b, "b", seed.frontier, {.kind = std::string{"edit"}, .path = "x", .offset = 1, .count = 1});
+            change(p.a, "a", seed.frontier, {.kind = nodes::edit_kind::edit, .path = "x", .offset = 1, .count = 1});
+            change(*p.b, "b", seed.frontier, {.kind = nodes::edit_kind::edit, .path = "x", .offset = 1, .count = 1});
             auto merged = inspect(p.a);
             expect(text(merged, "x") == "acd") << "both claims select the same character";
             expect(merged.frontier.size() == 2u);
@@ -1404,8 +1542,8 @@ namespace {
         "R08 hidden insertion anchors still retain another author's descendants"_test = [] {
             peers p;
             auto seed = p.seed();
-            auto a = change(p.a, "a", seed.frontier, {.kind = std::string{"edit"}, .path = "x", .text = "AA", .offset = 1});
-            change(*p.b, "b", a.frontier, {.kind = std::string{"edit"}, .path = "x", .text = "BB", .offset = 2});
+            auto a = change(p.a, "a", seed.frontier, {.kind = nodes::edit_kind::edit, .path = "x", .text = "AA", .offset = 1});
+            change(*p.b, "b", a.frontier, {.kind = nodes::edit_kind::edit, .path = "x", .text = "BB", .offset = 2});
             auto merged = inspect(p.a);
             good(p.a, {.action = "reverse", .operation = op("reverse"), .expected = merged.frontier, .target = a.frontier.front()});
             expect(text(inspect(p.a), "x") == "aBBbcd");
@@ -1413,11 +1551,11 @@ namespace {
         "R09 recorded source dependencies block an unreviewed reversal"_test = [] {
             peers p;
             auto seed = p.seed();
-            auto a = change(p.a, "a", seed.frontier, {.kind = std::string{"edit"}, .path = "x", .text = "AA", .offset = 1});
+            auto a = change(p.a, "a", seed.frontier, {.kind = nodes::edit_kind::edit, .path = "x", .text = "AA", .offset = 1});
             good(*p.b, {.action = "apply",
                         .operation = op("b"),
                         .expected = a.frontier,
-                        .edits = {{.kind = std::string{"edit"}, .path = "x", .text = "dependent", .offset = 2, .count = 1}}});
+                        .edits = {{.kind = nodes::edit_kind::edit, .path = "x", .text = "dependent", .offset = 2, .count = 1}}});
             auto merged = inspect(p.a);
             auto reversal = attempt(p.a, {.action = "reverse", .operation = op("reverse"), .expected = merged.frontier, .target = a.frontier.front()});
             expect(reversal.code == "dependency_conflict");
@@ -1434,7 +1572,7 @@ namespace {
         "R10 concurrent activation choices require an explicit fixed-frontier choice"_test = [] {
             peers p;
             auto seed = p.seed();
-            auto a = change(p.a, "a", seed.frontier, {.kind = std::string{"edit"}, .path = "x", .text = "AA", .offset = 1});
+            auto a = change(p.a, "a", seed.frontier, {.kind = nodes::edit_kind::edit, .path = "x", .text = "AA", .offset = 1});
             auto x = good(p.a, {.action = "reverse", .operation = op("x-reverse"), .expected = a.frontier, .target = a.frontier.front()});
             auto y = good(*p.b, {.action = "reverse", .operation = op("y-reverse"), .expected = a.frontier, .target = a.frontier.front()});
             // The second caller redoes from the state it published, before it saw the other caller's reversal.
@@ -1455,9 +1593,9 @@ namespace {
                 peers p;
                 auto seed = p.seed();
                 bool insertion = std::string_view{scenario} == "same_gap";
-                change(p.a, "a", seed.frontier, {.kind = std::string{"edit"}, .path = "x", .text = "A", .offset = 1, .count = insertion ? 0u : 1u});
+                change(p.a, "a", seed.frontier, {.kind = nodes::edit_kind::edit, .path = "x", .text = "A", .offset = 1, .count = insertion ? 0u : 1u});
                 change(*p.b, "b", seed.frontier,
-                       {.kind = std::string{"edit"},
+                       {.kind = nodes::edit_kind::edit,
                         .path = "x",
                         .text = std::string_view{scenario} == "replace_delete" ? "" : "B",
                         .offset = 1,
@@ -1469,13 +1607,13 @@ namespace {
             }
         };
         "file modes and removal reverse while retaining another author's text"_test = [] {
-            for (auto kind : {"mode", "remove"}) {
+            for (auto kind : {nodes::edit_kind::mode, nodes::edit_kind::remove}) {
                 peers p;
                 auto seed = p.seed();
                 auto a = change(p.a, "a", seed.frontier, {.kind = kind, .path = "x", .executable = true});
-                change(*p.b, "b", seed.frontier, {.kind = std::string{"edit"}, .path = "x", .text = "BB", .offset = 3});
+                change(*p.b, "b", seed.frontier, {.kind = nodes::edit_kind::edit, .path = "x", .text = "BB", .offset = 3});
                 auto merged = inspect(p.a);
-                if (std::string_view{kind} == "mode")
+                if (kind == nodes::edit_kind::mode)
                     expect(merged.files.front().executable);
                 else
                     expect(!merged.conflicts.empty());
@@ -1484,7 +1622,7 @@ namespace {
                 expect(text(inspect(p.a), "x") == "abcBBd");
                 expect(!inspect(p.a).files.front().executable);
                 auto redone = good(p.a, {.action = "redo", .operation = op("redo"), .expected = reversed.frontier, .target = a.frontier.front()});
-                if (std::string_view{kind} == "mode") {
+                if (kind == nodes::edit_kind::mode) {
                     expect(inspect(p.a).files.front().executable);
                     expect(text(inspect(p.a), "x") == "abcBBd");
                 } else {
@@ -1500,24 +1638,24 @@ namespace {
                 nodes::node_reply seed;
                 if (std::string_view{scenario} == "binary")
                     seed =
-                        good(p.a, {.action = "apply", .operation = op("seed"), .edits = {{.kind = std::string{"binary_create"}, .path = "x", .text = "0102"}}});
+                        good(p.a, {.action = "apply", .operation = op("seed"), .edits = {{.kind = nodes::edit_kind::binary_create, .path = "x", .text = "0102"}}});
                 else
                     seed = p.seed();
                 auto second = [&](nodes::edit edit) {
                     return attempt(*p.b, {.action = "apply", .operation = op("b"), .expected = seed.frontier, .edits = {edit}});
                 };
                 if (std::string_view{scenario} == "rename_delete") {
-                    change(p.a, "a", seed.frontier, {.kind = std::string{"move"}, .path = "x", .target = "moved"});
-                    expect(second({.kind = std::string{"remove"}, .path = "x"}).code == "ok");
+                    change(p.a, "a", seed.frontier, {.kind = nodes::edit_kind::move, .path = "x", .target = "moved"});
+                    expect(second({.kind = nodes::edit_kind::remove, .path = "x"}).code == "ok");
                     expect(!inspect(p.a).conflicts.empty()) << "a move and a removal of one file stay a recorded conflict";
                 } else if (std::string_view{scenario} == "binary") {
-                    change(p.a, "a", seed.frontier, {.kind = std::string{"binary"}, .path = "x", .text = "0001"});
-                    expect(second({.kind = std::string{"binary"}, .path = "x", .text = "ff00"}).code == "ok");
+                    change(p.a, "a", seed.frontier, {.kind = nodes::edit_kind::binary, .path = "x", .text = "0001"});
+                    expect(second({.kind = nodes::edit_kind::binary, .path = "x", .text = "ff00"}).code == "ok");
                     expect(!inspect(p.a).conflicts.empty()) << "two binary alternatives stay a recorded conflict";
                 } else {
-                    change(p.a, "a", seed.frontier, {.kind = std::string{"create"}, .path = "new", .text = "A"});
+                    change(p.a, "a", seed.frontier, {.kind = nodes::edit_kind::create, .path = "new", .text = "A"});
                     auto path = std::string_view{scenario} == "duplicate" ? "new" : "new/child";
-                    auto refused = second({.kind = std::string{"create"}, .path = std::string{path}, .text = "B"});
+                    auto refused = second({.kind = nodes::edit_kind::create, .path = std::string{path}, .text = "B"});
                     expect(refused.code == nodes::code::source_conflict) << scenario << ": " << refused.code;
                 }
             }
@@ -1525,12 +1663,12 @@ namespace {
         "K10 a new overlapping candidate is outside a prior conflict decision"_test = [] {
             peers p;
             auto seed = p.seed();
-            change(p.a, "a", seed.frontier, {.kind = std::string{"edit"}, .path = "x", .text = "A", .offset = 1});
-            change(*p.b, "b", seed.frontier, {.kind = std::string{"edit"}, .path = "x", .text = "B", .offset = 1});
+            change(p.a, "a", seed.frontier, {.kind = nodes::edit_kind::edit, .path = "x", .text = "A", .offset = 1});
+            change(*p.b, "b", seed.frontier, {.kind = nodes::edit_kind::edit, .path = "x", .text = "B", .offset = 1});
             auto merged = inspect(p.a);
             auto resolved = good(p.a, {.action = "resolve", .operation = op("resolve"), .expected = merged.frontier, .decisions = merged.conflicts});
             expect(resolved.conflicts.empty());
-            change(*p.c, "c", seed.frontier, {.kind = std::string{"edit"}, .path = "x", .text = "C", .offset = 1});
+            change(*p.c, "c", seed.frontier, {.kind = nodes::edit_kind::edit, .path = "x", .text = "C", .offset = 1});
             expect(!inspect(p.a).conflicts.empty()) << "a later overlapping contribution is outside the prior decision";
         };
         "native source reads remain available while the writer entry is occupied"_test = [] {
@@ -1541,8 +1679,8 @@ namespace {
                 return node.call({.action = "apply",
                                   .operation = content::hash_of("reader-seed").str(),
                                   .owner = node.node_id(),
-                                  .edits = {{.kind = std::string{"create"}, .path = "x", .text = "retained"},
-                                            {.kind = std::string{"create"}, .path = "y", .text = "retained"}}});
+                                  .edits = {{.kind = nodes::edit_kind::create, .path = "x", .text = "retained"},
+                                            {.kind = nodes::edit_kind::create, .path = "y", .text = "retained"}}});
             });
             expect((seed.code == "ok") >> fatal);
             std::promise<void> entered, finish;
@@ -1578,8 +1716,8 @@ namespace {
                                               .operation = content::hash_of("reader-publication-" + std::to_string(i)).str(),
                                               .owner = node.node_id(),
                                               .expected = frontier,
-                                              .edits = {{.kind = std::string{"edit"}, .path = "x", .text = std::to_string(i) + ":"},
-                                                        {.kind = std::string{"edit"}, .path = "y", .text = std::to_string(i) + ":"}}});
+                                              .edits = {{.kind = nodes::edit_kind::edit, .path = "x", .text = std::to_string(i) + ":"},
+                                                        {.kind = nodes::edit_kind::edit, .path = "y", .text = std::to_string(i) + ":"}}});
                         });
                         if (accepted.code != "ok")
                             consistent = false;

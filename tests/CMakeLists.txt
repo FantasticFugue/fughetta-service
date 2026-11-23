@@ -8,6 +8,10 @@
 # every layer up to gateway. SERVICE suites start the built fughetta-service.
 # Sources that need a script driver are registered directly with add_test.
 #
+# Test names are dotted: <layer>.<suite>, where <layer> is the directory under
+# tests/ and matches the layer the suite exercises, so `ctest -R '^model\.'`
+# selects a layer. Scripted registrations follow the same scheme.
+#
 # tests/platform/<system>.cmake adds the platform's own tests. TEST_ENVIRONMENT
 # collects what every test sees.
 
@@ -49,60 +53,64 @@ endfunction()
 
 ## Suites
 
-add_suite(allocation model/allocation.cpp)
-add_suite(control model/control.cpp)
-add_suite(async core/async.cpp)
-add_suite(boundary io/boundary.cpp)
-add_suite(cancel gateway/cancel.cpp)
-add_suite(build model/build.cpp)
-add_suite(python model/python.cpp)
-add_suite(typescript model/typescript.cpp)
-add_suite(managed model/managed.cpp)
-add_suite(toolchain model/toolchain.cpp)
-add_suite(tooling model/tooling.cpp)
-add_suite(bindings model/bindings.cpp)
-add_suite(config gateway/config.cpp)
-add_suite(identity gateway/identity.cpp)
-add_suite(enrollment gateway/enrollment.cpp)
-add_suite(content model/content.cpp)
-add_suite(delivery model/delivery.cpp)
-add_suite(durability source/durability.cpp source)
-add_suite(edge io/edge.cpp)
-add_suite(websocket io/websocket.cpp)
-add_suite(resolver io/resolver.cpp)
-add_suite(environment platform/environment.cpp)
-add_suite(foundation core/foundation.cpp)
-add_suite(mpmc core/mpmc.cpp)
-add_suite(fleet gateway/fleet.cpp)
-add_suite(tools gateway/tools.cpp source worker)
-add_suite(backlog gateway/backlog.cpp)
-add_suite(dispatch gateway/dispatch.cpp worker)
-add_suite(front gateway/front.cpp)
-add_suite(generation gateway/generation.cpp)
-add_suite(host platform/host.cpp ENVIRONMENT "HOST_TEST_VALUE=left=right")
-add_suite(settings gateway/settings.cpp)
-add_suite(meta gateway/meta.cpp)
-add_suite(node source/node.cpp source unofficial::sqlite3::sqlite3)
-add_suite(mail source/mail.cpp source unofficial::sqlite3::sqlite3)
-add_suite(optimistic source/optimistic.cpp source unofficial::sqlite3::sqlite3)
-add_suite(storage source/storage.cpp source)
-add_suite(executor worker/executor.cpp worker)
-add_suite(backend worker/backend.cpp worker)
+add_suite(model.allocation model/allocation.cpp)
+add_suite(model.control model/control.cpp)
+add_suite(core.async core/async.cpp)
+add_suite(io.boundary io/boundary.cpp)
+add_suite(gateway.cancel gateway/cancel.cpp)
+add_suite(session.build session/build.cpp)
+add_suite(languages.python languages/python.cpp)
+add_suite(languages.typescript languages/typescript.cpp)
+add_suite(languages.managed languages/managed.cpp)
+add_suite(model.toolchain model/toolchain.cpp)
+add_suite(session.tooling session/tooling.cpp)
+add_suite(languages.bindings languages/bindings.cpp)
+add_suite(gateway.config gateway/config.cpp)
+add_suite(gateway.identity gateway/identity.cpp)
+add_suite(gateway.enrollment gateway/enrollment.cpp)
+add_suite(gateway.publicshards gateway/publicshards.cpp SERVICE)
+add_test(NAME gateway.publicshards.r2 COMMAND gateway.publicshards-test r2)
+set_tests_properties(gateway.publicshards.r2 PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 30)
+add_suite(model.content model/content.cpp)
+add_suite(session.delivery session/delivery.cpp)
+add_suite(source.durability source/durability.cpp source)
+add_suite(io.edge io/edge.cpp)
+add_suite(io.websocket io/websocket.cpp)
+add_suite(io.resolver io/resolver.cpp)
+add_suite(platform.environment platform/environment.cpp)
+add_suite(core.foundation core/foundation.cpp)
+add_suite(core.mpmc core/mpmc.cpp)
+add_suite(gateway.fleet gateway/fleet.cpp)
+add_suite(gateway.tools gateway/tools.cpp source worker)
+add_suite(gateway.tools-units gateway/tools_units.cpp)
+add_suite(gateway.backlog gateway/backlog.cpp)
+add_suite(gateway.dispatch gateway/dispatch.cpp worker)
+add_suite(gateway.front gateway/front.cpp)
+add_suite(gateway.generation gateway/generation.cpp)
+add_suite(platform.host platform/host.cpp ENVIRONMENT "HOST_TEST_VALUE=left=right")
+add_suite(gateway.settings gateway/settings.cpp)
+add_suite(gateway.meta gateway/meta.cpp)
+add_suite(source.node source/node.cpp source unofficial::sqlite3::sqlite3)
+add_suite(source.mail source/mail.cpp source unofficial::sqlite3::sqlite3)
+add_suite(source.optimistic source/optimistic.cpp source unofficial::sqlite3::sqlite3)
+add_suite(source.storage source/storage.cpp source)
+add_suite(worker.executor worker/executor.cpp worker)
+add_suite(worker.backend worker/backend.cpp worker)
 # The language-server suites drive clice when it is found.
 find_program(CLICE_TOOL clice)
 if(CLICE_TOOL)
   set(CLICE_ENVIRONMENT "TEST_CLICE=${CLICE_TOOL}")
 endif()
-add_suite(lsp source/lsp.cpp ENVIRONMENT ${CLICE_ENVIRONMENT})
-add_suite(server source/server.cpp source)
+add_suite(languages.lsp languages/lsp.cpp ENVIRONMENT ${CLICE_ENVIRONMENT})
+add_suite(source.server source/server.cpp source)
 
-add_suite(analysis system/analysis.cpp SERVICE TIMEOUT 360 ENVIRONMENT ${CLICE_ENVIRONMENT})
+add_suite(system.analysis system/analysis.cpp SERVICE TIMEOUT 360 ENVIRONMENT ${CLICE_ENVIRONMENT})
 
-add_suite(workflow system/workflow.cpp SERVICE)
-add_suite(lifecycle system/lifecycle.cpp SERVICE)
-add_suite(startup system/startup.cpp SERVICE)
-add_suite(recovery system/recovery.cpp SERVICE)
-add_suite(projects system/projects.cpp SERVICE unofficial::sqlite3::sqlite3)
+add_suite(system.workflow system/workflow.cpp SERVICE)
+add_suite(system.lifecycle system/lifecycle.cpp SERVICE)
+add_suite(system.startup system/startup.cpp SERVICE)
+add_suite(system.recovery system/recovery.cpp SERVICE)
+add_suite(system.projects system/projects.cpp SERVICE unofficial::sqlite3::sqlite3)
 
 include("${CMAKE_CURRENT_SOURCE_DIR}/platform/${CMAKE_SYSTEM_NAME}.cmake")
 
@@ -113,8 +121,8 @@ include("${CMAKE_CURRENT_SOURCE_DIR}/platform/${CMAKE_SYSTEM_NAME}.cmake")
 function(add_compile_failure NAME DIAGNOSTIC)
   add_library(fail_${NAME} OBJECT EXCLUDE_FROM_ALL invalid/${NAME}.cpp)
   target_link_libraries(fail_${NAME} PRIVATE gateway)
-  add_test(NAME ${NAME} COMMAND ${CMAKE_COMMAND} --build ${CMAKE_BINARY_DIR} --target fail_${NAME})
-  set_tests_properties(${NAME} PROPERTIES PASS_REGULAR_EXPRESSION "${DIAGNOSTIC}" RUN_SERIAL TRUE)
+  add_test(NAME invalid.${NAME} COMMAND ${CMAKE_COMMAND} --build ${CMAKE_BINARY_DIR} --target fail_${NAME})
+  set_tests_properties(invalid.${NAME} PROPERTIES PASS_REGULAR_EXPRESSION "${DIAGNOSTIC}" RUN_SERIAL TRUE)
 endfunction()
 
 add_compile_failure(duplicate "two tools share a name")
@@ -122,76 +130,106 @@ add_compile_failure(naming "an MCP tool name is")
 
 ## Scripted scenarios
 #
-# Python drivers that exercise the real binaries through the services. The
-# managed providers' scenarios run when cmake/providers.cmake built them.
+# Managed provider scenarios run against the installed toolchains and helpers.
 
 # Each provider's model exporter runs against the sample projects.
-function(add_model_test PROVIDER TOOL EXPORTER)
-  add_test(NAME model.${PROVIDER} COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/model/managed.py"
-    "${PROVIDER}" "${TOOL}" "${EXPORTER}" --work "${CMAKE_BINARY_DIR}/providers/tests" --validator "$<TARGET_FILE:managed-test>")
-  set_tests_properties(model.${PROVIDER} PROPERTIES TIMEOUT 300)
-endfunction()
 
-find_program(FUGHETTA_JAVAC javac)
+find_package(Java COMPONENTS Development QUIET)
+set(FUGHETTA_JAVAC "${Java_JAVAC_EXECUTABLE}")
+if(GRADLE_TOOL OR DOTNET_TOOL)
+  add_executable(managed-driver languages/managed_driver.cpp)
+  target_link_libraries(managed-driver PRIVATE testing)
+  add_dependencies(managed-driver languages.managed-test)
+endif()
 if(FUGHETTA_JAVAC)
-  add_executable(jvm-test model/jvm.cpp)
+  add_executable(jvm-test languages/jvm.cpp)
   target_link_libraries(jvm-test PRIVATE testing)
-  add_test(NAME model.jvm COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/model/jvm.py"
-    "$<TARGET_FILE:jvm-test>" "${FUGHETTA_JAVAC}" "${CMAKE_BINARY_DIR}/jvm-tests")
-  set_tests_properties(model.jvm PROPERTIES TIMEOUT 120)
+  add_executable(jvm-driver languages/jvm_driver.cpp)
+  target_link_libraries(jvm-driver PRIVATE testing)
+  add_dependencies(jvm-driver jvm-test)
+  add_test(NAME languages.jvm COMMAND jvm-driver "$<TARGET_FILE:jvm-test>" "${FUGHETTA_JAVAC}" "${CMAKE_BINARY_DIR}/jvm-tests")
+  set_tests_properties(languages.jvm PROPERTIES TIMEOUT 120)
 endif()
 
 if(GRADLE_TOOL)
-  add_test(NAME helper.kotlin COMMAND ${FUGHETTA_GRADLE} test)
-  set_tests_properties(helper.kotlin PROPERTIES TIMEOUT 300 ENVIRONMENT
-    "FUGHETTA_RECORD_VALIDATOR=$<TARGET_FILE:managed-test>;FUGHETTA_WORKER_TEST=$<TARGET_FILE:executor-test>")
-  add_model_test(kotlin "${GRADLE_TOOL}" "${FUGHETTA_JVM_EXPORTER}")
+  add_test(NAME languages.kotlin-helper COMMAND ${FUGHETTA_GRADLE} :fughetta-kotlin:test)
+  add_test(NAME languages.scala-helper COMMAND ${FUGHETTA_GRADLE} :fughetta-scala:test)
+  set_tests_properties(languages.kotlin-helper languages.scala-helper PROPERTIES TIMEOUT 300 RESOURCE_LOCK jvm-providers ENVIRONMENT
+    "FUGHETTA_RECORD_VALIDATOR=$<TARGET_FILE:languages.managed-test>;FUGHETTA_WORKER_TEST=$<TARGET_FILE:worker.executor-test>")
+  if(TARGET jvm-test)
+    set_property(TEST languages.kotlin-helper APPEND PROPERTY ENVIRONMENT "FUGHETTA_JVM_TEST=$<TARGET_FILE:jvm-test>")
+  endif()
+  add_test(NAME languages.kotlin COMMAND managed-driver kotlin "${GRADLE_TOOL}" "${FUGHETTA_JVM_EXPORTER}"
+    --work "${CMAKE_BINARY_DIR}/providers/tests" --validator "$<TARGET_FILE:languages.managed-test>" --java "${Java_JAVA_EXECUTABLE}")
+  add_test(NAME languages.scala COMMAND managed-driver scala "${GRADLE_TOOL}" "${FUGHETTA_JVM_EXPORTER}"
+    --work "${CMAKE_BINARY_DIR}/providers/tests" --validator "$<TARGET_FILE:languages.managed-test>" --java "${Java_JAVA_EXECUTABLE}")
+  set_tests_properties(languages.kotlin languages.scala PROPERTIES TIMEOUT 300)
   if(FUGHETTA_JAVAC AND TEST_MANAGED_HOSTS AND FUGHETTA_PROVIDER_llvm)
-    cmake_path(GET FUGHETTA_JAVAC PARENT_PATH FUGHETTA_JAVA_BIN)
-    add_test(NAME model.kotlin-jni COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/model/jvm.py" --kotlin
-      "$<TARGET_FILE:jvm-test>" "${GRADLE_TOOL}" "${FUGHETTA_JVM_EXPORTER}" "${FUGHETTA_JAVA_BIN}/java"
+    add_executable(kotlin-jni-driver languages/kotlin_jni_driver.cpp)
+    target_link_libraries(kotlin-jni-driver PRIVATE testing)
+    add_dependencies(kotlin-jni-driver jvm-test languages.managed-test)
+    add_test(NAME languages.kotlin-jni COMMAND kotlin-jni-driver
+      "$<TARGET_FILE:jvm-test>" "${GRADLE_TOOL}" "${FUGHETTA_JVM_EXPORTER}" "${Java_JAVA_EXECUTABLE}"
       "${FUGHETTA_PROVIDER_jvm}" "${FUGHETTA_PROVIDER_kotlin}"
-      "$<TARGET_FILE:managed-test>" "${CMAKE_CXX_COMPILER}" "${CMAKE_BINARY_DIR}/jvm-tests")
-    set_tests_properties(model.kotlin-jni PROPERTIES TIMEOUT 600)
+      "$<TARGET_FILE:languages.managed-test>" "${CMAKE_CXX_COMPILER}" "${CMAKE_BINARY_DIR}/jvm-tests" "${FUGHETTA_PROVIDER_llvm}")
+    set_tests_properties(languages.kotlin-jni PROPERTIES TIMEOUT 600)
   endif()
 endif()
 
 if(DOTNET_TOOL)
-  add_executable(clr-test model/clr.cpp)
+  add_dependencies(managed-driver clr-providers)
+  add_executable(clr-test languages/clr.cpp)
   target_link_libraries(clr-test PRIVATE testing)
   if(TEST_MANAGED_HOSTS AND FUGHETTA_PROVIDER_llvm)
-    add_test(NAME model.clr COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/model/clr.py"
-      "${DOTNET_TOOL}" "${FUGHETTA_PROVIDER_clr}" "${FUGHETTA_PROVIDER_fsharp}" "$<TARGET_FILE:managed-test>"
+    add_executable(clr-driver languages/clr_driver.cpp)
+    target_link_libraries(clr-driver PRIVATE testing)
+    add_dependencies(clr-driver clr-test languages.managed-test)
+    add_test(NAME languages.clr COMMAND clr-driver
+      "${DOTNET_TOOL}" "${FUGHETTA_PROVIDER_clr}" "${FUGHETTA_PROVIDER_fsharp}" "$<TARGET_FILE:languages.managed-test>"
       "$<TARGET_FILE:clr-test>" "${CMAKE_BINARY_DIR}/clr-tests"
-      --exporter "${FUGHETTA_CLR_EXPORTER}" --compiler "${CMAKE_CXX_COMPILER}")
-    set_tests_properties(model.clr PROPERTIES TIMEOUT 300)
+      "${FUGHETTA_CLR_EXPORTER}" "${CMAKE_CXX_COMPILER}" "${FUGHETTA_PROVIDER_llvm}")
+    set_tests_properties(languages.clr PROPERTIES TIMEOUT 300)
   endif()
-  add_test(NAME helper.fsharp COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/model/fsharp.py"
-    "${DOTNET_TOOL}" "${FUGHETTA_PROVIDER_clr}" "${FUGHETTA_PROVIDER_fsharp}" "$<TARGET_FILE:managed-test>"
-    --worker "$<TARGET_FILE:executor-test>" --work "${CMAKE_BINARY_DIR}/fsharp-tests" --exporter "${FUGHETTA_CLR_EXPORTER}")
-  set_tests_properties(helper.fsharp PROPERTIES TIMEOUT 300)
-  add_model_test(fsharp "${DOTNET_TOOL}" "${FUGHETTA_CLR_EXPORTER}")
+  add_executable(fsharp-driver languages/fsharp_driver.cpp)
+  target_link_libraries(fsharp-driver PRIVATE testing)
+  add_dependencies(fsharp-driver languages.managed-test worker.executor-test)
+  add_test(NAME languages.fsharp-helper COMMAND fsharp-driver
+    "${DOTNET_TOOL}" "${FUGHETTA_PROVIDER_clr}" "${FUGHETTA_PROVIDER_fsharp}" "$<TARGET_FILE:languages.managed-test>"
+    "$<TARGET_FILE:worker.executor-test>" "${CMAKE_BINARY_DIR}/fsharp-tests" "${FUGHETTA_CLR_EXPORTER}")
+  set_tests_properties(languages.fsharp-helper PROPERTIES TIMEOUT 300)
+  add_test(NAME languages.fsharp COMMAND managed-driver fsharp "${DOTNET_TOOL}" "${FUGHETTA_CLR_EXPORTER}"
+    --work "${CMAKE_BINARY_DIR}/providers/tests" --validator "$<TARGET_FILE:languages.managed-test>")
+  add_test(NAME languages.csharp COMMAND managed-driver csharp "${DOTNET_TOOL}" "${FUGHETTA_CLR_EXPORTER}"
+    --work "${CMAKE_BINARY_DIR}/providers/tests" --validator "$<TARGET_FILE:languages.managed-test>"
+    --host "${FUGHETTA_PROVIDER_clr}" --adapter "${FUGHETTA_PROVIDER_csharp}")
+  set_tests_properties(languages.fsharp languages.csharp PROPERTIES TIMEOUT 300)
 endif()
 
-# The analysis suite runs the whole managed flow when both providers and a JDK
-# are present.
-if(TEST_MANAGED_HOSTS AND GRADLE_TOOL AND DOTNET_TOOL AND FUGHETTA_JAVAC)
-  file(REAL_PATH "${FUGHETTA_JAVAC}" FUGHETTA_JDK_BIN)
+# Each managed analysis scenario uses its own toolchain and the native reader.
+if(TEST_MANAGED_HOSTS AND FUGHETTA_PROVIDER_llvm AND GRADLE_TOOL AND FUGHETTA_JAVAC)
+  file(REAL_PATH "${Java_JAVA_EXECUTABLE}" FUGHETTA_JDK_BIN)
   cmake_path(GET FUGHETTA_JDK_BIN PARENT_PATH FUGHETTA_JDK_BIN)
   cmake_path(GET FUGHETTA_JDK_BIN PARENT_PATH FUGHETTA_JDK)
-  set_property(TEST analysis APPEND PROPERTY ENVIRONMENT
+  set_property(TEST system.analysis APPEND PROPERTY ENVIRONMENT
     "TEST_GRADLE=${GRADLE_TOOL}"
-    "TEST_GRADLE_MODULES=${JVM_OUTPUT}/home/caches/modules-2"
-    "TEST_DOTNET=${DOTNET_TOOL}"
-    "TEST_JAVA=${FUGHETTA_JDK_BIN}/java"
+    "TEST_GRADLE_MODULES=${FUGHETTA_GRADLE_USER_HOME}/caches/modules-2"
+    "TEST_JAVA=${Java_JAVA_EXECUTABLE}"
     "TEST_JDK=${FUGHETTA_JDK}"
-    "TEST_CXX=${CMAKE_CXX_COMPILER}"
     "TEST_JVM_HOST=${FUGHETTA_PROVIDER_jvm}"
     "TEST_KOTLIN_ADAPTER=${FUGHETTA_PROVIDER_kotlin}"
+    "TEST_SCALA_ADAPTER=${FUGHETTA_PROVIDER_scala}"
+    "TEST_GRADLE_MODEL=${FUGHETTA_JVM_EXPORTER}")
+endif()
+if(TEST_MANAGED_HOSTS AND FUGHETTA_PROVIDER_llvm AND DOTNET_TOOL)
+  set_property(TEST system.analysis APPEND PROPERTY ENVIRONMENT
+    "TEST_DOTNET=${DOTNET_TOOL}"
     "TEST_CLR_HOST=${FUGHETTA_PROVIDER_clr}"
     "TEST_FSHARP_ADAPTER=${FUGHETTA_PROVIDER_fsharp}"
-    "TEST_GRADLE_MODEL=${FUGHETTA_JVM_EXPORTER}"
+    "TEST_CSHARP_ADAPTER=${FUGHETTA_PROVIDER_csharp}"
     "TEST_MSBUILD_MODEL=${FUGHETTA_CLR_EXPORTER}")
+endif()
+if(TEST_MANAGED_HOSTS AND FUGHETTA_PROVIDER_llvm)
+  set_property(TEST system.analysis APPEND PROPERTY ENVIRONMENT "TEST_CXX=${CMAKE_CXX_COMPILER}")
 endif()
 
 
@@ -214,7 +252,9 @@ if(FUGHETTA_PROVIDER_llvm)
   if(NATIVE_RUSTC)
     list(APPEND NATIVE_TEST_OPTIONS --rustc "${NATIVE_RUSTC}")
   endif()
-  add_test(NAME model.llvm COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/model/llvm.py"
+  add_executable(llvm-test languages/llvm.cpp)
+  target_link_libraries(llvm-test PRIVATE testing)
+  add_test(NAME languages.llvm COMMAND llvm-test
     "${FUGHETTA_PROVIDER_llvm}" "${NATIVE_CLANG}" "${CMAKE_BINARY_DIR}/llvm-tests" ${NATIVE_TEST_OPTIONS})
 endif()
 
@@ -224,5 +264,5 @@ set_property(TEST ${PROJECT_TESTS} APPEND PROPERTY ENVIRONMENT ${TEST_ENVIRONMEN
 # Beside the compiler first, since Windows does not put the clang tree on PATH.
 cmake_path(GET CMAKE_CXX_COMPILER PARENT_PATH DISPATCH_CC_BIN)
 find_program(DISPATCH_CC NAMES cc clang gcc HINTS "${DISPATCH_CC_BIN}" REQUIRED)
-set_property(TEST dispatch tools APPEND PROPERTY ENVIRONMENT "TEST_CC=${DISPATCH_CC}")
-target_compile_definitions(dispatch-test PRIVATE TEST_EXECUTABLE_SUFFIX="${CMAKE_EXECUTABLE_SUFFIX}")
+set_property(TEST gateway.dispatch gateway.tools APPEND PROPERTY ENVIRONMENT "TEST_CC=${DISPATCH_CC}")
+target_compile_definitions(gateway.dispatch-test PRIVATE TEST_EXECUTABLE_SUFFIX="${CMAKE_EXECUTABLE_SUFFIX}")

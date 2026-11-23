@@ -184,7 +184,7 @@ module Records =
             let kind, valueType =
                 match symbol with
                 | :? FSharpEntity as value ->
-                    (if value.IsFSharpModule then "module" elif value.IsNamespace then "namespace" else "type"),
+                    (if value.IsFSharpModule then "module" elif value.IsNamespace then "namespace" elif value.IsFSharpRecord then "fsharp:record" else "type"),
                     (if value.IsFSharpModule || value.IsNamespace then None else Some(typeRecords.Classifier(id, value)))
                 | :? FSharpMemberOrFunctionOrValue as value ->
                     (if parameters.Contains id then "parameter" elif value.IsConstructor then "constructor" elif value.IsProperty then "property" elif value.IsMember then "method" elif value.IsFunction then "function" else "variable"),

@@ -57,6 +57,15 @@ export namespace tools {
         return name;
     }
 
+    struct tool_refusal {
+        std::string_view code;
+        std::string message;
+    };
+
+    inline auto refuse_tool(tool_refusal r) -> mcp::tool_outcome {
+        return {.text = json::write(r), .structured = json::to_value(r), .error = true};
+    }
+
     template <class... Tools> struct toolbox {
         static_assert(meta::distinct(std::array<std::string_view, sizeof...(Tools)>{Tools::name...}), "two tools share a name");
         static_assert((tool_for<Tools> && ...), "every tool runs on the gateway's services");
@@ -85,33 +94,27 @@ export namespace tools {
                         json::schema<typename T::output>()};
             }
 
-            struct refusal {
-                std::string_view code;
-                std::string message;
-            };
-            static auto refused(refusal r) -> mcp::tool_outcome { return {.text = json::write(r), .structured = json::to_value(r), .error = true}; }
-
             template <class T>
             auto invoke(services& s, mcp::call_context context, json::value args, mcp::notifier& note, const worlds::actor& who)
                 -> coroutine::task<mcp::tool_outcome> {
                 auto started = std::chrono::steady_clock::now();
                 if (!who.run.empty()) {
                     if constexpr (T::name == "task")
-                        co_return refused({nodes::code::permission_denied, "execution cannot administer tasks"});
+                        co_return refuse_tool({nodes::code::permission_denied, "execution cannot administer tasks"});
                     auto object = args.to_object();
                     if (!object)
-                        co_return refused({nodes::code::invalid_record, "arguments must be an object"});
+                        co_return refuse_tool({nodes::code::invalid_record, "arguments must be an object"});
                     if (auto project = object->get("project")) {
                         auto value = project->to_string();
                         if (!value || *value != who.project)
-                            co_return refused({nodes::code::permission_denied, "project differs from task binding"});
+                            co_return refuse_tool({nodes::code::permission_denied, "project differs from task binding"});
                     } else
                         (*object)["project"] = who.project;
                     if constexpr (requires(typename T::input input) { input.worldline; }) {
                         if (auto line = object->get("worldline")) {
                             auto value = line->to_string();
                             if (!value || *value != who.worldline)
-                                co_return refused({nodes::code::permission_denied, "worldline differs from task binding"});
+                                co_return refuse_tool({nodes::code::permission_denied, "worldline differs from task binding"});
                         } else
                             (*object)["worldline"] = who.worldline;
                     }
@@ -119,7 +122,7 @@ export namespace tools {
                 }
                 auto in = json::from_value<typename T::input>(args);
                 if (!in)
-                    co_return refused({nodes::code::invalid_record, std::format("{}: bad arguments: {}", T::name, in.error().what())});
+                    co_return refuse_tool({nodes::code::invalid_record, std::format("{}: bad arguments: {}", T::name, in.error().what())});
                 std::optional<std::string> where;
                 if constexpr (on_project<typename T::input>)
                     if (config::valid_name(project_name(*in)))
@@ -155,7 +158,7 @@ export namespace tools {
                     if constexpr (requires { value->failed(); })
                         outcome.error = value->failed();
                 } else
-                    outcome = refused({code.empty() ? "failed" : code, std::move(error)});
+                    outcome = refuse_tool({code.empty() ? "failed" : code, std::move(error)});
                 if (where) {
                     usage::tool_event e{.project = *where,
                                         .tool = std::string{T::name},

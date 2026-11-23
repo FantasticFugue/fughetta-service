@@ -16,6 +16,7 @@ import archive;
 import registry;
 import fleet;
 import commands;
+import channels;
 export import templates;
 export import publication;
 import native;
@@ -25,8 +26,9 @@ export import :execution;
 export namespace tools {
     struct language_query
         : tool<"language", "Query scopes, symbols, definitions, references or diagnostics for a worldline version; schema reads semantic contracts. "
-                           "Analysis is prepared automatically within the call when missing or stale. inspect returns body text and registers "
-                           "bodies, so a later worldline apply locks the enclosing function and reports its reach."> {
+                           "Analysis is prepared automatically within the call when missing or stale. Inspecting a callable returns its signature, "
+                           "one-hop type surface, input producers and result consumers. inspect returns and registers body text so a later worldline "
+                           "apply locks the enclosing function and reports its reach."> {
         struct scope_filter {
             std::optional<std::vector<std::string>> modules, files, contexts, projects;
             auto extent() const -> semantic::extent {
@@ -57,7 +59,7 @@ export namespace tools {
             std::optional<std::uint64_t> limit;
             std::optional<std::string> cursor;
             json::described<"Resume the query retained by a partial result; budget may be overridden", std::optional<std::string>> continuation;
-            std::optional<std::vector<std::string>> relations;
+            std::optional<std::vector<semantic::relation_kind>> relations;
             json::described<"Impact change kinds: declaration and/or body; both when omitted", std::optional<std::vector<std::string>>> changes;
             std::optional<json::literal<"outgoing", "incoming", "both">> direction;
             std::optional<std::uint64_t> depth;
@@ -171,8 +173,8 @@ export namespace tools {
                 entry.units.erase(std::ranges::unique(entry.units).begin(), entry.units.end());
             }
         }
-        static auto read_view(services& s, const std::string& project, const std::string& id, const input& in, const worlds::actor& actor)
-            -> coroutine::task<output> {
+        static auto read_view(services& s, const std::string& project, const std::string& id, const input& in, const worlds::actor& actor,
+                              std::optional<std::string> reproject_version = std::nullopt) -> coroutine::task<output> {
             semantic::view description;
             std::optional<semantic::view> earlier;
             semantic::retention_roots reading;
@@ -190,6 +192,17 @@ export namespace tools {
                 co_return output{.view = id, .status = "expired", .code = "view_expired", .message = e.what()};
             }
             const auto found = std::ranges::find(description.snapshots, project, &semantic::snapshot::project);
+            if (!actor.run.empty()) {
+                if (found == description.snapshots.end())
+                    throw tool_error(nodes::code::permission_denied, "view is outside the task project");
+                execution_line(actor, found->worldline);
+                if (earlier) {
+                    auto pin = std::ranges::find(earlier->snapshots, project, &semantic::snapshot::project);
+                    if (pin == earlier->snapshots.end())
+                        throw tool_error(nodes::code::permission_denied, "comparison view is outside the task project");
+                    execution_line(actor, pin->worldline);
+                }
+            }
             if (found == description.snapshots.end())
                 throw tool_error("not_found", "semantic view not found in this project");
             const auto& snapshot = *found;
@@ -217,7 +230,7 @@ export namespace tools {
                                       .action = in.action.value().value_or(semantic::tool_action::make<"diagnostics">()).str(),
                                       .selector = in.selector.value(),
                                       .include = in.include.value_or(std::vector<std::string>{}),
-                                      .relations = in.relations.value_or(std::vector<std::string>{}),
+                                      .relations = in.relations.value_or(std::vector<semantic::relation_kind>{}),
                                       .changes = in.changes.value().value_or(std::vector<std::string>{}),
                                       .direction = in.direction.value_or(json::literal<"outgoing", "incoming", "both">{}),
                                       .depth = in.depth.value_or(description.defaults.relation_depth),
@@ -324,9 +337,57 @@ export namespace tools {
                 for (const auto& at : row.related_locations)
                     enlist(at);
             }
+            const bool reprojecting = reproject_version && *reproject_version != snapshot.version;
+            if (reprojecting) {
+                std::vector<semantic::place*> targets;
+                std::vector<semantic::place> places;
+                auto track = [&](std::optional<semantic::place>& place, const std::optional<std::string>& owner) {
+                    if (place && owner.value_or(project) == project) {
+                        targets.push_back(&*place);
+                        places.push_back(*place);
+                    }
+                };
+                for (auto& row : out.occurrences) {
+                    track(row.location.source, row.location.project);
+                    track(row.selection, row.location.project);
+                    track(row.body, row.location.project);
+                }
+                for (auto& row : out.references)
+                    track(row.location.source, row.location.project);
+                for (auto& row : out.scopes)
+                    track(row.location.source, row.location.project);
+                for (auto& row : out.diagnostics) {
+                    track(row.location.source, row.location.project);
+                    for (auto& at : row.related_locations)
+                        track(at.source, at.project);
+                }
+                if (!places.empty()) {
+                    auto reply = co_await node_call(
+                        s, project,
+                        {.action = "scope_classify",
+                         .worldline = snapshot.worldline,
+                         .revision = *reproject_version,
+                         .target = snapshot.version,
+                         .scope_hints = {.reproject_places = std::move(places)}},
+                        read_actor(actor, project, snapshot, declarations), true);
+                    if (!reply.classification ||
+                        (!reply.classification->sealed_body_only && !reply.classification->comment_or_whitespace_only) ||
+                        reply.reprojected.size() != targets.size() ||
+                        std::ranges::any_of(reply.reprojected, [](const auto& item) { return !item.has_value(); }))
+                        throw tool_error("reprojection_stale", "CRDT anchor reprojection unavailable; full analysis required");
+                    for (std::size_t i = 0; i < targets.size(); ++i)
+                        *targets[i] = *reply.reprojected[i];
+                }
+                out.version = *reproject_version;
+                for (auto& pin : out.snapshots)
+                    if (pin.project == project)
+                        pin.version = *reproject_version;
+            }
             for (auto& [key, index] : positions) {
                 const auto& [input_project, path] = key;
-                const auto& pin = semantic::snapshot_for(description.snapshots, input_project);
+                auto pin = semantic::snapshot_for(description.snapshots, input_project);
+                if (reprojecting && input_project == project)
+                    pin.version = *reproject_version;
                 auto source = co_await node_call(s, input_project, {.action = "read", .worldline = pin.worldline, .revision = pin.version, .target = path},
                                                  read_actor(actor, project, pin, declarations), true);
                 const auto found = std::ranges::find(source.files, path, &nodes::file_view::path);
@@ -413,18 +474,28 @@ export namespace tools {
                         offsets.emplace(row.id, i);
                     }
                 }
-                // A range holding the declared name is a whole declaration, not a body.
-                auto declaration = [](const semantic::records::occurrence& row) {
-                    return row.selection && row.selection->path == row.body->path && row.body->begin <= row.selection->begin &&
-                           row.selection->end <= row.body->end;
-                };
+                std::map<semantic::symbol_id, const semantic::records::symbol*> symbols_by_id;
+                for (const auto& sym : out.symbols)
+                    symbols_by_id.try_emplace(sym.id, &sym);
+                std::map<semantic::type_id, const semantic::records::type*> types_by_id;
+                for (const auto& type : out.types)
+                    types_by_id.try_emplace(type.id, &type);
                 for (const auto& row : out.occurrences)
-                    if (row.body && !declaration(row) && std::ranges::contains(row.roles, semantic::role::make<"definition">()) &&
+                    if (channels::is_body_range(row) &&
                         std::ranges::contains(out.items, std::pair{row.symbol, row.ownership.context},
-                                              [](const auto& item) { return std::pair{item.symbol_id, item.context}; }))
-                        group(row.location.project.value_or(project)).body_ranges.try_emplace(row.symbol, *row.body);
+                                              [](const auto& item) { return std::pair{item.symbol_id, item.context}; })) {
+                        auto& reg = group(row.location.project.value_or(project));
+                        reg.body_ranges.try_emplace(row.symbol, *row.body);
+                        if (const auto sym = symbols_by_id.find(row.symbol);
+                            sym != symbols_by_id.end() && channels::is_sealed_body(*sym->second, row, types_by_id))
+                            reg.scope_hints.sealed_bodies.insert(row.symbol);
+                    }
                 for (auto& [input_project, registration] : grouped) {
-                    const auto& pin = semantic::snapshot_for(description.snapshots, input_project);
+                    auto pin = semantic::snapshot_for(description.snapshots, input_project);
+                    if (reprojecting && input_project == project) {
+                        pin.version = *reproject_version;
+                        registration.revision = *reproject_version;
+                    }
                     auto reply = co_await node_call(s, input_project, std::move(registration), read_actor(actor, project, pin, declarations));
                     if (reveal)
                         for (auto& row : reply.scopes)
@@ -487,6 +558,8 @@ export namespace tools {
                 pending->budget = query.budget;
                 pending->scope = scope_filter{
                     .modules = query.scope.modules, .files = query.scope.files, .contexts = query.scope.contexts, .projects = query.scope.projects};
+                if (!actor.run.empty() && query.project != actor.project)
+                    throw tool_error(nodes::code::permission_denied, "continuation is outside the task project");
                 if (in.project.value() && in.project.value() != pending->project.value())
                     throw tool_error(nodes::code::invalid_record, "continuation belongs to another project");
                 if (in.budget.value()) {
@@ -784,7 +857,8 @@ export namespace tools {
                             for (const auto& [owner, unit] : units) {
                                 auto& inputs = consumer.project_inputs[unit.recipe.unit.project];
                                 for (const auto& value : unit.direct_inputs)
-                                    if (observed_inputs[unit.recipe.unit.project].emplace(value.kind, value.name, value.object, value.type).second)
+                                    if (value.kind != semantic::input_kind::tool && value.kind != semantic::input_kind::environment &&
+                                        observed_inputs[unit.recipe.unit.project].emplace(value.kind, value.name, value.object, value.type).second)
                                         inputs.push_back(value);
                             }
                             for (const auto& pin : description.snapshots) {
@@ -829,6 +903,79 @@ export namespace tools {
                 request.snapshots = selected_view.snapshots;
                 request.sources = dependency_sources;
                 request.project_inputs = dependency_inputs;
+            }
+            // Zero-compilation CRDT reprojection fast path:
+            // - comment/whitespace-only edits preserve full semantic truth for every read query (including diagnostics/references);
+            // - sealed body-only edits (without FFI boundary breaks) preserve declaration/structure queries.
+            const bool reprojectable_query =
+                !restored && !pinned && selected_view.snapshots.size() == 1 &&
+                (action == "symbols" || action == "inspect" || action == "definitions" || action == "scopes" ||
+                 action == "diagnostics" || action == "references" || action == "relations");
+            const bool declaration_only_query =
+                reprojectable_query &&
+                (action == "symbols" || action == "inspect" || action == "definitions" || action == "scopes") &&
+                (!in.include ||
+                 std::ranges::none_of(*in.include, [](const std::string& item) {
+                     return item == "diagnostics" || item == "typed_ranges" || item == "references";
+                 }));
+            if (reprojectable_query) {
+                const auto wanted_facts = semantic::required_facts(action, in.include.value_or(std::vector<std::string>{}));
+                auto candidate = co_await s.files.with_semantic(
+                    s.core,
+                    [project, line, name, env = *out.environment, target_version = source.version, file_scope, wanted_facts,
+                     selector = query.selector](semantic::store& store) -> std::optional<std::tuple<semantic::view_id, std::string, std::size_t>> {
+                        auto id = store.current(project, line, name);
+                        if (!id)
+                            return std::nullopt;
+                        const auto view = store.describe(*id);
+                        if (view.snapshots.size() != 1 || !view.coverage.missing.empty())
+                            return std::nullopt;
+                        const auto& pin = view.snapshots.front();
+                        if (pin.project != project || pin.worldline != line || pin.version == target_version)
+                            return std::nullopt;
+                        const auto env_match = std::ranges::any_of(view.effective_profile, [&](const auto& value) {
+                            return value.kind == semantic::input_kind::project_model && value.name == "analysis/configuration" && value.object == env;
+                        });
+                        if (!env_match)
+                            return std::nullopt;
+                        if (view.coverage.requested.selector && view.coverage.requested.selector != selector)
+                            return std::nullopt;
+                        if (!view.coverage.requested.files.empty() &&
+                            (file_scope.empty() || !std::ranges::all_of(file_scope, [&](const auto& f) {
+                                 return std::ranges::contains(view.coverage.requested.files, f);
+                             })))
+                            return std::nullopt;
+                        if (!view.coverage.requested.facts.empty() &&
+                            !std::ranges::all_of(wanted_facts, [&](const auto& f) {
+                                return std::ranges::contains(view.coverage.requested.facts, f);
+                            }))
+                            return std::nullopt;
+                        return std::tuple{*id, pin.version, view.units.size()};
+                    });
+                if (candidate) {
+                    const auto& [v0_id, v0_version, v0_units] = *candidate;
+                    try {
+                        auto classified = co_await node_call(
+                            s, project,
+                            {.action = "scope_classify", .worldline = line, .revision = source.version, .target = v0_version},
+                            actor, true);
+                        const bool can_reproject =
+                            classified.classification &&
+                            (classified.classification->comment_or_whitespace_only ||
+                             (declaration_only_query && classified.classification->sealed_body_only && !classified.classification->ffi_boundary_touched));
+                        if (can_reproject) {
+                            auto fixed = in;
+                            fixed.version.value().reset();
+                            auto queried = co_await read_view(s, project, v0_id, fixed, actor, source.version);
+                            queried.analyzed = false;
+                            queried.reused_units = v0_units;
+                            co_return queried;
+                        }
+                    } catch (const tool_error& error) {
+                        if (error.code != "reprojection_stale")
+                            throw;
+                    }
+                }
             }
             auto prepared = co_await prepare(s, context, project, name, line, source.version, std::move(requests), std::move(exposed), actor, &note, query,
                                              computation.toolchains);

@@ -10,10 +10,14 @@ repositories {
 // Adapters load parent-first against this classpath, so they must build against the same versions.
 dependencies {
     implementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.9.0")
+    compileOnly(fileTree(checkNotNull(gradle.gradleHomeDir).resolve("lib")) {
+        include("gradle-tooling-api-*.jar")
+        exclude("gradle-tooling-api-provider-*.jar")
+    })
 }
 
 kotlin {
-    jvmToolchain(25)
+    jvmToolchain(providers.gradleProperty("fughetta.javaVersion").get().toInt())
 }
 
 application { mainClass.set("fughetta.jvm.MainKt") }

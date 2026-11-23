@@ -43,10 +43,8 @@ export namespace mcp {
         json::optional<mcp::error, "error"> error;
     };
 
-    inline constexpr auto response_padding = json::padding;
-
     // An audit projection of a reply. The tool result itself is relayed as received.
-    inline auto response_failed(std::string_view text, std::string_view expected_id, std::size_t readable = 0) -> std::optional<bool> {
+    inline auto response_failed(std::string_view text, std::string_view expected_id) -> std::optional<bool> {
         using id_view = std::variant<std::int64_t, std::string_view>;
         struct response_fields {
             json::required<id_view, decltype(response::id)::name> id;
@@ -56,7 +54,7 @@ export namespace mcp {
         struct result_fields {
             json::optional<bool, "isError"> failed;
         };
-        const json::document document{text, readable};
+        const json::document document{text};
         auto response = json::read<response_fields>(document.root());
         if (!response)
             return {};

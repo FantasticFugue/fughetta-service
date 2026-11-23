@@ -16,6 +16,7 @@ import publication;
 import tools;
 import executor;
 import host;
+import toolchain;
 import support;
 import fixture;
 
@@ -157,13 +158,16 @@ int main(int argc, char** argv) {
             auto sock = co_await io::connect(io, {net::ip::address_v4{{127, 0, 0, 1}}, port});
             transport::channel<socket> chan{sock};
             transport::dispatcher<socket> serve;
+            const auto runtime = toolchain::inspect(host::resolve_tools(test::toolset(), toolchain::required_tools()), {});
+            worker.set_runtime(runtime);
             worker.install(serve, 1);
             co_await chan.post(jobs::hello{.name = "w1",
                                            .platform = {.os = "linux", .arch = "x86_64"},
                                            .max_inflight = 4,
                                            .protocol = jobs::protocol_version,
-                                           .tools = host::detect_tools(test::toolset()),
-                                           .toolchain_id = std::string(64, 'a')});
+                                           .tools = runtime.tools,
+                                           .toolchain_id = std::string(64, 'a'),
+                                           .capabilities = toolchain::capabilities(runtime)});
             try {
                 auto run_requests = [&](coroutine::scope& requests) -> coroutine::task<> {
                     static constexpr auto run_child = [](ctx& io, auto& channel) -> coroutine::task<> {
@@ -465,7 +469,8 @@ int main(int argc, char** argv) {
                                            .protocol = jobs::protocol_version,
                                            .tools = {"vcpkg"},
                                            .toolchain_id = toolchain,
-                                           .dependency_publisher = publisher});
+                                           .dependency_publisher = publisher,
+                                           .capabilities = test::capabilities({"vcpkg"})});
             try {
                 auto run_requests = [&](coroutine::scope& requests) -> coroutine::task<> {
                     static constexpr auto run_child = [](ctx& io, auto& channel) -> coroutine::task<> {
@@ -652,7 +657,9 @@ int main(int argc, char** argv) {
                 auto listener = native::listener{io, {net::ip::address_v4::loopback(), 0}};
                 auto client = co_await io::connect(io, {net::ip::address_v4{{127, 0, 0, 1}}, listener.local_endpoint().port()});
                 auto [server, endpoint] = co_await net::async_accept(listener);
-                transport::channel<socket> incoming{server}, outgoing{client};
+                transport::channel<socket> incoming{server};
+                routing::worker_stream stream{std::move(client)};
+                routing::router::channel outgoing{stream};
                 auto run_children = [&](coroutine::scope& children) -> coroutine::task<> {
                     children.spawn(outgoing.pump([](const transport::frame&) {}));
                     static constexpr auto run_child = [](transport::channel<socket>& incoming) -> coroutine::task<> {

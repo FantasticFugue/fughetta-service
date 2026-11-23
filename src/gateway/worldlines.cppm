@@ -183,7 +183,7 @@ export namespace tools {
         config::check_name("project", project);
         if (token.size() != 64)
             throw tool_error("unauthenticated", "invalid execution credential");
-        auto reply = co_await node_call(s, project, {.action = "task_lookup", .execution_token = token}, worlds::service_actor("execution"));
+        auto reply = co_await node_call(s, project, {.action = "task_lookup", .execution_token = token}, worlds::service_actor("execution"), true);
         if (!reply.execution)
             throw tool_error("unauthenticated", "execution not found");
         auto identity = json::read<worlds::actor>(reply.execution->identity);
@@ -220,8 +220,9 @@ export namespace tools {
         co_return co_await node_call(s, project, {.action = "tree", .worldline = worldline, .revision = version}, actor, true);
     }
 
+    using change_kind = json::literal<"edit", "replace", "write", "create", "remove", "move", "mode">;
     struct change {
-        json::described<"edit, replace, write, create, remove, move or mode", std::string> kind;
+        json::described<"edit, replace, write, create, remove, move or mode", change_kind> kind;
         json::described<"Path relative to the project root", std::string> path;
         json::described<"edit: first Unicode scalar to replace, in the observed version; replace: first scalar of the search window",
                          std::optional<std::uint64_t>>
@@ -265,12 +266,12 @@ export namespace tools {
                     throw tool_error(nodes::code::resource_limit, std::format("{} exceeds the {} byte file limit", path, limits.max_file_bytes));
                 return bytes;
             };
-            if (kind == "edit") {
+            if (kind == change_kind::make<"edit">()) {
                 if (!c.offset.value() || !c.text.value())
                     throw tool_error(nodes::code::invalid_record, "an edit names offset and text");
                 out.push_back(
-                    {.kind = std::string{"edit"}, .path = path, .text = *c.text.value(), .offset = *c.offset.value(), .count = c.count.value().value_or(0)});
-            } else if (kind == "replace") {
+                    {.kind = nodes::edit_kind::edit, .path = path, .text = *c.text.value(), .offset = *c.offset.value(), .count = c.count.value().value_or(0)});
+            } else if (kind == change_kind::make<"replace">()) {
                 if (!c.old_text.value() || c.old_text.value()->empty() || !c.new_text.value())
                     throw tool_error(nodes::code::invalid_record, "a replace names a non-empty old_text and new_text");
                 if (c.scope.value() && (c.offset.value() || c.count.value()))
@@ -298,16 +299,16 @@ export namespace tools {
                 if (window.find(needle, at + 1) != std::string_view::npos)
                     throw tool_error(nodes::code::invalid_record,
                                      "old_text occurs more than once in the window of " + path + "; narrow it with scope or offset");
-                out.push_back({.kind = std::string{"edit"},
+                out.push_back({.kind = nodes::edit_kind::edit,
                                .path = path,
                                .text = *c.new_text.value(),
                                .offset = lines::scalars(text.substr(0, begin + at)),
                                .count = lines::scalars(needle)});
-            } else if (kind == "write" || kind == "create") {
+            } else if (kind == change_kind::make<"write">() || kind == change_kind::make<"create">()) {
                 auto bytes = content();
                 bool text = lines::textual(bytes);
-                if (kind == "create")
-                    out.push_back({.kind = text ? "create" : "binary_create",
+                if (kind == change_kind::make<"create">())
+                    out.push_back({.kind = text ? nodes::edit_kind::create : nodes::edit_kind::binary_create,
                                    .path = path,
                                    .text = text ? bytes : lines::hex(bytes),
                                    .executable = c.executable.value().value_or(false)});
@@ -318,20 +319,19 @@ export namespace tools {
                         throw tool_error(nodes::code::invalid_record, "change the executable flag with a mode change");
                     if (text != (found->second->kind == "text"))
                         throw tool_error(nodes::code::invalid_record, "a write keeps a file text or binary; remove and create it to change that");
-                    out.push_back({.kind = text ? "write" : "binary", .path = path, .text = text ? bytes : lines::hex(bytes)});
+                    out.push_back({.kind = text ? nodes::edit_kind::write : nodes::edit_kind::binary, .path = path, .text = text ? bytes : lines::hex(bytes)});
                 }
-            } else if (kind == "remove")
-                out.push_back({.kind = std::string{"remove"}, .path = path});
-            else if (kind == "move") {
+            } else if (kind == change_kind::make<"remove">())
+                out.push_back({.kind = nodes::edit_kind::remove, .path = path});
+            else if (kind == change_kind::make<"move">()) {
                 if (!c.destination.value())
                     throw tool_error(nodes::code::invalid_record, "a move names its destination");
-                out.push_back({.kind = std::string{"move"}, .path = path, .target = *c.destination.value()});
-            } else if (kind == "mode") {
+                out.push_back({.kind = nodes::edit_kind::move, .path = path, .target = *c.destination.value()});
+            } else if (kind == change_kind::make<"mode">()) {
                 if (!c.executable.value())
                     throw tool_error(nodes::code::invalid_record, "a mode change names executable");
-                out.push_back({.kind = std::string{"mode"}, .path = path, .executable = *c.executable.value()});
-            } else
-                throw tool_error(nodes::code::invalid_record, "unknown change kind " + kind);
+                out.push_back({.kind = nodes::edit_kind::mode, .path = path, .executable = *c.executable.value()});
+            }
         }
         return out;
     }
@@ -373,7 +373,7 @@ export namespace tools {
         try {
             co_return co_await fresh();
         } catch (const tool_error&) {
-            failed = std::current_exception();
+            failed = util::capture_current_exception();
         }
         // When even the receipt cannot be read, the caller hears the first answer, which may be outcome_unknown.
         std::optional<std::pair<nodes::node_reply, record>> done;
@@ -390,8 +390,9 @@ export namespace tools {
         : tool<"worldline", "Work in an explicit worldline: list, inspect, read, compare, diff, promote, fork, apply, receipt, history, reverse or redo. "
                             "Concurrent edits within a worldline converge; worldlines never merge. Writes name the observed version; "
                             "a replace change swaps old_text, unique within the file, an offset window or a language scope reference, "
-                            "for new_text without offsets. An apply without leases locks the smallest enclosing scope the language tool returned "
-                            "(else the edited text) for the caller and reports reach: body_only or declaration_touched. "
+                            "for new_text without offsets. An apply without leases locks the nearest enclosing registered scope, "
+                            "falling back to the edited text. Reach is body_only for registered function bodies, "
+                            "ffi_boundary_touched for changes to a registered FFI boundary, or declaration_touched. "
                             "Repeat an operation_id with identical input to recover its recorded result."> {
         struct input {
             json::described<"Project; supplied by the execution context when absent", std::optional<std::string>> project;
@@ -447,8 +448,7 @@ export namespace tools {
         };
         struct output {
             std::optional<std::string> worldline, version, written_version, base_version, path, digest, kind, data_base64, receipt, operation_id, text;
-            // apply: body_only when every change edits text inside a function body the language tool returned,
-            // else declaration_touched; absent on a replay.
+            // Apply reach uses the observed revision.
             std::optional<std::string> reach;
             std::optional<std::uint64_t> size, offset, count, total_scalars, next_offset;
             std::optional<bool> executable, replayed, truncated, unchanged;
@@ -701,12 +701,12 @@ export namespace tools {
                 std::set<std::string> loaded, scopes;
                 for (const auto& change : in.changes.value().value_or(std::vector<change>{})) {
                     const auto& kind = change.kind.value();
-                    if ((kind == "edit" || kind == "replace" || kind == "write") && loaded.insert(change.path.value()).second) {
+                    if ((kind == change_kind::make<"edit">() || kind == change_kind::make<"replace">() || kind == change_kind::make<"write">()) && loaded.insert(change.path.value()).second) {
                         auto file = co_await node_call(
                             s, project, {.action = "read", .worldline = line, .revision = observed.version, .target = change.path.value()}, actor, true);
                         observed.files.insert(observed.files.end(), file.files.begin(), file.files.end());
                     }
-                    if (kind == "replace" && change.scope.value())
+                    if (kind == change_kind::make<"replace">() && change.scope.value())
                         scopes.insert(*change.scope.value());
                 }
                 std::map<std::string, semantic::place> located;

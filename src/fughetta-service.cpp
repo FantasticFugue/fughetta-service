@@ -4,15 +4,20 @@ import gateway;
 import source;
 import worker;
 import signals;
+import hostrole;
 
 int application(int argc, char** argv) {
     if (argc == 2 && std::string_view{argv[1]} == "--help") {
         std::cout << "Usage: fughetta-service [--service] [--instance NAME] [--log-dir PATH] [config.json]\n"
                      "       fughetta-service token NAME owner|member [config.json]\n"
                      "       fughetta-service worker run --config PATH\n"
+                     "       fughetta-service public-cache-fill CONFIG DIRECTORY KEY [KEY ...]\n"
+                     "       fughetta-service --role host [config.json]\n"
                      "Starts the gateway, source, and workers with the configured runtime budget.\n";
         return 0;
     }
+    if (argc > 1 && std::string_view{argv[1]} == "public-cache-fill")
+        return fill_public_cache(argc - 1, argv + 1);
     if (argc > 1 && std::string_view{argv[1]} == "worker")
         return worker_cli(argc - 1, argv + 1);
     if (argc > 2 && std::string_view{argv[1]} == "--role") {
@@ -21,6 +26,8 @@ int application(int argc, char** argv) {
             return run_source(argc - 2, argv + 2);
         if (role == "worker")
             return run_worker(argc - 2, argv + 2);
+        if (role == "host")
+            return run_host(argc - 2, argv + 2);
         if (role == "gateway")
             return run_gateway(argc - 2, argv + 2, false);
         std::cerr << "unknown service role\n";

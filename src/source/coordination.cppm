@@ -38,9 +38,10 @@ namespace nodes {
         auto record = execution_record(in.execution_token);
         if (record.at("line").text() != in.worldline || record.at("run").text() != in.run_id)
             fail(nodes::code::permission_denied, "execution belongs to another worldline or run");
-        static const std::set<std::string> reads{"tree",       "head",           "stat",         "read",       "inspect",
-                                                 "compare",    "history",        "receipt",      "content",    "contribution",
-                                                 "scope_list", "scope_register", "scope_locate", "references", "reference_history"};
+        static const std::set<std::string> reads{"tree",       "head",           "stat",         "read",           "inspect",
+                                                 "compare",    "history",        "receipt",      "content",        "contribution",
+                                                 "scope_list", "scope_register", "scope_locate", "scope_classify", "references",
+                                                 "reference_history"};
         static const std::set<std::string> writes{"apply", "scope_acquire", "scope_renew", "scope_release", "reference"};
         if (!reads.contains(in.action) && !(record.at("writable").boolean() && writes.contains(in.action)))
             fail(nodes::code::permission_denied, "operation is outside the execution grant");
@@ -211,10 +212,12 @@ namespace nodes {
         return anchored(lease, file);
     }
 
+    static auto scope_label(const value& lease) -> std::string { return lease.at("scope").text(); }
+
     auto local_node::impl::lease_reply(const value& lease, const source_state& state, bool reveal) -> scope_lease {
         auto range = lease_range(lease, state);
         return {.token = reveal ? lease.at("token").text() : "",
-                .scope = lease.at("scope").text(),
+                .scope = scope_label(lease),
                 .path = range ? range->path : lease.at("path").text(),
                 .worldline = lease.at("line").text(),
                 .version = version(roots.at(lease.at("line").text())),
@@ -242,7 +245,7 @@ namespace nodes {
         auto selected = selected_heads(in);
         auto state = source.projection(selected);
         auto records = scope_references();
-        if (in.analyzed_scopes.size() + in.body_ranges.size() > constants::scope_reference_limit)
+        if (in.analyzed_scopes.size() + in.body_ranges.size() + in.scope_hints.ffi_boundaries.size() > constants::scope_reference_limit)
             fail(nodes::code::resource_limit, "too many scope references in one batch");
         auto out = identity();
         out.worldline = in.worldline;
@@ -262,7 +265,7 @@ namespace nodes {
         // A reference keeps the characters around its range, so later
         // versions resolve it without analysis. Analyzing the same version
         // again refreshes its reference instead of adding another.
-        auto refer = [&](std::string kind, const std::string& scope, std::string scope_kind, const semantic::place& range) {
+        auto refer = [&](std::string kind, const std::string& scope, std::string scope_kind, const semantic::place& range, bool sealed = false) {
             const auto& stub = state->path(range.path);
             auto held = materialize(*state, stub);
             const auto& file = held ? *held : stub;
@@ -270,6 +273,15 @@ namespace nodes {
                 fail(nodes::code::invalid_record, "analysis returned an invalid " + kind + " range");
             auto [left, right] =
                 kind == "body" ? std::pair{file.at(range.begin).encoded(), file.at(range.end - 1).encoded()} : range_anchors(file, range.begin, range.end);
+            auto same = std::ranges::find_if(records, [&](const auto& r) {
+                return r.at("kind").text() == kind && r.at("line").text() == in.worldline && r.at("version").text() == out.version &&
+                       r.at("file").text() == file.id && r.at("scope").text() == scope && r.at("left") == left && r.at("right") == right;
+            });
+            if (same != records.end()) {
+                const auto& existing = std::get<value::map>(same->data);
+                if (auto found = existing.find("sealed"); found != existing.end() && found->second.boolean())
+                    sealed = true;
+            }
             value record = value::map{{"kind", kind},
                                       {"line", in.worldline},
                                       {"version", out.version},
@@ -283,11 +295,8 @@ namespace nodes {
                                       {"end", range.end},
                                       {"left", left},
                                       {"right", right},
+                                      {"sealed", sealed},
                                       {"expires", lease_now() + constants::scope_max_seconds}};
-            auto same = std::ranges::find_if(records, [&](const auto& r) {
-                return r.at("kind").text() == kind && r.at("line").text() == in.worldline && r.at("version").text() == out.version &&
-                       r.at("file").text() == file.id && r.at("scope").text() == scope && r.at("left") == left && r.at("right") == right;
-            });
             auto ref = same == records.end() ? hex(random_bytes(32)) : same->at("ref").text();
             std::get<value::map>(record.data)["ref"] = ref;
             if (same == records.end())
@@ -300,7 +309,9 @@ namespace nodes {
             if (scope.location.source)
                 scope.reference = refer("scope", scope.id, std::string{scope.kind.name()}, *scope.location.source);
         for (const auto& [symbol, range] : in.body_ranges)
-            refer("body", symbol, "", range);
+            refer("body", symbol, "", range, in.scope_hints.sealed_bodies.contains(symbol));
+        for (const auto& [symbol, range] : in.scope_hints.ffi_boundaries)
+            refer("ffi_boundary", symbol, "", range, false);
         // Registration also happens silently on reads, so the table drops
         // the references that would expire first instead of refusing one.
         if (records.size() > constants::scope_reference_limit) {
@@ -334,6 +345,274 @@ namespace nodes {
             if (!range)
                 fail("scope_stale", "the scope's boundaries are gone in this version; query language(scopes)");
             out.located.emplace(ref, *range);
+        }
+        return out;
+    }
+
+    // Compute visible character intervals [begin, end) in `left` whose CRDT elements do not appear in `right`.
+    static auto missing_intervals(const source_file& left, const source_file& right) -> std::vector<std::pair<std::uint64_t, std::uint64_t>> {
+        std::unordered_map<std::string, std::vector<std::pair<std::uint64_t, std::uint64_t>>> present;
+        for (const auto& f : right.fragments)
+            present[f.run].emplace_back(f.first, f.first + f.count);
+        for (auto& [_, spans] : present)
+            std::ranges::sort(spans);
+
+        std::vector<std::pair<std::uint64_t, std::uint64_t>> out;
+        std::uint64_t pos = 0;
+        for (const auto& f : left.fragments) {
+            const auto f_begin = f.first, f_end = f.first + f.count;
+            auto found = present.find(f.run);
+            if (found == present.end()) {
+                out.emplace_back(pos, pos + f.count);
+                pos += f.count;
+                continue;
+            }
+            std::uint64_t cursor = f_begin;
+            for (const auto& [s_begin, s_end] : found->second) {
+                if (s_end <= cursor)
+                    continue;
+                if (s_begin >= f_end)
+                    break;
+                if (s_begin > cursor)
+                    out.emplace_back(pos + (cursor - f_begin), pos + (s_begin - f_begin));
+                cursor = std::max(cursor, std::min(s_end, f_end));
+            }
+            if (cursor < f_end)
+                out.emplace_back(pos + (cursor - f_begin), pos + f.count);
+            pos += f.count;
+        }
+        return out;
+    }
+
+    auto local_node::impl::classify_scopes(const node_request& in) -> node_reply {
+        if (in.target.empty())
+            fail(nodes::code::invalid_record, "scope_classify requires a base revision in target");
+        ensure_kernel();
+        auto to_heads = selected_heads(in);
+        auto base_id = resolve_revision(in.worldline, in.target);
+        statement revision{*db, "SELECT data FROM revisions WHERE id=?1"};
+        revision.text(1, base_id);
+        if (!revision.next())
+            fail(nodes::code::invalid_record, "base revision not found");
+        auto from_heads = string_list(codec::decode(revision.data(0)).at("frontier"));
+        if (version(from_heads) != base_id)
+            fail(nodes::code::invalid_record, "base revision does not identify the selected frontier");
+        within_line(root_line(in.worldline), from_heads);
+
+        auto out = identity();
+        out.worldline = in.worldline;
+        out.version = version(to_heads);
+        scope_classification result{.body_only = true, .sealed_body_only = true, .comment_or_whitespace_only = true, .ffi_boundary_touched = false};
+
+        if (from_heads == to_heads) {
+            out.classification = std::move(result);
+            out.reprojected.reserve(in.scope_hints.reproject_places.size());
+            for (const auto& place : in.scope_hints.reproject_places)
+                out.reprojected.push_back(place);
+            return out;
+        }
+
+        auto from_state = source.projection(from_heads);
+        auto to_state = source.projection(to_heads);
+        auto all_references = scope_references();
+        std::unordered_map<std::string_view, std::vector<const value*>> references_by_file;
+        for (const auto& r : all_references)
+            if (r.at("line").text() == in.worldline)
+                references_by_file[r.at("file").text()].push_back(&r);
+
+        std::map<std::string, std::shared_ptr<const source_file>> before_materialized, after_materialized;
+        auto get_before = [&](const source_file& stub) -> const source_file& {
+            auto [it, inserted] = before_materialized.try_emplace(stub.id);
+            if (inserted)
+                it->second = materialize(*from_state, stub);
+            return it->second ? *it->second : stub;
+        };
+        auto get_after = [&](const source_file& stub) -> const source_file& {
+            auto [it, inserted] = after_materialized.try_emplace(stub.id);
+            if (inserted)
+                it->second = materialize(*to_state, stub);
+            return it->second ? *it->second : stub;
+        };
+
+        std::set<std::string> touched_files, touched_symbols, touched_ffi_symbols;
+        auto mark_declaration = [&] {
+            result.body_only = false;
+            result.sealed_body_only = false;
+        };
+        auto mark_non_comment = [&] {
+            result.comment_or_whitespace_only = false;
+        };
+
+        for (const auto& [id, after_stub] : to_state->files) {
+            if (!after_stub->present)
+                continue;
+            const auto before_it = from_state->files.find(id);
+            if (before_it == from_state->files.end() || !before_it->second->present) {
+                touched_files.insert(after_stub->path);
+                mark_declaration();
+                mark_non_comment();
+                continue;
+            }
+            const auto& before_stub = *before_it->second;
+            if (before_stub.path != after_stub->path || before_stub.kind != after_stub->kind || before_stub.executable != after_stub->executable) {
+                touched_files.insert(before_stub.path);
+                touched_files.insert(after_stub->path);
+                mark_declaration();
+                mark_non_comment();
+                continue;
+            }
+            if (before_stub.digest == after_stub->digest)
+                continue;
+            touched_files.insert(after_stub->path);
+            if (after_stub->kind != "text") {
+                mark_declaration();
+                mark_non_comment();
+                continue;
+            }
+            const auto& before = get_before(before_stub);
+            const auto& after = get_after(*after_stub);
+            const auto deleted_spans = missing_intervals(before, after);
+            const auto inserted_spans = missing_intervals(after, before);
+
+            const auto& references = references_by_file[id];
+            for (const auto* reference : references) {
+                const auto& r = *reference;
+                if (r.at("kind").text() != "ffi_boundary")
+                    continue;
+                auto f_before = anchored(r, before);
+                auto f_after = anchored(r, after);
+                if (!f_before || !f_after) {
+                    result.ffi_boundary_touched = true;
+                    touched_ffi_symbols.insert(r.at("scope").text());
+                    continue;
+                }
+                auto overlaps_any = [](const std::vector<std::pair<std::uint64_t, std::uint64_t>>& spans, const semantic::place& range) {
+                    return std::ranges::any_of(spans, [&](const auto& seg) { return seg.first < range.end && range.begin < seg.second; });
+                };
+                if (overlaps_any(deleted_spans, *f_before) || overlaps_any(inserted_spans, *f_after)) {
+                    result.ffi_boundary_touched = true;
+                    touched_ffi_symbols.insert(r.at("scope").text());
+                }
+            }
+
+            // Without a syntax tree no text change can be proven comment-only, and a file
+            // without registered references has no known bodies.
+            mark_non_comment();
+            if (references.empty()) {
+                mark_declaration();
+                continue;
+            }
+
+            struct live_body {
+                std::string symbol;
+                semantic::place before, after;
+                bool sealed = false;
+            };
+            std::vector<live_body> bodies;
+            for (const auto* reference : references) {
+                const auto& r = *reference;
+                if (r.at("kind").text() != "body")
+                    continue;
+                auto b_before = anchored(r, before);
+                auto b_after = anchored(r, after);
+                if (!b_before || !b_after)
+                    continue;
+                if (b_before->end <= b_before->begin + 1 || b_after->end <= b_after->begin + 1)
+                    continue;
+                bool sealed = false;
+                const auto& fields = std::get<value::map>(r.data);
+                if (auto s = fields.find("sealed"); s != fields.end())
+                    sealed = s->second.boolean();
+                bodies.push_back({r.at("scope").text(), *b_before, *b_after, sealed});
+            }
+
+            auto check_intervals = [&](const std::vector<std::pair<std::uint64_t, std::uint64_t>>& spans, bool is_after) {
+                for (const auto& [seg_begin, seg_end] : spans) {
+                    bool covered = false;
+                    bool sealed_covered = false;
+                    for (const auto& b : bodies) {
+                        const auto& range = is_after ? b.after : b.before;
+                        if (seg_begin > range.begin && seg_end <= range.end - 1) {
+                            covered = true;
+                            touched_symbols.insert(b.symbol);
+                            if (b.sealed)
+                                sealed_covered = true;
+                        }
+                    }
+                    if (!covered)
+                        mark_declaration();
+                    else if (!sealed_covered)
+                        result.sealed_body_only = false;
+                }
+            };
+
+            check_intervals(deleted_spans, false);
+            check_intervals(inserted_spans, true);
+        }
+        for (const auto& [id, before_stub] : from_state->files) {
+            if (!before_stub->present)
+                continue;
+            const auto after_it = to_state->files.find(id);
+            if (after_it == to_state->files.end() || !after_it->second->present) {
+                touched_files.insert(before_stub->path);
+                mark_declaration();
+                mark_non_comment();
+            }
+        }
+
+        result.touched_files.assign(touched_files.begin(), touched_files.end());
+        result.touched_symbols.assign(touched_symbols.begin(), touched_symbols.end());
+        result.touched_ffi_symbols.assign(touched_ffi_symbols.begin(), touched_ffi_symbols.end());
+        out.classification = std::move(result);
+
+        out.reprojected.reserve(in.scope_hints.reproject_places.size());
+        for (const auto& place : in.scope_hints.reproject_places) {
+            if (!touched_files.contains(place.path)) {
+                auto found = to_state->paths.find(place.path);
+                if (found != to_state->paths.end() && found->second->size() == 1) {
+                    out.reprojected.push_back(place);
+                    continue;
+                }
+            }
+            auto before_path = from_state->paths.find(place.path);
+            if (before_path == from_state->paths.end() || before_path->second->size() != 1) {
+                out.reprojected.push_back(std::nullopt);
+                continue;
+            }
+            const auto& file_id = *before_path->second->begin();
+            auto before_it = from_state->files.find(file_id);
+            auto after_it = to_state->files.find(file_id);
+            if (before_it == from_state->files.end() || !before_it->second->present || after_it == to_state->files.end() || !after_it->second->present ||
+                before_it->second->kind != "text" || after_it->second->kind != "text") {
+                out.reprojected.push_back(std::nullopt);
+                continue;
+            }
+            const auto& before = get_before(*before_it->second);
+            const auto& after = get_after(*after_it->second);
+            if (place.begin > place.end || place.end > before.size()) {
+                out.reprojected.push_back(std::nullopt);
+                continue;
+            }
+            if (place.begin < place.end) {
+                auto first = after.position(before.at(place.begin));
+                auto last = after.position(before.at(place.end - 1));
+                if (first && last && *first <= *last) {
+                    out.reprojected.push_back(semantic::place{after.path, *first, *last + 1});
+                    continue;
+                }
+            }
+            auto left = place.begin ? after.position(before.at(place.begin - 1)) : std::optional<std::uint64_t>{0};
+            auto right = place.end < before.size() ? after.position(before.at(place.end)) : std::optional<std::uint64_t>{after.size()};
+            if (!left || !right) {
+                out.reprojected.push_back(std::nullopt);
+                continue;
+            }
+            auto begin = place.begin ? *left + 1 : std::uint64_t{0};
+            if (begin > *right) {
+                out.reprojected.push_back(std::nullopt);
+                continue;
+            }
+            out.reprojected.push_back(semantic::place{after.path, begin, *right});
         }
         return out;
     }
@@ -449,7 +728,7 @@ namespace nodes {
                         continue;
                     auto range = lease_range(record, *state);
                     if (!range || (begin <= range->end && end >= range->begin))
-                        fail("scope_conflict", "scope overlaps " + record.at("scope").text() + " until " + std::to_string(record.at("expires").number()));
+                        fail("scope_conflict", "scope overlaps " + scope_label(record) + " until " + std::to_string(record.at("expires").number()));
                 }
                 if (records.size() >= constants::scope_lease_limit)
                     fail(nodes::code::resource_limit, "too many active scope leases");
@@ -509,7 +788,7 @@ namespace nodes {
             checked.action = "apply";
             for (const auto& change : promotion(in, false)) {
                 const auto& file = change.after ? *change.after : *change.before;
-                checked.edits.push_back({.kind = change.before ? (change.after ? "write" : "remove") : "create", .path = file.path});
+                checked.edits.push_back({.kind = change.before ? (change.after ? nodes::edit_kind::write : nodes::edit_kind::remove) : nodes::edit_kind::create, .path = file.path});
             }
             check_scope_leases(checked, prior);
             return;
@@ -550,7 +829,7 @@ namespace nodes {
             const auto& edit = in.edits[i];
             if (!edit.path.empty())
                 edits[edit.path].push_back(i);
-            if ((edit.kind == "move" || edit.kind == "directory_move") && !edit.target.empty())
+            if ((edit.kind == nodes::edit_kind::move || edit.kind == nodes::edit_kind::directory_move) && !edit.target.empty())
                 edits[edit.target].push_back(i);
         }
         for (const auto& record : records) {
@@ -592,7 +871,7 @@ namespace nodes {
             for (auto id : group->second) {
                 const auto& p = protections[id];
                 const auto& range = *p.observed;
-                if (p.kind == "file" || (edit.kind == "edit" ? edit.offset >= range.begin && edit.offset <= range.end && edit.count <= range.end - edit.offset
+                if (p.kind == "file" || (edit.kind == nodes::edit_kind::edit ? edit.offset >= range.begin && edit.offset <= range.end && edit.count <= range.end - edit.offset
                                                              : range.begin == 0 && range.end == observed->path(edit.path).size())) {
                     result = true;
                     break;
@@ -627,9 +906,10 @@ namespace nodes {
                     const auto guard_begin = range.begin ? range.begin - 1 : 0;
                     // Every move touching this file changes its path or
                     // destination; only a disjoint range edit can pass.
-                    if (p.kind == "file" || edit.kind != "edit" || (edit.offset <= range.end && edit.offset + edit.count >= guard_begin))
-                        fail("scope_conflict", "edit overlaps " + p.record->at("scope").text() + " held by " + holder_name(p.record->at("owner").text()) +
+                    if (p.kind == "file" || edit.kind != nodes::edit_kind::edit || (edit.offset <= range.end && edit.offset + edit.count >= guard_begin)) {
+                        fail("scope_conflict", "edit overlaps " + scope_label(*p.record) + " held by " + holder_name(p.record->at("owner").text()) +
                                                    " until " + std::to_string(p.record->at("expires").number()));
+                    }
                 }
             }
         }
@@ -638,7 +918,7 @@ namespace nodes {
         if (in.edits.empty())
             return {};
         const bool implicit = in.leases.empty() && !in.lease_owner.empty();
-        bool body_only = std::ranges::all_of(in.edits, [](const auto& edit) { return edit.kind == "edit"; });
+        bool body_only = std::ranges::all_of(in.edits, [](const auto& edit) { return edit.kind == nodes::edit_kind::edit; });
         if (!body_only && !implicit)
             return "declaration_touched";
         // Snapping to these scopes would lock whole files or modules.
@@ -649,8 +929,9 @@ namespace nodes {
         std::erase_if(references, [&](const auto& r) { return r.at("line").text() != in.worldline; });
         auto records = scope_leases();
         bool claimed = false;
+        bool ffi_touched = false;
         for (const auto& edit : in.edits) {
-            if (edit.kind != "edit")
+            if (edit.kind != nodes::edit_kind::edit)
                 continue;
             // An edit may select one of several files at its path by identity.
             const source_file* selected = nullptr;
@@ -666,13 +947,20 @@ namespace nodes {
             const auto& file = held ? *held : *selected;
             const auto begin = edit.offset, end = edit.offset + edit.count;
             bool in_body = false;
-            const value* snapped = nullptr;
+            std::string_view snapped;
             std::optional<semantic::place> range;
             for (const auto& r : references) {
                 if (r.at("file").text() != file.id)
                     continue;
                 auto found = anchored(r, file);
-                if (!found || found->begin > begin || found->end < end)
+                if (!found)
+                    continue;
+                if (r.at("kind").text() == "ffi_boundary") {
+                    if (begin <= found->end && found->begin <= end)
+                        ffi_touched = true;
+                    continue;
+                }
+                if (found->begin > begin || found->end < end)
                     continue;
                 // An edit at a body's braces may change the signature or the
                 // next declaration.
@@ -680,7 +968,7 @@ namespace nodes {
                 if (broad.contains(r.at("scope_kind").text()))
                     continue;
                 if (!range || found->end - found->begin < range->end - range->begin) {
-                    snapped = &r;
+                    snapped = r.at("scope").text();
                     range = found;
                 }
             }
@@ -692,13 +980,13 @@ namespace nodes {
                 continue;
             auto current = materialize(*after, *now->second);
             const auto& target = current ? *current : *now->second;
-            auto lease = [&](const value* scope, std::uint64_t first, std::uint64_t last) {
+            auto lease = [&](std::string_view scope, std::uint64_t first, std::uint64_t last) {
                 auto [left, right] = range_anchors(file, first, last);
                 return value{value::map{{"kind", "scope"},
                                         {"token", hex(random_bytes(32))},
                                         {"operation", in.operation},
                                         {"owner", in.lease_owner},
-                                        {"scope", scope ? scope->at("scope").text() : "text:" + target.path},
+                                        {"scope", scope.empty() ? "text:" + target.path : std::string{scope}},
                                         {"line", in.worldline},
                                         {"version", version(heads)},
                                         {"path", target.path},
@@ -717,9 +1005,9 @@ namespace nodes {
                     --first;
                 while (last < file.size() && !target.position(file.at(last)))
                     ++last;
-                return lease(nullptr, first, last);
+                return lease({}, first, last);
             };
-            auto candidate = snapped ? lease(snapped, range->begin, range->end) : edited();
+            auto candidate = range ? lease(snapped, range->begin, range->end) : edited();
             auto span = anchored(candidate, target);
             auto blocked = [&](const semantic::place& at, bool touching) {
                 return std::ranges::any_of(records, [&](const auto& r) {
@@ -731,7 +1019,7 @@ namespace nodes {
             };
             // Another caller's lease inside the enclosing scope keeps this
             // lease to the edited characters, which it already avoids.
-            if (snapped && (!span || blocked(*span, true))) {
+            if (range && (!span || blocked(*span, true))) {
                 candidate = edited();
                 span = anchored(candidate, target);
             }
@@ -764,6 +1052,10 @@ namespace nodes {
         }
         if (claimed)
             metadata("scope_leases", codec::encode(value::map{{"leases", records}}));
-        return body_only ? "body_only" : "declaration_touched";
+        if (ffi_touched)
+            return "ffi_boundary_touched";
+        if (body_only)
+            return "body_only";
+        return "declaration_touched";
     }
 } // namespace nodes

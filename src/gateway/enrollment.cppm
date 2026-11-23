@@ -1,4 +1,5 @@
 export module enrollment;
+import utility;
 import std;
 import json;
 import content;
@@ -10,11 +11,13 @@ export namespace enrollment {
     auto mint(std::size_t bytes) -> std::string;
     auto secret_matches(std::string_view digest, std::string_view secret) -> bool;
     inline auto now() -> std::int64_t { return std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count(); }
-    struct refused : std::runtime_error {
+    struct refused : std::runtime_error, util::retained_exception {
         int status;
         std::string code;
         refused(int status, std::string code, std::string message) : std::runtime_error(std::move(message)), status(status), code(std::move(code)) {}
+        auto retain() const noexcept -> std::exception_ptr override;
     };
+    auto refused::retain() const noexcept -> std::exception_ptr { return util::copy_current_exception(*this); }
     struct worker {
         std::string worker_id, name, secret_hash, created_by;
         std::int64_t created_at = 0, last_connected_at = 0;

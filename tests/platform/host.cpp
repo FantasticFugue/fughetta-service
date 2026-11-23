@@ -16,6 +16,12 @@ namespace {
             if (env.contains("HOST_TEST_VALUE"))
                 expect(env.at("HOST_TEST_VALUE") == expected);
             expect(!host::name().empty());
+            // A child inherits the build environment, not the unit that started this process.
+            host::set_environment_if_absent("INVOCATION_ID", "test-invocation");
+            host::set_environment_if_absent("NOTIFY_SOCKET", "/run/test/notify");
+            auto child = host::child_environment();
+            expect(!child.contains("INVOCATION_ID") && !child.contains("NOTIFY_SOCKET")) << "the parent's unit identity stays behind";
+            expect(child.contains("HOST_TEST_VALUE") && child.at("HOST_TEST_VALUE") == expected) << "the build environment reaches the child";
         };
 
         // Nothing here names a tool the build machine is assumed to have: the sorted, unique shape is

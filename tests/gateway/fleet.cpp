@@ -3,6 +3,7 @@ import boost.ut;
 import coroutine;
 import native;
 import protocol;
+import json;
 import fleet;
 import configuration;
 import enrollment;
@@ -70,7 +71,8 @@ namespace {
                                        .toolchain_id = std::string(64, 'a'),
                                        .dependency_publisher = publisher,
                                        .memory_bytes = report ? report->memory.limit : std::nullopt,
-                                       .slots = announce_slots ? report->slots : std::vector<jobs::worker_slot>{}});
+                                       .slots = announce_slots ? report->slots : std::vector<jobs::worker_slot>{},
+                                       .capabilities = test::capabilities(tools)});
         if (!announce_slots) {
             if (report)
                 ++report->sequence;
@@ -274,6 +276,14 @@ namespace {
                     auto refusal = transport::decode<jobs::admission>(co_await next_channel.recv());
                     expect(!refusal.accepted && refusal.code == "worker_enrollment_disabled");
                     expect(router.workers(0).holds({}));
+                    auto older = co_await io::connect(io, listener.local_endpoint());
+                    auto [older_peer, older_endpoint] = co_await net::async_accept(listener);
+                    transport::channel<socket> older_channel{older};
+                    const json::object greeting{{"name", "machine"}, {"auth", credential.secret}, {"protocol", jobs::protocol_version ^ 1u}};
+                    co_await older_channel.send(jobs::code<jobs::hello>, 0, greeting);
+                    children.spawn(router.workers(0).admit(io, std::move(older_peer), &registry, &pool, [&] { return enabled; }));
+                    auto mismatch = transport::decode<jobs::admission>(co_await older_channel.recv());
+                    expect(!mismatch.accepted && mismatch.code == "worker_protocol_mismatch");
                     registry.revoke(credential.worker_id);
                     expect(!router.workers(0).holds({}));
                     expect(!router.workers(0).describe(0).front().online);
@@ -368,7 +378,7 @@ namespace {
             h.rt.run(std::move(run_core));
             expect(h.out.hex == "fake:acme/a.txt");
             expect(h.out.progress == std::vector<std::uint64_t>{1, 2, 3});
-            expect(h.out.missing.starts_with("no build machine is online")) << h.out.missing;
+            expect(h.out.missing.contains("tool mold (worker 'fake' (core 2): not installed)")) << h.out.missing;
         };
     };
 
@@ -409,12 +419,11 @@ namespace {
                     expect(fleet.describe(0).front().dependency_publisher);
                     expect(!fleet.holds({}));
                     expect(!fleet.busy({}));
-                    expect(fleet.diagnose({}) == "no live general build worker is available");
                     bool refused = false;
                     try {
                         co_await h.who({});
                     } catch (const routing::no_worker& error) {
-                        refused = !error.busy;
+                        refused = !error.busy && std::string_view{error.what()} == "no live general build worker is available";
                     }
                     expect(refused);
                     expect(co_await h.who({.needs = {.dependency_publisher = true}}) == "publisher:who");
@@ -499,17 +508,28 @@ namespace {
                 auto run_children = [&](coroutine::scope& children) -> coroutine::task<> {
                     children.spawn(h.router.workers(0).admit(io, std::move(pa)));
                     children.spawn(h.router.workers(0).admit(io, std::move(pb)));
-                    children.spawn(fake_worker(a, "gcc-builder", {"gcc", "cmake"}));
-                    children.spawn(fake_worker(b, "clang-builder", {"clang", "cmake"}));
+                    children.spawn(fake_worker(a, "clang-18-builder", {"clang@18.1.8", "cmake"}));
+                    children.spawn(fake_worker(b, "clang-19-builder", {"clang@19.1.0", "cmake"}));
                     while (h.router.workers(0).describe(0).size() < 2)
                         co_await execution::schedule_after(io, 1ms);
 
-                    h.out.first = co_await h.who({.needs = {.tools = {"clang"}}});
+                    h.out.first = co_await h.who({.needs = {.tools = {"clang>=19"}}});
+                    const routing::requirements needs{.tools = {"clang>=20", "mold"}, .sdks = {{"jdk", "^21"}}};
                     try {
-                        co_await h.who({.needs = {.tools = {"mold"}}});
+                        co_await h.who({.needs = needs});
                     } catch (const routing::no_worker& e) {
                         h.out.capacity_err = e.what();
                     }
+                    auto& fleet = h.router.workers(0);
+                    const auto constraints = routing::parse_constraints(needs);
+                    co_await fleet.with({.needs = {.tools = {"clang>=19"}}}, [&](auto& worker) -> coroutine::task<> {
+                        try {
+                            (void)fleet.resolve(worker, constraints);
+                        } catch (const routing::no_worker& error) {
+                            h.out.second = error.what();
+                        }
+                        co_return;
+                    });
                     try {
                         co_await h.who({.needs = {.os = "windows"}});
                     } catch (const routing::no_worker& e) {
@@ -519,8 +539,12 @@ namespace {
                 co_await coroutine::with_scope(std::move(run_children));
             };
             h.rt.run(std::move(run_core));
-            expect(h.out.first == "clang-builder:who") << h.out.first;
-            expect(h.out.capacity_err == "no attached worker provides all required tools (missing: mold)") << h.out.capacity_err;
+            expect(h.out.first == "clang-19-builder:who") << h.out.first;
+            expect(h.out.capacity_err.contains("clang>=20") && h.out.capacity_err.find("clang>=20") == h.out.capacity_err.rfind("clang>=20") &&
+                   h.out.capacity_err.contains("worker 'clang-18-builder' (core 0): 18.1.8") &&
+                   h.out.capacity_err.contains("worker 'clang-19-builder' (core 0): 19.1.0") && h.out.capacity_err.contains("SDK jdk ^21"))
+                << h.out.capacity_err;
+            expect(h.out.second.contains("tool clang>=20") && h.out.second.contains("tool mold") && h.out.second.contains("SDK jdk ^21")) << h.out.second;
             expect(h.out.overflow == "no attached worker matches the required platform os=windows") << h.out.overflow;
         };
 

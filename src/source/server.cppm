@@ -149,11 +149,11 @@ export namespace source_server {
         auto stored_nodes() const -> std::uint64_t {
             std::uint64_t n = 0;
             std::error_code ec;
-            for (auto it = std::filesystem::directory_iterator(storage_ / ".nodes", ec); !ec && it != std::filesystem::directory_iterator(); it.increment(ec)) {
+            for (auto it = std::filesystem::directory_iterator(storage_ / constants::repositories_directory, ec); !ec && it != std::filesystem::directory_iterator(); it.increment(ec)) {
                 if (!std::filesystem::is_directory(it->symlink_status(ec)) || ec)
                     continue;
-                for (auto name : {"repository.sqlite", "repository.sqlite-wal", "repository.sqlite-shm", "repository.sqlite-journal"}) {
-                    const auto path = it->path() / name;
+                for (auto suffix : {"", "-wal", "-shm", "-journal"}) {
+                    const auto path = it->path() / (std::string{constants::repository_database} + suffix);
                     std::error_code error;
                     if (std::filesystem::is_regular_file(std::filesystem::symlink_status(path, error)))
                         if (auto size = std::filesystem::file_size(path, error); !error)
@@ -278,7 +278,7 @@ export namespace source_server {
                 authorize(request.actor);
                 jobs::node_usage_reply out;
                 std::error_code ec;
-                for (auto& entry : std::filesystem::directory_iterator(storage_ / ".nodes", ec)) {
+                for (auto& entry : std::filesystem::directory_iterator(storage_ / constants::repositories_directory, ec)) {
                     if (!entry.is_directory(ec) || entry.is_symlink(ec))
                         continue;
                     jobs::project_usage u{.project = entry.path().filename().string()};
@@ -298,20 +298,20 @@ export namespace source_server {
 
         auto node(std::size_t core, jobs::node_call request) -> coroutine::task<nodes::node_reply> {
             config::check_name("project", request.project);
-            auto root = storage_ / ".nodes" / request.project;
+            auto root = storage_ / constants::repositories_directory / request.project;
             co_return co_await io::blocking(rt_.get_scheduler(core), pool_, [this, root, request = std::move(request)]() mutable {
                 authorize(request.actor);
                 const bool delegated = request.actor.dependency.has_value();
                 if (delegated) {
                     const auto& grant = *request.actor.dependency;
-                    static const std::set<std::string, std::less<>> reads{"tree", "read", "content", "scope_register"};
+                    static const std::set<std::string, std::less<>> reads{"tree", "read", "content", "scope_register", "scope_classify"};
                     if ((!request.reading && request.request.action != "scope_register") || !reads.contains(request.request.action) ||
                         grant.project != request.project || grant.worldline != request.request.worldline ||
                         (grant.version.empty() ? request.request.action != "tree" : grant.version != request.request.revision))
                         throw transport::coded_error(nodes::code::permission_denied, "operation is outside the dependency read grant");
                     if (request.actor.execution_token.empty() || request.actor.project.empty())
                         throw transport::coded_error(nodes::code::permission_denied, "dependency read has no originating execution");
-                    const auto origin = storage_ / ".nodes" / request.actor.project;
+                    const auto origin = storage_ / constants::repositories_directory / request.actor.project;
                     auto checked = repositories_.with(
                         origin,
                         [&](nodes::local_node& node) {
@@ -374,7 +374,7 @@ export namespace source_server {
             co_return co_await with(core, std::move(project), std::move(ignore), [this, request = std::move(request)](storage::project_files& files) {
                 authorize(request.actor);
                 config::check_name("project", request.project);
-                return repositories_.with(storage_ / ".nodes" / request.project, [&](nodes::local_node& node) {
+                return repositories_.with(storage_ / constants::repositories_directory / request.project, [&](nodes::local_node& node) {
                     confirmation confirmed{*this, node, request.actor, request.workspace_limit};
                     auto reply = files.capture_node(node, content::is_hash(request.operation) ? scoped(request.actor, request.operation) : request.operation,
                                                     request.operation, author_key(request.actor), request.expected, request.intent, request.file_limit,

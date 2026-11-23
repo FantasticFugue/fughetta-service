@@ -1,5 +1,6 @@
 import std;
 import boost.ut;
+import build;
 import toolchain;
 import usage;
 import projectmodel;
@@ -8,6 +9,58 @@ import support;
 namespace {
     using namespace boost::ut;
     static constexpr auto cases = [] {
+        "a Worker resolves all constraints for each installed instance"_test = [] {
+            using toolchain::parse_version;
+            using toolchain::version_constraint;
+            expect(parse_version("1.0.0-rc.2") < parse_version("1.0.0-rc.10"));
+            expect(parse_version("1.0.0-rc.10") < parse_version("1.0.0+build.1"));
+            expect(version_constraint::parse("^0.2.3").matches(parse_version("0.2.9")) &&
+                   !version_constraint::parse("^0.2.3").matches(parse_version("0.3.0")));
+            expect(version_constraint::parse("~2.13").matches(parse_version("2.13.16")) &&
+                   !version_constraint::parse("~2.13").matches(parse_version("2.14.0")));
+            expect(throws<std::invalid_argument>([] { version_constraint::parse(">=17,"); }));
+
+            toolchain::catalog available{.tools = {toolchain::installation("java@17.0.12"), toolchain::installation("java@21.0.4"),
+                                                    {.name = "fughetta-scala", .id = "fughetta-scala", .features = {"scala-3"}}},
+                                        .sdks = {toolchain::installation("jdk@17.0.12"), toolchain::installation("jdk@21.0.4")}};
+            const std::vector<std::string> tools{"java>=17,<22", "java 21.x", "fughetta-scala[scala-3]"};
+            const std::vector<toolchain::sdk_constraint> sdks{{"jdk", "^21"}};
+            const auto result = toolchain::resolve(available, toolchain::parse_constraints(tools, sdks));
+            expect(result.missing.empty());
+            expect(result.selected.tools.at("java") == "java@21.0.4" && result.selected.sdks.at("jdk") == "jdk@21.0.4");
+            const auto constraints = toolchain::parse_constraints(std::vector<std::string>{"java>=22"}, sdks);
+            const auto missing = toolchain::resolve(available, constraints, true);
+            expect(missing.missing.size() == 1_u && missing.missing.front().requirement == "tool java>=22" &&
+                   missing.missing.front().installed == std::vector<std::string>{"17.0.12", "21.0.4"});
+        };
+        "dispatch binds each requested JDK with its tool and environment"_test = [] {
+            test::scratch tmp{"jdk-bindings"};
+            const auto java17 = tmp.dir / "jdk17", java21 = tmp.dir / "jdk21";
+            test::spit(java17 / "bin/java", "java 17");
+            test::spit(java17 / "release", "JAVA_VERSION=\"17.0.12\"\n");
+            test::spit(java21 / "bin/java", "java 21");
+            test::spit(java21 / "release", "JAVA_VERSION=\"21.0.4\"\n");
+            const std::map<std::string, std::string> configured{{"java@17", (java17 / "bin/java").string()}, {"java@21", (java21 / "bin/java").string()}};
+            auto discovered = configured;
+            discovered["java"] = discovered["java@17.0.12"] = configured.at("java@17");
+            const auto runtime = toolchain::inspect(discovered, {}, {{"jdk", {.manifest = (java17 / "release").string(), .roots = {java17.string()}}}},
+                                                     configured);
+            const auto available = toolchain::capabilities(runtime);
+            expect(available.tools.size() == 2_u);
+            const auto preferred = toolchain::resolve(available, toolchain::parse_constraints(std::vector<std::string>{"java"}, {}));
+            expect(preferred.selected.tools.at("java") == "java@17");
+            expect(available.sdks.size() == 2_u);
+            expect(available.sdks.front().id == "jdk" && available.sdks.front().version == "17.0.12");
+            for (const auto& [tool, sdk, root] : {std::tuple{"java>=17,<18", "^17", java17}, std::tuple{"java>=21", "^21", java21}}) {
+                const auto constraints = toolchain::parse_constraints(std::vector<std::string>{tool}, std::vector<toolchain::sdk_constraint>{{"jdk", sdk}});
+                const auto resolution = toolchain::resolve(available, constraints);
+                expect(resolution.missing.empty() >> fatal);
+                const auto bound = toolchain::bind(runtime, resolution.selected);
+                const auto command = builds::locate({.argv = {"${tool:java}", "${sdk:jdk}"}}, tmp.dir, bound.tools, 1, {}, {}, {}, bound.sdks);
+                expect(command.argv == std::vector<std::string>{(root / "bin/java").generic_string(), std::filesystem::canonical(root).generic_string()});
+                expect(bound.env.at("JAVA_HOME") == std::filesystem::canonical(root).generic_string());
+            }
+        };
         "SDK bindings reject shared directories and select the longest nested root"_test = [] {
             test::scratch tmp{"sdk-roots"};
             const auto first = tmp.dir / "first", second = tmp.dir / "second";
@@ -48,7 +101,7 @@ namespace {
             expect(throws<std::invalid_argument>([&] { toolchain::inspect({}, {{"ANDROID_HOME", first.string()}, {"ANDROID_SDK_ROOT", second.string()}}); }));
         };
 
-        "SDK bindings change independently from the execution runtime"_test = [] {
+        "installation identity covers tools and SDK bindings"_test = [] {
             test::scratch tmp{"toolchain"};
             test::spit(tmp.dir / "compiler", "compiler version one");
             test::spit(tmp.dir / "sdk", "sdk version one");
@@ -60,40 +113,15 @@ namespace {
             expect(toolchain::inspect(tools, {}, sdk).id == first.id);
             test::spit(tmp.dir / "compiler", "compiler version two");
             auto second = toolchain::inspect(tools, {}, sdk);
-            expect(second.id != first.id && second.execution != first.execution);
+            expect(second.id != first.id && !std::ranges::equal(second.executables, first.executables));
             test::spit(tmp.dir / "sdk", "sdk version two");
             auto third = toolchain::inspect(tools, {}, sdk);
-            expect(third.id != second.id && third.execution == second.execution && third.inputs.front().object != second.inputs.front().object);
+            expect(third.id != second.id && std::ranges::equal(third.executables, second.executables) && third.inputs.front().object != second.inputs.front().object);
             std::filesystem::create_directory(tmp.dir / "headers");
             sdk.at("native").roots = {(tmp.dir / "headers").string()};
             auto relocated = toolchain::inspect(tools, {}, sdk);
-            expect(relocated.execution == third.execution && relocated.inputs.front().object == third.inputs.front().object && relocated.id != third.id);
-            expect(toolchain::inspect(tools, {{"TARGET", "other"}}, sdk).execution != third.execution);
-        };
-        "provider execution follows selected tools and its effective environment"_test = [] {
-            toolchain::identity runtime{.platform = "system",
-                                        .executables = {{"/tools/reader", "reader"}, {"/tools/symbolizer", "symbols"}, {"/tools/java", "java"}}};
-            const std::map<std::string, std::string> commands{{"reader", "/tools/reader"}, {"symbolizer", "/tools/symbolizer"}};
-            const auto first = toolchain::select(runtime, commands, {});
-            auto relocated = runtime;
-            relocated.executables = {{"/another-worker/reader", "reader"}, {"/another-worker/symbolizer", "symbols"}};
-            const std::map<std::string, std::string> moved{{"reader", "/another-worker/reader"}, {"symbolizer", "/another-worker/symbolizer"}};
-            expect(toolchain::select(relocated, moved, {}) == first) << "logical tools retain their identity after moving worker installations";
-            auto different = moved;
-            auto role = different.extract("reader");
-            role.key() = "different-role";
-            different.insert(std::move(role));
-            expect(toolchain::select(relocated, different, {}) != first);
-            toolchain::identity drivers{.platform = "system", .executables = {{"/tools/clang", "one-binary"}, {"/tools/clang++", "one-binary"}}};
-            expect(toolchain::select(drivers, {{"compiler", "/tools/clang"}}, {}) != toolchain::select(drivers, {{"compiler", "/tools/clang++"}}, {}))
-                << "argv0 keeps multicall compiler modes distinct";
-            runtime.executables.at("/tools/java") = "changed";
-            expect(!first.empty() && toolchain::select(runtime, commands, {}) == first);
-            runtime.executables.at("/tools/symbolizer") = "changed";
-            const auto changed = toolchain::select(runtime, commands, {});
-            expect(changed != first && toolchain::select(runtime, commands, {{"TARGET", "other"}}) != changed);
-            runtime.executables.erase("/tools/reader");
-            expect(toolchain::select(runtime, commands, {}).empty());
+            expect(std::ranges::equal(relocated.executables, third.executables) && relocated.inputs.front().object == third.inputs.front().object && relocated.id != third.id);
+            expect(toolchain::inspect(tools, {{"TARGET", "other"}}, sdk).id != third.id);
         };
         "call records retain each caller without charging another execution and survive replay"_test = [] {
             test::scratch tmp{"calls"};

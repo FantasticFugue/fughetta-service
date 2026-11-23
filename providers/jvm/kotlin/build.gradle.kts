@@ -29,6 +29,7 @@ dependencies {
     implementation("org.jetbrains.kotlin:kotlin-compiler-ir-for-ide:2.4.21@jar")
     implementation("org.jetbrains.kotlin:kotlin-compiler-fir-for-ide:2.4.21@jar")
     implementation("org.jetbrains.kotlin:kotlin-compiler-fe10-for-ide:2.4.21@jar")
+    implementation("org.jetbrains.intellij.deps:asm-all:9.6.1")
     listOf("util-rt", "util-class-loader", "util-xml-dom", "util-base", "util", "core", "extensions").forEach {
         implementation("com.jetbrains.intellij.platform:$it:251.27812.49")
     }
@@ -41,7 +42,7 @@ dependencies {
 }
 
 kotlin {
-    jvmToolchain(25)
+    jvmToolchain(providers.gradleProperty("fughetta.javaVersion").get().toInt())
     compilerOptions {
         optIn.add("org.jetbrains.kotlin.analysis.api.KaExperimentalApi")
         optIn.add("org.jetbrains.kotlin.analysis.api.KaImplementationDetail")
@@ -56,7 +57,7 @@ tasks.test {
     dependsOn(tasks.installDist, host.tasks.named("installDist"))
     systemProperty("fughetta.host.jar", host.layout.buildDirectory.file("install/fughetta-jvm/lib/fughetta-jvm.jar").get().asFile.absolutePath)
     systemProperty("fughetta.adapter.jar", layout.buildDirectory.file("install/fughetta-kotlin/lib/fughetta-kotlin.jar").get().asFile.absolutePath)
-    listOf("FUGHETTA_RECORD_VALIDATOR", "FUGHETTA_WORKER_TEST").forEach { name ->
+    listOf("FUGHETTA_RECORD_VALIDATOR", "FUGHETTA_WORKER_TEST", "FUGHETTA_JVM_TEST").forEach { name ->
         providers.environmentVariable(name).orNull?.let { inputs.file(it) }
     }
     val scratch = layout.buildDirectory.dir("test-work")

@@ -1,4 +1,6 @@
 export module publication;
+import utility;
+import native;
 import std;
 import coroutine;
 import registry;
@@ -8,6 +10,8 @@ import channels;
 import enrollment;
 import pybind;
 import constants;
+import publiccache;
+import publicrecord;
 export import tool;
 
 export namespace publishing {
@@ -122,7 +126,7 @@ export namespace publishing {
         std::vector<semantic::shard> shards;
         std::vector<semantic::missing> missing;
         std::uint64_t reused = 0;
-        std::vector<semantic::shard_receipt> receipts;
+        std::vector<std::optional<semantic::shard_receipt>> receipts;
     };
     struct bound {
 
@@ -142,7 +146,10 @@ export namespace publishing {
         receipt_authority signer;
         std::vector<semantic::artifact_receipt> artifacts;
         void receive(language::evaluated_unit unit);
-        auto validate(jobs::reuse_request request) -> jobs::reuse_reply;
+        public_shards::units public_units;
+        std::map<semantic::candidate_id, semantic::shard> public_hits;
+        std::vector<std::size_t> public_outputs;
+        auto validate(jobs::reuse_request request) -> coroutine::task<jobs::reuse_reply>;
         auto read(jobs::shard_read request) -> coroutine::task<jobs::shard_piece>;
         auto serve(jobs::analysis_link inputs) -> coroutine::task<>;
         auto finish() -> coroutine::task<std::optional<semantic::view_id>>;
@@ -161,6 +168,7 @@ export namespace publishing {
         const auto expected_snapshot = pin.snapshot;
         if (!roots)
             roots = co_await files.with_semantic(core, [](semantic::store& store) { return store.protect(); });
+        analysis.public_lookup = files.shard_cache() != nullptr;
         analysis.candidates =
             co_await files.with_semantic(core, [snapshots, project, options = analysis.options, sources, retained = analysis.retained,
                                                 roots](semantic::store& store) { return store.offer(snapshots, project, options, sources, retained, roots); });
@@ -223,20 +231,58 @@ export namespace publishing {
             return jobs::shard_piece{request.offset, total, std::move(bytes)};
         });
     }
-    auto bound::validate(jobs::reuse_request request) -> jobs::reuse_reply {
+    auto bound::validate(jobs::reuse_request request) -> coroutine::task<jobs::reuse_reply> {
         const auto& session = request.session;
         expect_session(plan, session, project, expected_snapshot, units->session);
         if (request.execution != plan.execution)
             throw tool_error("stale_analysis", "reuse inputs do not belong to this analysis");
         units->session = session;
         const auto& validators = language::providers::validators();
-        reuse::environment current{sources, request.inputs, input_channels, project, validators, input_collections};
+        reuse::environment current{sources, request.inputs, input_channels, project, validators, input_collections, std::move(request.processes)};
         jobs::reuse_reply reply;
         for (const auto& candidate : plan.candidates)
             if (reuse::accept(candidate, session, plan.demand, current, true))
                 reply.accepted.push_back({candidate.id, semantic::recipe_identifier(candidate.recipe)});
         approved = reply.accepted;
-        return reply;
+        if (auto* cache = files->shard_cache()) {
+            for (auto& [unit, inputs] : request.public_units) {
+                if (unit.project != project || unit.stage != session.stage || unit.provider != session.provider || unit.operation != "evaluate" ||
+                    !public_shards::eligible(inputs))
+                    continue;
+                const auto id = semantic::unit_identifier(unit);
+                const auto process = current.processes.find(id);
+                if ((process != current.processes.end() && !std::ranges::all_of(process->second, [&](const auto& input) {
+                        return std::ranges::contains(inputs, input);
+                    })) || !std::ranges::all_of(inputs, [&](const auto& input) {
+                        if (input.kind == semantic::input_kind::tool)
+                            return process != current.processes.end() && std::ranges::contains(process->second, input);
+                        return reuse::input(input, project, current);
+                    }))
+                    continue;
+                if (!public_units.emplace(unit, inputs).second)
+                    continue;
+                const semantic::recipe recipe{unit, plan.options};
+                if (std::ranges::any_of(reply.accepted, [&](const auto& accepted) { return accepted.recipe == semantic::recipe_identifier(recipe); }))
+                    continue;
+                auto shard = co_await cache->lookup(files->scheduler(core), files->disk_pool(), recipe, std::move(inputs));
+                if (!shard)
+                    continue;
+                semantic::candidate candidate{.id = "public-" + public_shards::lookup_key(recipe, shard->unit.direct_inputs),
+                                              .recipe = recipe, .units = {shard->unit}};
+                auto public_inputs = request.inputs;
+                public_inputs[project].append_range(shard->unit.direct_inputs);
+                reuse::environment installed{sources, public_inputs, input_channels, project, validators, input_collections, current.processes};
+                if (!reuse::accept(candidate, session, plan.demand, installed, true))
+                    continue;
+                candidate.units.clear();
+                candidate.nodes = shard->identities.size() + shard->symbols.size() + shard->types.size() + shard->occurrences.size() +
+                                  shard->references.size() + shard->scopes.size() + shard->relations.size();
+                approved.push_back({candidate.id, semantic::recipe_identifier(recipe)});
+                public_hits.emplace(candidate.id, std::move(*shard));
+                reply.public_candidates.push_back(std::move(candidate));
+            }
+        }
+        co_return reply;
     }
     void bound::receive(language::evaluated_unit unit) {
         const auto& session = unit.session;
@@ -269,6 +315,14 @@ export namespace publishing {
             if (!unit.shards.empty() ||
                 !std::ranges::contains(approved, reuse::key{*unit.reused, semantic::recipe_identifier(semantic::recipe{unit.request.unit, plan.options})}))
                 throw tool_error("invalid_worker_reply", "provider reused an unoffered unit");
+            if (auto hit = public_hits.find(*unit.reused); hit != public_hits.end()) {
+                units->shards.push_back(std::move(hit->second));
+                units->receipts.emplace_back();
+                public_hits.erase(hit);
+                units->keys.insert(key);
+                ++units->reused;
+                return;
+            }
             const auto candidate = std::ranges::find(plan.candidates, *unit.reused, &semantic::candidate::id);
             if (candidate == plan.candidates.end())
                 throw tool_error("invalid_worker_reply", "unknown reused contribution");
@@ -298,8 +352,13 @@ export namespace publishing {
         }
         units->session = session;
         units->keys.insert(key);
+        if (verified.size() == 1 && public_units.contains(unit.request.unit))
+            public_outputs.push_back(units->shards.size());
         std::ranges::move(unit.shards, std::back_inserter(units->shards));
-        std::ranges::move(verified, std::back_inserter(units->receipts));
+        if (verified.empty())
+            units->receipts.resize(units->shards.size());
+        else
+            std::ranges::move(verified, std::back_inserter(units->receipts));
         return;
     }
     auto bound::serve(jobs::analysis_link inputs) -> coroutine::task<> {
@@ -310,14 +369,14 @@ export namespace publishing {
                     receive(std::move(*unit));
                     item->answer(std::monostate{});
                 } else if (auto* request = std::get_if<jobs::reuse_request>(&item->data)) {
-                    item->answer(validate(std::move(*request)));
+                    item->answer(co_await validate(std::move(*request)));
                 } else if (auto* request = std::get_if<jobs::shard_read>(&item->data)) {
                     item->answer(co_await read(std::move(*request)));
                 } else {
                     item->answer(co_await files->read_model(core, project, std::move(std::get<jobs::model_read>(item->data))));
                 }
             } catch (...) {
-                item->fail(std::current_exception());
+                item->fail(util::capture_current_exception());
             }
         }
     }
@@ -328,14 +387,40 @@ export namespace publishing {
         const auto& worldline = pin.worldline;
         const auto& version = pin.version;
         nodes::node_request registration{.action = "scope_register", .worldline = worldline, .revision = version};
-        for (const auto& shard : units->shards)
-            for (const auto& occurrence : shard.occurrences)
+        const auto project_sources = sources.find(project);
+        for (const auto& shard : units->shards) {
+            std::map<semantic::symbol_id, const semantic::records::symbol*> symbols;
+            for (const auto& symbol : shard.symbols)
+                symbols.try_emplace(symbol.id, &symbol);
+            std::map<semantic::type_id, const semantic::records::type*> types;
+            for (const auto& type : shard.types)
+                types.try_emplace(type.id, &type);
+            for (const auto& occurrence : shard.occurrences) {
                 // Implicit declarations share their owner's source range;
                 // their identity comes from the owner and relative native key.
-                if (occurrence.location.source && !std::ranges::contains(occurrence.roles, semantic::role{"implicit"}))
+                if (occurrence.location.source && !std::ranges::contains(occurrence.roles, semantic::role{"implicit"}) &&
+                    registration.declaration_ranges.size() < constants::scope_reference_limit)
                     registration.declaration_ranges.try_emplace(occurrence.symbol, occurrence.selection.value_or(*occurrence.location.source));
+                if (channels::is_body_range(occurrence) && occurrence.location.project.value_or(project) == project &&
+                    project_sources != sources.end() && project_sources->second.contains(occurrence.body->path) &&
+                    registration.body_ranges.size() + registration.scope_hints.ffi_boundaries.size() < constants::scope_reference_limit) {
+                    registration.body_ranges.try_emplace(occurrence.symbol, *occurrence.body);
+                    if (const auto sym = symbols.find(occurrence.symbol); sym != symbols.end() && channels::is_sealed_body(*sym->second, occurrence, types))
+                        registration.scope_hints.sealed_bodies.insert(occurrence.symbol);
+                }
+                if (occurrence.location.source && occurrence.location.project.value_or(project) == project &&
+                    project_sources != sources.end() && project_sources->second.contains(occurrence.location.source->path) &&
+                    !std::ranges::contains(occurrence.roles, semantic::role{"implicit"}) &&
+                    (std::ranges::contains(occurrence.roles, semantic::role::make<"declaration">()) ||
+                     std::ranges::contains(occurrence.roles, semantic::role::make<"definition">())) &&
+                    registration.body_ranges.size() + registration.scope_hints.ffi_boundaries.size() < constants::scope_reference_limit) {
+                    if (const auto sym = symbols.find(occurrence.symbol); sym != symbols.end() && channels::is_ffi_boundary(*sym->second))
+                        registration.scope_hints.ffi_boundaries.try_emplace(occurrence.symbol, occurrence.selection.value_or(*occurrence.location.source));
+                }
+            }
+        }
         std::map<std::string, semantic::source_anchor> anchors;
-        if (!registration.declaration_ranges.empty()) {
+        if (!registration.declaration_ranges.empty() || !registration.body_ranges.empty() || !registration.scope_hints.ffi_boundaries.empty()) {
             auto reply = co_await files->node(core, project, std::move(registration), actor, false);
             if (reply.code != "ok")
                 throw tool_error(reply.code, reply.reason);
@@ -346,9 +431,34 @@ export namespace publishing {
         selected.coverage.requested = plan.demand;
         selected.coverage.missing = units->missing;
         selected.artifact_receipts = std::move(artifacts);
-        co_return co_await files->with_semantic(
+        auto* cache = files->shard_cache();
+        std::vector<public_shards::object> uploads;
+        if (cache && cache->signer() && !public_outputs.empty()) {
+            uploads = co_await io::blocking(files->scheduler(core), files->disk_pool(), [this, cache] {
+                std::vector<public_shards::object> objects;
+                for (auto index : public_outputs) {
+                    const auto& shard = units->shards[index];
+                    try {
+                        if (auto value = public_shards::encode(shard, public_units.at(shard.unit.recipe.unit), *cache->signer()))
+                            objects.push_back(std::move(*value));
+                    } catch (const std::exception& error) {
+                        logging::warn(std::format("public shard encoding failed: {}", error.what()));
+                    }
+                }
+                return objects;
+            });
+        }
+        auto published = co_await files->with_semantic(
             core, [selected = std::move(selected), units = units, anchors = std::move(anchors), roots = roots](semantic::store& store) mutable {
                 return store.publish_records(std::move(selected), std::move(units->shards), anchors, roots, std::move(units->receipts));
             });
+        for (const auto& value : uploads) {
+            try {
+                co_await cache->publish(files->scheduler(core), value);
+            } catch (const std::exception& error) {
+                logging::warn(std::format("public shard upload failed: {}", error.what()));
+            }
+        }
+        co_return published;
     }
 } // namespace publishing

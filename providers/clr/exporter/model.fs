@@ -10,6 +10,7 @@ open System.Reflection.PortableExecutable
 open System.Security.Cryptography
 open System.Text.Json.Nodes
 open System.Text.RegularExpressions
+open System.Xml.Linq
 
 let text (s: string) : JsonNode = JsonValue.Create(s)
 let number (n: int) : JsonNode = JsonValue.Create(n)
@@ -22,6 +23,45 @@ let values (node: JsonNode) = node.AsArray() |> Seq.cast<JsonNode>
 let full (path: string) = Path.GetFullPath(path)
 let within (root: string) (path: string) = path = root || path.StartsWith(root.TrimEnd(Path.DirectorySeparatorChar) + string Path.DirectorySeparatorChar, StringComparison.Ordinal)
 let join root path = Path.Combine(root, path) |> full
+let expandProjects directory projects =
+    let supported (path: string) =
+        match Path.GetExtension(path).ToLowerInvariant() with
+        | ".csproj" | ".fsproj" -> true
+        | _ -> false
+    let solutionEntry = Regex("""^\s*Project\("[^"]*"\)\s*=\s*"[^"]*",\s*"([^"]+\.(?:cs|fs)proj)"(?:\s*,|\s*$)""",
+                              RegexOptions.IgnoreCase ||| RegexOptions.CultureInvariant)
+    let comparer = if OperatingSystem.IsWindows() then StringComparer.OrdinalIgnoreCase else StringComparer.Ordinal
+    let seen = HashSet<string>(comparer)
+    projects
+    |> List.collect (fun path ->
+        let path = join directory path
+        let resolve (entry: string) =
+            entry.Replace('\\', Path.DirectorySeparatorChar).Replace('/', Path.DirectorySeparatorChar)
+            |> join (Path.GetDirectoryName path)
+        let entries =
+            match Path.GetExtension(path).ToLowerInvariant() with
+            | ".slnx" ->
+                XDocument.Load(path).Descendants()
+                |> Seq.filter (fun node -> node.Name.LocalName = "Project")
+                |> Seq.choose (fun node ->
+                    match node.Attribute(XName.Get "Path") with
+                    | null -> None
+                    | attribute ->
+                        let project = resolve attribute.Value
+                        if not (File.Exists project) then failwithf "Solution %s references missing project: %s" path project
+                        Some project)
+                |> Seq.filter supported
+                |> Seq.toList
+            | ".sln" ->
+                File.ReadLines(path)
+                |> Seq.choose (fun line ->
+                    let entry = solutionEntry.Match line
+                    if entry.Success then Some (resolve entry.Groups[1].Value) else None)
+                |> Seq.toList
+            | _ -> [path]
+        if entries.IsEmpty then failwithf "Solution %s contains no supported .csproj or .fsproj projects" path
+        entries)
+    |> List.filter seen.Add
 let relative root path =
     let path = full path
     if not (within root path) then failwithf "Source/output lies outside the installed tree: %s" path
@@ -84,7 +124,7 @@ type Arguments =
             | Restore_Output _ -> "Destination for the restore receipt."
             | Model_Output _ -> "Destination for the exported project model."
             | Assets _ -> "Path to the restore receipt."
-            | Project _ -> "MSBuild project to evaluate."
+            | Project _ -> "MSBuild project or solution to evaluate."
             | Generated _ -> "Generated source input."
             | Argument _ -> "Extra MSBuild argument."
             | Operations _ -> "Operations to execute in order."
@@ -99,7 +139,7 @@ let runModel (argv: string array) =
     if jobs < 1 then failwith "--jobs must be positive"
     let root, directory, tool = full (options.GetResult Root), full (options.GetResult Project_Dir), options.GetResult Tool
     let extra = options.GetResults Argument
-    let projects = options.GetResults Project |> List.map (join directory)
+    let projects = options.GetResults Project |> expandProjects directory
     let objects = Environment.GetEnvironmentVariable("FUGHETTA_STAGING")
     if String.IsNullOrEmpty objects then failwith "FUGHETTA_STAGING must name this step staging directory"
     let bindings =
@@ -218,8 +258,8 @@ let runModel (argv: string array) =
                                      "-property:SkipCompilerExecution=true"; "-property:ProvideCommandLineArgs=true"]
                         let result =
                             query project flags
-                                ["TargetPath"; "AssemblyName"; "LangVersion"; "DefineConstants"; "IntermediateOutputPath"; "NETCoreSdkVersion"; "ProjectAssetsFile"]
-                                ["Compile"; "ReferencePath"; "_MSBuildProjectReferenceExistent"; "FscCommandLineArgs"; "Analyzer"; "AdditionalFiles"]
+                                ["TargetPath"; "AssemblyName"; "LangVersion"; "DefineConstants"; "IntermediateOutputPath"; "NETCoreSdkVersion"; "ProjectAssetsFile"; "CompilerGeneratedFilesOutputPath"]
+                                ["Compile"; "ReferencePath"; "_MSBuildProjectReferenceExistent"; "FscCommandLineArgs"; "CscCommandLineArgs"; "Analyzer"; "AdditionalFiles"]
                         let props, items = result["Properties"], result["Items"]
                         if not (restoredAssets.Contains(full (field props "ProjectAssetsFile"))) then failwithf "Project assets are absent from nuget_assets input: %s" project
                         let version = field props "NETCoreSdkVersion"
@@ -227,6 +267,9 @@ let runModel (argv: string array) =
                         producerVersion <- version
                         let projectDirectory = Path.GetDirectoryName(project)
                         let intermediate = join projectDirectory ((field props "IntermediateOutputPath").Replace('\\', '/'))
+                        let isCSharp =
+                            String.Equals(Path.GetExtension(project), ".csproj", StringComparison.OrdinalIgnoreCase) ||
+                            (not (isNull items["CscCommandLineArgs"]) && not (Seq.isEmpty (values items["CscCommandLineArgs"])))
                         let generated = JsonObject()
                         let sources = ResizeArray<string>()
                         let sourceArguments = Dictionary<string, string>()
@@ -238,6 +281,25 @@ let runModel (argv: string array) =
                             let automatic = within intermediate path || field item "AutoGen" = "true" || field item "Generated" = "true"
                             if automatic || generatedInputs |> Array.exists (fun input -> within input path) then
                                 generated[logical] <- intern path
+                        let generatorOutput = field props "CompilerGeneratedFilesOutputPath"
+                        if isCSharp && generatorOutput <> "" then
+                            let directory = join projectDirectory generatorOutput
+                            let enumerator = EnumerationOptions(RecurseSubdirectories=true, AttributesToSkip=FileAttributes.ReparsePoint)
+                            for input in generatedInputs do
+                                let files =
+                                    if File.Exists input && within directory input then Seq.singleton input
+                                    elif Directory.Exists input then
+                                        let candidate = if within input directory then directory else input
+                                        if within directory candidate && Directory.Exists candidate then
+                                            Directory.EnumerateFiles(candidate, "*.cs", enumerator)
+                                        else Seq.empty
+                                    else Seq.empty
+                                for path in files |> Seq.sort do
+                                    if String.Equals(Path.GetExtension(path), ".cs", StringComparison.OrdinalIgnoreCase) then
+                                        let logical = relative root path
+                                        if not (generated.ContainsKey logical) then
+                                            sources.Add(logical)
+                                            generated[logical] <- intern path
                         let refs = ResizeArray<JsonNode>()
                         let mutable typeProviders = false
                         for item in values items["ReferencePath"] do
@@ -248,15 +310,25 @@ let runModel (argv: string array) =
                             let pack = field item "NuGetPackageId"
                             let framework = pack.EndsWith(".Ref", StringComparison.Ordinal) || field item "FrameworkReferenceName" <> ""
                             refs.Add(reference (full (field item "FullPath")) "classpath" framework)
-                        for item in values items["Analyzer"] do refs.Add(reference (full (field item "FullPath")) "plugin" false)
-                        let compilerArguments = values items["FscCommandLineArgs"] |> Seq.map (fun item ->
+                        let analyzers = values items["Analyzer"] |> Seq.map (fun item -> full (field item "FullPath")) |> Seq.toArray
+                        let analyzerFiles = HashSet<string>(analyzers)
+                        for path in analyzers do refs.Add(reference path "plugin" false)
+                        if isCSharp then
+                            for directory in analyzers |> Seq.map Path.GetDirectoryName |> Seq.distinct |> Seq.filter Directory.Exists do
+                                for path in Directory.EnumerateFiles(directory, "*.dll") |> Seq.sort do
+                                    if analyzerFiles.Add(path) then refs.Add(reference path "plugin_dependency" false)
+                        let language, compiler = if isCSharp then "csharp", "CscCommandLineArgs" else "fsharp", "FscCommandLineArgs"
+                        let compilerArguments = values items[compiler] |> Seq.map (fun item ->
                             let arg = field item "Identity"
                             if sourceArguments.ContainsKey arg then sourceArguments[arg] else arg) |> arguments
-                        let unit = object ["id", text id; "project", text projectId; "language", text "fsharp";
+                        let generatorPath = if generatorOutput = "" then "" else join projectDirectory generatorOutput
+                        let generatorModelPath = if generatorPath <> "" && within root generatorPath then relative root generatorPath else ""
+                        let unit = object ["id", text id; "project", text projectId; "language", text language;
                             "directory", text (relative root projectDirectory); "sources", strings sources; "generated", generated;
                             "references", JsonArray(); "variants", JsonArray(); "outputs", strings [relative root (field props "TargetPath")];
                             "compiler_arguments", compilerArguments; "extensions", object ["framework", text target;
                                 "assembly", props["AssemblyName"].DeepClone(); "language_version", props["LangVersion"].DeepClone();
+                                "compiler_generated_files", text generatorModelPath;
                                 "defines", strings ((field props "DefineConstants").Split(';', StringSplitOptions.RemoveEmptyEntries));
                                 "additional_files", strings (values items["AdditionalFiles"] |> Seq.map (fun item -> relative root (field item "FullPath")));
                                 "type_providers", (JsonValue.Create(typeProviders) :> JsonNode)]]

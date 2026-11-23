@@ -1,7 +1,10 @@
-# Linux: io_uring and a systemd template unit.
+# Linux: epoll during development (io_uring for deployment) and a systemd template unit.
 include("${CMAKE_CURRENT_LIST_DIR}/posix.cmake")
 list(APPEND PLATFORM_IMPLEMENTATION linux/posix linux/affinity)
-set(HTTPANT_IO_BACKEND uring CACHE STRING "Native I/O mechanism")
+set(HTTPANT_IO_BACKEND epoll CACHE STRING "Native I/O mechanism")
 set(DAEMON_DEFINITION fughetta-service.service)
 set(DAEMON_INSTALL_NAME fughetta-service@.service)
 set(PLATFORM_BENCHMARKS engine)
+set(HOST_MODULES backend containerd oci protobuf resources)
+set(HOST_LIBRARIES httpant::imports)
+set(HOST_SERVICE linux)

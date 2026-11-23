@@ -118,7 +118,8 @@ type TypeRecords(identify: FSharpSymbol -> string) =
         register owner shape value.GenericParameters
         let id = identifier (owner + ":callable:" + shape)
         if not (rows.ContainsKey id) then
-            let row = fresh id "function" (value.FullType.Format(FSharpDisplayContext.Empty))
+            let kind = if value.CurriedParameterGroups.Count > 1 then "fsharp:curried_signature" else "function"
+            let row = fresh id kind (value.FullType.Format(FSharpDisplayContext.Empty))
             row["parameter_groups"] <- value.CurriedParameterGroups |> Seq.map (parameterGroup owner) |> array
             row["return_type"] <- text (project owner value.ReturnParameter.Type)
             row["type_parameters"] <- value.GenericParameters |> Seq.map (parameter owner) |> strings

@@ -1,81 +1,20 @@
 name: build
 
-# Native debug builds and tests.
 on:
   push:
-    branches: [main]
   pull_request:
   workflow_dispatch:
 
 concurrency:
-  group: build-${{ github.head_ref || github.ref_name }}
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.head_ref || github.ref_name }}
   cancel-in-progress: true
 
+permissions:
+  contents: read
+
 jobs:
-  build:
-    name: ${{ matrix.name }}
-    runs-on: ${{ matrix.os }}
-    defaults:
-      run:
-        shell: bash
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - name: linux-x64
-            os: ubuntu-24.04
-          - name: macos-arm64
-            os: macos-15
-            configure: -DCLANG_SANITIZER=
-            targets: --target executor-test
-            test: -R '^executor$'
-          - name: windows-x64
-            os: windows-2025
-            configure: -DCLANG_SANITIZER=
-    steps:
-      - uses: actions/checkout@v7
-
-      - id: toolchain
-        uses: ./.github/actions/toolchain
-        with:
-          preset: debug
-
-      - name: Configure
-        run: cmake --preset debug ${{ matrix.configure }}
-
-      - name: Cache installed vcpkg dependencies
-        if: steps.toolchain.outputs.installed-hit != 'true'
-        uses: actions/cache/save@v6
-        with:
-          path: build/debug/vcpkg_installed
-          key: ${{ steps.toolchain.outputs.installed-key }}
-
-      - name: Build
-        # The compiler occasionally segfaults on a unit that compiles on
-        # the next attempt; ninja retries only what failed, and ten failures
-        # fail the step.
-        run: |
-          for attempt in $(seq 10); do
-            cmake --build --preset debug --parallel 2 ${{ matrix.targets }} && exit 0
-          done
-          exit 1
-
-      - name: Test
-        run: ctest --preset debug ${{ matrix.test }}
-
-      - name: Upload logs on failure
-        if: failure()
-        uses: actions/upload-artifact@v7
-        with:
-          name: logs-${{ matrix.name }}
-          path: |
-            build/debug/vcpkg-manifest-install.log
-            build/debug/Testing/Temporary/LastTest.log
-          if-no-files-found: ignore
-
-      - name: Retain macOS test results
-        if: matrix.name == 'macos-arm64' && success()
-        uses: actions/upload-artifact@v7
-        with:
-          name: tests-${{ matrix.name }}
-          path: build/debug/Testing/Temporary/LastTest.log
+  check:
+    if: github.event_name != 'push' || github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+    uses: ./.github/workflows/native.yml
+    with:
+      profile: check

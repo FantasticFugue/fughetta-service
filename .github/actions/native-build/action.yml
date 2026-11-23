@@ -1,0 +1,304 @@
+name: native-build
+description: Set up the native and managed toolchains, then configure and build a CMake preset.
+
+inputs:
+  settings:
+    description: Native build settings from the repository configuration
+    required: true
+  preset:
+    description: CMake configure and build preset
+    required: true
+  configure-args:
+    description: Additional CMake configure arguments
+    default: ''
+  targets:
+    description: Space-separated CMake targets, or empty to build the default targets
+    default: ''
+
+outputs:
+  build-directory:
+    description: CMake build directory for the selected preset
+    value: ${{ steps.paths.outputs.build-directory }}
+  package-directory:
+    description: Output directory for native installers and worker assets
+    value: ${{ steps.paths.outputs.package-directory }}
+
+runs:
+  using: composite
+  steps:
+    - uses: actions/setup-python@v7
+      with:
+        python-version: ${{ fromJSON(inputs.settings).toolchain.python }}
+
+    - name: Set dependency cache paths
+      id: paths
+      shell: bash
+      env:
+        PRESET: ${{ inputs.preset }}
+      run: |
+        root="$RUNNER_TEMP"
+        if [[ "$RUNNER_OS" == Windows ]]; then root=$(cygpath -m "$root"); fi
+        cache_root="$root/fughetta-ci"
+        build_dir="$root/fughetta-build-$PRESET"
+        vcpkg_cache="$cache_root/vcpkg"
+        mkdir -p "$vcpkg_cache/downloads" "$vcpkg_cache/archives"
+        {
+          echo "CI_IMAGE_VERSION=${ImageVersion:-$RUNNER_OS}"
+          echo "CI_BUILD_DIR=$build_dir"
+          echo "CI_TOOLCHAIN_CACHE=$cache_root/toolchain"
+          echo "CI_VCPKG_CACHE=$vcpkg_cache"
+          echo "VCPKG_DOWNLOADS=$vcpkg_cache/downloads"
+          echo "VCPKG_BINARY_SOURCES=clear;files,$vcpkg_cache/archives,readwrite"
+          echo "NUGET_PACKAGES=$cache_root/nuget"
+          echo "GRADLE_USER_HOME=$cache_root/gradle"
+        } >> "$GITHUB_ENV"
+        {
+          echo "build-directory=$build_dir"
+          echo "package-directory=$build_dir/packages"
+        } >> "$GITHUB_OUTPUT"
+
+    # Install the provider's build SDK and the target framework's reference pack.
+    - uses: actions/setup-dotnet@v5
+      with:
+        dotnet-version: ${{ fromJSON(inputs.settings).toolchain.dotnet }}
+
+    - uses: actions/setup-java@v5
+      with:
+        distribution: ${{ fromJSON(inputs.settings).toolchain.java.distribution }}
+        java-version: ${{ fromJSON(inputs.settings).toolchain.java.version }}
+
+    - uses: gradle/actions/setup-gradle@v5
+      with:
+        gradle-version: ${{ fromJSON(inputs.settings).toolchain.gradle }}
+        cache-read-only: ${{ github.event_name == 'pull_request' }}
+
+    - name: Restore toolchain downloads
+      id: tools-cache
+      uses: actions/cache/restore@v6
+      with:
+        path: ${{ env.CI_TOOLCHAIN_CACHE }}
+        key: native-toolchain-${{ runner.os }}-${{ runner.arch }}-${{ fromJSON(inputs.settings).toolchain.cmake }}-${{ fromJSON(inputs.settings).toolchain.llvm }}-ninja-${{ fromJSON(inputs.settings).toolchain.ninja }}
+
+    - name: Install build tools
+      shell: bash
+      env:
+        CMAKE_VERSION: ${{ fromJSON(inputs.settings).toolchain.cmake }}
+        NINJA_VERSION: ${{ fromJSON(inputs.settings).toolchain.ninja }}
+        FETCH_RETRIES: ${{ fromJSON(inputs.settings).download_retries }}
+      run: |
+        set -euo pipefail
+        case "$RUNNER_OS-$RUNNER_ARCH" in
+          Linux-X64) package=linux-x86_64.tar.gz bin=bin ninja=ninja-linux.zip ;;
+          Linux-ARM64) package=linux-aarch64.tar.gz bin=bin ninja=ninja-linux-aarch64.zip ;;
+          macOS-*) package=macos-universal.tar.gz bin=CMake.app/Contents/bin ninja=ninja-mac.zip ;;
+          Windows-X64) package=windows-x86_64.zip bin=bin ninja=ninja-win.zip ;;
+          Windows-ARM64) package=windows-arm64.zip bin=bin ninja=ninja-winarm64.zip ;;
+        esac
+        archive="$CI_TOOLCHAIN_CACHE/cmake-$CMAKE_VERSION-$package"
+        mkdir -p "$(dirname "$archive")"
+        if [[ ! -f "$archive" ]]; then
+          curl -fsSL --retry "$FETCH_RETRIES" -o "$archive" \
+            "https://github.com/Kitware/CMake/releases/download/v$CMAKE_VERSION/cmake-$CMAKE_VERSION-$package"
+        fi
+        case "$package" in
+          *.zip) 7z x -y -o"$RUNNER_TEMP" "$archive" >/dev/null ;;
+          *) tar -xzf "$archive" -C "$RUNNER_TEMP" ;;
+        esac
+        root="$RUNNER_TEMP/cmake-$CMAKE_VERSION-${package%%.*}/$bin"
+        if [ "$RUNNER_OS" = Windows ]; then root="$(cygpath -w "$root")"; fi
+        echo "$root" >> "$GITHUB_PATH"
+        archive="$CI_TOOLCHAIN_CACHE/ninja-$NINJA_VERSION-$ninja"
+        if [[ ! -f "$archive" ]]; then
+          curl -fsSL --retry "$FETCH_RETRIES" -o "$archive" \
+            "https://github.com/ninja-build/ninja/releases/download/v$NINJA_VERSION/$ninja"
+        fi
+        root="$RUNNER_TEMP/ninja"
+        mkdir -p "$root"
+        if [[ "$RUNNER_OS" == Windows ]]; then
+          7z x -y -o"$root" "$archive" >/dev/null
+          root="$(cygpath -w "$root")"
+        else
+          unzip -oq "$archive" -d "$root"
+        fi
+        echo "$root" >> "$GITHUB_PATH"
+        case "$RUNNER_OS" in
+          Linux)
+            sudo apt-get update
+            sudo apt-get install -y autoconf autoconf-archive automake libtool ;;
+          macOS) brew install autoconf autoconf-archive automake libtool ;;
+        esac
+
+    # Linux takes clang from apt.llvm.org and macOS from the LLVM release; both
+    # ship libc++ with its modules manifest. Windows takes clang-cl from the
+    # LLVM release and compiles against the MSVC STL and Windows SDK of the
+    # runner's Visual Studio. The release trees also carry LLVM's libraries.
+    - name: Fetch clang
+      shell: bash
+      env:
+        LLVM_VERSION: ${{ fromJSON(inputs.settings).toolchain.llvm }}
+        FETCH_RETRIES: ${{ fromJSON(inputs.settings).download_retries }}
+      run: |
+        set -euo pipefail
+        temporary="$RUNNER_TEMP"
+        archive_dir="$CI_TOOLCHAIN_CACHE"
+        case "$RUNNER_OS" in
+          Linux)
+            major="${LLVM_VERSION%%.*}"
+            . /etc/os-release
+            curl -fsSL --retry "$FETCH_RETRIES" https://apt.llvm.org/llvm-snapshot.gpg.key |
+              sudo gpg --dearmor --yes -o /usr/share/keyrings/llvm-archive-keyring.gpg
+            echo "deb [signed-by=/usr/share/keyrings/llvm-archive-keyring.gpg] https://apt.llvm.org/$VERSION_CODENAME/ llvm-toolchain-$VERSION_CODENAME-$major main" |
+              sudo tee /etc/apt/sources.list.d/llvm.list
+            sudo apt-get update
+            sudo apt-get install -y "clang-$major" "clang-tools-$major" "lld-$major" "llvm-$major" "llvm-$major-dev" \
+              "libc++-$major-dev" "libc++abi-$major-dev" "libclang-rt-$major-dev"
+            driver=$(readlink -f "$(command -v "clang-$major")")
+            root=$(dirname "$(dirname "$driver")")
+            id="apt-$("$root/bin/clang" -dumpversion)" ;;
+          macOS)
+            case "$RUNNER_ARCH" in ARM64) arch=ARM64 ;; esac
+            name="LLVM-$LLVM_VERSION-macOS-$arch"
+            root="$temporary/$name"
+            # Autotools invokes upstream clang directly, so it needs the SDK
+            # in the environment as well as CMake's compiler configuration.
+            echo "SDKROOT=$(xcrun --sdk macosx --show-sdk-path)" >> "$GITHUB_ENV"
+            id="llvm-$LLVM_VERSION-sdk-$(xcrun --sdk macosx --show-sdk-version)" ;;
+          Windows)
+            case "$RUNNER_ARCH" in X64) arch=x86_64 ;; ARM64) arch=aarch64 ;; esac
+            name="clang+llvm-$LLVM_VERSION-$arch-pc-windows-msvc"
+            temporary="$(cygpath -u "$temporary")"
+            archive_dir="$(cygpath -u "$archive_dir")"
+            root="$(cygpath -m "$temporary/$name")"
+            id="llvm-$LLVM_VERSION" ;;
+        esac
+        if [[ "$RUNNER_OS" != Linux ]]; then
+          archive="$archive_dir/$name.tar.xz"
+          if [[ ! -f "$archive" ]]; then
+            curl -fsSL --retry "$FETCH_RETRIES" -o "$archive" \
+              "https://github.com/llvm/llvm-project/releases/download/llvmorg-$LLVM_VERSION/$name.tar.xz"
+          fi
+          tar -xf "$archive" -C "$temporary"
+        fi
+        if [[ "$RUNNER_OS" == macOS ]]; then
+          runtime=$(find "$root" -name libc++.dylib | sed -n '1p')
+          runtime_dir=$(dirname "${runtime:?LLVM archive lacks libc++.dylib}")
+          # Keep the archive's libc++ symbols and let Darwin unwind every image.
+          for library in "$runtime_dir/libc++.dylib" "$runtime_dir/libc++abi.dylib"; do
+            unwinder=$(otool -L "$library" | awk '$1 ~ /\/libunwind(\.[0-9]+)*\.dylib$/ { print $1; exit }')
+            if [[ -n "$unwinder" ]]; then
+              xcrun install_name_tool -change "$unwinder" /usr/lib/libSystem.B.dylib "$library"
+              codesign --force --sign - "$library"
+            fi
+          done
+          echo "CLANG_RUNTIME_DIR=$runtime_dir" >> "$GITHUB_ENV"
+          echo "LDFLAGS=${LDFLAGS:+$LDFLAGS }-L\"$runtime_dir\" -Wl,-rpath,\"$runtime_dir\" -lc++abi" >> "$GITHUB_ENV"
+        fi
+        echo "CLANG_ROOT=$root" >> "$GITHUB_ENV"
+        echo "CLANG_ID=$id" >> "$GITHUB_ENV"
+
+    - name: Save toolchain downloads
+      if: steps.tools-cache.outputs.cache-hit != 'true'
+      uses: actions/cache/save@v6
+      with:
+        path: ${{ env.CI_TOOLCHAIN_CACHE }}
+        key: ${{ steps.tools-cache.outputs.cache-primary-key }}
+
+    # Port versions can refer to Git trees from earlier commits, so the
+    # registry needs the history reachable from the manifest's baseline.
+    - name: Install vcpkg
+      shell: bash
+      run: |
+        set -euo pipefail
+        root="$RUNNER_TEMP/vcpkg"
+        if [ "$RUNNER_OS" = Windows ]; then
+          root="$(cygpath -m "$root")"
+        fi
+        baseline="$(jq -er '."default-registry".baseline' vcpkg-configuration.json)"
+        git init -q "$root"
+        git -C "$root" fetch -q --no-tags https://github.com/microsoft/vcpkg.git "$baseline"
+        git -C "$root" checkout -q FETCH_HEAD
+        if [ "$RUNNER_OS" = Windows ]; then
+          cmd //c "$(cygpath -w "$root/bootstrap-vcpkg.bat")" -disableMetrics
+        else
+          "$root/bootstrap-vcpkg.sh" -disableMetrics
+        fi
+        echo "VCPKG_ROOT=$root" >> "$GITHUB_ENV"
+
+    - name: Restore vcpkg downloads and binary packages
+      id: vcpkg-cache
+      uses: actions/cache/restore@v6
+      with:
+        path: ${{ env.CI_VCPKG_CACHE }}
+        key: vcpkg-packages-${{ runner.os }}-${{ runner.arch }}-${{ inputs.preset }}-${{ env.CLANG_ID }}-${{ env.CI_IMAGE_VERSION }}-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json', 'cmake/toolchain.cmake') }}
+        restore-keys: vcpkg-packages-${{ runner.os }}-${{ runner.arch }}-${{ inputs.preset }}-${{ env.CLANG_ID }}-
+
+    - name: Configure
+      shell: bash
+      env:
+        PRESET: ${{ inputs.preset }}
+        CONFIGURE_ARGS: ${{ inputs.configure-args }}
+      run: |
+        read -r -a arguments <<< "$CONFIGURE_ARGS"
+        if [[ "$RUNNER_OS" == macOS ]]; then
+          arguments+=("-DCMAKE_EXE_LINKER_FLAGS=$LDFLAGS")
+        fi
+        cmake --preset "$PRESET" -B "$CI_BUILD_DIR" "${arguments[@]}" \
+          -DFUGHETTA_GRADLE_USER_HOME="$GRADLE_USER_HOME"
+
+    # vcpkg selects binary archives by its own package ABI at install time.
+    - name: Save vcpkg downloads and binary packages
+      if: steps.vcpkg-cache.outputs.cache-hit != 'true'
+      uses: actions/cache/save@v6
+      with:
+        path: ${{ env.CI_VCPKG_CACHE }}
+        key: ${{ steps.vcpkg-cache.outputs.cache-primary-key }}
+
+    - name: Restore NuGet packages
+      id: nuget-cache
+      uses: actions/cache/restore@v6
+      with:
+        path: ${{ env.NUGET_PACKAGES }}
+        key: nuget-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('providers/clr/**/*.fsproj', 'providers/clr/**/*.csproj', 'providers/clr/Directory.Build.props') }}
+        restore-keys: nuget-${{ runner.os }}-${{ runner.arch }}-
+
+    - name: Build
+      id: build
+      shell: bash
+      env:
+        PRESET: ${{ inputs.preset }}
+        BUILD_TARGETS: ${{ inputs.targets }}
+        BUILD_JOBS: ${{ fromJSON(inputs.settings).compile_jobs }}
+        BUILD_ATTEMPTS: ${{ fromJSON(inputs.settings).build_attempts }}
+        RATE_LIMIT_WAIT: ${{ fromJSON(inputs.settings).rate_limit_wait_seconds }}
+      run: |
+        read -r -a targets <<< "$BUILD_TARGETS"
+        arguments=()
+        if ((${#targets[@]})); then
+          arguments=(--target "${targets[@]}")
+        fi
+        build_log="$RUNNER_TEMP/native-build-$PRESET.log"
+        for ((attempt = 1; ; ++attempt)); do
+          if cmake --build "$CI_BUILD_DIR" --parallel "$BUILD_JOBS" "${arguments[@]}" 2>&1 | tee "$build_log"; then
+            exit 0
+          else
+            status=$?
+          fi
+          if ((attempt >= BUILD_ATTEMPTS)); then
+            exit "$status"
+          fi
+          if grep -Fq 'PLEASE submit a bug report to https://github.com/llvm/llvm-project/issues/' "$build_log"; then
+            echo "Clang crashed; resuming the Ninja build."
+          elif grep -Fq 'Received status code 429 from server: Too Many Requests' "$build_log"; then
+            echo "The dependency repository rate-limited Gradle; waiting before resuming the Ninja build."
+            sleep "$RATE_LIMIT_WAIT"
+          else
+            exit "$status"
+          fi
+        done
+
+    - name: Save NuGet packages
+      if: ${{ !cancelled() && steps.build.outcome != 'skipped' && steps.nuget-cache.outputs.cache-hit != 'true' }}
+      uses: actions/cache/save@v6
+      with:
+        path: ${{ env.NUGET_PACKAGES }}
+        key: ${{ steps.nuget-cache.outputs.cache-primary-key }}

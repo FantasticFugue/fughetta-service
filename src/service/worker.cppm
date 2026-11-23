@@ -1,6 +1,7 @@
 module;
 #include <argparse/argparse.hpp>
 export module worker;
+import utility;
 import std;
 import runtime;
 import coroutine;
@@ -15,13 +16,16 @@ import host;
 import constants;
 import toolchain;
 import sibling;
+import websocket;
 
 namespace worker {
     // The Core refused this identity; retrying cannot succeed.
-    struct refused : std::runtime_error {
+    struct refused : std::runtime_error, util::retained_exception {
         explicit refused(std::string_view code)
             : std::runtime_error(code == "worker_revoked" ? "Worker identity was revoked" : "Worker credentials or endpoint were refused") {}
+        auto retain() const noexcept -> std::exception_ptr override;
     };
+    auto refused::retain() const noexcept -> std::exception_ptr { return util::copy_current_exception(*this); }
     // Refusals that leave the identity valid are retried like a lost connection.
     [[noreturn]] void reject(std::string_view code) {
         if (code == "worker_protocol_mismatch")
@@ -56,7 +60,7 @@ namespace worker {
                       compute_) {}
 
         auto run(native::scheduler& io, std::size_t core) -> coroutine::task<> {
-            if (cfg_.execute_stdio || cfg_.dependency_publish || !std::ranges::contains(cfg_.roles, constants::execute_role)) {
+            if (cfg_.execute_stdio || cfg_.dependency_publish || !std::ranges::contains(cfg_.roles, config::execute_role)) {
                 co_await builds_.run(core, connected(io, core));
                 co_return;
             }
@@ -77,11 +81,12 @@ namespace worker {
                 for (const auto& [name, value] : cfg_.env)
                     env[name] = value;
                 env["OMP_NUM_THREADS"] = std::to_string(cfg_.parallel);
-                return toolchain::inspect(host::resolve_tools(cfg_.tools, toolchain::required_tools()), env, cfg_.sdk_manifests);
+                return toolchain::inspect(toolchain::discover(cfg_.tools), env, cfg_.sdk_manifests, cfg_.tools);
             });
             if (!identity)
                 throw std::runtime_error(identity.error());
             tools_ = identity->tools;
+            capabilities_ = toolchain::capabilities(*identity);
             toolchain_ = identity->id;
             builds_.set_runtime(std::move(*identity));
             if (!cfg_.worker_id) {
@@ -124,6 +129,14 @@ namespace worker {
             if (!co_await coroutine::deadline(io, std::chrono::seconds{10}, connect(io, sock)))
                 throw std::runtime_error(std::format("worker '{}': no answer from {} in 10s", name_, cfg_.gateway));
             logging::info(std::format("worker '{}': connected to {}", name_, cfg_.gateway));
+            if (cfg_.gateway.starts_with(config::worker_tunnel_scheme)) {
+                web::ws::worker_tunnel tunnel{std::move(*sock)};
+                if (!co_await coroutine::deadline(io, std::chrono::seconds{10},
+                                                 tunnel.handshake(std::string{config::worker_gateway_address(cfg_.gateway)}, cfg_.front_token)))
+                    throw std::runtime_error("Worker WebSocket upgrade timed out");
+                co_await session(io, core, tunnel.bytes());
+                co_return;
+            }
             co_await session(io, core, *sock);
         }
 
@@ -168,7 +181,9 @@ namespace worker {
                                            .toolchain_id = toolchain_,
                                            .dependency_publisher = cfg_.dependency_publish.has_value(),
                                            .memory_bytes = cfg_.memory_bytes,
-                                           .slots = std::move(inventory.slots)});
+                                           .slots = std::move(inventory.slots),
+                                           .parallel = cfg_.parallel,
+                                           .capabilities = capabilities_});
 
             if (cfg_.worker_id) {
                 auto first = co_await coroutine::deadline(io, std::chrono::seconds{30}, chan.recv(constants::worker_hello_bytes));
@@ -234,7 +249,7 @@ namespace worker {
         }
 
         auto connect(native::scheduler& io, std::optional<socket>& sock) -> coroutine::task<> {
-            sock.emplace(co_await io::connect(io, io::parse_endpoint(cfg_.gateway)));
+            sock.emplace(co_await io::connect(io, io::parse_endpoint(config::worker_gateway_address(cfg_.gateway))));
         }
 
         template <io::stream S> auto beat(native::scheduler& io, transport::channel<S>& chan) -> coroutine::task<> {
@@ -282,6 +297,7 @@ namespace worker {
         config::worker cfg_;
         std::string name_;
         std::vector<std::string> tools_;
+        toolchain::catalog capabilities_;
         std::string toolchain_;
         execution::thread_pool compute_;
         replica::service builds_;
@@ -290,7 +306,12 @@ namespace worker {
 
 export int run_worker(int argc, char** argv, bool private_file = false) {
     try {
-        auto cfg = argc > 1 ? config::load_worker(argv[1], private_file) : config::worker{};
+        const bool awaiting = argc == 3 && std::string_view{argv[1]} == "--await-binding";
+        if (awaiting)
+            while (!std::filesystem::exists(argv[2]))
+                std::this_thread::sleep_for(std::chrono::milliseconds{25});
+        auto cfg = awaiting ? config::load_worker(argv[2], true) :
+            argc > 1 ? config::load_worker(argv[1], private_file) : config::worker{};
         cores::io_context<runtime::context> context{1};
         cores::signal_watch signals{context};
         worker::node node{std::move(cfg), context};

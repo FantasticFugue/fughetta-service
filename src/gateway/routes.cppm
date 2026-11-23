@@ -97,11 +97,11 @@ namespace front {
 
         struct get_config : endpoint<"GET", "/api/v1/config", access::member> {
             static auto handle(context& c, params, const web::target&, std::string_view) -> coroutine::task<web::reply> {
-                auto doc = c.config.current(c.core);
+                auto mine = *c.config.current(c.core);
+                mine.server.auth.front_token.reset();
                 if (worlds::rank(c.who->role) >= worlds::rank("owner"))
-                    co_return ok(*doc);
+                    co_return ok(mine);
                 // Credentials are for those who run workers and hand out tokens: the owners.
-                auto mine = *doc;
                 mine.server.auth.tokens.clear();
                 mine.worker_token.reset();
                 co_return ok(mine);
@@ -111,7 +111,7 @@ namespace front {
         struct get_server : endpoint<"GET", "/api/v1/config/server"> {
             static auto handle(context& c, params, const web::target&, std::string_view) -> coroutine::task<web::reply> {
                 auto doc = c.config.current(c.core);
-                co_return ok(section_view{doc->revisions.server, doc->server});
+                co_return ok(section_view{doc->revisions.server, config::public_server(doc->server)});
             }
         };
 
@@ -119,8 +119,10 @@ namespace front {
             static auto handle(context& c, params, const web::target&, std::string_view body) -> coroutine::task<web::reply> {
                 auto [revision, s] = read_save<config::server>(body, "server");
                 // Who may call is not the callers' to change: the authentication settings are set where the core is run.
-                if (!(s.auth == c.config.current(c.core)->server.auth))
+                auto current = c.config.current(c.core);
+                if (!(s.auth == config::public_server(current->server).auth))
                     throw coded_error(403, nodes::code::permission_denied, "server.auth is set in the configuration file or with `fughetta-service token`");
+                s.auth = current->server.auth;
                 co_await c.config.edit(c.core, [revision, s](config::store& st) { st.put_server(s, revision); });
                 co_return ok(message{"saved; takes effect when the gateway restarts"});
             }
@@ -270,6 +272,7 @@ namespace front {
                     actor.execution_token.clear();
                     auto response = ok(actor);
                     response.head.fields.push_back({"cache-control", "no-store"});
+                    response.head.fields.push_back({"x-fughetta-execution", "scoped"});
                     co_return response;
                 } catch (const std::exception& error) {
                     throw coded_error(401, "unauthenticated", error.what());
@@ -348,7 +351,9 @@ namespace front {
                     throw coded_error(400, nodes::code::invalid_record, in.error().what());
                 if (in->action.starts_with("scope_") || in->action.starts_with("task_") || !in->task_id.empty() || !in->run_id.empty() ||
                     !in->execution_token.empty() || !in->execution_identity.empty() || !in->execution_owner.empty() || !in->analyzed_scopes.empty() ||
-                    !in->body_ranges.empty() || !in->scope_refs.empty() || !in->scope_files.empty() || !in->scope_entries.empty())
+                    !in->body_ranges.empty() || !in->scope_hints.sealed_bodies.empty() || !in->scope_hints.ffi_boundaries.empty() ||
+                    !in->scope_hints.reproject_places.empty() || !in->scope_refs.empty() ||
+                    !in->scope_files.empty() || !in->scope_entries.empty())
                     throw coded_error(403, nodes::code::permission_denied, "task and scope coordination require their typed tools");
                 in->caller_operation.clear();
                 auto reply = co_await c.files.node(c.core, p[0], *in, *c.who, in->action == "receipt");

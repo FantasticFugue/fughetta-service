@@ -1,5 +1,6 @@
 export module executor;
 import std;
+import publicrecord;
 import native;
 import coroutine;
 import replica;
@@ -19,6 +20,7 @@ import enumeration;
 import codec;
 import process;
 import allocation;
+import utility;
 
 export namespace replica {
     // A call path to the execute role of this Worker when it runs in a process of its own. `hold` keeps the process from
@@ -80,7 +82,7 @@ export namespace replica {
             try {
                 stopped = !(co_await coroutine::under(token, std::move(work)));
             } catch (...) {
-                failed = std::current_exception();
+                failed = util::capture_current_exception();
             }
             auto finish = [this]() -> coroutine::task<> {
                 std::exception_ptr failed;
@@ -90,9 +92,11 @@ export namespace replica {
                         co_await retire(key);
                     } catch (...) {
                         if (!failed)
-                            failed = std::current_exception();
+                            failed = util::capture_current_exception();
                     }
                 }
+                while (!gradle_.empty())
+                    co_await retire_gradle(gradle_.begin()->first);
                 if (failed)
                     std::rethrow_exception(failed);
             };
@@ -168,16 +172,34 @@ export namespace replica {
                 auto execute = [&](coroutine::scope& children) -> coroutine::task<jobs::build_report> {
                     auto close = jobs::analysis_exchange::lifetime{inputs};
                     children.spawn(relay(ex, inputs));
+                    // A build runs on the home core while its request arrived on this one, so every message it reports goes
+                    // back to the core that owns the connection.
+                    auto report_progress = [this, core, &ex](jobs::progress p) -> coroutine::task<> {
+                        if (core == home_) {
+                            co_await ex.progress(std::move(p));
+                            co_return;
+                        }
+                        co_await cores::call(rt_.get_scheduler(home_), rt_.get_scheduler(core),
+                                             [&ex, p = std::move(p)]() -> coroutine::task<> { co_await ex.progress(p); });
+                    };
+                    auto sink = progress_sink{report_progress};
                     if (options_.execute) {
                         if (core != home_)
                             throw std::logic_error("a Worker with an execute role of its own runs on one core");
-                        auto sink = [&ex](jobs::progress p) { return ex.progress(std::move(p)); };
                         co_return co_await front(std::move(r), inputs, sink);
                     }
-                    if (core == home_)
-                        co_return co_await build(std::move(r), inputs);
-                    co_return co_await cores::call(rt_.get_scheduler(core), rt_.get_scheduler(home_),
-                                                   [this, r = std::move(r), inputs] { return build(r, inputs); });
+                    // Only a build runs steps of its own; an analysis reports through its execution channel.
+                    if constexpr (std::same_as<Request, jobs::build_request>) {
+                        if (core == home_)
+                            co_return co_await build(std::move(r), inputs, &sink);
+                        co_return co_await cores::call(rt_.get_scheduler(core), rt_.get_scheduler(home_),
+                                                       [this, r = std::move(r), inputs, &sink] { return build(r, inputs, &sink); });
+                    } else {
+                        if (core == home_)
+                            co_return co_await build(std::move(r), inputs);
+                        co_return co_await cores::call(rt_.get_scheduler(core), rt_.get_scheduler(home_),
+                                                       [this, r = std::move(r), inputs] { return build(r, inputs); });
+                    }
                 };
                 auto report = co_await coroutine::with_scope(std::move(execute));
                 // Publish the completed slot before the next stage can be dispatched.
@@ -417,7 +439,7 @@ export namespace replica {
                         item->answer(std::move(*reply));
                     }
                 } catch (...) {
-                    item->fail(std::current_exception());
+                    item->fail(util::capture_current_exception());
                 }
             }
         }
@@ -444,6 +466,12 @@ export namespace replica {
             process_book processes;
             coroutine::stop_source stop;
             bool exceeded = false;
+        };
+        struct gradle_context {
+            process_book processes;
+            std::unique_ptr<runner::gradle_session> session;
+            std::string identity;
+            std::chrono::steady_clock::time_point used;
         };
 
         struct context {
@@ -479,6 +507,27 @@ export namespace replica {
             std::string request;
         };
 
+        static auto model_sources_only(std::span<const jobs::step> steps, std::span<const content::entry> before,
+                                       std::span<const content::entry> after) -> bool {
+            if (before.size() != after.size() || steps.empty())
+                return false;
+            static constexpr std::array<std::string_view, 8> suffixes{".kt", ".java", ".scala", ".sc", ".cs", ".fs", ".fsi", ".fsx"};
+            for (const auto& [old, file] : std::views::zip(before, after)) {
+                if (old.path != file.path || old.executable != file.executable)
+                    return false;
+                if (old.digest == file.digest)
+                    continue;
+                if (!std::ranges::any_of(suffixes, [&](auto suffix) { return file.path.ends_with(suffix); }))
+                    return false;
+                for (const auto& step : steps)
+                    if (!step.model_source_dirs || !std::ranges::any_of(*step.model_source_dirs, [&](const auto& dir) {
+                            return dir == "." || jobs::worktree_capture::within(file.path, dir);
+                        }))
+                        return false;
+            }
+            return true;
+        }
+
         std::uint64_t status_sequence_ = 0;
         std::uint64_t generations_ = 0;
 
@@ -508,15 +557,20 @@ export namespace replica {
             auto result = request.processes.usage();
             if (!result)
                 return {};
-            if (const auto context = contexts_.find({slot, request.stage}); context != contexts_.end()) {
-                auto child = context->second->processes.usage();
+            auto include = [&](const process_book& processes) {
+                auto child = processes.usage();
                 if (!child)
-                    return {};
+                    return false;
                 result->resident_bytes += child->resident_bytes;
                 result->cpu_nanoseconds += child->cpu_nanoseconds;
                 result->threads += child->threads;
                 result->processes += child->processes;
-            }
+                return true;
+            };
+            if (const auto context = contexts_.find({slot, request.stage}); context != contexts_.end() && !include(context->second->processes))
+                return {};
+            if (const auto session = gradle_.find(slot); session != gradle_.end() && !include(session->second->processes))
+                return {};
             return result;
         }
         auto execute_memory() -> coroutine::task<jobs::worker_memory> {
@@ -547,6 +601,13 @@ export namespace replica {
                     out.resident.reset();
             }
             for (const auto& [key, context] : contexts_) {
+                const auto child = context->processes.usage();
+                if (out.resident && child)
+                    *out.resident += child->resident_bytes;
+                else
+                    out.resident.reset();
+            }
+            for (const auto& [slot, context] : gradle_) {
                 const auto child = context->processes.usage();
                 if (out.resident && child)
                     *out.resident += child->resident_bytes;
@@ -595,6 +656,11 @@ export namespace replica {
                     if (!in_use(key) && key != session_key{slot, request->stage})
                         idle.emplace_back(value->used, key);
                 order_idle(idle);
+                std::vector<std::pair<std::chrono::steady_clock::time_point, std::string>> idle_gradle;
+                for (const auto& [key, context] : gradle_)
+                    if (key != slot && !resources_.contains(key))
+                        idle_gradle.emplace_back(context->used, key);
+                std::ranges::sort(idle_gradle);
                 auto room = [&] {
                     std::uint64_t retained = 0;
                     for (const auto& [key, value] : contexts_) {
@@ -605,8 +671,21 @@ export namespace replica {
                             return false;
                         retained += usage->resident_bytes;
                     }
+                    for (const auto& [key, context] : gradle_) {
+                        if (key == slot || resources_.contains(key))
+                            continue;
+                        const auto usage = context->processes.usage();
+                        if (!usage)
+                            return false;
+                        retained += usage->resident_bytes;
+                    }
                     return retained <= capacity - reserved - request->reserved;
                 };
+                for (const auto& [used, key] : idle_gradle) {
+                    if (room())
+                        break;
+                    co_await retire_gradle(key);
+                }
                 for (const auto& [used, key] : idle) {
                     if (room())
                         break;
@@ -630,17 +709,27 @@ export namespace replica {
             try {
                 co_await old->server->close();
             } catch (...) {
-                failed = std::current_exception();
+                failed = util::capture_current_exception();
             }
             old->server.reset();
             if (failed)
                 std::rethrow_exception(failed);
         }
 
+        auto retire_gradle(const std::string& slot) -> coroutine::task<> {
+            auto found = gradle_.find(slot);
+            if (found == gradle_.end())
+                co_return;
+            auto old = std::move(found->second);
+            gradle_.erase(found);
+            co_await old->session->close();
+        }
+
         // When the execute child owns the tree, its builds replace the preparation receipt.
         auto retire_slot(const std::string& slot) -> coroutine::task<> {
             if (!options_.execute)
                 preparations_.erase(slot);
+            co_await retire_gradle(slot);
             std::vector<session_key> sessions;
             for (const auto& [key, _] : contexts_)
                 if (key.first == slot)
@@ -651,7 +740,7 @@ export namespace replica {
                     co_await retire(key);
                 } catch (...) {
                     if (!failed)
-                        failed = std::current_exception();
+                        failed = util::capture_current_exception();
                 }
             }
             if (failed)
@@ -738,7 +827,16 @@ export namespace replica {
                 }
             }
             const auto state = memory_state();
-            if (state.limit && state.resident && *state.resident > *state.limit) {
+            std::vector<std::string> idle_gradle;
+            for (const auto& [slot, session] : gradle_)
+                if (!tree_locks_.contains(slot) && (pressure || !session->session->alive() || now - session->used >= constants::language_idle ||
+                    (state.limit && state.resident.value_or(*state.limit) > *state.limit)))
+                    idle_gradle.push_back(slot);
+            for (const auto& slot : idle_gradle)
+                if (!tree_locks_.contains(slot))
+                    co_await retire_gradle(slot);
+            const auto after_reclaim = idle_gradle.empty() ? state : memory_state();
+            if (after_reclaim.limit && after_reclaim.resident && *after_reclaim.resident > *after_reclaim.limit) {
                 std::shared_ptr<resource_request> largest;
                 std::uint64_t bytes = 0;
                 for (const auto& [slot, request] : resources_) {
@@ -835,6 +933,8 @@ export namespace replica {
                 busy.insert(key);
             for (const auto& [key, value] : contexts_)
                 busy.insert(key.first);
+            for (const auto& [key, value] : gradle_)
+                busy.insert(key);
             for (auto& [key, n] : active_)
                 if (n > 0)
                     busy.insert(key);
@@ -874,16 +974,105 @@ export namespace replica {
             return env;
         }
 
-        void allocate_runtime(std::map<std::string, std::string>& env) const {
+        void allocate_runtime(std::map<std::string, std::string>& env, bool java_environment = true) const {
             const auto jobs = std::to_string(options_.parallel);
-            auto& java = env["JAVA_TOOL_OPTIONS"];
-            if (!java.empty())
-                java += ' ';
-            java += "-XX:ActiveProcessorCount=" + jobs;
+            if (java_environment) {
+                auto& java = env["JAVA_TOOL_OPTIONS"];
+                if (!java.empty())
+                    java += ' ';
+                java += "-XX:ActiveProcessorCount=" + jobs;
+            }
             env["DOTNET_PROCESSOR_COUNT"] = jobs;
         }
 
-        auto build(jobs::build_request r, jobs::analysis_link messages = {}) -> coroutine::task<jobs::build_report> {
+        auto gradle_installation(const builds::step& step, const std::string& launcher, const std::optional<std::uint32_t>& cpu,
+                                 std::uint64_t output_limit) const -> std::filesystem::path {
+            if (!step.gradle || cpu || step.standard_output || output_limit > constants::semantic_object_bytes / 8 ||
+                !options_.tools.contains("java") || !options_.tools.contains("fughetta-jvm"))
+                return {};
+            std::error_code error;
+            const auto executable = std::filesystem::canonical(launcher, error);
+            const auto bin = executable.parent_path();
+            if (error || bin.filename() != "bin" || (executable.filename() != "gradle" && executable.filename() != "gradle.bat"))
+                return {};
+            return bin.parent_path();
+        }
+
+        auto step_recipes(const jobs::build_request& request, const toolchain::bindings& bindings, const std::string& key) const
+            -> std::vector<content::hash> {
+            const auto dir = trees().tree(key);
+            const auto reports = trees().reports(key);
+            const auto cache = options_.dependency_cache.value_or(options_.root / (options_.dependency_publish ? "publisher/dependencies" : "dependencies"));
+            auto base = environment(request.env, {});
+            const auto parent = host::environment();
+            std::map<std::string, std::string> digests;
+            auto observe = [&](std::string path, const builds::environment& env) -> std::pair<std::string, std::string> {
+                if (!builds::absolute_path(path)) {
+                    const auto search = env.find("PATH");
+                    const auto inherited = parent.find("PATH");
+                    if (search == env.end() || inherited == parent.end() || search->second != inherited->second)
+                        return {};
+                    const auto found = host::resolve_tools({}, {path});
+                    if (found.empty())
+                        return {};
+                    path = found.begin()->second;
+                }
+                const auto name = toolchain::tool_path(path);
+                if (const auto relative = std::filesystem::path{name}.lexically_relative(std::filesystem::absolute(dir));
+                    !relative.empty() && *relative.begin() != "..")
+                    return {};
+                const auto [found, inserted] = digests.try_emplace(name);
+                if (inserted) {
+                    found->second = toolchain::tool_digest(options_.runtime, name);
+                    if (found->second.empty())
+                        try {
+                            found->second = toolchain::digest(name);
+                        } catch (const std::runtime_error&) {
+                        }
+                }
+                return {name, found->second};
+            };
+            std::map<std::string, std::string> sdk_objects;
+            for (const auto& sdk : bindings.sdk_inputs)
+                sdk_objects.emplace(sdk.name, sdk.object);
+            std::vector<content::hash> recipes;
+            for (const auto& step : request.steps) {
+                builds::toolset used;
+                const auto local = builds::locate(step, dir, bindings.tools, options_.parallel, reports, cache,
+                                                 options_.dependency_publish.value_or(options_.dependency_upstream.value_or(std::filesystem::path{})),
+                                                 bindings.sdks, &used);
+                auto env = base;
+                auto launch_env = base;
+                for (const auto& [name, value] : step.env)
+                    env[name] = value;
+                for (const auto& [name, value] : local.env)
+                    launch_env[name] = value;
+                for (const auto& [name, value] : bindings.env) {
+                    env[name] = value;
+                    launch_env[name] = value;
+                }
+                allocate_runtime(env, !step.gradle);
+                auto& recipe = recipes.emplace_back();
+                if (local.argv.empty())
+                    continue;
+                std::vector<std::pair<std::string, std::string>> tools{observe(local.argv.front(), launch_env)};
+                for (const auto& [_, path] : used)
+                    tools.push_back(observe(path, launch_env));
+                if (!gradle_installation(step, local.argv.front(), request.max_cpu_seconds, request.output_limit).empty())
+                    for (const auto name : {"java", "fughetta-jvm"})
+                        tools.push_back(observe(options_.tools.at(name), launch_env));
+                if (std::ranges::any_of(tools, [](const auto& tool) { return tool.second.empty(); }))
+                    continue;
+                recipe = content::hash_of(json::write(std::tie(step, env, tools, sdk_objects, options_.runtime.platform)));
+            }
+            return recipes;
+        }
+
+        // Where a running step says which step it is on and how that step ended; the caller routes each message to the
+        // core that owns its connection.
+        using progress_sink = util::function_ref<coroutine::task<>(jobs::progress)>;
+
+        auto build(jobs::build_request r, jobs::analysis_link messages = {}, progress_sink* sink = nullptr) -> coroutine::task<jobs::build_report> {
             if (r.capture_worktree_changes) {
                 if (r.prepares || !r.measure.empty() || r.capture_worktree_changes->prefixes.empty())
                     throw std::invalid_argument("worktree capture requires explicit paths and a standalone build");
@@ -915,40 +1104,78 @@ export namespace replica {
             ++active_[key];
             if (!r.fresh)
                 r.fresh = co_await locked([&](store& s) { return s.unfinished_generation(r.project, r.tree); });
+            const auto bindings = toolchain::bind(options_.runtime, r.resolved_toolchain, options_.tools);
+            std::vector<content::hash> steps;
+            if (!r.relocatable_build_dirs.empty() || !r.preparation_tasks.empty())
+                steps = co_await io::blocking(rt_.get_scheduler(home_), pool_, [&] { return step_recipes(r, bindings, key); });
             content::hash recipe;
-            if (!r.relocatable_build_dirs.empty())
-                recipe = content::hash_of(json::write(std::tie(r.steps, r.env, r.relocatable_build_dirs, r.generation_producers, options_.runtime.id)));
-            // A receipt belongs to this live directory and one snapshot. Moving
-            // it out before checkout makes cancellation and intervening builds
-            // invalidate it even when they stop before producing a report.
+            if (!r.relocatable_build_dirs.empty() && std::ranges::none_of(steps, &content::hash::empty))
+                recipe = content::hash_of(json::write(std::tie(steps, r.relocatable_build_dirs, r.generation_producers)));
+            // Move the receipt out of the live directory before checkout so
+            // cancellation and intervening builds invalidate it before execution.
             preparation prepared;
+            std::optional<preparation> previous;
             if (auto found = preparations_.find(key); found != preparations_.end()) {
-                if (!r.fresh && r.prepares && found->second.snapshot == r.snapshot) {
-                    prepared.tasks = std::move(found->second.tasks);
-                    prepared.inputs.generation = found->second.inputs.generation;
-                }
+                if (!r.fresh && r.prepares)
+                    previous = std::move(found->second);
                 preparations_.erase(found);
             }
             prepared.snapshot = r.snapshot;
+            const bool same_snapshot = previous && previous->snapshot == r.snapshot;
+            if (same_snapshot) {
+                prepared.tasks = std::move(previous->tasks);
+                prepared.inputs.generation = previous->inputs.generation;
+            }
             // A task is the same work when its steps and their environment are.
             std::vector<std::pair<std::string, std::string>> completing;
             if (!r.preparation_tasks.empty()) {
                 if (!r.prepares)
                     throw std::invalid_argument("preparation tasks belong to a build that prepares an analysis");
+                bool source_edit = false;
+                if (!same_snapshot && previous && r.exports.empty()) {
+                    if (r.body_only) {
+                        source_edit = co_await locked([&](store& s) {
+                            if (!std::filesystem::is_directory(s.tree(key)))
+                                return false;
+                            const auto next = s.files(r.project, r.snapshot);
+                            if (previous->files.size() != next.size())
+                                return false;
+                            for (const auto& [old, file] : std::views::zip(previous->files, next))
+                                if (old.path != file.path || old.executable != file.executable)
+                                    return false;
+                            return true;
+                        });
+                    }
+                    if (!source_edit && std::ranges::all_of(r.steps, [](const auto& step) { return step.model_source_dirs.has_value(); })) {
+                        source_edit = co_await locked([&](store& s) {
+                            return std::filesystem::is_directory(s.tree(key)) &&
+                                   model_sources_only(r.steps, previous->files, s.files(r.project, r.snapshot));
+                        });
+                    }
+                }
+                const auto& retained = source_edit ? previous->tasks : prepared.tasks;
                 std::vector<jobs::step> pending;
                 std::size_t covered = 0;
                 for (const auto& task : r.preparation_tasks) {
                     if (task.first_step != covered || task.step_count == 0 || task.step_count > r.steps.size() - covered)
                         throw std::invalid_argument("invalid preparation task steps");
-                    const std::span steps{r.steps.data() + covered, task.step_count};
-                    completing.emplace_back(task.name, content::hash_of(json::write(std::tuple{steps, r.env})).str());
-                    if (const auto ran = prepared.tasks.find(task.name); ran == prepared.tasks.end() || ran->second != completing.back().second)
-                        pending.insert(pending.end(), steps.begin(), steps.end());
+                    const std::span commands{r.steps.data() + covered, task.step_count};
+                    const std::span recipes{steps.data() + covered, task.step_count};
                     covered += task.step_count;
+                    if (std::ranges::any_of(recipes, &content::hash::empty)) {
+                        prepared.tasks.erase(task.name);
+                        pending.insert(pending.end(), commands.begin(), commands.end());
+                        continue;
+                    }
+                    completing.emplace_back(task.name, content::hash_of(json::write(recipes)).str());
+                    if (const auto ran = retained.find(task.name); ran == retained.end() || ran->second != completing.back().second)
+                        pending.insert(pending.end(), commands.begin(), commands.end());
                 }
                 if (covered != r.steps.size())
                     throw std::invalid_argument("preparation tasks do not cover the requested steps");
-                r.steps = std::move(pending);
+                // Across snapshots, use all of the requested model preparation or run it again.
+                if (!source_edit || pending.empty())
+                    r.steps = std::move(pending);
             }
             if (r.fresh)
                 co_await retire_slot(key);
@@ -984,7 +1211,7 @@ export namespace replica {
             std::exception_ptr failed;
             delivery::pins model_pins;
             try {
-                report = co_await coroutine::under(token, run_steps(r, dir, reports, deadline, r.prepares.has_value(), messages, model_pins));
+                report = co_await coroutine::under(token, run_steps(r, dir, reports, deadline, r.prepares.has_value(), messages, model_pins, bindings, sink));
                 if (report && report->ok() && preparation) {
                     auto remaining = std::max(std::chrono::steady_clock::duration::zero(), deadline - std::chrono::steady_clock::now());
                     prepared.loads_code = co_await install_models(r.measure, dir, messages, model_pins);
@@ -997,9 +1224,10 @@ export namespace replica {
                         report->steps.push_back({.name = "analysis", .timed_out = true, .output = "time budget exhausted while measuring build outputs"});
                 }
             } catch (...) {
-                failed = std::current_exception();
+                failed = util::capture_current_exception();
             }
             auto discard_captured_tree = [&]() -> coroutine::task<> {
+                co_await retire_gradle(key);
                 auto discarded = co_await locked([&](store& s) { return s.detach(r.project, r.tree); });
                 co_await io::blocking(rt_.get_scheduler(home_), pool_, [discarded] { store::discard(discarded); });
             };
@@ -1148,7 +1376,7 @@ export namespace replica {
                     }
                 }
             } catch (...) {
-                failed = std::current_exception();
+                failed = util::capture_current_exception();
             }
             if (resource->exceeded || failed || stopped || expired)
                 co_await coroutine::under(coroutine::stop_token{}, retire_slot(key));
@@ -1416,6 +1644,7 @@ export namespace replica {
                 });
                 const auto slot = store::tree_key(r.project, r.tree);
                 const auto cache = store_.analysis(slot) / analysis->execution.stage_id;
+                const auto bindings = toolchain::bind(options_.runtime, analysis->resolved_toolchain, options_.tools);
                 auto local = language::locate({.provider = analysis->provider,
                                                .argv = analysis->argv,
                                                .env = analysis->env,
@@ -1424,21 +1653,27 @@ export namespace replica {
                                                .executables = analysis->executables,
                                                .registration = analysis->registration,
                                                .documents = analysis->documents},
-                                              dir, options_.tools, options_.parallel, cache);
+                                              dir, bindings.tools, options_.parallel, cache, bindings.sdks);
                 const bool trusted = plan.project_code || (plan.model_code && loads_code);
                 if (options_.execute && trusted)
                     throw std::logic_error("the execute role answers analyses that run project code");
-                auto env = options_.execute ? analysis_environment(local.env)
-                                            : environment(trusted ? r.env : std::map<std::string, std::string>{}, local.env);
-                const auto semantic_environment = env;
-                const auto transport = analysis->registration
-                                           ? analysis->registration->adapter
-                                           : language::providers::dispatch(analysis->provider, []<class Provider>() { return Provider::adapter::transport; });
-                if (transport == language::adapter_kind::helper)
-                    env["FUGHETTA_OBJECTS"] = std::filesystem::absolute(options_.root / "exports").string();
+                auto overrides = trusted ? r.env : builds::environment{};
+                for (const auto& [name, value] : local.env)
+                    overrides[name] = value;
+                auto env = analysis_environment(overrides);
+                for (const auto& [name, value] : bindings.env)
+                    env[name] = value;
+                allocate_runtime(env);
+                auto known_tool = [&](const std::string& executable) {
+                    return !toolchain::tool_digest(options_.runtime, toolchain::tool_path(executable)).empty();
+                };
+                if (options_.execute &&
+                    ((!local.argv.empty() && !known_tool(local.argv.front())) || !std::ranges::all_of(local.executables, known_tool) ||
+                     !std::ranges::all_of(local.commands, [&](const auto& command) { return known_tool(command.second.front()); })))
+                    throw std::invalid_argument("the analysis names an executable outside this Worker's toolchain");
                 auto identity =
                     content::hash_of(json::write(std::tuple{analysis->provider, analysis->options, local.argv, env, local.initialization, local.commands,
-                                                                 local.executables, options_.runtime, r.max_memory_bytes, r.max_cpu_seconds}))
+                                                           local.executables, bindings.sdks, options_.runtime, r.max_memory_bytes, r.max_cpu_seconds}))
                         .str();
                 const session_key key{slot, analysis->execution.stage_id};
                 if (auto found = contexts_.find(key); found != contexts_.end() && found->second->identity != identity)
@@ -1457,22 +1692,6 @@ export namespace replica {
                     auto value = std::make_unique<context>();
                     value->identity = identity;
                     value->used = std::chrono::steady_clock::now();
-                    auto runtime = options_.runtime;
-                    std::map<std::string, std::string> executables;
-                    for (std::size_t i = 0; i < local.executables.size(); ++i)
-                        executables.emplace("executable:" + std::to_string(i), local.executables[i]);
-                    if (!local.argv.empty())
-                        executables.emplace("main", local.argv.front());
-                    for (const auto& [name, argv] : local.commands)
-                        executables.emplace("command:" + name, argv.front());
-                    // In-process readers use the worker's observed runtime;
-                    // there is no external executable subset to select.
-                    if (!executables.empty())
-                        runtime.execution = toolchain::select(runtime, executables, semantic_environment);
-                    // The analysis role starts the tools recorded in its runtime inventory.
-                    if (options_.execute && !executables.empty() && runtime.execution.empty())
-                        throw std::invalid_argument("the analysis names an executable outside this Worker's toolchain");
-                    allocate_runtime(env);
                     io::command command{.argv = std::move(local.argv),
                                         .cwd = dir,
                                         .env = std::move(env),
@@ -1485,9 +1704,11 @@ export namespace replica {
                                                                                    .provider = analysis->provider,
                                                                                    .options = analysis->options,
                                                                                    .stage = analysis->execution.stage_id},
-                                                           std::move(local.commands), std::move(runtime),
+                                                           std::move(local.commands), options_.runtime,
                                                            language::document_loader{.root = dir, .scheduler = rt_.get_scheduler(home_), .pool = &pool_},
-                                                           std::move(local.registration), {}, cache);
+                                                           std::move(local.registration), {.root = options_.root / "exports"}, cache);
+                    value->server->executables(std::move(local.executables));
+                    value->server->sdks(bindings.sdks);
                     std::filesystem::create_directories(cache);
                     auto& created = *contexts_.emplace(key, std::move(value)).first->second;
                     const auto opening = std::chrono::steady_clock::now();
@@ -1520,14 +1741,25 @@ export namespace replica {
                 auto units = co_await hot.server->units(installed.epoch, analysis->demand, analysis->query);
                 hot.install_seconds = std::max(hot.install_seconds, std::chrono::duration<double>(std::chrono::steady_clock::now() - installing).count());
                 std::vector<semantic::candidate> accepted;
-                if (!analysis->candidates.empty()) {
+                const auto public_inputs = analysis->public_lookup ? hot.server->public_inputs(units, analysis->demand) : public_shards::units{};
+                if (!analysis->candidates.empty() || !public_inputs.empty()) {
                     if (!messages)
                         throw std::logic_error("analysis reuse requires its gateway validator");
-                    const auto current_inputs = co_await hot.server->current_inputs(analysis->candidates);
-                    const auto decision = co_await messages->ask(jobs::reuse_request{analysis->execution, installed, current_inputs});
+                    auto current_inputs = co_await hot.server->current_inputs(analysis->candidates);
+                    auto processes = hot.server->current_processes(units, analysis->demand);
+                    jobs::reuse_request request{analysis->execution, installed, std::move(current_inputs), std::move(processes)};
+                    for (const auto& [unit, inputs] : public_inputs) {
+                        auto& installed_inputs = request.inputs[unit.project];
+                        for (const auto& input : inputs)
+                            if (!std::ranges::contains(installed_inputs, input))
+                                installed_inputs.push_back(input);
+                        request.public_units.emplace_back(unit, inputs);
+                    }
+                    auto decision = co_await messages->ask(std::move(request));
                     for (const auto& candidate : analysis->candidates)
                         if (std::ranges::contains(decision.accepted, reuse::key{candidate.id, semantic::recipe_identifier(candidate.recipe)}))
                             accepted.push_back(candidate);
+                    accepted.append_range(std::move(decision.public_candidates));
                 }
 
                 report.analyzed = true;
@@ -1563,10 +1795,10 @@ export namespace replica {
                     bool retained = false;
                     std::size_t count = 0;
                     if (unit.reused) {
-                        const auto candidate = std::ranges::find_if(analysis->candidates, [&](const auto& candidate) {
+                        const auto candidate = std::ranges::find_if(accepted, [&](const auto& candidate) {
                             return candidate.id == *unit.reused && candidate.recipe == semantic::recipe{unit.request.unit, installed.options};
                         });
-                        if (candidate == analysis->candidates.end())
+                        if (candidate == accepted.end())
                             throw std::logic_error("adapter returned an unoffered recipe");
                         retained = candidate->retained;
                         report.analysis_cacheable &= candidate->cacheable;
@@ -1623,10 +1855,75 @@ export namespace replica {
             }
         }
 
-        // Close the process group after its processes have been released.
+        auto run_command(const std::string& slot, const builds::step& step, io::command command, std::chrono::milliseconds timeout,
+                         std::uint64_t output_limit, std::optional<std::filesystem::path> log, std::uint64_t log_limit)
+            -> coroutine::task<runner::result> {
+            auto& scheduler = rt_.get_scheduler(home_);
+            if (!step.gradle)
+                co_return co_await runner::run_step(scheduler, std::move(command), timeout, output_limit, step.name, log, log_limit);
+
+            const auto java_limit = "-XX:ActiveProcessorCount=" + std::to_string(options_.parallel);
+            command.argv.insert(command.argv.end(), {"-Pkotlin.compiler.execution.strategy=in-process", "-Dorg.gradle.native=false"});
+
+            const auto java = options_.tools.find("java"), host = options_.tools.find("fughetta-jvm");
+            const auto installation = gradle_installation(step, command.argv.front(), command.max_cpu_seconds, output_limit);
+            if (installation.empty()) {
+                // A standalone Gradle launcher may fork a single-use daemon; that JVM must also stay in the group.
+                auto& launcher_options = (*command.env)["JAVA_TOOL_OPTIONS"];
+                if (!launcher_options.empty())
+                    launcher_options += ' ';
+                launcher_options += "-Dorg.gradle.native=false " + java_limit;
+                command.argv.insert(command.argv.end(), {"--no-daemon", "--console=plain"});
+                co_return co_await runner::run_step(scheduler, std::move(command), timeout, output_limit, step.name, log, log_limit);
+            }
+
+            const auto state = std::filesystem::absolute(store_.analysis(slot) / "gradle");
+            const auto configured = command.env->find("GRADLE_USER_HOME");
+            const auto home = std::filesystem::absolute(configured != command.env->end() && !configured->second.empty()
+                                                            ? command.cwd / configured->second
+                                                            : options_.root / "gradle");
+            (*command.env)["GRADLE_USER_HOME"] = home.string();
+            auto bootstrap = *command.env;
+            const auto identity = json::write(std::tuple{java->second, host->second, installation.string(), command.cwd.string(), bootstrap,
+                                                         command.max_memory_bytes});
+            auto found = gradle_.find(slot);
+            if (found != gradle_.end() && (found->second->identity != identity || !found->second->session->alive())) {
+                co_await retire_gradle(slot);
+                found = gradle_.end();
+            }
+            if (found == gradle_.end()) {
+                co_await io::blocking(scheduler, pool_, [home, state] {
+                    std::filesystem::create_directories(home);
+                    std::filesystem::create_directories(state);
+                });
+                auto resident = std::make_unique<gradle_context>();
+                resident->identity = identity;
+                resident->used = std::chrono::steady_clock::now();
+                const auto classpath_separator = std::filesystem::path::preferred_separator == L'\\' ? ";" : ":";
+                const auto classpath = host->second + classpath_separator + (installation / "lib" / "*").string();
+                resident->session = std::make_unique<runner::gradle_session>(
+                    scheduler, io::command{.argv = {java->second, "-Xms32m", "-Xmx128m", java_limit, "-cp", classpath, "fughetta.jvm.MainKt", "--gradle",
+                                                     installation.string(), home.string(), state.string(),
+                                                     std::to_string(std::chrono::duration_cast<std::chrono::milliseconds>(constants::language_idle).count()),
+                                                     java_limit},
+                                           .cwd = command.cwd,
+                                           .env = std::move(bootstrap),
+                                           .max_memory_bytes = command.max_memory_bytes,
+                                           .stdio = io::process_stdio::blocking,
+                                           .processes = resident->processes.group(),
+                                           .kill_group_on_owner_exit = true});
+                found = gradle_.emplace(slot, std::move(resident)).first;
+            }
+            auto& resident = *found->second;
+            std::vector<std::string> arguments(std::next(command.argv.begin()), command.argv.end());
+            auto result = co_await resident.session->run(std::move(arguments), std::move(*command.env), timeout, output_limit, step.name, log, log_limit);
+            resident.used = std::chrono::steady_clock::now();
+            co_return result;
+        }
+
         auto run_steps(const jobs::build_request& r, const std::filesystem::path& dir, const std::filesystem::path& reports,
-                       std::chrono::steady_clock::time_point deadline, bool analyzing, const jobs::analysis_link& models, delivery::pins& model_pins)
-            -> coroutine::task<jobs::build_report> {
+                       std::chrono::steady_clock::time_point deadline, bool analyzing, const jobs::analysis_link& models, delivery::pins& model_pins,
+                       const toolchain::bindings& bindings, progress_sink* sink = nullptr) -> coroutine::task<jobs::build_report> {
             jobs::build_report report{.worker = options_.worker, .tree = dir.string(), .preparation_seconds = 0, .execution_seconds = 0};
             const auto logs = reports.parent_path() / (reports.filename().string() + ".logs");
             std::string log_setup_error;
@@ -1645,17 +1942,21 @@ export namespace replica {
                 ~elapsed() { seconds += std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count(); }
             };
             auto invocations = builds::invocations(r.steps);
+            const auto steps_total = static_cast<std::uint64_t>(invocations.size());
+            std::uint64_t steps_done = 0;
             for (auto& invocation : invocations) {
                 auto& step = invocation.command;
+                if (sink)
+                    co_await (*sink)({.done = steps_done, .total = steps_total, .stage = step.name});
                 co_await install_models(step.inputs, dir, models, model_pins);
                 elapsed measured{step.preparation ? *report.preparation_seconds : *report.execution_seconds};
                 if (step.argv.empty())
                     throw std::invalid_argument(std::format("step '{}' has no command", step.name));
                 const auto cache =
                     options_.dependency_cache.value_or(options_.root / (options_.dependency_publish ? "publisher/dependencies" : "dependencies"));
-                auto local = co_await io::blocking(rt_.get_scheduler(home_), pool_, [this, step, dir, reports, cache] {
-                    return builds::locate(step, dir, options_.tools, options_.parallel, reports, cache,
-                                          options_.dependency_publish.value_or(options_.dependency_upstream.value_or(std::filesystem::path{})));
+                auto local = co_await io::blocking(rt_.get_scheduler(home_), pool_, [this, &bindings, step, dir, reports, cache] {
+                    return builds::locate(step, dir, bindings.tools, options_.parallel, reports, cache,
+                                          options_.dependency_publish.value_or(options_.dependency_upstream.value_or(std::filesystem::path{})), bindings.sdks);
                 });
                 std::vector<durability::dir_lock> dependency_locks;
                 bool cache_waited = false;
@@ -1713,13 +2014,18 @@ export namespace replica {
                                 .env = environment(r.env, local.env),
                                 .max_memory_bytes = r.max_memory_bytes,
                                 .max_cpu_seconds = r.max_cpu_seconds};
-                allocate_runtime(*cmd.env);
+                for (const auto& [name, value] : bindings.env)
+                    (*cmd.env)[name] = value;
+                allocate_runtime(*cmd.env, !step.gradle);
+                // Keep Cargo build-script fingerprints equal across check, build and test.
+                if (step.cargo)
+                    cmd.env->try_emplace("RUSTC_BOOTSTRAP", "");
                 cmd.processes = resources_.at(store::tree_key(r.project, r.tree))->processes.group();
-                // Exporter inputs belong to preparation commands. Keeping them
-                // out of language process identity preserves scoped SDK reuse.
+                // Keep exporter inputs stable across Gradle invocations in the same slot.
+                // Gradle inherits these at launch because native environment rewriting is disabled.
                 cmd.env->erase("FUGHETTA_STAGING");
                 cmd.env->erase("FUGHETTA_SDKS");
-                if (step.preparation) {
+                if (step.preparation || step.gradle) {
                     (*cmd.env)["FUGHETTA_STAGING"] = std::filesystem::absolute(reports / "objects").string();
                     (*cmd.env)["FUGHETTA_SDKS"] = json::write(options_.runtime.inputs);
                 }
@@ -1728,11 +2034,17 @@ export namespace replica {
                 if (local.standard_output)
                     cmd.standard_output = reports / *local.standard_output;
                 const auto log_name = std::to_string(report.steps.size()) + ".log";
-                report.steps.push_back(co_await runner::run_step(rt_.get_scheduler(home_), std::move(cmd), left, r.output_limit, step.name,
-                                                                 log_setup_error.empty() ? std::optional{logs / log_name} : std::nullopt,
-                                                                 constants::log_bytes - log_bytes));
+                report.steps.push_back(co_await run_command(store::tree_key(r.project, r.tree), step, std::move(cmd), left, r.output_limit,
+                                                            log_setup_error.empty() ? std::optional{logs / log_name} : std::nullopt,
+                                                            constants::log_bytes - log_bytes));
                 auto& last = report.steps.back();
                 last.tasks = invocation.tasks;
+                ++steps_done;
+                if (sink)
+                    co_await (*sink)({.done = steps_done,
+                                     .total = steps_total,
+                                     .stage = last.timed_out ? std::format("{}: timed out", step.name)
+                                                             : std::format("{}: exit {}", step.name, last.exit_code)});
                 if (!dependency_locks.empty() && options_.dependency_publish && last.exit_code == 0 && !last.timed_out) {
                     try {
                         co_await io::blocking(rt_.get_scheduler(home_), pool_, [cache, destination = *options_.dependency_publish, deadline] {
@@ -1749,7 +2061,8 @@ export namespace replica {
                     if (last.log_error.empty()) {
                         auto saved = co_await io::blocking(rt_.get_scheduler(home_), pool_,
                                                            [this, logs, log_name, root = options_.root,
-                                                            publish = !analyzing && r.measure.empty() && (last.truncated || last.output.size() > 8192)] {
+                                                            publish = !analyzing && r.measure.empty() &&
+                                                                      ((step.gradle && last.timed_out) || last.truncated || last.output.size() > 8192)] {
                                                                std::shared_lock guard{exports_lock_};
                                                                const auto size = std::filesystem::file_size(logs / log_name);
                                                                std::optional<builds::exported_file> file;
@@ -1823,6 +2136,7 @@ export namespace replica {
         std::chrono::steady_clock::time_point next_dependency_prune_{};
         std::map<std::string, int> active_;
         std::map<session_key, std::unique_ptr<context>> contexts_;
+        std::map<std::string, std::unique_ptr<gradle_context>> gradle_;
         std::map<std::string, preparation> preparations_;
         std::chrono::steady_clock::time_point export_collect_{};
         std::optional<view> execute_view_;

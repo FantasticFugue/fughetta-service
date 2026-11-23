@@ -207,6 +207,8 @@ export namespace nodes {
         auto register_scopes(const node_request& in) -> node_reply;
         // Where registered scope references are in one version of a worldline.
         auto locate_scopes(const node_request& in) -> node_reply;
+        // Net CRDT change classification between two versions of a worldline, with optional range reprojection.
+        auto classify_scopes(const node_request& in) -> node_reply;
         auto scope_call(const node_request& in) -> node_reply;
         void check_scope_leases(const node_request& in, const std::vector<std::string>& prior);
         // Takes or renews the caller's implicit leases for a committed apply

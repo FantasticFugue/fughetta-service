@@ -20,6 +20,7 @@ export namespace reuse {
         std::string_view project;
         std::span<const language::input_validator> validators;
         collection_values collections;
+        semantic::process_inputs processes;
 
         auto files(std::string_view project) const -> const std::map<std::string, std::string>* {
             auto found = sources.find(std::string{project});
@@ -156,14 +157,13 @@ export namespace reuse {
     }
     inline auto accept(const semantic::candidate& candidate, const language::session_state& session, const semantic::extent& demand, const environment& current,
                        bool sources_checked = false) -> bool {
-        if (!candidate.cacheable || candidate.units.empty() || !std::ranges::any_of(current.installed(session.project), [](const auto& input) {
-                return input.kind == semantic::input_kind::runtime && !input.object.empty();
-            }))
+        if (!candidate.cacheable || candidate.units.empty())
             return false;
         for (const auto& unit : candidate.units) {
             const auto& key = unit.recipe.unit;
             if (!unit.cacheable || unit.recipe != candidate.recipe || key.project != session.project || key.stage != session.stage ||
-                key.provider != session.provider || unit.recipe.options != session.options || unit.direct_inputs.empty() || !unit.coverage.missing.empty() ||
+                key.provider != session.provider || unit.recipe.options != session.options || (unit.direct_inputs.empty() && unit.observed_dependencies.empty()) ||
+                !unit.coverage.missing.empty() ||
                 !covers(unit, demand))
                 return false;
             for (const auto& required : demand.facts)
@@ -172,9 +172,23 @@ export namespace reuse {
                                (scope.contexts.empty() || std::ranges::contains(scope.contexts, unit.context));
                     }))
                     return false;
-            for (const auto& input : unit.direct_inputs)
-                if (!(sources_checked && input.kind == semantic::input_kind::file) && !reuse::input(input, key.project, current))
+            const auto process = current.processes.find(unit.id);
+            const std::span<const semantic::input_object> expected =
+                process == current.processes.end() ? std::span<const semantic::input_object>{} : std::span{process->second};
+            if (!std::ranges::all_of(expected, [&](const auto& input) {
+                    return !input.object.empty() && std::ranges::contains(unit.direct_inputs, input);
+                }))
+                return false;
+            for (const auto& input : unit.direct_inputs) {
+                if (input.kind == semantic::input_kind::environment) {
+                    if (!std::ranges::contains(expected, input))
+                        return false;
+                } else if (input.kind == semantic::input_kind::tool && expected.empty()) {
                     return false;
+                } else if (!(sources_checked && input.kind == semantic::input_kind::file) && !reuse::input(input, key.project, current)) {
+                    return false;
+                }
+            }
             for (const auto& read : unit.observed_dependencies) {
                 if (sources_checked && source_read(read)) {
                     // Unscoped negative lookups also depend on the worker's prepared inputs.

@@ -164,7 +164,8 @@ file(CONFIGURE OUTPUT "${VCPKG_OVERLAY_TRIPLETS}/${VCPKG_TARGET_TRIPLET}.cmake" 
 set(VCPKG_TARGET_ARCHITECTURE @TRIPLET_ARCH@)
 set(VCPKG_LIBRARY_LINKAGE static)
 @TRIPLET_SETTINGS@
-set(VCPKG_CHAINLOAD_TOOLCHAIN_FILE "@VCPKG_CHAINLOAD_TOOLCHAIN_FILE@")
+# Resolved where the triplet is read, beside the script this directory holds.
+set(VCPKG_CHAINLOAD_TOOLCHAIN_FILE "${CMAKE_CURRENT_LIST_DIR}/../clang-chainload.cmake")
 ]])
 
 # vcpkg's scratch space stays in the build directory, and so do its downloads

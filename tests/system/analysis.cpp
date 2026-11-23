@@ -9,6 +9,7 @@ import nodes;
 import semantic;
 import knowledge;
 import tools;
+import host;
 
 namespace {
     using namespace boost::ut;
@@ -33,12 +34,15 @@ namespace {
         settings.analysis.clear();
         const auto compiled = tmp.dir / "compiled";
         const auto configured = tmp.dir / "configured";
+        const auto gradle_processes = tmp.dir / "gradle-processes";
         const auto ran = tmp.dir / "ran";
         builds::configuration build;
         const std::string managed_artifact = kotlin ? "build/libs/managed-e2e.jar" : "bin/Debug/net10.0/Library.dll";
         if (kotlin) {
             build.builders["managed"] = builds::with<"gradle">{
-                .options = {.model_dir = "build/model", .compile_tasks = {"jar"}, .artifacts = {{"binary", {"jvm_artifact", managed_artifact}}}}};
+                .options = {.model_dir = "build/model", .compile_tasks = {"jar"}, .test_tasks = {"run"},
+                            .artifacts = {{"binary", {"jvm_artifact", managed_artifact}}},
+                            .model_source_dirs = {{"src/main/kotlin", "library/src/main/kotlin"}}}};
             build.tasks["prepare"] = {.builder = "managed", .operation = "prepare"};
             build.tasks["model"] = {.builder = "managed", .operation = "model", .inputs = {{"dependencies", {"prepare", "dependencies"}}}};
             build.tasks["compile"] = {.builder = "managed", .operation = "compile", .inputs = {{"dependencies", {"prepare", "dependencies"}}}};
@@ -54,12 +58,11 @@ namespace {
         builds::config<"command"> commands;
         commands.operations["native"] = {.argv = {"cxx", "-shared", "-fPIC", "-g", "native.cpp", "-o", "libnative.so"},
                                          .outputs = {{"binary", {"native-artifact", "libnative.so"}}}};
-        commands.operations["test"] = {.argv = kotlin ? std::vector<std::string>{"gradle", "--no-daemon", "--console=plain", "--max-workers=2", "run"}
-                                                      : std::vector<std::string>{"dotnet", "fsi", "--exec", "check.fsx"},
-                                       .env = {{"LD_LIBRARY_PATH", "${tree}"}}};
+        if (!kotlin)
+            commands.operations["test"] = {.argv = {"dotnet", "fsi", "--exec", "check.fsx"}, .env = {{"LD_LIBRARY_PATH", "${tree}"}}};
         build.builders["commands"] = builds::with<"command">{.options = commands};
         build.tasks["native"] = {.builder = "commands", .operation = "native"};
-        build.tasks["test"] = {.builder = "commands", .operation = "test", .after = {"compile", "native"}};
+        build.tasks["test"] = {.builder = kotlin ? "managed" : "commands", .operation = "test", .after = {"compile", "native"}};
         build.operations = {{"build", {.tasks = {"compile", "native"}, .receiver = "compile"}}, {"test", {.tasks = {"test"}}}};
         settings.build_configurations["managed"] = build;
         settings.default_configurations = {"managed"};
@@ -138,6 +141,7 @@ namespace {
         test::spit(tmp.dir / "sdk.json", kotlin ? "{\"sdk\":\"jdk\"}" : "{\"sdk\":\"dotnet\"}");
         worker_config.sdk_manifests[kotlin ? "sdk/java" : "sdk/dotnet"] = {.manifest = (tmp.dir / "sdk.json").string(), .roots = {sdk.string()}};
         if (kotlin) {
+            worker_config.env["FUGHETTA_TEST_JAVA_HOME"] = sdk.string();
             worker_config.tools["java"] = std::getenv("TEST_JAVA");
             worker_config.tools["gradle"] = std::getenv("TEST_GRADLE");
             worker_config.tools["fughetta-jvm"] = std::getenv("TEST_JVM_HOST");
@@ -156,7 +160,12 @@ namespace {
         auto online_workers = [&] { return test::decode<std::vector<worker_status>>(test::request(port, http::method::GET, "/api/v1/workers").body); };
         auto start_worker = [&] {
             test::spit(tmp.dir / "worker.json", json::write(worker_config));
-            auto process = std::make_unique<test::child>(test::worker_command(SERVICE_EXECUTABLE, tmp.dir, {"worker.json"}));
+            auto command = test::worker_command(SERVICE_EXECUTABLE, tmp.dir, {"worker.json"});
+            if (kotlin) {
+                command.env = host::environment();
+                command.env->erase("JAVA_HOME");
+            }
+            auto process = std::make_unique<test::child>(std::move(command));
             test::eventually(
                 [&] {
                     test::require(!process->finished(), process->output());
@@ -172,6 +181,8 @@ namespace {
         const std::string path = kotlin ? "src/main/kotlin/Main.kt" : "Library.fs";
         if (kotlin) {
             files["settings.gradle"] = "rootProject.name = 'managed-e2e'\ninclude 'library'\n";
+            files["gradle.properties"] = "org.gradle.java.installations.fromEnv=FUGHETTA_TEST_JAVA_HOME\n"
+                                         "org.gradle.java.installations.auto-detect=false\norg.gradle.java.installations.auto-download=false\n";
             files["build.gradle"] = "plugins { id 'org.jetbrains.kotlin.jvm' version '2.4.21'; id 'application' }\n"
                                     "repositories { mavenCentral() }\nkotlin { jvmToolchain(25) }\n"
                                     "subprojects { apply plugin: 'org.jetbrains.kotlin.jvm'; repositories { mavenCentral() }; kotlin { jvmToolchain(25) } }\n"
@@ -179,7 +190,8 @@ namespace {
                                     "application { mainClass = 'sample.MainKt'; applicationDefaultJvmArgs = ['-Djava.library.path=' + projectDir] }\n"
                                     "gradle.projectsEvaluated { new File(" +
                                     json::write(configured.string()) +
-                                    ").append('configure\\n') }\n"
+                                    ").append('configure\\n'); new File(" +
+                                    json::write(gradle_processes.string()) + ").append(ProcessHandle.current().pid().toString() + '\\n') }\n"
                                     "tasks.named('compileKotlin') { doLast { new File(" +
                                     json::write(compiled.string()) + ").append('compile\\n') } }\n";
             files[path] = "package sample\nimport dependency.scale\nimport dependency.adjust\nimport dependency.choose\n"
@@ -207,7 +219,10 @@ namespace {
                           "    [<DllImport(\"native\", EntryPoint=\"native_twice\", CallingConvention=CallingConvention.Cdecl)>]\n"
                           "    extern int Native(int input)\n    let run input = input * 2 + Native input\n"
                           "    let inferred (values: int list) =\n        let first = List.head values\n        let (named: int) = first\n"
-                          "        let total = named + 1\n        List.map string values, total\n";
+                          "        let total = named + 1\n        List.map string values, total\n"
+                          "    type Ticket = { Number: int }\n"
+                          "    let issueTicket number = Some { Number = number }\n"
+                          "    let readTicket (ticket: Ticket) offset = ticket.Number + offset\n";
             files["check.fsx"] = "#r \"bin/Debug/net10.0/Library.dll\"\n"
                                  "if Sample.Library.run 3 <> 12 then failwith \"wrong native result\"\nSystem.IO.File.AppendAllText(" +
                                  json::write(ran.string()) + ", \"run\\n\")\n";
@@ -236,7 +251,10 @@ namespace {
         test::tool(port, "task", R"({"project":"app","action":"create","task":"managed","worldline":"main","operation_id":"bind-managed"})");
         const auto run = test::decode<tools::task::output>(
             test::tool(port, "task", R"({"project":"app","action":"start","task":"managed","operation_id":"start-managed"})"));
-        auto agent = [&](const std::string& name, const std::string& args) { return test::tool(port, name, args, false, *run.credential); };
+        const auto analysis_timeout = std::chrono::seconds{language::timeout(profile.defaults.execution.limits)};
+        auto agent = [&](const std::string& name, const std::string& args) {
+            return test::tool(port, name, args, false, *run.credential, analysis_timeout);
+        };
         auto query = [&](std::string output) {
             return test::decode<tools::language_query::output>(
                 agent("language", json::write(tools::language_query::input{.project = "app",
@@ -277,6 +295,29 @@ namespace {
                           "project demand reused incomplete file-only F# records");
         timing("source", source_only);
         test::require(source_only.view.has_value() && source_only.analyzed && !source_only.items.empty(), "managed source query produced no view");
+        const semantic::selection read_ticket{.name = semantic::named{.text = "readTicket"}};
+        auto check_ticket_surface = [](const auto& result) {
+            const auto callable = std::ranges::find(result.items, "readTicket", &semantic::item::name);
+            test::require(callable != result.items.end() && callable->type_id, "F# inspect lost the selected callable");
+            const auto signature = std::ranges::find(result.types, *callable->type_id, &semantic::records::type::id);
+            test::require(signature != result.types.end() && signature->kind == "fsharp:curried_signature" && signature->parameter_groups.size() == 2 &&
+                              std::ranges::contains(result.symbols, "Number", &semantic::records::symbol::name) &&
+                              std::ranges::contains(result.producers, "issueTicket", &semantic::records::symbol::name),
+                          "F# inspect did not expand the curried signature and its option-wrapped producer");
+        };
+        if (!kotlin) {
+            check_ticket_surface(test::decode<tools::language_query::output>(
+                agent("language", json::write(tools::language_query::input{
+                                      .project = "app", .action = std::string{"inspect"}, .selector = read_ticket, .view = source_only.view}))));
+            const auto ticket = test::decode<tools::language_query::output>(
+                agent("language", json::write(tools::language_query::input{
+                                      .project = "app", .action = std::string{"inspect"},
+                                      .selector = semantic::selection{.name = semantic::named{.text = "Ticket", .kind = semantic::symbol_kind{"type"}}},
+                                      .view = source_only.view, .include = std::vector<std::string>{"consumers"}})));
+            test::require(ticket.items.size() == 1 && ticket.items.front().kind == "fsharp:record" &&
+                              std::ranges::contains(ticket.consumers, "readTicket", &semantic::records::symbol::name),
+                          "F# record lost its published kind or curried consumer in a type query");
+        }
         expect(!std::filesystem::exists(compiled)) << "source-only output must prepare the model without final compilation";
         if (kotlin)
             expect(test::slurp(configured) == "configure\n") << "the declared prepare and model tasks share one Gradle build evaluation";
@@ -432,8 +473,8 @@ namespace {
         auto updated_source = query("source");
         timing("edited source", updated_source);
         if (kotlin)
-            expect(test::slurp(configured) == before_configuration + "configure\n")
-                << "source edits reevaluate the build once and validate the preparation receipt in that invocation";
+            expect(test::slurp(configured) == before_configuration && updated_source.timings.preparation_seconds == 0.0)
+                << "a source content edit reuses the prepared model while analyzing the new snapshot";
         expect(updated_source.version == edited.version && updated_source.view != source_only.view && test::slurp(compiled) == before_compile)
             << "editing and rechecking source keeps compilation deferred";
         auto updated = query("linked");
@@ -443,14 +484,24 @@ namespace {
             agent("language", json::write(tools::language_query::input{
                                   .project = "app", .action = std::string{"impact"}, .from_view = linked.view, .to_view = updated.view, .limit = 250})));
         expect(compared.comparison.has_value() && !compared.comparison->reanalysis.empty());
-        struct execution {
-            bool ok;
-            std::string revision;
-        };
         const auto pinned = "{\"project\":\"app\",\"configurations\":[\"managed\"],\"version\":" + json::write(edited.version) + "}";
-        const auto built = test::decode<execution>(agent("build", pinned));
-        const auto tested = test::decode<execution>(agent("test", pinned));
+        const auto built = test::decode<tools::results>(agent("build", pinned));
+        const auto tester_before = kotlin ? test::slurp(gradle_processes) : std::string{};
+        const auto tested = test::decode<tools::results>(agent("test", pinned));
         expect(built.ok && tested.ok && tested.revision == *edited.version && std::filesystem::exists(ran));
+        if (kotlin) {
+            const auto builds = test::slurp(gradle_processes);
+            const auto delimiter = builds.find('\n');
+            test::require(delimiter != std::string::npos && builds.size() > tester_before.size() &&
+                              std::ranges::all_of(std::views::split(std::string_view{builds}.substr(0, builds.size() - 1), '\n'), [&](auto pid) {
+                                  return std::ranges::equal(pid, std::string_view{builds}.substr(0, delimiter));
+                              }),
+                          "Gradle model export, linked builds and JNI execution did not share the slot's daemon across snapshots");
+            const auto& result = tested.results.at(0);
+            const auto step = std::ranges::find(result.steps, "test", &tools::step_result::name);
+            test::require(step != result.steps.end(), "Kotlin JNI execution has no test step timing");
+            std::println(std::cerr, "Kotlin managed flow JNI test: step_seconds={:.6f}, worker_seconds={:.6f}", step->seconds, result.seconds);
+        }
         struct persisted_reuse {
             semantic::unit_id consumer, producer;
             semantic::view_id initial, before, body_only, inlined, overload, previous, returned;
@@ -495,13 +546,6 @@ namespace {
             test::eventually([&] { return std::ranges::none_of(online_workers(), [](const auto& current) { return current.online; }); });
             worker_config.name = "kotlin-jni-cold";
             worker_config.work_root = (tmp.dir / "other-worker").string();
-            // The same declared tools are installed at different local addresses;
-            // their JAR manifests still resolve all sibling runtime libraries.
-            for (const auto& [tool, variable] : {std::pair{"fughetta-jvm", "TEST_JVM_HOST"}, std::pair{"fughetta-kotlin", "TEST_KOTLIN_ADAPTER"}}) {
-                const auto installed = std::filesystem::path{std::getenv(variable)};
-                std::filesystem::create_directory_symlink(installed.parent_path(), tmp.dir / (std::string{tool} + "-installation"));
-                worker_config.tools[tool] = (tmp.dir / (std::string{tool} + "-installation") / installed.filename()).string();
-            }
             worker = start_worker();
             const auto body_only = read_source();
             timing("cold worker body-only dependency edit", body_only);
@@ -570,10 +614,26 @@ namespace {
                 << "alternating worldlines keeps each prepared model and source result attached to its requested snapshot";
             persistence->previous = *previous.view;
             persistence->returned = *returned.view;
+
+            const auto build_lease = test::decode<tools::scope::output>(
+                agent("scope", json::write(tools::scope::input{.project = "app", .action = "acquire", .files = std::vector<std::string>{"build.gradle"},
+                                                                .version = version, .operation_id = "edit-gradle-script"})));
+            const auto before_build_edit = test::slurp(configured);
+            const auto build_edit = test::decode<tools::worldline::output>(
+                agent("worldline", json::write(tools::worldline::input{
+                                       .project = "app", .action = "apply", .observed = version,
+                                       .leases = std::vector<std::string>{build_lease.leases.front().token}, .operation_id = "change-gradle-script",
+                                       .changes = std::vector<tools::change>{{.kind = "write", .path = "build.gradle", .text = files.at("build.gradle") + "\n// revised build\n"}}})));
+            const auto changed_model = query("source");
+            timing("edited Gradle script", changed_model);
+            expect(changed_model.version == build_edit.version && test::slurp(configured) == before_build_edit + "configure\n")
+                << "a build script edit reevaluates the Gradle model";
         }
         test::require(worker->stop() == 0 && gateway.stop() == 0 && source->stop() == 0, "managed process shutdown failed");
+        semantic::store stored{tmp.dir / "state/.semantic"};
+        if (!kotlin)
+            check_ticket_surface(stored.load(*source_only.view)->query({.action = "inspect", .selector = read_ticket}));
         if (persistence) {
-            semantic::store stored{tmp.dir / "state/.semantic"};
             auto contribution = [&](const std::string& view) { return stored.describe(view).units.at(persistence->consumer); };
             expect(contribution(persistence->body_only) == contribution(persistence->before))
                 << "body-only dependency edits reuse the exact gateway-persisted consumer shards on a cold worker";
@@ -1048,7 +1108,7 @@ namespace {
                                                           .action = std::string{"relations"},
                                                           .selector = semantic::selection{.entity = semantic::entity{emission.to, emission.ownership.context}},
                                                           .view = emitted.view,
-                                                          .relations = std::vector<std::string>{"emits"},
+                                                          .relations = std::vector<semantic::relation_kind>{"emits"},
                                                           .direction = std::string{"incoming"}};
             const auto back = test::decode<tools::language_query::output>(agent("language", json::write(reverse_emission)));
             expect(back.relations.size() == 1u && std::ranges::any_of(back.items, [](const auto& item) { return item.name == "twice"; }));
@@ -1322,7 +1382,7 @@ namespace {
                                                         .action = std::string{"relations"},
                                                         .selector = semantic::selection{.name = semantic::named{"BaseAgain"}},
                                                         .limit = 1,
-                                                        .relations = std::vector<std::string>{"aliases"},
+                                                        .relations = std::vector<semantic::relation_kind>{"aliases"},
                                                         .depth = 2};
             auto alias_first = test::decode<tools::language_query::output>(agent("language", json::write(relation_query)));
             test::require(alias_first.analyzed && alias_first.view.has_value() && alias_first.relations.size() == 1 && alias_first.cursor.has_value(),
@@ -1338,14 +1398,14 @@ namespace {
                    alias_first.relations.front().reference == alias_first.references.front().id);
             relation_query.cursor.reset();
             relation_query.selector = semantic::selection{.name = semantic::named{"Override::invoke"}};
-            relation_query.relations = std::vector<std::string>{"overrides"};
+            relation_query.relations = std::vector<semantic::relation_kind>{"overrides"};
             auto overrides = test::decode<tools::language_query::output>(agent("language", json::write(relation_query)));
             test::require(overrides.relations.size() == 1, "override relationship missing");
             const auto& overridden = overrides.relations.front();
             expect(overridden.occurrence.has_value() &&
                    std::ranges::contains(overrides.occurrences, *overridden.occurrence, &semantic::records::occurrence::id));
             relation_query.selector = semantic::selection{.name = semantic::named{"deferred"}};
-            relation_query.relations = std::vector<std::string>{"calls"};
+            relation_query.relations = std::vector<semantic::relation_kind>{"calls"};
             relation_query.limit = 50;
             auto candidates = test::decode<tools::language_query::output>(agent("language", json::write(relation_query)));
             test::require(candidates.relations.size() == 2 && candidates.references.size() == 1, "candidate call graph missing");
@@ -1356,8 +1416,13 @@ namespace {
                                                            .selector = semantic::selection{.name = semantic::named{"Widget::score"}},
                                                            .view = published.view};
             auto score = test::decode<tools::language_query::output>(agent("language", json::write(declaration_query)));
-            test::require(score.symbols.size() == 1 && score.symbols.front().parameters.size() == 1, "method declaration details missing");
-            const auto& score_record = score.symbols.front();
+            test::require(score.items.size() == 1, "method selection did not resolve to one declaration");
+            const auto& score_item = score.items.front();
+            const auto declaration = std::ranges::find_if(score.symbols, [&](const auto& symbol) {
+                return symbol.id == score_item.symbol_id && symbol.ownership.context == score_item.context;
+            });
+            test::require(declaration != score.symbols.end() && declaration->parameters.size() == 1, "method declaration details missing");
+            const auto& score_record = *declaration;
             const auto& parameter = score_record.parameters.front();
             expect(score_record.visibility == "public" && std::ranges::contains(score_record.modifiers, "const") &&
                    score_record.extensions.contains("cpp.attributes"));
@@ -1795,6 +1860,55 @@ pathlib.Path(sys.argv[1]).write_text(json.dumps({"files": files}))
             expect(retired.status == "complete" && retired.items.empty() && last_directory() == generated_directory &&
                    !std::filesystem::exists(generated_directory / "generated/value.hpp"))
                 << "a producer leaving the graph withdraws its files from the reused directory";
+            // A pure sealed body edit bypasses compilation completely via CRDT anchor reprojection.
+            {
+                auto current_main = line(R"({"project":"app","action":"read","path":"main.cpp"})");
+                const std::string old_factor = "int factor = 2;";
+                const std::string new_factor = "int factor = 2;\n    factor += 3;";
+                const auto factor_pos = current_main.text->find(old_factor);
+                test::require(factor_pos != std::string::npos, "factor statement missing");
+                tools::language_query::input baseline = inspect;
+                baseline.version = current_main.version;
+                auto base_view = test::decode<tools::language_query::output>(agent("language", json::write(baseline)));
+                // Without a syntax tree a comment edit is not proven comment-only, so inspect analyzes the new version.
+                auto comment_edit = line("{\"project\":\"app\",\"action\":\"apply\",\"observed\":" + json::write(current_main.version) +
+                                         ",\"operation_id\":\"comment-only-zero-compile\",\"changes\":[{\"kind\":\"edit\",\"path\":\"main.cpp\",\"offset\":0,"
+                                         "\"count\":0,\"text\":\"// zero-compile comment\\n\"}]}");
+                tools::language_query::input comment_query = inspect;
+                comment_query.version = comment_edit.version;
+                auto comment_reprojected = test::decode<tools::language_query::output>(agent("language", json::write(comment_query)));
+                expect(comment_reprojected.version == comment_edit.version) << "inspect answers the commented version";
+                // Pure sealed body edit on the original base version (concurrently checked on a fresh fork or before comment).
+                const auto shifted_factor_pos = factor_pos + std::string{"// zero-compile comment\n"}.size();
+                auto body_only_edit = line("{\"project\":\"app\",\"action\":\"apply\",\"observed\":" + json::write(comment_edit.version) +
+                                           ",\"operation_id\":\"sealed-body-only\",\"changes\":[{\"kind\":\"edit\",\"path\":\"main.cpp\",\"offset\":" +
+                                           std::to_string(shifted_factor_pos) + ",\"count\":" + std::to_string(old_factor.size()) +
+                                           ",\"text\":" + json::write(new_factor) + "}]}");
+                expect(body_only_edit.reach && *body_only_edit.reach == "body_only");
+                // Re-anchor baseline on comment_edit's view? No: verify sealed body edit on base_view by checking a pure body edit directly.
+                // Note: from base_view to body_only_edit includes both comment + body, so test sealed_body_only on a clean fork of current_main.
+                test::tool(port, "worldline",
+                           "{\"project\":\"app\",\"action\":\"fork\",\"name\":\"sealed-check\",\"worldline\":\"main\",\"version\":" +
+                               json::write(current_main.version) + ",\"operation_id\":\"fork-sealed-check\"}");
+                tools::language_query::input fork_base = inspect;
+                fork_base.worldline = "sealed-check";
+                fork_base.version.value().reset();
+                auto fork_view = test::decode<tools::language_query::output>(test::tool(port, "language", json::write(fork_base)));
+                auto fork_body_edit = test::decode<tools::worldline::output>(test::tool(
+                    port, "worldline",
+                    "{\"project\":\"app\",\"action\":\"apply\",\"worldline\":\"sealed-check\",\"observed\":" + json::write(current_main.version) +
+                        ",\"operation_id\":\"fork-sealed-body\",\"changes\":[{\"kind\":\"edit\",\"path\":\"main.cpp\",\"offset\":" +
+                        std::to_string(factor_pos) + ",\"count\":" + std::to_string(old_factor.size()) + ",\"text\":" + json::write(new_factor) + "}]}"));
+                expect(fork_body_edit.reach && *fork_body_edit.reach == "body_only");
+                tools::language_query::input zero_compile = fork_base;
+                zero_compile.version = fork_body_edit.version;
+                auto reprojected = test::decode<tools::language_query::output>(test::tool(port, "language", json::write(zero_compile)));
+                expect(!reprojected.analyzed && reprojected.view == fork_view.view && reprojected.version == fork_body_edit.version)
+                    << "sealed body edit must answer inspect with zero compilation";
+                expect(reprojected.items.size() == 1u && reprojected.items.front().source &&
+                       reprojected.items.front().source->contains("factor += 3;"))
+                    << "zero-compile inspect must reproject body anchors and return updated body text";
+            }
             expect(restored_worker.stop() == 0 && restored_gateway.stop() == 0 && source->stop() == 0);
             {
                 semantic::store persisted{std::filesystem::path{doc.server.storage} / ".semantic"};

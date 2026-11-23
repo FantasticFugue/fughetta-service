@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 4.5)
-project(fughetta-service VERSION 0.1.0 LANGUAGES CXX)
+project(fughetta-service VERSION 0.1.0 LANGUAGES C CXX)
 
 ## Language
 #
@@ -15,7 +15,7 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
   # -Wall is off: clang 23 crashes in module AST reading with it on this tree.
-  add_compile_options(-Wextra)
+  add_compile_options($<$<COMPILE_LANGUAGE:CXX>:-Wextra>)
 endif()
 
 ## Options
@@ -23,7 +23,9 @@ endif()
 # A subproject builds the layers its parent links, not this test tree.
 
 option(FUGHETTA_BUILD_TESTS "Build the testing tree" ${PROJECT_IS_TOP_LEVEL})
-option(FUGHETTA_BUILD_BENCHMARKS "Build benchmarks" OFF)
+# Benchmarks build by default in this tree, so they stay inside the compile
+# safety net; a parent project never builds them.
+option(FUGHETTA_BUILD_BENCHMARKS "Build benchmarks" ${PROJECT_IS_TOP_LEVEL})
 set(FUGHETTA_INSTANCE "" CACHE STRING "Workspace instance for launchd registration")
 if(NOT FUGHETTA_INSTANCE MATCHES "^[A-Za-z0-9_-]*$")
   message(FATAL_ERROR "FUGHETTA_INSTANCE must contain letters, digits, underscores or hyphens")
@@ -48,8 +50,9 @@ set(FUGHETTA_SOURCE "${PROJECT_SOURCE_DIR}/src")
 include(cmake/modules.cmake)
 
 add_layer(service)
-add_modules(service service gateway source worker runtime)
-target_link_libraries(service PUBLIC gateway source worker PRIVATE argparse::argparse)
+add_modules(service service gateway source worker runtime hostrole)
+add_implementation(service host ${HOST_SERVICE})
+target_link_libraries(service PUBLIC gateway source worker PRIVATE host_executor argparse::argparse)
 add_executable(fughetta-service src/fughetta-service.cpp)
 target_link_libraries(fughetta-service PRIVATE service argparse::argparse)
 
@@ -76,7 +79,8 @@ if(PROJECT_IS_TOP_LEVEL)
   # Each provider installs the directory its artifact sits in.
   foreach(PROVIDER IN LISTS FUGHETTA_PROVIDERS)
     cmake_path(GET FUGHETTA_PROVIDER_${PROVIDER} PARENT_PATH PROVIDER_DIRECTORY)
-    install(DIRECTORY "${PROVIDER_DIRECTORY}/" DESTINATION "${FUGHETTA_LIBEXEC}/${PROVIDER}" COMPONENT "${PROVIDER}")
+    install(DIRECTORY "${PROVIDER_DIRECTORY}/" DESTINATION "${FUGHETTA_LIBEXEC}/${PROVIDER}"
+      USE_SOURCE_PERMISSIONS COMPONENT "${PROVIDER}")
   endforeach()
 endif()
 
@@ -97,4 +101,29 @@ if(FUGHETTA_BUILD_BENCHMARKS)
     add_executable(${BENCHMARK}-bench bench/${BENCHMARK}.cpp)
     target_link_libraries(${BENCHMARK}-bench PRIVATE source)
   endforeach()
+  if(FUGHETTA_BUILD_TESTS)
+    add_test(NAME bench.crossing COMMAND crossing-bench 2000)
+    set_tests_properties(bench.crossing PROPERTIES TIMEOUT 120)
+    # The project benchmark imports the frozen source tree. The open and audit
+    # benchmarks use the repository created by the scale benchmark.
+    set(ENGINE_BENCH_ROOT "${CMAKE_BINARY_DIR}/bench")
+    string(SHA256 ENGINE_BENCH_NONCE "fughetta-engine-bench")
+    foreach(MODE project scale)
+      file(MAKE_DIRECTORY "${ENGINE_BENCH_ROOT}/${MODE}")
+      file(WRITE "${ENGINE_BENCH_ROOT}/${MODE}/nonce.hex" "${ENGINE_BENCH_NONCE}")
+    endforeach()
+    add_test(NAME bench.engine.clean COMMAND ${CMAKE_COMMAND} -E rm -rf
+      "${ENGINE_BENCH_ROOT}/project/a" "${ENGINE_BENCH_ROOT}/scale/a" "${ENGINE_BENCH_ROOT}/frozen")
+    set_tests_properties(bench.engine.clean PROPERTIES FIXTURES_SETUP bench.engine.clean)
+    add_test(NAME bench.engine.freeze COMMAND engine-bench freeze "${PROJECT_SOURCE_DIR}/src" "${ENGINE_BENCH_ROOT}/frozen")
+    set_tests_properties(bench.engine.freeze PROPERTIES FIXTURES_SETUP bench.engine.frozen FIXTURES_REQUIRED bench.engine.clean)
+    add_test(NAME bench.engine.project COMMAND engine-bench project "${ENGINE_BENCH_ROOT}/project" "${ENGINE_BENCH_ROOT}/frozen" 100)
+    set_tests_properties(bench.engine.project PROPERTIES TIMEOUT 300 FIXTURES_REQUIRED "bench.engine.clean;bench.engine.frozen")
+    add_test(NAME bench.engine.scale COMMAND engine-bench scale "${ENGINE_BENCH_ROOT}/scale" 1 50)
+    set_tests_properties(bench.engine.scale PROPERTIES TIMEOUT 300 FIXTURES_REQUIRED bench.engine.clean FIXTURES_SETUP bench.engine.repository)
+    add_test(NAME bench.engine.open COMMAND engine-bench open "${ENGINE_BENCH_ROOT}/scale/a")
+    set_tests_properties(bench.engine.open PROPERTIES TIMEOUT 60 FIXTURES_REQUIRED bench.engine.repository)
+    add_test(NAME bench.engine.audit COMMAND engine-bench audit "${ENGINE_BENCH_ROOT}/scale/a")
+    set_tests_properties(bench.engine.audit PROPERTIES TIMEOUT 120 FIXTURES_REQUIRED bench.engine.repository)
+  endif()
 endif()

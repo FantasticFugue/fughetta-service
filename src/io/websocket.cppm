@@ -1,7 +1,10 @@
 export module websocket;
+import utility;
 import std;
 import coroutine;
 import http;
+import native;
+import constants;
 
 export namespace web::ws {
     using http::operator co_await;
@@ -37,7 +40,7 @@ export namespace web::ws {
                     frame = state_->decoder_.next();
                 } catch (const http::websocket::failure& e) {
                     status = e.status;
-                    failed = std::current_exception();
+                    failed = util::capture_current_exception();
                 }
                 if (failed) {
                     std::array reason{std::byte(status >> 8), std::byte(status & 255)};
@@ -53,13 +56,17 @@ export namespace web::ws {
                     continue;
                 }
                 using enum http::websocket::opcode;
+                if (frame->kind != pong)
+                    state_->received_at_ = std::chrono::steady_clock::now();
                 if (frame->kind == ping) {
                     co_await send(pong, frame->payload);
                     continue;
                 }
                 if (frame->kind == pong) {
-                    if (state_->ping_nonce_ && std::ranges::equal(frame->payload, *state_->ping_nonce_))
+                    if (state_->ping_nonce_ && std::ranges::equal(frame->payload, *state_->ping_nonce_)) {
+                        state_->received_at_ = std::chrono::steady_clock::now();
                         state_->ping_nonce_.reset();
+                    }
                     continue;
                 }
                 if (frame->kind == close) {
@@ -84,14 +91,17 @@ export namespace web::ws {
             std::array reason{std::byte(status >> 8), std::byte(status & 255)};
             co_await send(http::websocket::opcode::close, reason);
         }
-        auto awaiting_pong() const noexcept -> bool { return state_->ping_nonce_.has_value(); }
+        auto received_at() const noexcept -> std::chrono::steady_clock::time_point { return state_->received_at_; }
         auto ping() -> coroutine::task<> {
+            auto held = state_->output_.try_lock();
+            if (!held)
+                co_return;
             std::array<std::byte, 8> nonce;
             auto first = random_mask(), second = random_mask();
             std::ranges::copy(first, nonce.begin());
             std::ranges::copy(second, nonce.begin() + 4);
             state_->ping_nonce_ = nonce;
-            co_await send(http::websocket::opcode::ping, nonce);
+            co_await send_frame(http::websocket::opcode::ping, nonce);
         }
 
     private:
@@ -105,6 +115,9 @@ export namespace web::ws {
         }
         auto send(http::websocket::opcode kind, std::span<const std::byte> payload) -> coroutine::task<> {
             auto held = co_await state_->output_.lock();
+            co_await send_frame(kind, payload);
+        }
+        auto send_frame(http::websocket::opcode kind, std::span<const std::byte> payload) -> coroutine::task<> {
             if (state_->sent_close_) {
                 if (kind == http::websocket::opcode::close)
                     co_return;
@@ -131,10 +144,70 @@ export namespace web::ws {
             coroutine::mutex output_;
             std::vector<std::byte> payload_;
             std::size_t offset_ = 0;
+            std::chrono::steady_clock::time_point received_at_ = std::chrono::steady_clock::now();
             bool sent_close_ = false, received_close_ = false;
             std::optional<std::array<std::byte, 8>> ping_nonce_;
             state(S& socket, http::websocket::side side, http::websocket::limits limits) : socket_(socket), side_(side), decoder_(side, limits) {}
         };
         std::unique_ptr<state> state_;
+    };
+
+    class worker_tunnel {
+    public:
+        explicit worker_tunnel(native::socket peer) : peer_(std::move(peer)), transport_(peer_) {}
+        worker_tunnel(const worker_tunnel&) = delete;
+        auto operator=(const worker_tunnel&) -> worker_tunnel& = delete;
+
+        void start(http::websocket::side side, std::span<const std::byte> pending) {
+            stream_.emplace(transport_, side, pending);
+        }
+
+        auto handshake(std::string authority, std::optional<std::string> token) -> coroutine::task<> {
+            http::v1::client client{transport_};
+            auto key = random_key();
+            http::request head{.method = http::method::GET,
+                               .target = std::string{constants::worker_tunnel_path},
+                               .scheme = "http",
+                               .authority = std::move(authority),
+                               .fields = {{"connection", "Upgrade"}, {"upgrade", "websocket"},
+                                          {"sec-websocket-key", key}, {"sec-websocket-version", "13"},
+                                          {"sec-websocket-protocol", std::string{constants::worker_tunnel_protocol}}}};
+            if (token)
+                head.fields.push_back({"authorization", "Bearer " + *token});
+            auto response = co_await http::coroutine::upgrade(client, std::move(head));
+            http::websocket::check_response(response.head, key, constants::worker_tunnel_protocol);
+            start(http::websocket::side::client, response.pending);
+        }
+
+        auto watch(native::scheduler io) -> coroutine::task<> {
+            struct disconnect {
+                native::socket& peer;
+                ~disconnect() { peer.close(); }
+            } on_exit{peer_};
+            using clock = std::chrono::steady_clock;
+            auto next_ping = clock::now() + constants::worker_tunnel_idle / 2;
+            while (peer_.is_open()) {
+                auto now = clock::now();
+                auto expires = stream_->received_at() + constants::worker_tunnel_idle;
+                if (now >= expires)
+                    break;
+                if (now >= next_ping) {
+                    if (!co_await coroutine::deadline(io, expires - now, stream_->ping()))
+                        break;
+                    next_ping = clock::now() + constants::worker_tunnel_idle / 2;
+                    continue;
+                }
+                co_await execution::schedule_after(io, std::min(next_ping, expires) - now);
+            }
+        }
+
+        auto socket() -> native::socket& { return peer_; }
+        auto transport() -> web::stream<native::socket>& { return transport_; }
+        auto bytes() -> stream<web::stream<native::socket>>& { return *stream_; }
+
+    private:
+        native::socket peer_;
+        web::stream<native::socket> transport_;
+        std::optional<stream<web::stream<native::socket>>> stream_;
     };
 } // namespace web::ws

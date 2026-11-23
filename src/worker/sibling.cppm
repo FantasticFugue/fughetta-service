@@ -84,12 +84,13 @@ export namespace sibling {
             auto execute = cfg_;
             execute.execute_stdio = true;
             execute.token.reset();
+            execute.front_token.reset();
             execute.inherit_env = false;
             execute.env = environment();
             execute.name = cfg_.name + "-execute";
             execute.data_root = root_.string();
             execute.work_root = root_.string();
-            execute.roles = {std::string{constants::execute_role}};
+            execute.roles = {config::execute_role};
             execute.backend = {};
             execute.worker_id.reset();
             execute.workspace_id.reset();
@@ -112,8 +113,10 @@ export namespace sibling {
 
         static auto accept(instance& started) -> coroutine::task<> {
             auto first = co_await started.chan.recv(constants::worker_hello_bytes);
-            if (first.kind != jobs::code<jobs::hello> ||
-                transport::decode<jobs::hello>(first).roles != std::vector<std::string>{std::string{constants::execute_role}})
+            if (first.kind != jobs::code<jobs::hello>)
+                throw std::runtime_error("invalid execute role greeting");
+            const auto hello = transport::decode<jobs::hello>(first);
+            if (hello.protocol != jobs::protocol_version || hello.roles != std::vector<config::worker_role>{config::execute_role})
                 throw std::runtime_error("invalid execute role greeting");
             for (;;) {
                 auto report = co_await started.chan.recv(constants::worker_hello_bytes);

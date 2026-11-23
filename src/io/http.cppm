@@ -68,6 +68,17 @@ export namespace web {
             wake();
         }
 
+        // The message that ends the stream: it is committed once, after what push() has already queued, and then read in
+        // pieces as the reader takes it. A stream that has ended ignores a later push() or finish().
+        void finish(std::string body) {
+            if (closed_)
+                return;
+            closed_ = true;
+            tail_ = std::move(body);
+            tail_offset_ = 0;
+            wake();
+        }
+
         static auto message(std::string_view data) -> std::string { return std::format("event: message\ndata: {}\n\n", data); }
         // What was pushed and not read yet, taken without waiting.
         auto take() -> std::string { return std::exchange(pending_, {}); }
@@ -83,7 +94,7 @@ export namespace web {
                     s_.waiter_ = {};
             }
 
-            auto await_ready() const noexcept -> bool { return !s_.pending_.empty() || s_.closed_; }
+            auto await_ready() const noexcept -> bool { return !s_.pending_.empty() || s_.tail_offset_ < s_.tail_.size() || s_.closed_; }
             auto await_suspend(std::coroutine_handle<> h) -> bool {
                 if (stop_.stop_requested()) {
                     cancelled_ = true;
@@ -99,9 +110,20 @@ export namespace web {
                 on_stop_.reset();
                 if (cancelled_)
                     throw http::stopped{};
-                auto n = std::min(into_.size(), s_.pending_.size());
-                std::memcpy(into_.data(), s_.pending_.data(), n);
-                s_.pending_.erase(0, n);
+                if (!s_.pending_.empty()) {
+                    auto n = std::min(into_.size(), s_.pending_.size());
+                    std::memcpy(into_.data(), s_.pending_.data(), n);
+                    s_.pending_.erase(0, n);
+                    return n;
+                }
+                // The ending body is handed over as much at a time as the reader asked for, and forgotten as it goes.
+                auto n = std::min(into_.size(), s_.tail_.size() - s_.tail_offset_);
+                std::memcpy(into_.data(), s_.tail_.data() + s_.tail_offset_, n);
+                s_.tail_offset_ += n;
+                if (s_.tail_offset_ == s_.tail_.size()) {
+                    s_.tail_.clear();
+                    s_.tail_offset_ = 0;
+                }
                 return n;
             }
 
@@ -132,6 +154,9 @@ export namespace web {
         }
 
         std::string pending_;
+        // What finish() committed: not queued, and read only after pending_ is empty.
+        std::string tail_;
+        std::size_t tail_offset_ = 0;
         bool closed_ = false;
         std::size_t max_pending_bytes_ = constants::event_stream_buffer_bytes;
         std::coroutine_handle<> waiter_{};

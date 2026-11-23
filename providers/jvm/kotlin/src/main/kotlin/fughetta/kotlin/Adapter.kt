@@ -6,6 +6,7 @@ import kotlinx.serialization.json.*
 import org.jetbrains.kotlin.analysis.api.projectStructure.KaLibraryModule
 import com.intellij.psi.PsiElement
 import fughetta.jvm.Evaluation
+import fughetta.jvm.JvmClasspath
 import fughetta.jvm.LanguageAdapter
 
 /** The Kotlin Analysis API projection served by the fughetta-jvm host. */
@@ -54,7 +55,7 @@ class KotlinAdapter : LanguageAdapter {
                 if (dependency is KaLibraryModule) {
                     val path = Path.of(dependency.libraryName).toAbsolutePath().normalize()
                     when {
-                        path.startsWith(objects) -> "object:" + objects.relativize(path).toString()
+                        path.startsWith(objects) -> "object:" + JvmClasspath.artifactName(objects.relativize(path).toString())
                         else -> {
                             val sdk = sdks.entries.filter { path.startsWith(it.value) }.maxByOrNull { it.value.nameCount }
                             when {

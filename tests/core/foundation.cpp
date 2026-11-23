@@ -432,7 +432,7 @@ namespace {
             auto io = context.get_scheduler();
             auto value = cores::run(context, coroutine::deadline(io, 1s, execution::then(execution::schedule_after(io, 1ms), [] { return 31; })));
             expect(value && *value == std::optional<int>{31});
-            auto empty = cores::run(context, coroutine::deadline(io, 1s, execution::just()));
+            auto empty = cores::run(context, coroutine::deadline(io, 1s, execution::schedule_after(io, 0ms)));
             expect(empty && empty->has_value());
             auto timed_out = cores::run(context, coroutine::deadline(io, 1ms, execution::schedule_after(io, 1h)));
             expect(timed_out && !timed_out->has_value());

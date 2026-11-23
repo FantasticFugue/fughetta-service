@@ -4,7 +4,6 @@
 find_package(stdexec CONFIG REQUIRED)
 find_package(argparse CONFIG REQUIRED)
 find_package(yyjson CONFIG REQUIRED)
-find_package(simdjson CONFIG REQUIRED)
 find_package(pugixml CONFIG REQUIRED)
 find_package(asio CONFIG REQUIRED)
 find_package(unofficial-sodium CONFIG REQUIRED)
@@ -28,3 +27,13 @@ FetchContent_Declare(httpant
   GIT_SHALLOW TRUE
   EXCLUDE_FROM_ALL)
 FetchContent_MakeAvailable(httpant)
+
+# A compilation database states the language of every command, and a tool that reads one loads a module unit only when the
+# command says C++ and the suffix is not one it assumes. httpant's module units keep .ixx, so each target that adds them
+# states the language of its own file set.
+foreach(HTTPANT_MODULE_TARGET httpant-stdexec httpant-imports httpant-asio httpant-tls-imports)
+  get_target_property(HTTPANT_MODULE_UNITS ${HTTPANT_MODULE_TARGET} CXX_MODULE_SET)
+  if(HTTPANT_MODULE_UNITS)
+    set_source_files_properties(${HTTPANT_MODULE_UNITS} TARGET_DIRECTORY ${HTTPANT_MODULE_TARGET} PROPERTIES LANGUAGE CXX)
+  endif()
+endforeach()

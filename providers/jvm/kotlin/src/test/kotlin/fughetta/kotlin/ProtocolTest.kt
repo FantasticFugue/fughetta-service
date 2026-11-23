@@ -1,26 +1,145 @@
 package fughetta.kotlin
 
+import java.io.ByteArrayOutputStream
 import java.nio.file.Files
 import java.nio.file.Path
 import java.util.concurrent.TimeUnit
+import java.util.zip.ZipEntry
+import java.util.zip.ZipOutputStream
 import kotlinx.serialization.json.*
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertFailsWith
 import kotlin.test.assertFalse
 import kotlin.test.assertTrue
 
+internal typealias MetadataRows = List<String>
+internal fun MetadataRows.metadataSize(): Int = size
+internal class FriendLibrary { fun value(): Int = 42 }
+internal class AarCaller { fun callAar(value: String): Int = listOf(value).metadataSize() }
+
 class ProtocolTest {
+    @Test
+    fun readsKotlinDeclarationsFromAndroidArchive() {
+        fun zip(vararg entries: Pair<String, ByteArray>): ByteArray = ByteArrayOutputStream().also { bytes ->
+            ZipOutputStream(bytes).use { archive ->
+                for ((name, data) in entries) {
+                    archive.putNextEntry(ZipEntry(name))
+                    archive.write(data)
+                }
+            }
+        }.toByteArray()
+        fun classBytes(name: String) = checkNotNull(javaClass.getResourceAsStream("$name.class")).use { it.readBytes() }
+
+        val path = Files.createTempFile("metadata-", ".aar")
+        try {
+            val primaryClass = classBytes("AarCaller")
+            val primary = zip("fughetta/kotlin/AarCaller.class" to primaryClass,
+                "classes.jar" to zip("fughetta/kotlin/FriendLibrary.class" to classBytes("FriendLibrary")))
+            val declarationsJar = zip("fughetta/kotlin/ProtocolTestKt.class" to classBytes("ProtocolTestKt"))
+            Files.write(path, zip("AndroidManifest.xml" to "<manifest package=\"fughetta.kotlin\"/>".toByteArray(),
+                "libs/helper.jar" to declarationsJar, "classes.jar" to primary))
+            val classes = Metadata.read(path, 0).getValue("classes").jsonArray.map { it.jsonObject }
+                .associateBy { it.getValue("owner").jsonPrimitive.content }
+            assertEquals(listOf("fughetta/kotlin/AarCaller", "fughetta/kotlin/ProtocolTestKt"), classes.keys.toList())
+            val facade = classes.getValue("fughetta/kotlin/ProtocolTestKt")
+            val declarations = facade.getValue("declarations").jsonArray.map { it.jsonObject }
+                .associateBy { it.getValue("name").jsonPrimitive.content }
+            assertEquals("type", declarations.getValue("MetadataRows").getValue("kind").jsonPrimitive.content)
+            val signature = declarations.getValue("metadataSize").getValue("type")
+            assertTrue(facade.getValue("types").jsonArray.map { it.jsonObject }.single { it["id"] == signature }.containsKey("receiver"))
+            System.getenv("FUGHETTA_JVM_TEST")?.let { executable ->
+                val child = ProcessBuilder(executable, "--aar", path.toString(), Path.of(System.getProperty("java.home"), "bin", "java").toString(),
+                    System.getProperty("fughetta.adapter.jar")).inheritIO().start()
+                try {
+                    assertTrue(child.waitFor(90, TimeUnit.SECONDS), "native AAR test timed out")
+                    assertEquals(0, child.exitValue())
+                } finally { child.destroyForcibly() }
+            }
+
+            Files.write(path, zip("classes.jar" to primary, "libs/duplicate.jar" to zip("alias.class" to primaryClass)))
+            val duplicate = assertFailsWith<IllegalArgumentException> { Metadata.read(path, 0) }
+            assertEquals("duplicate JVM class in artifact: fughetta/kotlin/AarCaller", duplicate.message)
+        } finally { Files.deleteIfExists(path) }
+    }
+
+    @Test
+    fun readsKotlinUnitsFromMixedLanguageModel() {
+        val root = Files.createTempDirectory(Path.of(System.getProperty("java.io.tmpdir")), "mixed-model-")
+        try {
+            val classes = Files.createDirectories(root.resolve("library/build/classes"))
+            val jdk = Path.of(System.getProperty("java.home"))
+            val input = Model(root, root.resolve("objects"), mapOf("jdk" to jdk)).read(
+                """
+                {
+                  "schema": 1,
+                  "producer": "test",
+                  "producer_version": "current",
+                  "units": [
+                    {
+                      "id": "kotlin-main", "project": "app", "language": "kotlin", "variants": [],
+                      "directory": "app", "sources": ["app/Main.kt"], "generated": {},
+                      "compiler_arguments": [], "outputs": [], "extensions": {},
+                      "references": [
+                        {"kind": "sdk", "name": "jdk", "path": "", "role": "runtime"},
+                        {"kind": "project", "project": "library", "unit": "", "role": "classpath",
+                         "attributes": {"usage": "api"}}
+                      ]
+                    },
+                    {
+                      "id": "scala-main", "project": "library", "language": "scala",
+                      "directory": "library", "variants": [{"usage": "api"}], "sources": ["library/Library.scala"],
+                      "generated": {}, "references": [], "compiler_arguments": [], "extensions": {},
+                      "outputs": ["library/build/classes", "library/build/resources"]
+                    }
+                  ]
+                }
+                """.trimIndent(),
+                mapOf("library/build/classes/Library.class" to "class-object"),
+            ).single()
+            assertEquals("kotlin-main", input.id)
+            assertEquals(emptyList(), input.dependencies)
+            assertEquals(listOf(classes), input.libraries)
+            assertEquals(mapOf("library/build/classes/Library.class" to "class-object"), input.binaryInputs)
+        } finally {
+            root.toFile().deleteRecursively()
+        }
+    }
+
     @Test
     fun subprocessInstallsModelAndEvaluatesUpdatedSource() {
         val root = Files.createTempDirectory(Path.of(System.getProperty("java.io.tmpdir")), "protocol-")
-        val source = "import kotlin.String as Text\nimport kotlin.collections.*\nfun answer() = listOf(42).first()\nval transform: (Int) -> Int = { it + 1 }\nclass Empty\nclass Box(var value: Int)\nfun make() = Empty()\n"
+        val source = "import kotlin.String as Text\nimport kotlin.collections.*\nfun answer() = listOf(42).first()\nval transform: (Int) -> Int = { it + 1 }\nclass Empty\nclass Box(var value: Int)\nfun make() = Empty()\nfun friendValue() = fughetta.kotlin.FriendLibrary().value()\n"
         Files.writeString(root.resolve("Main.kt"), source)
         Files.writeString(root.resolve("JavaApi.java"), "public class JavaApi { public static int value() { return 42; } }")
         val stdlib = Path.of(kotlin.Unit::class.java.protectionDomain.codeSource.location.toURI())
-        val libraryHash = java.security.MessageDigest.getInstance("SHA-256").digest(Files.readAllBytes(stdlib))
-            .joinToString("") { "%02x".format(it) }
         val objects = Files.createDirectories(root.resolve("objects"))
-        Files.copy(stdlib, objects.resolve(libraryHash))
+        fun installAar(classes: ByteArray, extra: ByteArray? = null): String {
+            val archive = ByteArrayOutputStream()
+            ZipOutputStream(archive).use { aar ->
+                aar.putNextEntry(ZipEntry("classes.jar"))
+                aar.write(classes)
+                if (extra != null) {
+                    aar.putNextEntry(ZipEntry("libs/friend.jar"))
+                    aar.write(extra)
+                }
+            }
+            val bytes = archive.toByteArray()
+            val hash = java.security.MessageDigest.getInstance("SHA-256").digest(bytes).joinToString("") { "%02x".format(it) }
+            Files.write(objects.resolve(hash), bytes)
+            return hash
+        }
+        val libraryHash = installAar(Files.readAllBytes(stdlib))
+        fun jar(className: String): ByteArray = ByteArrayOutputStream().also { bytes ->
+            ZipOutputStream(bytes).use { jar ->
+                jar.putNextEntry(ZipEntry("fughetta/kotlin/$className.class"))
+                checkNotNull(javaClass.getResourceAsStream("$className.class")).use { it.copyTo(jar) }
+            }
+        }.toByteArray()
+        val primaryJar = jar("ProtocolTestKt")
+        val friendHash = installAar(primaryJar, jar("FriendLibrary"))
+        val friendClasspath = Files.write(objects.resolve("$friendHash-classes.jar"), primaryJar)
+        val kotlinArguments = listOf("-cp", "${'$'}{object:$libraryHash}", "-Xfriend-paths=${'$'}{object:$friendHash}")
         val empty = JsonArray(emptyList())
         val model = buildJsonObject {
             put("schema", 1); put("producer", "test"); put("producer_version", "current")
@@ -31,12 +150,21 @@ class ProtocolTest {
                     add(buildJsonObject { put("kind", "sdk"); put("name", "jdk"); put("path", ""); put("role", "runtime") })
                     add(buildJsonObject {
                         put("kind", "artifact"); put("role", "classpath")
-                        putJsonObject("object") { put("hash", libraryHash); put("name", stdlib.fileName.toString()) }
+                        putJsonObject("object") { put("hash", libraryHash); put("name", "stdlib.aar") }
+                    })
+                    add(buildJsonObject {
+                        put("kind", "artifact"); put("role", "friend")
+                        putJsonObject("object") { put("hash", friendHash); put("name", "friend.aar") }
                     })
                 }
-                put("outputs", empty); put("compiler_arguments", empty); put("variants", empty); put("extensions", buildJsonObject {})
+                put("outputs", empty); put("compiler_arguments", JsonArray(kotlinArguments.map(::JsonPrimitive)))
+                put("variants", empty); put("extensions", buildJsonObject {})
             }) }
         }
+        val input = Model(root, objects, mapOf("jdk" to Path.of(System.getProperty("java.home"))))
+            .read(model.toString(), emptyMap()).single()
+        assertEquals(listOf("-cp", objects.resolve("$libraryHash-classes.jar").toString(), "-Xfriend-paths=$friendClasspath"),
+            input.compilerArguments)
         Files.writeString(root.resolve("model.json"), model.toString())
         System.getenv("FUGHETTA_WORKER_TEST")?.let { executable ->
             val worker = ProcessBuilder(executable, "--kotlin", root.toString(),
@@ -49,10 +177,27 @@ class ProtocolTest {
                 assertEquals(0, worker.exitValue())
             } finally { worker.destroyForcibly() }
         }
+        val androidSdk = root.resolve("android-sdk")
+        val androidJarPath = "platforms/android-35/android.jar"
+        val androidJar = androidSdk.resolve(androidJarPath)
+        Files.createDirectories(androidJar.parent)
+        val contextSource = Files.writeString(root.resolve("Context.java"),
+            "package android.content; public class Context { public String getPackageName() { return \"demo\"; } }")
+        val androidClasses = Files.createDirectory(root.resolve("android-classes"))
+        assertEquals(0, javax.tools.ToolProvider.getSystemJavaCompiler().run(null, null, null,
+            "-d", androidClasses.toString(), contextSource.toString()))
+        ZipOutputStream(Files.newOutputStream(androidJar)).use { jar ->
+            jar.putNextEntry(ZipEntry("android/content/Context.class"))
+            Files.copy(androidClasses.resolve("android/content/Context.class"), jar)
+        }
+        val sdkBindings = mapOf("jdk" to System.getProperty("java.home"), "sdk/android" to androidSdk.toString())
         // The subprocess session also consumes a source module, so its exported
         // read-set and the host's current-value observation share a real graph.
         Files.writeString(root.resolve("Dependency.kt"), "package dependency\nfun value(): Int = 1\n")
-        val mainUnit = model.getValue("units").jsonArray.single().jsonObject
+        val originalUnit = model.getValue("units").jsonArray.single().jsonObject
+        val mainUnit = JsonObject(originalUnit + ("references" to JsonArray(originalUnit.getValue("references").jsonArray + buildJsonObject {
+            put("kind", "sdk"); put("name", "sdk/android"); put("path", androidJarPath); put("role", "classpath")
+        })))
         val dependency = JsonObject(mainUnit.toMutableMap().apply {
             put("id", JsonPrimitive("dependency")); put("project", JsonPrimitive("dependency"))
             put("sources", JsonArray(listOf(JsonPrimitive("Dependency.kt"))))
@@ -60,12 +205,22 @@ class ProtocolTest {
         val main = JsonObject(mainUnit.toMutableMap().apply {
             put("references", JsonArray(mainUnit.getValue("references").jsonArray + buildJsonObject {
                 put("kind", "project"); put("project", "dependency"); put("unit", "dependency"); put("role", "classpath")
-                put("attributes", buildJsonObject {})
+                put("path", ""); put("attributes", buildJsonObject {})
             }))
         })
-        Files.writeString(root.resolve("model.json"), JsonObject(model.toMutableMap().apply {
+        val modelPath = Files.writeString(root.resolve("model.json"), JsonObject(model.toMutableMap().apply {
             put("units", JsonArray(listOf(main, dependency)))
         }).toString())
+        System.getenv("FUGHETTA_RECORD_VALIDATOR")?.let { validator ->
+            val bindings = JsonArray(sdkBindings.map { (name, location) -> buildJsonObject {
+                put("name", name); put("object", name); putJsonArray("roots") { add(location) }
+            } })
+            val checked = ProcessBuilder(validator, "--model", modelPath.toString()).apply {
+                environment()["FUGHETTA_SDKS"] = bindings.toString()
+                environment()["FUGHETTA_STAGING"] = objects.toString()
+            }.inheritIO().start()
+            assertEquals(0, checked.waitFor())
+        }
         val process = ProcessBuilder(Path.of(System.getProperty("java.home"), "bin", "java").toString(),
             "-Djava.io.tmpdir=$root", "-jar", System.getProperty("fughetta.host.jar"), "--adapter", System.getProperty("fughetta.adapter.jar"))
             .directory(root.toFile()).redirectError(ProcessBuilder.Redirect.INHERIT).start()
@@ -93,7 +248,7 @@ class ProtocolTest {
             call("open", buildJsonObject {
                 put("session", state(0)); putJsonObject("initialization") {}; putJsonObject("host") {
                     put("objects", root.resolve("objects").toString())
-                    putJsonObject("sdks") { put("jdk", System.getProperty("java.home")); put("stdlib", stdlib.parent.toString()) }
+                    putJsonObject("sdks") { sdkBindings.forEach { (name, path) -> put(name, path) } }
                 }
             })
             val demand = buildJsonObject {
@@ -111,7 +266,7 @@ class ProtocolTest {
                     putJsonArray("documents") { add(buildJsonObject { put("path", "Main.kt"); put("language", "kotlin"); put("text", text) }) }
                 })
             }
-            update(1, source)
+            update(1, source + "fun androidAnswer(context: android.content.Context) = context.packageName + fughetta.kotlin.FriendLibrary().value()\n")
             val units = call("units", buildJsonObject { put("epoch", 1); put("demand", demand) }).jsonArray
             assertEquals(1, units.size)
             val key = units.single()
@@ -145,10 +300,22 @@ class ProtocolTest {
                         it.jsonObject.getValue("ownership").jsonObject.getValue("origin").jsonObject.getValue("provider").jsonPrimitive.content == "workspace-kotlin"
                     })
                 }
-                if (epoch >= 3) assertTrue(shard.getValue("identities").jsonArray.map { it.jsonObject }.any {
-                    it.getValue("declaration").jsonObject["module"]?.jsonPrimitive?.content == "tree:vendor/stdlib.jar"
+                val libraryModule = if (epoch >= 3) "tree:vendor/stdlib.jar" else "object:$libraryHash"
+                assertTrue(shard.getValue("identities").jsonArray.map { it.jsonObject }.any {
+                    it.getValue("declaration").jsonObject["module"]?.jsonPrimitive?.content == libraryModule
                 })
                 if (epoch == 1) {
+                    assertFalse(shard.getValue("diagnostics").jsonArray.any {
+                        it.jsonObject["severity"]?.jsonPrimitive?.content == "error"
+                    }, shard.getValue("diagnostics").toString())
+                    assertTrue(shard.getValue("identities").jsonArray.any {
+                        it.jsonObject.getValue("declaration").jsonObject["module"]?.jsonPrimitive?.content == "object:$friendHash"
+                    })
+                    val androidAnswer = shard.getValue("symbols").jsonArray.map { it.jsonObject }
+                        .single { it.getValue("name").jsonPrimitive.content == "androidAnswer" }
+                    val types = shard.getValue("types").jsonArray.map { it.jsonObject }.associateBy { it.getValue("id") }
+                    val returned = types.getValue(types.getValue(androidAnswer.getValue("type")).getValue("return_type"))
+                    assertEquals("kotlin.String", returned.getValue("name").jsonPrimitive.content)
                     val reads = shard.getValue("unit").jsonObject.getValue("observed_dependencies").jsonArray
                     assertEquals(setOf("lookup", "body"), reads.map { it.jsonObject.getValue("kind").jsonPrimitive.content }.toSet())
                     val producers = result.getValue("producer_keys").jsonObject
@@ -195,8 +362,9 @@ class ProtocolTest {
                 })
                 System.getenv("FUGHETTA_RECORD_VALIDATOR")?.let { validator ->
                     val path = Files.writeString(root.resolve("shard.json"), shard.toString())
-                    // This fixture has no references; the typed reader still admits the wire structure.
-                    val checked = ProcessBuilder(validator, "--read-shard", path.toString()).inheritIO().start()
+                    val command = if (epoch == 1) listOf(validator, "--android-shard", path.toString(), friendHash)
+                        else listOf(validator, "--read-shard", path.toString())
+                    val checked = ProcessBuilder(command).inheritIO().start()
                     assertEquals(0, checked.waitFor())
                 }
                 return shard.getValue("types").jsonArray.map { it.jsonObject }.single { it["id"] == type["return_type"] }
@@ -212,7 +380,8 @@ class ProtocolTest {
                 put("units", JsonArray(model.getValue("units").jsonArray.map { unit ->
                     JsonObject(unit.jsonObject.toMutableMap().apply {
                         put("references", JsonArray(unit.jsonObject.getValue("references").jsonArray.map { reference ->
-                            if (reference.jsonObject["kind"]?.jsonPrimitive?.content == "artifact") buildJsonObject {
+                            if (reference.jsonObject["kind"]?.jsonPrimitive?.content == "artifact" &&
+                                reference.jsonObject["role"]?.jsonPrimitive?.content == "classpath") buildJsonObject {
                                 put("kind", "tree"); put("path", "vendor/stdlib.jar"); put("role", "classpath")
                             } else reference
                         }))

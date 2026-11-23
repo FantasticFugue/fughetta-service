@@ -93,9 +93,13 @@ type Workspace(root: string, host: JsonNode) =
         let model = JsonNode.Parse(File.ReadAllText(full models[0]))
         modelPath <- models[0]
         if model["schema"].GetValue<int>() <> 1 then failwith "Unknown project model schema"
+        let allUnits = items model["units"] |> Seq.map (fun unit -> field unit "id", unit) |> Seq.toArray
+        let fsharpUnits = allUnits |> Array.filter (fun (_, unit) -> field unit "language" = "fsharp")
+        if fsharpUnits.Length = 0 then failwith "project_model has no F# compilation units"
+        let units = Map.ofArray fsharpUnits
         aliases.Clear()
         objectNames.Clear()
-        for unit in items model["units"] do
+        for _, unit in fsharpUnits do
             for reference in items unit["references"] do
                 if field reference "kind" = "artifact" then
                     let artifact = reference["object"]
@@ -105,7 +109,6 @@ type Workspace(root: string, host: JsonNode) =
                         let named = original + extension
                         objectNames[original] <- named
                         aliases[named] <- original
-        let units = items model["units"] |> Seq.map (fun unit -> field unit "id", unit) |> Map.ofSeq
         let currentSources = units |> Map.toSeq |> Seq.collect (fun (_, unit) -> items unit["sources"] |> Seq.map (fun path -> full (path.GetValue<string>()))) |> Set.ofSeq
         for path in documents.Keys |> Seq.toArray do
             if not (currentSources.Contains path) then documents.Remove path |> ignore
@@ -141,19 +144,21 @@ type Workspace(root: string, host: JsonNode) =
             | _ ->
                 if not (visiting.Add id) then failwith "Cyclic F# project references"
                 let unit = units[id]
-                if field unit "language" <> "fsharp" then failwith "FCS input must contain F# source units"
                 let sources = items unit["sources"] |> Seq.map (fun item -> full (item.GetValue<string>())) |> Seq.toArray
-                let references = items unit["references"] |> Seq.filter (fun r -> field r "kind" = "project") |> Seq.map (fun reference ->
-                    let matches = units |> Map.toSeq |> Seq.filter (fun (id, unit) ->
+                let references = items unit["references"] |> Seq.filter (fun r -> field r "kind" = "project") |> Seq.choose (fun reference ->
+                    let matches = allUnits |> Array.filter (fun (id, unit) ->
                         field unit "project" = field reference "project" &&
                         (if field reference "unit" <> "" then id = field reference "unit"
-                         else items unit["variants"] |> Seq.exists (fun attributes -> JsonNode.DeepEquals(attributes, reference["attributes"])))) |> Seq.toArray
+                         else items unit["variants"] |> Seq.exists (fun attributes -> JsonNode.DeepEquals(attributes, reference["attributes"]))))
                     if matches.Length <> 1 then failwith "F# project reference requires one unit"
-                    let project = build (fst matches[0])
-                    let output =
-                        if field reference "path" <> "" then full (field reference "path")
-                        else items ((snd matches[0])["outputs"]) |> Seq.exactlyOne |> fun value -> full (value.GetValue<string>())
-                    project.Id, FSharpReferencedProject.FSharpReference(output, project.Options)) |> Seq.toArray
+                    let dependency, target = matches[0]
+                    if not (units.ContainsKey dependency) then None
+                    else
+                        let project = build dependency
+                        let output =
+                            if field reference "path" <> "" then full (field reference "path")
+                            else items target["outputs"] |> Seq.exactlyOne |> fun value -> full (value.GetValue<string>())
+                        Some (project.Id, FSharpReferencedProject.FSharpReference(output, project.Options))) |> Seq.toArray
                 let arguments =
                     Seq.append
                         (items unit["compiler_arguments"] |> Seq.map (fun value -> expand (value.GetValue<string>())))

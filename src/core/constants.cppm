@@ -18,14 +18,19 @@ export namespace constants {
     // A stream whose reader falls behind is closed at this size instead of buffering without bound.
     inline constexpr std::size_t event_stream_buffer_bytes = 65536;
     inline constexpr std::size_t source_handler_limit = 64;
+    inline constexpr char managed_source_directory[] = "source";
+    inline constexpr char repositories_directory[] = ".nodes";
+    inline constexpr char repository_database[] = "repository.sqlite";
     inline constexpr auto client_sync_limit = std::chrono::hours{24};
     inline constexpr auto mcp_heartbeat = std::chrono::seconds{15};
     inline constexpr auto workspace_event_heartbeat = std::chrono::seconds{15};
     inline constexpr auto workspace_event_lifetime = std::chrono::minutes{5};
     inline constexpr auto language_idle = std::chrono::minutes{10};
+    inline constexpr std::uint64_t host_minimum_storage = 16u << 20;
+    inline constexpr auto host_answer_limit = std::chrono::seconds{89};
+    inline constexpr std::uint16_t host_core_port = 8080, host_worker_port = 9090, host_remote_port = 9092;
     // What a worker takes. The execute role runs code the project supplies: builds, preparations and the
     // analyses that load it. The analyze role reads the project's data with this program's own code.
-    inline constexpr std::string_view execute_role = "execute", analyze_role = "analyze";
     // The execute child must greet the Worker over stdio before this deadline.
     inline constexpr auto execute_start = std::chrono::seconds{60};
     inline constexpr auto execute_memory_wait = std::chrono::seconds{5};
@@ -33,6 +38,10 @@ export namespace constants {
     // Host settings shared with the execute child and analysis tools.
     inline constexpr std::array<std::string_view, 9> analysis_environment{"PATH", "HOME",      "LANG",        "LC_ALL",    "TMPDIR",
                                                                           "USER", "JAVA_HOME", "DOTNET_ROOT", "SystemRoot"};
+    // The variables that name the systemd unit a process was started by. They describe the parent's journal and notification
+    // channel, differ on every restart, and belong to no work a child does.
+    inline constexpr std::array<std::string_view, 5> instance_environment{"INVOCATION_ID", "JOURNAL_STREAM", "MANAGERPID", "NOTIFY_SOCKET",
+                                                                         "SYSTEMD_EXEC_PID"};
     inline constexpr std::size_t language_sessions = 16;
     inline constexpr std::size_t semantic_candidates_per_unit = 4;
     inline constexpr auto semantic_view_retention = std::chrono::hours{24};
@@ -62,6 +71,9 @@ export namespace constants {
     inline constexpr std::size_t dependency_archive_count = 65536;
     inline constexpr std::size_t worker_registry_limit = 1024;
     inline constexpr std::size_t worker_hello_bytes = 128u << 10;
+    inline constexpr std::string_view worker_tunnel_path = "/workers/tunnel";
+    inline constexpr std::string_view worker_tunnel_protocol = "fughetta-worker.v1";
+    inline constexpr auto worker_tunnel_idle = std::chrono::seconds{90};
     inline constexpr auto remote_worker_stale = std::chrono::seconds{90};
     inline constexpr std::string_view source_ledger_directory = ".source-usage";
     inline constexpr std::string_view temporary_suffix = ".write-tmp";

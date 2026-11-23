@@ -1,4 +1,5 @@
 export module tool;
+import utility;
 import std;
 import meta;
 
@@ -20,9 +21,11 @@ export namespace tools {
     };
 
     // A refusal from the node engine, kept with its code so MCP callers get { code, message }.
-    struct tool_error : std::runtime_error {
+    struct tool_error : std::runtime_error, util::retained_exception {
         tool_error(std::string_view code, std::string message) : std::runtime_error(std::move(message)), code(code) {}
         std::string code;
+        auto retain() const noexcept -> std::exception_ptr override;
     };
+    auto tool_error::retain() const noexcept -> std::exception_ptr { return util::copy_current_exception(*this); }
 
 } // namespace tools

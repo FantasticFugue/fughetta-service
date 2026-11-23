@@ -56,7 +56,7 @@ namespace nodes {
             edits.emplace_back(value::map{{"count", e.count},
                                           {"document", e.document},
                                           {"executable", e.executable},
-                                          {"kind", e.kind},
+                                          {"kind", std::string{json::enum_spelling(e.kind)}},
                                           {"offset", e.offset},
                                           {"path", e.path},
                                           {"target", e.target},
@@ -213,10 +213,10 @@ namespace nodes {
 
     local_node::impl::impl(std::filesystem::path path, bool rebuild, bool reading) : root(checked_root(std::move(path))) {
         read_only = reading;
-        for (auto name : {"repository.sqlite", "repository.sqlite-wal", "repository.sqlite-shm"})
-            if (std::filesystem::is_symlink(std::filesystem::symlink_status(root / name)))
+        for (auto suffix : {"", "-wal", "-shm"})
+            if (std::filesystem::is_symlink(std::filesystem::symlink_status(root / (std::string{constants::repository_database} + suffix))))
                 fail(nodes::code::storage_failure, "node database is a symbolic link");
-        db = std::make_unique<database>(root / "repository.sqlite");
+        db = std::make_unique<database>(root / constants::repository_database);
         create_schema(*db);
         {
             statement q{*db, "SELECT data FROM metadata WHERE name='identity'"};
