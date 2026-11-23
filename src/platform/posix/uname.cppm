@@ -3,12 +3,23 @@ module;
 #include <stdlib.h>
 #include <sys/utsname.h>
 #include <unistd.h>
+#ifdef __linux__
+#include <sched.h>
+#endif
 
 module host;
 import std;
 import posix;
 
 namespace host {
+    auto available_cpus() noexcept -> unsigned {
+#ifdef __linux__
+        cpu_set_t cpus;
+        if (::sched_getaffinity(0, sizeof cpus, &cpus) == 0)
+            return static_cast<unsigned>(CPU_COUNT(&cpus));
+#endif
+        return std::thread::hardware_concurrency();
+    }
     auto executable() -> std::filesystem::path { return posix::executable(); }
     const std::string_view default_data_root = "/srv/data";
     namespace {
@@ -74,7 +85,10 @@ namespace host {
         }
         for (const auto& [name, path] : mapped) {
             found.erase(name);
-            if (::access(path.c_str(), X_OK) == 0)
+            // Explicit tools also include resources passed to an interpreter,
+            // such as helper JARs and model-export scripts.
+            std::error_code ec;
+            if (std::filesystem::is_regular_file(path, ec) && !ec && ::access(path.c_str(), R_OK) == 0)
                 found[name] = std::filesystem::absolute(path).string();
         }
         return found;

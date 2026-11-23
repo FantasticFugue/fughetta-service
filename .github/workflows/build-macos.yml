@@ -1,0 +1,425 @@
+name: build-macos
+
+on:
+  push:
+    branches: [main, feat/worker-roles]
+  workflow_dispatch:
+
+concurrency:
+  group: build-macos-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 180
+    defaults:
+      run:
+        shell: bash
+    env:
+      PLATFORM: macos-arm64
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.x'
+
+      - name: Load build settings
+        id: settings
+        uses: ./.github/actions/build-settings
+
+      - uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: ${{ fromJSON(steps.settings.outputs.settings).toolchain.dotnet }}
+      - uses: actions/setup-java@v5
+        id: java
+        with:
+          distribution: ${{ fromJSON(steps.settings.outputs.settings).toolchain.java.distribution }}
+          java-version: ${{ fromJSON(steps.settings.outputs.settings).toolchain.java.version }}
+      - uses: gradle/actions/setup-gradle@v5
+        id: gradle
+        with:
+          gradle-version: ${{ fromJSON(steps.settings.outputs.settings).toolchain.gradle }}
+          cache-read-only: ${{ github.event_name == 'pull_request' }}
+
+      - name: Set paths
+        run: |
+          set -euo pipefail
+          cache="$RUNNER_TEMP/fughetta-ci"
+          mkdir -p "$cache/vcpkg/downloads" "$cache/vcpkg/archives"
+          {
+            echo "DEBUG_DIR=$RUNNER_TEMP/fughetta-build-debug"
+            echo "RELEASE_DIR=$RUNNER_TEMP/fughetta-build-release"
+            echo "PACKAGE_DIR=$RUNNER_TEMP/fughetta-build-release/packages"
+            echo "CI_IMAGE_VERSION=${ImageVersion:-$RUNNER_OS}"
+            echo "CI_TOOLCHAIN_CACHE=$cache/toolchain"
+            echo "CI_VCPKG_CACHE=$cache/vcpkg"
+            echo "VCPKG_DOWNLOADS=$cache/vcpkg/downloads"
+            echo "VCPKG_BINARY_SOURCES=clear;files,$cache/vcpkg/archives,readwrite"
+            echo "NUGET_PACKAGES=$cache/nuget"
+            echo "GRADLE_USER_HOME=$cache/gradle"
+          } >> "$GITHUB_ENV"
+
+      - name: Restore toolchain downloads
+        id: tools-cache
+        uses: actions/cache/restore@v6
+        with:
+          path: ${{ env.CI_TOOLCHAIN_CACHE }}
+          key: native-toolchain-${{ runner.os }}-${{ runner.arch }}-${{ fromJSON(steps.settings.outputs.settings).toolchain.cmake }}-${{ fromJSON(steps.settings.outputs.settings).toolchain.llvm }}
+
+      - name: Install build tools
+        env:
+          CMAKE_VERSION: ${{ fromJSON(steps.settings.outputs.settings).toolchain.cmake }}
+          FETCH_RETRIES: ${{ fromJSON(steps.settings.outputs.settings).download_retries }}
+        run: |
+          set -euo pipefail
+          archive="$CI_TOOLCHAIN_CACHE/cmake-$CMAKE_VERSION-macos-universal.tar.gz"
+          mkdir -p "$(dirname "$archive")"
+          if [[ ! -f "$archive" ]]; then
+            curl -fsSL --retry "$FETCH_RETRIES" -o "$archive" \
+              "https://github.com/Kitware/CMake/releases/download/v$CMAKE_VERSION/cmake-$CMAKE_VERSION-macos-universal.tar.gz"
+          fi
+          tar -xzf "$archive" -C "$RUNNER_TEMP"
+          echo "$RUNNER_TEMP/cmake-$CMAKE_VERSION-macos-universal/CMake.app/Contents/bin" >> "$GITHUB_PATH"
+          brew install autoconf autoconf-archive automake coreutils libtool
+
+      - name: Fetch clang
+        env:
+          LLVM_VERSION: ${{ fromJSON(steps.settings.outputs.settings).toolchain.llvm }}
+          FETCH_RETRIES: ${{ fromJSON(steps.settings.outputs.settings).download_retries }}
+        run: |
+          set -euo pipefail
+          name="LLVM-$LLVM_VERSION-macOS-ARM64"
+          root="$RUNNER_TEMP/$name"
+          echo "SDKROOT=$(xcrun --sdk macosx --show-sdk-path)" >> "$GITHUB_ENV"
+          archive="$CI_TOOLCHAIN_CACHE/$name.tar.xz"
+          if [[ ! -f "$archive" ]]; then
+            curl -fsSL --retry "$FETCH_RETRIES" -o "$archive" \
+              "https://github.com/llvm/llvm-project/releases/download/llvmorg-$LLVM_VERSION/$name.tar.xz"
+          fi
+          tar -xf "$archive" -C "$RUNNER_TEMP"
+          runtime=$(find "$root" -name libc++.dylib | sed -n '1p')
+          runtime_dir=$(dirname "${runtime:?LLVM archive lacks libc++.dylib}")
+          # Link and load the runtimes that ship with the selected compiler.
+          libcxx="$runtime_dir/libc++.dylib"
+          abi="$runtime_dir/libc++abi.dylib"
+          libcxx_id=$(otool -D "$libcxx" | sed -n '2p')
+          abi_id=$(otool -D "$abi" | sed -n '2p')
+          libcxx_name=${libcxx_id##*/}
+          abi_name=${abi_id##*/}
+          xcrun install_name_tool -id "@rpath/$libcxx_name" "$libcxx"
+          xcrun install_name_tool -id "@rpath/$abi_name" "$abi"
+          linked_abi=$(otool -L "$libcxx" | awk '$1 ~ /\/libc\+\+abi(\.[0-9]+)*\.dylib$/ { print $1; exit }')
+          if [[ -n "$linked_abi" && "$linked_abi" != "@rpath/$abi_name" ]]; then
+            xcrun install_name_tool -change "$linked_abi" "@rpath/$abi_name" "$libcxx"
+          fi
+          for library in "$libcxx" "$abi"; do
+            unwinder=$(otool -L "$library" | awk '$1 ~ /\/libunwind(\.[0-9]+)*\.dylib$/ { print $1; exit }')
+            if [[ -n "$unwinder" ]]; then
+              xcrun install_name_tool -change "$unwinder" /usr/lib/libSystem.B.dylib "$library"
+            fi
+            codesign --force --sign - "$library"
+          done
+          echo "CLANG_RUNTIME_DIR=$runtime_dir" >> "$GITHUB_ENV"
+          echo "LDFLAGS=${LDFLAGS:+$LDFLAGS }-L\"$runtime_dir\" -Wl,-rpath,\"$runtime_dir\" -lc++abi" >> "$GITHUB_ENV"
+          echo "CLANG_ROOT=$root" >> "$GITHUB_ENV"
+          echo "CLANG_ID=llvm-$LLVM_VERSION-sdk-$(xcrun --sdk macosx --show-sdk-version)" >> "$GITHUB_ENV"
+
+      - name: Save toolchain downloads
+        if: steps.tools-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: ${{ env.CI_TOOLCHAIN_CACHE }}
+          key: ${{ steps.tools-cache.outputs.cache-primary-key }}
+
+      - name: Restore vcpkg downloads and binary packages
+        id: vcpkg-cache
+        uses: actions/cache/restore@v6
+        with:
+          path: ${{ env.CI_VCPKG_CACHE }}
+          key: vcpkg-packages-${{ runner.os }}-${{ runner.arch }}-${{ env.CLANG_ID }}-${{ env.CI_IMAGE_VERSION }}-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json', 'cmake/toolchain.cmake') }}
+          restore-keys: vcpkg-packages-${{ runner.os }}-${{ runner.arch }}-${{ env.CLANG_ID }}-
+
+      - name: Install vcpkg
+        env:
+          VCPKG_REVISION: ${{ steps.settings.outputs.vcpkg_revision }}
+        run: |
+          set -euo pipefail
+          root="$RUNNER_TEMP/vcpkg"
+          git init -q "$root"
+          git -C "$root" fetch -q --no-tags https://github.com/microsoft/vcpkg.git "$VCPKG_REVISION"
+          git -C "$root" checkout -q FETCH_HEAD
+          "$root/bootstrap-vcpkg.sh" -disableMetrics
+          echo "VCPKG_ROOT=$root" >> "$GITHUB_ENV"
+
+      - name: Identify build caches
+        id: keys
+        env:
+          CMAKE_VERSION: ${{ fromJSON(steps.settings.outputs.settings).toolchain.cmake }}
+          JAVA_VERSION: ${{ steps.java.outputs.version }}
+          GRADLE_VERSION: ${{ steps.gradle.outputs.gradle-version }}
+        run: |
+          set -euo pipefail
+          config=$(git log -1 --format=%H -- CMakePresets.json cmake/toolchain.cmake vcpkg.json vcpkg-configuration.json)
+          common="$RUNNER_OS-$RUNNER_ARCH-$CI_IMAGE_VERSION-$CMAKE_VERSION-$CLANG_ID-$JAVA_VERSION-$GRADLE_VERSION-$(dotnet --version)-$config-"
+          paths_for() {
+            for path in .ninja_deps .ninja_log build.ninja CMakeCache.txt CMakeFiles '*.cmake' \
+                '*.a' '*.exe' '*.lib' '*.pdb' '*-test' fughetta-service _deps clr jvm llvm tests \
+                vcpkg_installed vcpkg-triplets source-mtimes.json; do
+              printf '%s/%s\n' "$1" "$path"
+            done
+          }
+          {
+            echo "debug_prefix=native-build-debug-$common"
+            echo "release_prefix=native-build-release-$common"
+            echo "debug_paths<<NATIVE_DEBUG_PATHS"
+            paths_for "$DEBUG_DIR"
+            echo NATIVE_DEBUG_PATHS
+            echo "release_paths<<NATIVE_RELEASE_PATHS"
+            paths_for "$RELEASE_DIR"
+            echo NATIVE_RELEASE_PATHS
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Restore debug build cache
+        id: debug-cache
+        uses: actions/cache/restore@v6
+        with:
+          key: ${{ steps.keys.outputs.debug_prefix }}${{ github.sha }}
+          restore-keys: ${{ steps.keys.outputs.debug_prefix }}
+          path: ${{ steps.keys.outputs.debug_paths }}
+
+      - name: Restore debug source timestamps
+        if: steps.debug-cache.outputs.cache-matched-key != ''
+        uses: ./.github/actions/build-cache
+        with:
+          directory: ${{ env.DEBUG_DIR }}
+          mode: restore
+
+      - name: Configure (check)
+        env:
+          CONFIGURE_ARGS: ${{ steps.settings.outputs.check_configure }}
+        run: |
+          set -euo pipefail
+          read -r -a arguments <<< "$CONFIGURE_ARGS"
+          arguments+=("-DCMAKE_EXE_LINKER_FLAGS=$LDFLAGS")
+          cmake --preset "${{ steps.settings.outputs.check_preset }}" -B "$DEBUG_DIR" "${arguments[@]}" \
+            -DFUGHETTA_GRADLE_USER_HOME="$GRADLE_USER_HOME"
+
+      - name: Save vcpkg downloads and binary packages
+        if: steps.vcpkg-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: ${{ env.CI_VCPKG_CACHE }}
+          key: ${{ steps.vcpkg-cache.outputs.cache-primary-key }}
+
+      - name: Restore NuGet packages
+        id: nuget-cache
+        uses: actions/cache/restore@v6
+        with:
+          path: ${{ env.NUGET_PACKAGES }}
+          key: nuget-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('providers/clr/**/*.fsproj', 'providers/clr/**/*.csproj', 'providers/clr/Directory.Build.props') }}
+          restore-keys: nuget-${{ runner.os }}-${{ runner.arch }}-
+
+      - name: Build service (check)
+        env:
+          BUILD_JOBS: ${{ fromJSON(steps.settings.outputs.settings).compile_jobs }}
+          BUILD_ATTEMPTS: ${{ fromJSON(steps.settings.outputs.settings).build_attempts }}
+          RATE_LIMIT_WAIT: ${{ fromJSON(steps.settings.outputs.settings).rate_limit_wait_seconds }}
+        uses: ./.github/actions/build-stage
+        with:
+          directory: ${{ env.DEBUG_DIR }}
+          stage: check-service
+          targets: fughetta-service
+
+      - name: Store check build cache through service
+        if: steps.debug-cache.outputs.cache-hit != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        uses: ./.github/actions/build-cache
+        with:
+          directory: ${{ env.DEBUG_DIR }}
+          mode: save
+          prefix: ${{ steps.keys.outputs.debug_prefix }}
+      - uses: actions/cache/save@v6
+        if: steps.debug-cache.outputs.cache-hit != 'true'
+        with:
+          key: ${{ steps.debug-cache.outputs.cache-primary-key }}
+          path: ${{ steps.keys.outputs.debug_paths }}
+
+      - name: Build providers (check)
+        env:
+          BUILD_JOBS: ${{ fromJSON(steps.settings.outputs.settings).compile_jobs }}
+          BUILD_ATTEMPTS: ${{ fromJSON(steps.settings.outputs.settings).build_attempts }}
+          RATE_LIMIT_WAIT: ${{ fromJSON(steps.settings.outputs.settings).rate_limit_wait_seconds }}
+        uses: ./.github/actions/build-stage
+        with:
+          directory: ${{ env.DEBUG_DIR }}
+          stage: check-providers
+          targets: llvm-provider clr-providers jvm-providers
+
+      - name: Store check build cache through providers
+        if: steps.debug-cache.outputs.cache-hit != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        uses: ./.github/actions/build-cache
+        with:
+          directory: ${{ env.DEBUG_DIR }}
+          mode: save
+          prefix: ${{ steps.keys.outputs.debug_prefix }}
+      - uses: actions/cache/save@v6
+        if: steps.debug-cache.outputs.cache-hit != 'true'
+        with:
+          key: ${{ steps.debug-cache.outputs.cache-primary-key }}
+          path: ${{ steps.keys.outputs.debug_paths }}
+
+      - name: Build tests (check)
+        env:
+          BUILD_JOBS: ${{ fromJSON(steps.settings.outputs.settings).compile_jobs }}
+          BUILD_ATTEMPTS: ${{ fromJSON(steps.settings.outputs.settings).build_attempts }}
+          RATE_LIMIT_WAIT: ${{ fromJSON(steps.settings.outputs.settings).rate_limit_wait_seconds }}
+        uses: ./.github/actions/build-stage
+        with:
+          directory: ${{ env.DEBUG_DIR }}
+          stage: check-tests
+          targets: all
+
+      - name: Store check build cache through tests
+        if: steps.debug-cache.outputs.cache-hit != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        uses: ./.github/actions/build-cache
+        with:
+          directory: ${{ env.DEBUG_DIR }}
+          mode: save
+          prefix: ${{ steps.keys.outputs.debug_prefix }}
+      - uses: actions/cache/save@v6
+        if: steps.debug-cache.outputs.cache-hit != 'true'
+        with:
+          key: ${{ steps.debug-cache.outputs.cache-primary-key }}
+          path: ${{ steps.keys.outputs.debug_paths }}
+
+      - name: Save NuGet packages
+        if: ${{ !cancelled() && steps.nuget-cache.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@v6
+        with:
+          path: ${{ env.NUGET_PACKAGES }}
+          key: ${{ steps.nuget-cache.outputs.cache-primary-key }}
+
+      - name: Test
+        env:
+          BUILD_DIR: ${{ env.DEBUG_DIR }}
+          PRESET: ${{ steps.settings.outputs.check_preset }}
+          TEST_PATTERN: ${{ steps.settings.outputs.check_pattern }}
+        run: |
+          set -euo pipefail
+          if [[ -n "$TEST_PATTERN" ]]; then
+            ctest --preset "$PRESET" --test-dir "$BUILD_DIR" -R "$TEST_PATTERN"
+          else
+            ctest --preset "$PRESET" --test-dir "$BUILD_DIR"
+          fi
+
+      - name: Retain test results
+        if: always() && steps.settings.outputs.retain_test_log == 'true'
+        uses: actions/upload-artifact@v7
+        with:
+          name: tests-macos
+          path: ${{ env.DEBUG_DIR }}/Testing/Temporary/LastTest.log
+
+      - name: Restore release build cache
+        id: release-cache
+        uses: actions/cache/restore@v6
+        with:
+          key: ${{ steps.keys.outputs.release_prefix }}${{ github.sha }}
+          restore-keys: ${{ steps.keys.outputs.release_prefix }}
+          path: ${{ steps.keys.outputs.release_paths }}
+
+      - name: Restore release source timestamps
+        if: steps.release-cache.outputs.cache-matched-key != ''
+        uses: ./.github/actions/build-cache
+        with:
+          directory: ${{ env.RELEASE_DIR }}
+          mode: restore
+
+      - name: Configure (package)
+        env:
+          CONFIGURE_ARGS: ${{ steps.settings.outputs.package_configure }}
+        run: |
+          set -euo pipefail
+          read -r -a arguments <<< "$CONFIGURE_ARGS"
+          arguments+=("-DCMAKE_EXE_LINKER_FLAGS=$LDFLAGS")
+          cmake --preset "${{ steps.settings.outputs.package_preset }}" -B "$RELEASE_DIR" "${arguments[@]}" \
+            -DFUGHETTA_GRADLE_USER_HOME="$GRADLE_USER_HOME"
+
+      - name: Build service (package)
+        env:
+          BUILD_JOBS: ${{ fromJSON(steps.settings.outputs.settings).compile_jobs }}
+          BUILD_ATTEMPTS: ${{ fromJSON(steps.settings.outputs.settings).build_attempts }}
+          RATE_LIMIT_WAIT: ${{ fromJSON(steps.settings.outputs.settings).rate_limit_wait_seconds }}
+        uses: ./.github/actions/build-stage
+        with:
+          directory: ${{ env.RELEASE_DIR }}
+          stage: package-service
+          targets: fughetta-service
+
+      - name: Store package build cache through service
+        if: steps.release-cache.outputs.cache-hit != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        uses: ./.github/actions/build-cache
+        with:
+          directory: ${{ env.RELEASE_DIR }}
+          mode: save
+          prefix: ${{ steps.keys.outputs.release_prefix }}
+      - uses: actions/cache/save@v6
+        if: steps.release-cache.outputs.cache-hit != 'true'
+        with:
+          key: ${{ steps.release-cache.outputs.cache-primary-key }}
+          path: ${{ steps.keys.outputs.release_paths }}
+
+      - name: Build providers (package)
+        env:
+          BUILD_JOBS: ${{ fromJSON(steps.settings.outputs.settings).compile_jobs }}
+          BUILD_ATTEMPTS: ${{ fromJSON(steps.settings.outputs.settings).build_attempts }}
+          RATE_LIMIT_WAIT: ${{ fromJSON(steps.settings.outputs.settings).rate_limit_wait_seconds }}
+        uses: ./.github/actions/build-stage
+        with:
+          directory: ${{ env.RELEASE_DIR }}
+          stage: package-providers
+          targets: llvm-provider clr-providers jvm-providers
+
+      - name: Store package build cache through providers
+        if: steps.release-cache.outputs.cache-hit != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        uses: ./.github/actions/build-cache
+        with:
+          directory: ${{ env.RELEASE_DIR }}
+          mode: save
+          prefix: ${{ steps.keys.outputs.release_prefix }}
+      - uses: actions/cache/save@v6
+        if: steps.release-cache.outputs.cache-hit != 'true'
+        with:
+          key: ${{ steps.release-cache.outputs.cache-primary-key }}
+          path: ${{ steps.keys.outputs.release_paths }}
+
+      - name: Package
+        env:
+          BUILD_DIR: ${{ env.RELEASE_DIR }}
+          PACKAGE_OUTPUT: ${{ env.PACKAGE_DIR }}
+        run: |
+          cmake "-DBUILD_DIR=$BUILD_DIR" "-DOUTPUT_DIR=$PACKAGE_OUTPUT" \
+            "-DBUILD_NUMBER=$GITHUB_RUN_NUMBER" -DWORKER_ASSETS=ON -P cmake/packaging/package.cmake
+
+      - name: Upload packages
+        uses: actions/upload-artifact@v7
+        with:
+          name: package-macos
+          path: ${{ env.PACKAGE_DIR }}
+          if-no-files-found: error

@@ -1,3 +1,5 @@
+module;
+#include <argparse/argparse.hpp>
 export module gateway;
 import std;
 import environment;
@@ -12,10 +14,11 @@ import front;
 import keyring;
 import usage;
 import protocol;
-import reflection;
+import json;
 import runtime;
 import host;
 import enrollment;
+import publiccache;
 
 namespace gateway {
     class node {
@@ -28,12 +31,13 @@ namespace gateway {
             : interrupted_(interrupted), executable_(std::move(executable)), doc_(doc), server_(doc.server), rt_(rt),
               control_(doc.runtime, doc.revisions.runtime), io_pool_(allocation::distribute(doc.runtime).gateway_disk),
               hub_(rt, config::store(std::move(doc), std::move(file)), io_pool_), identities_(server_.storage, server_.auth.workspace),
-              router_(rt, routing::stale_after, &hub_), files_(rt, server_.storage, hub_, io_pool_, io::parse_endpoint(server_.source)) {
+              router_(rt, routing::stale_after, &hub_),
+              files_(rt, server_.storage, hub_, io_pool_, io::parse_endpoint(server_.source), doc_.public_shards) {
             files_.changed = [this] { hub_.events().publish(6); };
             identities_.changed = [this] { hub_.events().publish(1); };
             for (std::size_t c = 0; c < rt.size(); ++c)
                 router_.workers(c).changed = [this] { hub_.events().publish(1); };
-            if (server_.auth.mode == "token" && server_.auth.tokens.empty())
+            if (server_.auth.mode == config::auth_mode::token && server_.auth.tokens.empty())
                 logging::warn("gateway: no bearer token is configured; create one with `fughetta-service token NAME owner`");
             for (std::size_t c = 0; c < rt.size(); ++c)
                 cores_.push_back(std::make_unique<per_core>(*this, c));
@@ -62,7 +66,7 @@ namespace gateway {
                 children.spawn(router_.workers(core).watch(io));
                 children.spawn(accept_workers(workers, core, children));
                 if (remote)
-                    children.spawn(accept_workers(*remote, core, children, true));
+                    children.spawn(accept_tunnels(*remote, here, children));
                 if (core == 0) {
                     children.spawn(queue_->serve(io));
                     if (!executable_.empty())
@@ -114,7 +118,7 @@ namespace gateway {
                     }
                 } else {
                     auto workers = router_.workers(0).describe(0);
-                    if (std::ranges::count_if(workers, [](const auto& w) { return w.online; }) == doc_.runtime.workers) {
+                    if (std::ranges::count_if(workers, [](const auto& w) { return w.online && !w.worker_id && w.name.starts_with("local-"); }) == doc_.runtime.workers) {
                         control_.ready(current->revisions.runtime);
                         lifecycle::publish(lifecycle::phase::ready);
                     }
@@ -140,12 +144,17 @@ namespace gateway {
             }
         }
 
-        auto accept_workers(listener& l, std::size_t core, coroutine::scope& children, bool remote = false) -> coroutine::task<> {
+        auto accept_workers(listener& l, std::size_t core, coroutine::scope& children) -> coroutine::task<> {
             for (;;) {
                 auto [connection, peer] = co_await net::async_accept(l);
-                children.spawn(router_.workers(core).admit(rt_.get_scheduler(core), std::move(connection), remote ? &identities_ : nullptr,
-                                                           remote ? &io_pool_ : nullptr,
-                                                           [this, core] { return hub_.current(core)->server.remote_worker_enrollment; }));
+                children.spawn(router_.workers(core).admit(rt_.get_scheduler(core), std::move(connection)));
+            }
+        }
+
+        auto accept_tunnels(listener& l, per_core& here, coroutine::scope& children) -> coroutine::task<> {
+            for (;;) {
+                auto [connection, peer] = co_await net::async_accept(l);
+                children.spawn(here.http.serve_worker(std::move(connection)));
             }
         }
 
@@ -168,16 +177,20 @@ namespace gateway {
 } // namespace gateway
 
 // `gateway token NAME ROLE [config.json]` adds a bearer token to the configuration and prints it once; only its hash is kept.
-auto add_token(std::span<char*> args) -> int {
-    if (args.size() < 2 || args.size() > 3)
-        throw std::invalid_argument("usage: fughetta-service token NAME owner|member [config.json]");
-    std::string role = args[1];
-    std::filesystem::path file = args.size() > 2 ? args[2] : "config.json";
-    config::store store{std::filesystem::exists(file) ? config::load(file) : config::document{}, file};
+auto add_token(int argc, char** argv) -> int {
+    argparse::ArgumentParser arguments{"fughetta-service token", "", argparse::default_arguments::help};
+    arguments.add_argument("name");
+    arguments.add_argument("role").choices("owner", "member");
+    arguments.add_argument("config").nargs(argparse::nargs_pattern::optional).default_value(std::string{"config.json"});
+    arguments.parse_args(argc, argv);
+    const auto role = arguments.get<std::string>("role") == "owner" ? config::token_role::owner : config::token_role::member;
+    const auto file = std::filesystem::path{arguments.get<std::string>("config")};
+    const auto budget = allocation::self_hosted(host::available_cpus());
+    config::store store{std::filesystem::exists(file) ? config::load(file, budget) : config::document{.runtime = budget}, file};
     auto doc = store.current();
     auto token = keyring::mint();
     auto server = doc->server;
-    server.auth.tokens.push_back({.name = args[0], .hash = keyring::hash(token), .role = role});
+    server.auth.tokens.push_back({.name = arguments.get<std::string>("name"), .hash = keyring::hash(token), .role = role});
     store.put_server(server, doc->revisions.server);
     std::println("{}", token);
     return 0;
@@ -186,7 +199,7 @@ auto add_token(std::span<char*> args) -> int {
 export int run_gateway(int argc, char** argv, bool managed) {
     try {
         if (argc > 1 && std::string_view{argv[1]} == "token")
-            return add_token(std::span{argv + 2, argv + argc});
+            return add_token(argc - 1, argv + 1);
         if (argc > 2)
             throw std::invalid_argument("usage: fughetta-service [config.json] | fughetta-service token NAME owner|member [config.json]");
         std::filesystem::path file = argc > 1 ? argv[1] : "config.json";
@@ -195,10 +208,16 @@ export int run_gateway(int argc, char** argv, bool managed) {
         for (;;) {
             lifecycle::publish(lifecycle::phase::starting);
             config::document doc;
+            const auto budget = managed ? std::optional{allocation::self_hosted(host::available_cpus())} : std::nullopt;
             if (argc > 1 || std::filesystem::exists(file))
-                doc = config::load(file);
+                doc = config::load(file, budget);
+            else if (budget)
+                doc.runtime = *budget;
             if (managed) {
-                doc.worker_token = keyring::mint();
+                // A hosted backend provisions a shared credential for overflow Workers.
+                // The embedded supervisor still rotates its private credential on restart.
+                if (!doc.server.overflow_wait_seconds)
+                    doc.worker_token = keyring::mint();
                 host::set_environment_if_absent("SOURCE_TOKEN", keyring::mint());
             }
             cores::io_context<runtime::context> context{1};
@@ -224,5 +243,22 @@ export int run_gateway(int argc, char** argv, bool managed) {
         return 1;
     }
     lifecycle::publish(lifecycle::phase::stopping);
+    return 0;
+}
+
+
+export auto fill_public_cache(int argc, char** argv) -> int {
+    if (argc < 4)
+        throw std::invalid_argument("usage: fughetta-service public-cache-fill CONFIG DIRECTORY KEY [KEY ...]");
+    const auto doc = config::load(argv[1]);
+    if (!doc.public_shards)
+        throw std::invalid_argument("public_shards is not configured");
+    const public_shards::cache cache{*doc.public_shards, doc.server.storage, false};
+    native::context context;
+    auto run = [&]() -> coroutine::task<> {
+        for (int i = 3; i < argc; ++i)
+            co_await cache.fill(context.get_scheduler(), argv[2], argv[i]);
+    };
+    cores::run(context, run());
     return 0;
 }

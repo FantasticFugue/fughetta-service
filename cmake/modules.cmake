@@ -29,9 +29,9 @@ function(add_implementation TARGET DIRECTORY)
   set_source_files_properties(${UNITS} PROPERTIES LANGUAGE CXX)
 endfunction()
 
-# core: the execution model, reflection and the runtime constants
+# core: the execution model, wire codecs and runtime constants
 add_layer(core)
-add_modules(core core async coroutine reflection meta constants utility mpmc)
+add_modules(core core async coroutine fields meta constants utility mpmc value json xml)
 
 # platform: operating system providers
 add_layer(platform)
@@ -42,25 +42,52 @@ add_layer(io)
 add_modules(io io native http websocket tls resolver)
 add_implementation(io io entropy dns)
 
-# model
+# model: the domain foundation — content and records, the worldline model, the
+# abstract toolchain and provider contracts. Nothing here knows a concrete
+# build system or language.
 add_layer(model)
-add_modules(model model allocation content codec archive semantic world nodes provider report cmake bazel
-  commands clice vcpkg typescript bun uv ty ruff build language protocol configuration usage runner replica delivery lsp toolchain)
-add_implementation(model model crypto planning generator analysis)
+add_modules(model model allocation archive channels codec commands content enumeration objects
+  projectmodel provider publicrecord records report reuse runner toolchain version world)
+add_implementation(model model crypto)
+
+# toolchain: concrete build-system and package-manager adapters. (The abstract
+# toolchain model they plug into is the toolchain module of the model layer.)
+add_layer(toolchain)
+add_modules(toolchain toolchain bazel bun cargo cmake gradle msbuild uv vcpkg)
+add_implementation(toolchain toolchain generator)
+
+# languages: the analysis interface (evaluation, lsp) and the knowledge of each
+# language — compiler frontends, VM metadata and cross-language bindings.
+add_layer(languages)
+add_modules(languages languages bridge clice clr csharp evaluation fsharp helper jni jvm kmetadata kotlin llvm lsp
+  pinvoke pybind ruff rust scala ty typescript)
+
+# session: the facet registries that aggregate toolchains and languages (build,
+# language, profiles), the semantic graph (semantic, indexing, nodes,
+# knowledge) and the workspace protocol the upper layers speak.
+add_layer(session)
+add_modules(session session build configuration delivery indexing knowledge language nodes profiles
+  protocol replica semantic usage)
+add_implementation(session session planning analysis impact comparison reanalysis wire)
 
 # gateway
 add_layer(gateway)
-add_modules(gateway gateway fleet front mcp settings tools registry client keyring templates enrollment)
+add_modules(gateway gateway fleet front mcp settings tool publication toolbase worldlines dispatch queries tools registry client keyring templates enrollment publiccache)
 add_implementation(gateway gateway exchange routes broadcast backlog pairing)
 
 # source
 add_layer(source)
-add_modules(source source server storage index kernel engine package)
-add_implementation(source source database)
+add_modules(source source server storage kernel nodestore engineapi nodestate engine package)
+add_implementation(source source database objects history coordination worldstate)
 
 # worker
 add_layer(worker)
-add_modules(worker worker executor dependencies)
+add_modules(worker worker executor dependencies backend sibling)
+
+# Host Executor protocol, journal, and platform provisioner.
+add_layer(host_executor)
+add_modules(host_executor host api journal operation ${HOST_MODULES})
+target_link_libraries(host_executor PUBLIC session PRIVATE gateway ${HOST_LIBRARIES})
 
 ## Platform provider
 #
@@ -77,10 +104,13 @@ target_link_libraries(platform PRIVATE ${PLATFORM_LIBRARIES})
 #
 # PUBLIC is part of the interface, PRIVATE is implementation.
 
-target_link_libraries(core PUBLIC STDEXEC::stdexec httpant::io reflectcpp::reflectcpp)
+target_link_libraries(core PUBLIC STDEXEC::stdexec httpant::io PRIVATE yyjson::yyjson pugixml::pugixml)
 target_link_libraries(platform PUBLIC core)
-target_link_libraries(io PUBLIC platform httpant::httpant httpant::tls PRIVATE unofficial-sodium::sodium c-ares::cares)
+target_link_libraries(io PUBLIC platform httpant::httpant httpant::tls PRIVATE unofficial-sodium::sodium c-ares::cares ada::ada)
 target_link_libraries(model PUBLIC io PRIVATE unofficial-sodium::sodium zstd::libzstd)
-target_link_libraries(gateway PUBLIC model PRIVATE unofficial-sodium::sodium)
-target_link_libraries(source PUBLIC model PRIVATE unofficial::sqlite3::sqlite3)
-target_link_libraries(worker PUBLIC model)
+target_link_libraries(toolchain PUBLIC model)
+target_link_libraries(languages PUBLIC model PRIVATE ada::ada libzip::zip)
+target_link_libraries(session PUBLIC model toolchain languages PRIVATE unofficial::sqlite3::sqlite3)
+target_link_libraries(gateway PUBLIC session PRIVATE unofficial-sodium::sodium)
+target_link_libraries(source PUBLIC session PRIVATE unofficial::sqlite3::sqlite3 roaring::roaring)
+target_link_libraries(worker PUBLIC session)

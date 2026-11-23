@@ -32,22 +32,20 @@ namespace cores {
     signal_watch::~signal_watch() = default;
 } // namespace cores
 
-namespace lifecycle {
-    void publish(phase value) {
-        if (current.exchange(value) == value)
-            return;
-        std::string message = "STATUS=" + std::string{name(value)};
-        if (value == phase::ready)
-            message += "\nREADY=1";
-        if (value == phase::stopping)
-            message += "\nSTOPPING=1";
-        posix::notify(message);
-    }
-    auto run(int argc, char** argv, int (*application)(int, char**), bool, std::string_view instance) -> int {
-        identity = instance;
-        auto result = application(argc, argv);
-        if (current.load() != phase::starting)
-            publish(phase::stopped);
-        return result;
-    }
-} // namespace lifecycle
+void lifecycle::publish(phase value) {
+    if (current.exchange(value) == value)
+        return;
+    std::string message = "STATUS=" + std::string{name(value)};
+    if (value == phase::ready)
+        message += "\nREADY=1";
+    if (value == phase::stopping)
+        message += "\nSTOPPING=1";
+    posix::notify(message);
+}
+auto lifecycle::run(int argc, char** argv, int (*application)(int, char**), bool, std::string_view instance) -> int {
+    identity = instance;
+    auto result = application(argc, argv);
+    if (current.load() != phase::starting)
+        publish(phase::stopped);
+    return result;
+}

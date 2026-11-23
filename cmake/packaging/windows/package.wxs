@@ -1,0 +1,42 @@
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
+     xmlns:util="http://wixtoolset.org/schemas/v4/wxs/util">
+  <Package Name="Fughetta Service" Manufacturer="FantasticFugue"
+           Version="$(Version)" UpgradeCode="F48A1B5C-5779-4778-8621-53535EA18F5A"
+           Scope="perMachine" InstallerVersion="500">
+    <MajorUpgrade DowngradeErrorMessage="A newer Fughetta Service is installed."
+                  Schedule="afterInstallInitialize" AllowSameVersionUpgrades="yes" />
+    <MediaTemplate EmbedCab="yes" />
+    <StandardDirectory Id="ProgramFiles64Folder">
+      <Directory Id="INSTALLFOLDER" Name="Fughetta">
+        <Directory Id="BINDIR" Name="bin">
+          <Component Id="Service" Guid="*">
+            <File Id="ServiceExe" Source="$(Stage)/bin/fughetta-service.exe" KeyPath="yes" />
+            <ServiceInstall Id="InstallService" Name="fughetta-service-default"
+                DisplayName="Fughetta (default workspace)" Type="ownProcess" Start="auto"
+                ErrorControl="normal" Account="NT AUTHORITY\LocalService"
+                Arguments="--service --instance default --log-dir &quot;[CommonAppDataFolder]Fughetta\default\logs&quot; &quot;[CommonAppDataFolder]Fughetta\default\config.json&quot;">
+              <util:ServiceConfig FirstFailureActionType="restart" SecondFailureActionType="restart"
+                  ThirdFailureActionType="restart" RestartServiceDelayInSeconds="5" ResetPeriodInDays="1" />
+            </ServiceInstall>
+            <ServiceControl Id="ControlService" Name="fughetta-service-default"
+                Start="install" Stop="both" Remove="uninstall" Wait="yes" />
+            <Environment Id="Path" Name="PATH" Value="[BINDIR]" Part="last" Action="set" System="yes" />
+          </Component>
+        </Directory>
+      </Directory>
+    </StandardDirectory>
+    <Feature Id="Complete" Title="Fughetta Service" Level="1">
+      <ComponentRef Id="Service" />
+      <Files Directory="INSTALLFOLDER" Include="$(Stage)/**">
+        <Exclude Files="$(Stage)/bin/fughetta-service.exe" />
+      </Files>
+    </Feature>
+    <SetProperty Id="InitializeWorkspace" Before="InitializeWorkspace" Sequence="execute"
+        Value="&quot;[System64Folder]WindowsPowerShell\v1.0\powershell.exe&quot; -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File &quot;[INSTALLFOLDER]share\fughetta-service\initialize.ps1&quot; -Prefix &quot;[INSTALLFOLDER].&quot; -Workspace &quot;[CommonAppDataFolder]Fughetta\default&quot;" />
+    <CustomAction Id="InitializeWorkspace" BinaryRef="Wix4UtilCA_$(sys.BUILDARCHSHORT)"
+        DllEntry="WixQuietExec" Execute="deferred" Impersonate="no" Return="check" />
+    <InstallExecuteSequence>
+      <Custom Action="InitializeWorkspace" After="InstallServices" Condition="NOT REMOVE~=&quot;ALL&quot;" />
+    </InstallExecuteSequence>
+  </Package>
+</Wix>

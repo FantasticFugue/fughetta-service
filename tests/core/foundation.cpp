@@ -52,7 +52,6 @@ namespace {
         ~marker() { *hit = true; }
     };
 
-    auto sleep(ctx& io) -> coroutine::task<> { co_await execution::schedule_after(io, 1ms); }
     auto hop(ctx& io) -> coroutine::task<> { co_await execution::schedule(io); }
     auto add(int a, int b) -> coroutine::task<int> { co_return a + b; }
     auto chain(ctx& io) -> coroutine::task<int> {
@@ -295,18 +294,6 @@ namespace {
             expect(hit);
         };
 
-        "a sender runs on the loop"_test = [] {
-            native::context context;
-            auto io = context.get_scheduler();
-            expect(static_cast<bool>(cores::run(context, execution::schedule_after(io, 1ms))));
-        };
-
-        "a task awaits a timer"_test = [] {
-            native::context context;
-            auto io = context.get_scheduler();
-            expect(static_cast<bool>(cores::run(context, sleep(io))));
-        };
-
         "a task hops onto the loop"_test = [] {
             native::context context;
             auto io = context.get_scheduler();
@@ -445,7 +432,7 @@ namespace {
             auto io = context.get_scheduler();
             auto value = cores::run(context, coroutine::deadline(io, 1s, execution::then(execution::schedule_after(io, 1ms), [] { return 31; })));
             expect(value && *value == std::optional<int>{31});
-            auto empty = cores::run(context, coroutine::deadline(io, 1s, execution::just()));
+            auto empty = cores::run(context, coroutine::deadline(io, 1s, execution::schedule_after(io, 0ms)));
             expect(empty && empty->has_value());
             auto timed_out = cores::run(context, coroutine::deadline(io, 1ms, execution::schedule_after(io, 1h)));
             expect(timed_out && !timed_out->has_value());

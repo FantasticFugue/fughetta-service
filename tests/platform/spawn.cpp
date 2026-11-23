@@ -6,6 +6,7 @@ import std;
 import boost.ut;
 import coroutine;
 import native;
+import process;
 
 namespace {
     using namespace boost::ut;
@@ -29,6 +30,38 @@ namespace {
     }
 
     static constexpr auto spawn_suite = [] {
+        "process observations cover descendants and end with the child"_test = [] {
+            native::context context;
+            auto group = std::make_shared<io::process_group>();
+            io::command command{.argv = {"sh", "-c", "sleep 60 & echo ready; read line; kill $!; wait"},
+                                .cwd = std::filesystem::current_path(),
+                                .stdio = io::process_stdio::blocking,
+                                .processes = group};
+            auto child = io::spawn_process(context.get_scheduler(), command);
+            auto inspect = [&]() -> coroutine::task<> {
+                std::array<std::byte, 64> bytes;
+                auto count = co_await io::async_read_some(child, net::buffer(bytes));
+                expect(count > 0);
+                auto usage = native_process::usage(*group);
+                expect(usage.has_value());
+                if (usage) {
+                    expect(usage->processes >= 2_u && usage->threads >= 2_u);
+                    expect(usage->resident_bytes > 0_u);
+                }
+                auto own = native_process::self_usage();
+                expect(own.has_value());
+                if (own)
+                    expect(own->processes == 1_u && own->threads > 0_u && own->resident_bytes > 0_u);
+                std::string line = "finish\n";
+                co_await child.write_some(std::as_bytes(std::span{line}));
+                child.close_input();
+            };
+            auto result = cores::run(context, execution::when_all(inspect(), io::async_wait(child)));
+            expect(result.has_value());
+            expect(group->children.empty());
+            expect(native_process::usage(*group)->processes == 0_u);
+        };
+
         "exit code and merged output"_test = [] {
             native::context context;
             auto [text, code] = run(context, {"sh", "-c", "pwd; echo out; echo err >&2; exit 3"});
@@ -39,7 +72,8 @@ namespace {
         "an interactive child reads its input and keeps stdout for replies"_test = [] {
             native::context context;
             io::command command{
-                .argv = {"sh", "-c", "read line; echo \"got $line\"; echo noise >&2; cat"}, .cwd = std::filesystem::current_path(), .interactive = true};
+                .argv = {"sh", "-c", "read line; echo \"got $line\"; echo noise >&2; cat"}, .cwd = std::filesystem::current_path(),
+                .stdio = io::process_stdio::blocking};
             auto child = io::spawn_process(context.get_scheduler(), command);
             auto talk = [](native::process& child) -> coroutine::task<> {
                 std::string message = "hello\nrest\n";

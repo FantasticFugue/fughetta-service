@@ -2,7 +2,7 @@ export module storage;
 import utility;
 import constants;
 import std;
-import reflection;
+import json;
 import content;
 import configuration;
 import usage;
@@ -15,9 +15,11 @@ import async;
 import native;
 
 export namespace storage {
-    struct stale_blob : std::runtime_error {
+    struct stale_blob : std::runtime_error, util::retained_exception {
         explicit stale_blob(std::string_view hash) : std::runtime_error(std::format("blob {} is no longer in the project (files changed during sync)", hash)) {}
+        auto retain() const noexcept -> std::exception_ptr override;
     };
+    auto stale_blob::retain() const noexcept -> std::exception_ptr { return util::copy_current_exception(*this); }
 
     class project_files {
     public:
@@ -68,7 +70,7 @@ export namespace storage {
             auto request_digest = nodes::object_id(nodes::value::map{{"expected", nodes::strings(expected)}, {"intent", intent}, {"operation", operation}});
             auto retained = repository.call({.action = "receipt", .operation = operation});
             if (retained.code == "ok") {
-                auto record = rfl::json::read<capture_record, rfl::NoExtraFields>(retained.result);
+                auto record = json::read<capture_record, json::strict>(retained.result);
                 if (!record || record->tool != "workspace.capture/1" || record->request_digest != request_digest)
                     return {.code = std::string{nodes::code::identity_conflict}, .reason = "capture operation ID has another accepted input"};
                 retained.replayed = true;
@@ -101,7 +103,7 @@ export namespace storage {
                             throw;
                         binary = true;
                     }
-                edits.push_back({.kind = binary ? "binary_create" : "create",
+                edits.push_back({.kind = binary ? nodes::edit_kind::binary_create : nodes::edit_kind::create,
                                  .path = entry.path,
                                  .text = binary ? nodes::hex(bytes) : std::move(bytes),
                                  .executable = entry.executable});
@@ -114,7 +116,7 @@ export namespace storage {
                                     .expected = expected,
                                     .edits = std::move(edits),
                                     .intent = std::move(intent),
-                                    .result = rfl::json::write(capture_record{"workspace.capture/1", request_digest, tree.id().str()}),
+                                    .result = json::write(capture_record{"workspace.capture/1", request_digest, tree.id().str()}),
                                     .tool = "workspace.capture/1",
                                     .capture = true,
                                     .file_limit = file_limit,
@@ -129,7 +131,7 @@ export namespace storage {
             auto size = std::filesystem::file_size(path);
             if (offset > size || length > size - offset)
                 throw stale_blob{h};
-            native::context resource;
+            static thread_local native::context resource;
             auto in = io::open_file(resource.get_scheduler(), path);
             std::vector<std::byte> out(length);
             for (std::size_t done = 0; done < out.size();) {
@@ -307,7 +309,7 @@ export namespace storage {
                         selected->node->initialize();
                 }
                 if (reading && !selected->reader)
-                    selected->reader = std::make_unique<nodes::local_node>(root, std::string{}, false, true);
+                    selected->reader = std::make_unique<nodes::local_node>(root, false, true);
             }
             return f(reading ? *selected->reader : *selected->node);
         }

@@ -17,10 +17,22 @@ namespace {
         d.limits = {.max_file_bytes = 1000, .max_projects = 5, .read_max_lines = 50};
         d.projects["app"].build_configurations["Debug"] = fixture::cmake("build/debug");
         fixture::options<"cmake">(d.projects["app"].build_configurations["Debug"].builders.at("main")).export_compile_commands = true;
-        d.projects["app"].analysis["Cpp"] = {.server = fixture::clice("clice", {"--log-level", "off"}), .build_configuration = "Debug"};
+        d.projects["app"].analysis["Cpp"] =
+            fixture::profile({.server = fixture::clice("clice", {"--mode", "pipe"}),
+                              .build_configuration = "Debug",
+                              .inputs = {{"compilation_database", {language::build_input{"Debug", "configure", "compilation_database"}}}}});
         return d;
     }
     static constexpr auto cases = [] {
+        "self-hosted runtime uses available CPUs when the runtime object is omitted"_test = [] {
+            const auto small = allocation::self_hosted(0);
+            const auto larger = allocation::self_hosted(8);
+            expect(small.threads == 8_u && small.workers == 1_u && small.jobs == 1_u);
+            expect(larger.threads == 10_u && larger.workers == 2_u && larger.jobs == 6_u);
+            expect(config::parse("{}", larger).runtime == larger);
+            expect(config::parse(R"({"runtime":{"threads":6,"jobs":1,"workers":0}})", larger).runtime.workers == 0_u);
+            expect(config::parse(R"({"server":{"auth":{"mode":"trusted","workspace":"ws","front_token":"sk_front"}}})", larger).runtime == allocation::budget{});
+        };
         "worker dependency publisher requires an absolute exclusive destination"_test = [] {
             for (const auto* text : {R"({"dependency_publish":""})", R"({"dependency_publish":"relative"})",
                                      R"({"dependency_publish":"/published","dependency_upstream":"/upstream"})", R"({"dependency_publish":"/published"})",
@@ -30,12 +42,29 @@ namespace {
                 R"({"dependency_publish":"/published","dependency_recipe":{"executable":"/usr/bin/vcpkg","root":"/opt/vcpkg","triplets":["x64-linux"]}})");
             expect(worker.dependency_publish == "/published" && !worker.dependency_upstream);
         };
+        "worker child configuration includes resource bounds"_test = [] {
+            const auto worker = config::parse_worker(
+                R"({"backend":{"max_memory_bytes":1073741824,"max_cpu_seconds":600}})");
+            expect(worker.backend.max_cpu_seconds == 600 && worker.backend.max_memory_bytes == 1073741824);
+            expect(throws<std::invalid_argument>([] { config::parse_worker(R"({"backend":{"max_memory_bytes":0}})"); }));
+            expect(throws<std::invalid_argument>([] { config::parse_worker(R"({"backend":{"max_cpu_seconds":0}})"); }));
+            expect(throws<std::invalid_argument>([] { config::parse_worker(R"({"execute_stdio":true})"); }));
+            // A managed Worker takes the SDK manifests this configuration names, and saving keeps them.
+            auto mapped = config::parse(R"({"sdk_manifests":{"sdk/dotnet":{"manifest":"sdk/11.0.100/.version","roots":["/toolchains/dotnet"]}}})");
+            expect(mapped.sdk_manifests.at("sdk/dotnet").manifest == "sdk/11.0.100/.version" &&
+                   mapped.sdk_manifests.at("sdk/dotnet").roots == std::vector<std::string>{"/toolchains/dotnet"});
+            expect(config::parse(config::write(mapped)).sdk_manifests.at("sdk/dotnet").roots == mapped.sdk_manifests.at("sdk/dotnet").roots)
+                << "the configuration a service writes keeps its SDK manifests";
+            constexpr std::string_view invalid = R"({"sdk_manifests":{"sdk/../dotnet":{"manifest":"release","roots":["/toolchains/dotnet"]}}})";
+            expect(throws<std::invalid_argument>([&] { config::parse(invalid); }));
+            expect(throws<std::invalid_argument>([&] { config::parse_worker(invalid); }));
+        };
         "source limits and language profiles resolve independently"_test = [] {
             auto d = document();
             config::validate(d);
             auto e = config::resolve(d, "app");
             expect(e.limits.max_file_bytes == 1000u && e.limits.read_max_lines == 50u);
-            expect(language::provider_of(e.analysis.at("Cpp").server) == "clice");
+            expect(language::provider_of(e.analysis.at("Cpp").stages.at("main").server) == "clice");
         };
         "source configuration edits use revision preconditions and preserve conflicting drafts"_test = [] {
             test::scratch tmp{"source-config"};
@@ -47,15 +76,14 @@ namespace {
             expect(throws<config::revision_conflict>([&] { s.put_project("app", settings, revision); }));
             auto restored = config::load(tmp.dir / "config.json");
             expect(restored.find("app")->ignore == std::vector<std::string>{"generated"});
-            auto& server = rfl::get<language::with<"clice">>(restored.find("app")->analysis.at("Cpp").server.variant());
-            expect(server.options.args == std::vector<std::string>{"--log-level", "off"});
+            auto& server = std::get<language::with<"clice">>(restored.find("app")->analysis.at("Cpp").stages.at("main").server.variant());
+            expect(server.options.args == std::vector<std::string>{"--mode", "pipe"});
         };
         "language servers are known by name and keep their files inside the source"_test = [] {
-            expect(throws<std::invalid_argument>([] { language::validate({.server = language::with<"clice">{.options = {.cache_dir = "../cache"}}}); }));
             expect(throws<std::invalid_argument>([] { language::validate({.server = fixture::clice("")}); }));
-            expect(throws<std::invalid_argument>([] { config::parse_as<language::configuration>(R"({"server":{"provider":"clangd"}})", "analysis"); }));
+            expect(throws<std::invalid_argument>([] { config::parse_as<language::stage>(R"({"server":{"provider":"clangd"}})", "analysis"); }));
             expect(throws<std::invalid_argument>(
-                [] { config::parse_as<language::configuration>(R"({"server":{"provider":"clice","command":["sh","-c","touch sentinel"]}})", "analysis"); }));
+                [] { config::parse_as<language::stage>(R"({"server":{"provider":"clice","command":["sh","-c","touch sentinel"]}})", "analysis"); }));
         };
     };
 } // namespace
@@ -163,11 +191,13 @@ namespace {
             source_build.outputs["database"] = {"configure", "compilation_database"};
             source_build.env["OWNER"] = "source";
             d.projects.at("app").build_configurations["Analysis"] = source_build;
-            d.projects.at("app").analysis["cpp"] = {.build_configuration = "Analysis"};
+            d.projects.at("app").analysis["cpp"] =
+                fixture::profile({.build_configuration = "Analysis",
+                                  .inputs = {{"compilation_database", {language::build_input{"Analysis", "configure", "compilation_database"}}}}});
             config::validate(d);
             auto e = config::resolve(d, "app");
             expect(e.config("Debug-gcc").build.env.contains("CC"));
-            auto& analysis = e.config(e.analysis.at("cpp").build_configuration);
+            auto& analysis = e.config(e.analysis.at("cpp").stages.at("main").build_configuration);
             expect(analysis.build.env.at("CC") == "clang" && analysis.build.env.at("OWNER") == "source");
             expect(fixture::options<"cmake">(analysis.build.builders.at("main")).build_dir == "build/source");
         };
@@ -190,15 +220,14 @@ namespace {
             config::store store{config::document{}, file};
             auto good = std::string(64, 'a');
             auto server = store.current()->server;
-            server.auth.tokens = {{.name = "agent", .hash = good, .role = "member"}};
+            server.auth.tokens = {{.name = "agent", .hash = good, .role = config::token_role::member}};
             store.put_server(server, 0);
             auto before = store.current();
             auto saved = test::slurp(file);
             for (auto token : std::vector<config::token>{{.name = "", .hash = good},
                                                          {.name = "../x", .hash = good},
                                                          {.name = "short", .hash = "abc"},
-                                                         {.name = "upper", .hash = std::string(64, 'A')},
-                                                         {.name = "operator", .hash = good, .role = "operator"}}) {
+                                                         {.name = "upper", .hash = std::string(64, 'A')}}) {
                 auto changed = before->server;
                 changed.auth.tokens.push_back(token);
                 expect(throws<std::invalid_argument>([&] { store.put_server(changed, before->revisions.server); })) << token.name;
@@ -206,9 +235,8 @@ namespace {
             auto twice = before->server;
             twice.auth.tokens.push_back({.name = "agent", .hash = std::string(64, 'b')});
             expect(throws<std::invalid_argument>([&] { store.put_server(twice, before->revisions.server); }));
-            auto mode = before->server;
-            mode.auth.mode = "supabase";
-            expect(throws<std::invalid_argument>([&] { store.put_server(mode, before->revisions.server); }));
+            expect(throws<std::invalid_argument>([] { config::parse_as<config::auth>(R"({"mode":"supabase"})", "auth"); }));
+            expect(throws<std::invalid_argument>([] { config::parse_as<config::token>(R"({"role":"operator"})", "token"); }));
             expect(store.current() == before) << "a refused save keeps the published snapshot";
             expect(test::slurp(file) == saved) << "a refused save keeps the file";
         };

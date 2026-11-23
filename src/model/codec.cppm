@@ -1,3 +1,5 @@
+module;
+#include <sodium.h>
 export module codec;
 import utility;
 import std;
@@ -19,13 +21,15 @@ export namespace nodes {
         inline constexpr std::string_view identity_conflict = "identity_conflict";
     } // namespace code
 
-    struct error : std::runtime_error {
+    struct error : std::runtime_error, util::retained_exception {
         std::string code;
         std::vector<std::string> missing;
         std::vector<std::string> conflicts;
         error(std::string_view c, std::string message) : std::runtime_error(std::move(message)), code(c) {}
         ~error() override;
+        auto retain() const noexcept -> std::exception_ptr override;
     };
+    auto error::retain() const noexcept -> std::exception_ptr { return util::copy_current_exception(*this); }
 
     error::~error() = default;
 
@@ -464,61 +468,19 @@ export namespace nodes {
         }
     } // namespace codec
 
-    struct key {
-        std::string secret;
-        std::string public_key;
-        static auto generate() -> key;
-        static auto from_secret(std::string bytes) -> key;
-        auto id() const -> std::string { return digest_of(public_key); }
-        auto sign(std::string_view bytes) const -> std::string;
-    };
-    auto verify_signature(std::string_view public_key, std::string_view bytes, std::string_view signature) -> bool;
     auto random_bytes(std::size_t n) -> std::string;
-    inline auto signed_message(const value& body) -> std::string {
-        return "fughetta/node/1/" + body.at("kind").text() + std::string(1, '\0') + codec::encode(body);
-    }
-    inline auto seal(value body, const key& signer) -> value {
-        auto signature = signer.sign(signed_message(body));
-        value::map out;
-        out.reserve(3);
-        out.emplace("body", std::move(body));
-        out.emplace("public_key", bytes{signer.public_key});
-        out.emplace("signature", bytes{std::move(signature)});
-        return out;
-    }
-    inline auto open(const value& object) -> const value& {
-        fields(object, {"body", "public_key", "signature"});
-        auto& body = object.at("body");
-        if (body.at("schema").number() != 1)
-            fail(nodes::code::invalid_record, "unsupported record schema");
-        if (!verify_signature(object.at("public_key").raw(), signed_message(body), object.at("signature").raw()))
-            fail("invalid_signature", "origin signature failed");
-        return body;
-    }
     inline auto object_id(const value& object) -> std::string { return digest_of(codec::encode(object)); }
     inline auto hex(std::string_view bytes) -> std::string {
-        constexpr std::string_view digits = "0123456789abcdef";
-        std::string out;
-        out.reserve(bytes.size() * 2);
-        for (unsigned char b : bytes) {
-            out += digits[b >> 4];
-            out += digits[b & 15];
-        }
-        return out;
+        return content::hex_encode({reinterpret_cast<const unsigned char*>(bytes.data()), bytes.size()});
     }
     inline auto unhex(std::string_view text) -> std::string {
         if (text.size() % 2)
             fail(nodes::code::invalid_record, "invalid hex length");
-        std::string out;
-        auto digit = [](char c) -> int {
-            if (c >= '0' && c <= '9')
-                return c - '0';
-            if (c >= 'a' && c <= 'f')
-                return c - 'a' + 10;
+        if (text.find_first_of("ABCDEF") != std::string_view::npos)
             fail(nodes::code::invalid_record, "invalid hex digit");
-        };
-        for (std::size_t i = 0; i < text.size(); i += 2)
-            out += static_cast<char>((digit(text[i]) << 4) | digit(text[i + 1]));
+        std::string out(text.size() / 2, '\0');
+        if (sodium_hex2bin(reinterpret_cast<unsigned char*>(out.data()), out.size(), text.data(), text.size(), nullptr, nullptr, nullptr) != 0)
+            fail(nodes::code::invalid_record, "invalid hex digit");
         return out;
     }
 } // namespace nodes

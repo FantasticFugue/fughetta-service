@@ -1,0 +1,56 @@
+require "json"
+
+class FughettaService < Formula
+  desc "Workspace source, semantic analysis, and build service"
+  homepage "https://github.com/FantasticFugue/fughetta-service"
+  url "@URL@"
+  version "@VERSION@"
+  sha256 "@SHA256@"
+  license "MPL-2.0"
+
+  depends_on :macos
+  depends_on arch: :arm64
+
+  def install
+    prefix.install Dir["*"]
+  end
+
+  def post_install
+    workspace = var/"lib/fughetta-service/default"
+    config_dir = etc/"fughetta-service/default"
+    [workspace, config_dir, var/"log/fughetta-service"].each do |directory|
+      directory.mkpath
+      directory.chmod 0700
+    end
+    config = config_dir/"config.json"
+    return if config.exist?
+
+    template = (share/"fughetta-service/config.json.in").read
+    text = template.gsub("@PREFIX@", opt_prefix.to_s.to_json[1...-1])
+                   .gsub("@STATE@", workspace.to_s.to_json[1...-1])
+                   .gsub("@EXE@", "")
+    config.write text
+    config.chmod 0600
+  end
+
+  service do
+    run [opt_bin/"fughetta-service", "--instance", "default", etc/"fughetta-service/default/config.json"]
+    keep_alive successful_exit: false
+    working_dir var/"lib/fughetta-service/default"
+    log_path var/"log/fughetta-service/default.log"
+    error_log_path var/"log/fughetta-service/default.err.log"
+    environment_variables PATH: std_service_path_env
+    stop_timeout 20
+  end
+
+  def caveats
+    <<~EOS
+      The default workspace listens on http://127.0.0.1:8080.
+      Create an owner token before using its API:
+        #{opt_bin}/fughetta-service token local owner #{etc}/fughetta-service/default/config.json
+      Restart with: brew services restart fughetta-service
+      Workspace data and configuration are retained when uninstalling.
+      Install Java 25 or .NET 10 when using the JVM or CLR providers.
+    EOS
+  end
+end

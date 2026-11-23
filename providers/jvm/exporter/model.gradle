@@ -1,0 +1,552 @@
+import groovy.json.JsonOutput
+import groovy.json.JsonSlurper
+import java.nio.file.Files
+import java.nio.file.Path
+import java.nio.file.StandardCopyOption
+import java.security.MessageDigest
+import java.util.regex.Pattern
+import java.util.regex.Matcher
+import org.gradle.api.JavaVersion
+import org.gradle.api.artifacts.component.ProjectComponentIdentifier
+import org.gradle.api.artifacts.result.ResolvedDependencyResult
+import org.gradle.api.tasks.SourceSetContainer
+import org.gradle.api.tasks.scala.ScalaCompile
+import org.gradle.internal.jvm.Jvm
+
+import org.gradle.api.tasks.testing.Test
+import org.gradle.api.provider.MapProperty
+import org.gradle.api.provider.Property
+import org.gradle.api.services.BuildService
+import org.gradle.api.services.BuildServiceParameters
+import org.gradle.build.event.BuildEventsListenerRegistry
+import org.gradle.tooling.events.FinishEvent
+import org.gradle.tooling.events.OperationCompletionListener
+import org.gradle.tooling.events.task.TaskFailureResult
+import org.gradle.tooling.events.task.TaskFinishEvent
+import org.gradle.tooling.events.task.TaskSuccessResult
+
+abstract class FughettaTestReports implements BuildService<FughettaTestReports.Parameters>, OperationCompletionListener {
+    interface Parameters extends BuildServiceParameters {
+        Property<String> getDestination()
+        MapProperty<String, String> getTestOutputs()
+    }
+
+    @Override
+    void onFinish(FinishEvent event) {
+        if (!(event instanceof TaskFinishEvent)) return
+        def result = event.result
+        if (!(result instanceof TaskSuccessResult || result instanceof TaskFailureResult)) return
+        def output = parameters.testOutputs.get().get(event.descriptor.taskPath)
+        if (output == null) return
+        def source = Path.of(output)
+        if (!Files.isDirectory(source)) return
+        def destination = Files.createDirectories(Path.of(parameters.destination.get()))
+        Files.newDirectoryStream(source, 'TEST-*.xml').withCloseable { files ->
+            files.each { file ->
+                if (!Files.isRegularFile(file)) return
+                if (result instanceof TaskFailureResult && Files.getLastModifiedTime(file).toMillis() < result.startTime) return
+                def pending = Files.createTempFile(destination.parent, '.gradle-test-', '.xml')
+                try {
+                    Files.copy(file, pending, StandardCopyOption.REPLACE_EXISTING)
+                    Files.move(pending, destination.resolve(pending.fileName), StandardCopyOption.ATOMIC_MOVE)
+                } finally {
+                    Files.deleteIfExists(pending)
+                }
+            }
+        }
+    }
+}
+
+def reportDirectory = System.getProperty('fughetta.test.report')
+if (reportDirectory) {
+    gradle.taskGraph.whenReady { graph ->
+        def testOutputs = graph.allTasks.findAll { it instanceof Test && it.reports.junitXml.required.get() }
+            .collectEntries { task -> [(task.identityPath.toString()): task.reports.junitXml.outputLocation.get().asFile.absolutePath] }
+        if (!testOutputs.empty) {
+            def collector = gradle.sharedServices.registerIfAbsent('fughettaTestReports', FughettaTestReports) {
+                parameters.destination.set(reportDirectory)
+                parameters.testOutputs.set(testOutputs)
+            }
+            gradle.services.get(BuildEventsListenerRegistry).onTaskCompletion(collector)
+        }
+    }
+}
+
+def requestedAndroidVariant = System.getProperty('fughetta.android.variant')
+def androidVariants = { project ->
+    def android = project.extensions.findByName('android')
+    def variants = android?.hasProperty('applicationVariants') ? android.applicationVariants.toList() :
+        android?.hasProperty('libraryVariants') ? android.libraryVariants.toList() : []
+    variants.sort { it.name }
+}
+def selectAndroidVariant = { variants ->
+    if (requestedAndroidVariant == null)
+        return variants.find { it.name == 'debug' } ?:
+            variants.find { it.name.toLowerCase(Locale.ROOT).contains('debug') } ?: variants.find()
+    variants.find { it.name == requestedAndroidVariant } ?: variants.findAll {
+        def buildType = it.buildType.name
+        requestedAndroidVariant == buildType || requestedAndroidVariant.endsWith(buildType.capitalize())
+    }.with { it.size() == 1 ? it.first() : null }
+}
+
+def variantOperation = System.getProperty('fughetta.variant.operation')
+if (variantOperation && gradle.parent == null && gradle.startParameter.taskNames.any {
+    it == 'fughettaAndroidVariant' || it.endsWith(':fughettaProjectAndroidVariant')
+}) {
+    gradle.projectsEvaluated {
+        def active = []
+        boolean exact = false
+        def projects = gradle.rootProject.allprojects.collectEntries { p ->
+            def variants = androidVariants(p)
+            active.addAll(variants*.name)
+            exact |= variants.any { it.name == requestedAndroidVariant }
+            def selected = selectAndroidVariant(variants)
+            if (!variants.empty && selected == null)
+                throw new GradleException("${p.path}: Android variant '${requestedAndroidVariant}' has no unique build type fallback. Active variants: ${variants*.name.sort().join(', ')}")
+            def task = selected == null ? variantOperation :
+                variantOperation == 'test' ? "test${selected.name.capitalize()}UnitTest" : "assemble${selected.name.capitalize()}"
+            [(p): p.tasks.findByName(task.toString())]
+        }
+        if (!exact)
+            throw new GradleException("Android variant '${requestedAndroidVariant}' is unavailable in this build. Active variants: ${active.unique().sort().join(', ')}")
+        projects.each { p, task ->
+            p.tasks.register('fughettaProjectAndroidVariant') {
+                if (task != null) dependsOn(task)
+            }
+        }
+        gradle.rootProject.tasks.register('fughettaAndroidVariant') {
+            dependsOn(projects.values().findAll { it != null })
+        }
+    }
+}
+if (System.getProperty('fughetta.root') == null) return
+
+// Recorded integration-test ranges; accessor availability determines whether export can proceed.
+final testedKgpRanges = [['2.4.21', '2.4.21']]
+def requireAccessors = { task, version ->
+    def missing = ['createCompilerArgs', 'setupCompilerArgs'].findAll { name -> !task.metaClass.methods.any { it.name == name } }
+    missing.addAll(['libraries', 'pluginClasspath', 'friendPaths', 'serializedCompilerArguments', 'kotlinJavaToolchain', 'sources', 'javaSources']
+        .findAll { !task.metaClass.hasProperty(task, it) })
+    if (missing.empty && !task.kotlinJavaToolchain.metaClass.hasProperty(task.kotlinJavaToolchain, 'javaExecutable$kotlin_gradle_plugin_common'))
+        missing.add('kotlinJavaToolchain.javaExecutable$kotlin_gradle_plugin_common')
+    if (!missing.empty) throw new GradleException("KGP ${version}: missing exporter accessors: ${missing.join(', ')}")
+}
+gradle.projectsEvaluated {
+    def root = Path.of(System.getProperty('fughetta.root')).toAbsolutePath().normalize()
+    def objectsValue = System.getenv('FUGHETTA_STAGING')
+    if (!objectsValue) throw new GradleException('FUGHETTA_STAGING must name this step staging directory')
+    def objects = Path.of(objectsValue)
+    def sdks = new JsonSlurper().parseText(System.getenv('FUGHETTA_SDKS') ?: '[]')
+    def replacement = [:]
+    def stagingEnabled = false
+    def absolute = { File file -> file.toPath().toAbsolutePath().normalize() }
+    def relative = { File file ->
+        def path = absolute(file)
+        if (!path.startsWith(root)) throw new GradleException("Source/output lies outside the installed tree: ${file}")
+        def text = root.relativize(path).toString().replace('\\', '/')
+        text ?: '.'
+    }
+    def sdk = { File file, String role ->
+        def path = absolute(file)
+        def matches = sdks.collectMany { binding -> binding.roots.collect { [binding: binding, root: Path.of(it).normalize()] } }
+            .findAll { path.startsWith(it.root) }.sort { -it.root.toString().length() }
+        if (matches.empty) return null
+        def hit = matches.first()
+        replacement[hit.root.toString()] = '${sdk:' + hit.binding.name + '}'
+        [kind: 'sdk', name: hit.binding.name, path: hit.root.relativize(path).toString().replace('\\', '/'), role: role]
+    }
+    def intern = { File file, boolean stage = true ->
+        if (!file.isFile()) throw new GradleException("Expected a dependency file: ${file}")
+        def digest = MessageDigest.getInstance('SHA-256')
+        file.withInputStream { stream ->
+            byte[] buffer = new byte[65536]
+            for (int count; (count = stream.read(buffer)) >= 0;) if (count) digest.update(buffer, 0, count)
+        }
+        def hash = HexFormat.of().formatHex(digest.digest())
+        def target = objects.resolve(hash)
+        if (stage && stagingEnabled && !Files.exists(target)) {
+            Files.createDirectories(objects)
+            def temporary = Files.createTempFile(objects, '.incoming-', '')
+            try {
+                Files.copy(file.toPath(), temporary, StandardCopyOption.REPLACE_EXISTING)
+                try { Files.move(temporary, target, StandardCopyOption.ATOMIC_MOVE) }
+                catch (java.nio.file.FileAlreadyExistsException ignored) { }
+            } finally { Files.deleteIfExists(temporary) }
+        }
+        if (stage) replacement[file.absolutePath] = '${object:' + hash + '}'
+        [hash: hash, name: file.name]
+    }
+    def reference = { File file, String role ->
+        def installed = sdk(file, role)
+        if (installed) return installed
+        def aar = role in ['classpath', 'friend'] && file.name.toLowerCase(Locale.ROOT).endsWith('.aar')
+        if (!aar && absolute(file).startsWith(root))
+            return [kind: 'tree', path: relative(file), role: role]
+        [kind: 'artifact', role: role, object: intern(file)]
+    }
+    def arguments = { List<String> values ->
+        def paths = replacement + [(root.toString()): '${tree}']
+        values.collect { value ->
+            paths.entrySet().sort { -it.key.length() }.each { entry ->
+                value = value.replaceAll(Pattern.quote(entry.key) + '(?=$|[/\\\\,;:\\s"\'])', Matcher.quoteReplacement(entry.value))
+            }
+            value
+        }
+    }
+    def write = { Path target, value ->
+        Files.createDirectories(target.parent)
+        def temp = Files.createTempFile(target.parent, '.model-', '')
+        try {
+            Files.writeString(temp, JsonOutput.toJson(value) + '\n')
+            Files.move(temp, target, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE)
+        } finally { Files.deleteIfExists(temp) }
+    }
+    def variantAttributes = { attrs ->
+        attrs.keySet().sort { it.name }.collectEntries { [(it.name): attrs.getAttribute(it).toString()] }
+    }
+    def variantsFor = { p, configurationNames ->
+        configurationNames.collect { p.configurations.findByName(it) }.findAll { it?.canBeConsumed }
+            .collect { variantAttributes(it.attributes) }.unique()
+    }
+    def androidReferenceUnits = { units, attrs ->
+        def platform = attrs['org.jetbrains.kotlin.platform.type']
+        if (platform && platform != 'androidJvm') return []
+        def android = units.findAll { it.extensions.android_variant && !it.variants.empty }
+        def subset = { smaller, larger -> larger.entrySet().containsAll(smaller.entrySet()) }
+        def matched = android.findAll { unit -> unit.variants.any { subset(it, attrs) || subset(attrs, it) } }
+        if (!matched.empty || android.size() != 1) return matched
+        // AGP secondary artifacts may add attributes without selecting different Android sources.
+        def selectsSources = { key -> key in ['com.android.build.api.attributes.BuildTypeAttr',
+            'org.jetbrains.kotlin.platform.type', 'org.gradle.category'] || key.startsWith('com.android.build.api.attributes.ProductFlavor') }
+        android.findAll { unit -> unit.variants.any { offered ->
+            attrs.every { key, value -> !selectsSources(key) || !offered.containsKey(key) || offered[key] == value }
+        } }
+    }
+    def projectReference = { project, unit, role, attrs ->
+        [kind: 'project', project: project, unit: unit, path: '', role: role, attributes: attrs]
+    }
+    def projectReferences = { configuration, projectId ->
+        configuration.incoming.resolutionResult.allDependencies
+            .findAll { it instanceof ResolvedDependencyResult && it.selected.id instanceof ProjectComponentIdentifier && it.selected.id.buildTreePath != projectId }
+            .collect { dep -> projectReference(dep.selected.id.buildTreePath, '', 'classpath', variantAttributes(dep.resolvedVariant.attributes)) }
+            .unique().sort { JsonOutput.toJson(it) }
+    }
+    def runtime = { File home ->
+        def jdk = sdk(home, 'runtime')
+        if (!jdk) throw new GradleException("Selected JDK requires a worker SDK mapping: ${home}")
+        jdk
+    }
+    def androidPlatform = { File file, jdk ->
+        def binding = sdk(file, 'classpath')
+        if (binding && binding.name != jdk.name) return binding
+        if (!binding && absolute(file).startsWith(root)) return [kind: 'tree', path: relative(file), role: 'classpath']
+        throw new GradleException("Selected Android SDK requires a worker SDK mapping: ${file}")
+    }
+    def androidCompilations = { p, target, androidSelections ->
+        def variants = target.compilations.collect { compilation ->
+            def variant = compilation.androidVariant
+            def tested = variant.metaClass.respondsTo(variant, 'getTestedVariant') ? variant.testedVariant : null
+            [compilation: compilation, variant: variant, tested: tested]
+        }
+        def available = androidVariants(p)
+        def variant = selectAndroidVariant(available)
+        if (requestedAndroidVariant != null)
+            androidSelections.add([project: p.buildTreePath, exact: available.any { it.name == requestedAndroidVariant },
+                active: available*.name, selected: variant?.name])
+        if (variant == null) return []
+        def selected = variants.find { it.tested == null && it.variant.name == variant.name }
+        if (selected == null)
+            throw new GradleException("${p.path}: selected Android variant '${variant.name}' has no Kotlin compilation")
+        variants.findAll { it == selected || it.tested?.name == selected.variant.name }.collect {
+            it + [main: selected.variant.name]
+        }
+    }
+    def generatedRootFor = { p, File source, generatedInputs ->
+        def path = absolute(source)
+        path.startsWith(absolute(p.layout.buildDirectory.get().asFile)) || generatedInputs.any { path.startsWith(it) }
+    }
+    def generatedSources = { p, roots, sources, generatedInputs, preparing, android = false ->
+        if (preparing) return [:]
+        def generatedRoots = roots.findAll { generatedRootFor(p, it, generatedInputs) }.collect(absolute)
+        if (!android) generatedRoots.each { path ->
+            if (!Files.exists(path) || !generatedInputs.any { path.startsWith(it) })
+                throw new GradleException("Generated source root needs a generated_sources input: ${path}")
+        }
+        sources.findAll { source ->
+            def path = absolute(source)
+            generatedRoots.any { path.startsWith(it) } || generatedInputs.any { path.startsWith(it) } ||
+                (android && path.startsWith(absolute(p.layout.buildDirectory.get().asFile)))
+        }.collectEntries { [(relative(it)): intern(it)] }
+    }
+    def export = { boolean preparing ->
+        def destination = Path.of(System.getProperty(preparing ? 'fughetta.prepare.output' : 'fughetta.model.output'))
+        stagingEnabled = !preparing
+        def receipt = null
+        if (!preparing && gradle.parent == null) {
+            receipt = new JsonSlurper().parse(new File(System.getProperty('fughetta.dependencies')))
+            if (receipt.kind != 'gradle_dependencies') throw new GradleException('Expected gradle_dependencies input')
+        }
+        def generatedInputs = System.properties.findAll { k, v -> k.startsWith('fughetta.generated.') }
+            .values().collect { Path.of(it).toAbsolutePath().normalize() }
+        generatedInputs.each { if (!Files.exists(it)) throw new GradleException("Missing generated_sources input: ${it}") }
+        def units = []
+        def resolution = []
+        def androidSelections = []
+        def skipped = [:]
+        def compilationsByProject = [:].withDefault { [] }
+        def scalaTools = [:]
+        rootProject.allprojects.sort { it.buildTreePath }.each { p ->
+            def projectId = p.buildTreePath
+            def compilations = compilationsByProject[projectId]
+            def kotlin = p.extensions.findByName('kotlin')
+            def multiplatform = p.plugins.findPlugin('org.jetbrains.kotlin.multiplatform')
+            def plugin = multiplatform ?: p.plugins.findPlugin('org.jetbrains.kotlin.android') ?: p.plugins.findPlugin('org.jetbrains.kotlin.jvm')
+            if (plugin != null) {
+                def targets = multiplatform ? kotlin.targets : [kotlin.target]
+                def agp = p.plugins.hasPlugin('com.android.application') || p.plugins.hasPlugin('com.android.library')
+                targets.each { target ->
+                    def platform = target.platformType.toString()
+                    def candidates = platform == 'jvm' ? target.compilations.collect { [compilation: it] } :
+                        platform == 'androidJvm' && agp ? androidCompilations(p, target, androidSelections) : []
+                    candidates.each { candidate ->
+                        def compilation = candidate.compilation
+                        compilations.add([id: JsonOutput.toJson([projectId, target.name, compilation.name]),
+                            target: target.name, compilation: compilation.name, language: 'kotlin',
+                            p: p, kotlinTarget: target, kotlinCompilation: compilation, kgpVersion: plugin.pluginVersion,
+                            outputDirs: compilation.output.allOutputs.files, androidVariant: candidate.variant, androidMain: candidate.main])
+                    }
+                }
+            }
+            if (p.plugins.hasPlugin('scala')) {
+                p.extensions.findByType(SourceSetContainer).each { sourceSet ->
+                    def task = p.tasks.findByName(sourceSet.getCompileTaskName('scala'))
+                    if (task instanceof ScalaCompile) {
+                        def outputDirs = sourceSet.output.classesDirs.files.toList()
+                        if (sourceSet.output.resourcesDir != null) outputDirs.add(sourceSet.output.resourcesDir)
+                        compilations.add([id: JsonOutput.toJson([projectId, 'jvm', sourceSet.name]),
+                            target: 'jvm', compilation: sourceSet.name, language: 'scala',
+                            p: p, sourceSet: sourceSet, task: task, outputDirs: outputDirs])
+                    }
+                }
+                def zinc = p.configurations.findByName('zinc')
+                def plugins = p.configurations.findByName('scalaCompilerPlugins')
+                scalaTools[projectId] = [
+                    zinc: (zinc?.files ?: []).collect { intern(it, false) }.sort { JsonOutput.toJson(it) },
+                    plugins: plugins?.files ?: [],
+                ]
+            } else if (plugin == null) {
+                skipped[projectId] = kotlin != null ? 'unsupported Kotlin plugin' : 'project has neither the Kotlin nor the Scala plugin'
+            }
+        }
+        compilationsByProject.each { projectId, compilations ->
+            def scalaCompilations = compilations.findAll { it.language == 'scala' }
+            def scalaIds = scalaCompilations*.id.toSet()
+            def scalaByOutput = scalaCompilations.collectEntries { [(absolute(it.task.destinationDirectory.get().asFile)): it] }
+            def kotlinIds = compilations.findAll { it.language == 'kotlin' }.collectEntries { entry ->
+                if (entry.id in scalaIds)
+                    entry.id = JsonOutput.toJson([projectId, entry.target, entry.compilation, 'kotlin'])
+                // Java source sets can expose Scala classes through the Kotlin compilation's outputs.
+                entry.outputDirs = entry.outputDirs.findAll { !scalaByOutput.containsKey(absolute(it)) }
+                [(entry.kotlinCompilation): entry.id]
+            }
+            compilations.each { entry ->
+                def p = entry.p
+                if (entry.language == 'kotlin') {
+                    def target = entry.kotlinTarget
+                    def compilation = entry.kotlinCompilation
+                    def androidVariant = entry.androidVariant
+                    def kgpVersion = entry.kgpVersion
+                    def task = compilation.compileTaskProvider.get()
+                    requireAccessors(task, kgpVersion)
+                    def args = task.createCompilerArgs()
+                    task.setupCompilerArgs(args, false, false)
+                    def configuration = androidVariant ? androidVariant.compileConfiguration :
+                        p.configurations.getByName(compilation.compileDependencyConfigurationName)
+                    def refs = projectReferences(configuration, projectId)
+                    def generatedClasspath = []
+                    def associated = compilation.associatedCompilations
+                    def associateIds = associated.collect { kotlinIds[it] }
+                    def associatedOutputs = associated.collectMany { it.output.allOutputs.files.toList() }
+                        .collect(absolute).toSet()
+                    // KGP can pass the target's main archive as a friend root
+                    // instead of its class directories. It is the same source
+                    // compilation already represented by the project reference,
+                    // and need not have been built for source analysis.
+                    associated.findAll { !androidVariant && it.name == 'main' }.each { friend ->
+                        def archive = friend.target.project.tasks.named(friend.target.artifactsTaskName).get()
+                        associatedOutputs.add(absolute(archive.archiveFile.get().asFile))
+                    }
+                    // The Kotlin launcher supplies the host JDK. Android's boot classpath has its own SDK binding.
+                    def java = task.kotlinJavaToolchain.'javaExecutable$kotlin_gradle_plugin_common'.get().asFile
+                    def jdk = runtime(java.parentFile.parentFile)
+                    def libraries = task.libraries.files
+                    def platform = [:]
+                    if (androidVariant) {
+                        def boot = p.extensions.findByName('android').bootClasspath.toList()
+                        def optionalRoots = (boot + libraries).findAll { it.name == 'android.jar' }
+                            .collect { absolute(it).parent.resolve('optional') }
+                        (boot + libraries.findAll { library ->
+                            library.name == 'android.jar' || optionalRoots.any { absolute(library).startsWith(it) }
+                        }).each { platform[absolute(it)] = it }
+                        platform.values().each { refs.add(androidPlatform(it, jdk)) }
+                    }
+                    def classpath = new HashSet(associatedOutputs)
+                    classpath.addAll(platform.keySet())
+                    def androidGenerated = { File file -> androidVariant && generatedRootFor(p, file, generatedInputs) }
+                    def localAndroidClasspath = { File file, String role ->
+                        if (!preparing && file.exists()) generatedClasspath.add([kind: 'tree', path: relative(file), role: role])
+                    }
+                    // AGP's artifact collection resolves the class JARs used by Kotlin, including transformed AARs.
+                    def artifacts = androidVariant ? androidVariant.getCompileClasspathArtifacts(null).artifacts : configuration.incoming.artifacts.artifacts
+                    artifacts.each { artifact ->
+                        def path = absolute(artifact.file)
+                        classpath.add(path)
+                        if (!(artifact.id.componentIdentifier instanceof ProjectComponentIdentifier) &&
+                            !associatedOutputs.contains(path) && !platform.containsKey(path) && !androidGenerated(artifact.file))
+                            refs.add(reference(artifact.file, 'classpath'))
+                    }
+                    libraries.each { library ->
+                        def path = absolute(library)
+                        if (!associatedOutputs.contains(path) && !platform.containsKey(path) && androidGenerated(library))
+                            localAndroidClasspath(library, 'classpath')
+                        else if (!classpath.contains(path))
+                            throw new GradleException("Unclassified compiler classpath input for ${task.path}: ${library}")
+                        def scalaDependency = scalaByOutput[path]
+                        if (scalaDependency != null)
+                            refs.add(projectReference(projectId, scalaDependency.id, 'classpath', [:]))
+                    }
+                    task.pluginClasspath.files.each { refs.add(reference(it, 'plugin')) }
+                    associateIds.each { id ->
+                        ['classpath', 'friend'].each { role ->
+                            refs.add(projectReference(projectId, id, role, [:]))
+                        }
+                    }
+                    task.friendPaths.files.findAll { !associatedOutputs.contains(absolute(it)) }
+                        .each {
+                            if (androidGenerated(it)) localAndroidClasspath(it, 'friend')
+                            else refs.add(reference(it, 'friend'))
+                        }
+                    refs.add(jdk)
+                    def roots = compilation.allKotlinSourceSets.collectMany { it.kotlin.srcDirs }.unique()
+                    def sources = (task.sources.files + task.javaSources.files).findAll { !androidVariant || it.isFile() }
+                        .unique().sort { it.absolutePath }
+                    def generated = generatedSources(p, roots, sources, generatedInputs, preparing, androidVariant != null)
+                    def variants = androidVariant ? (androidVariant.name == entry.androidMain ?
+                        variantsFor(p, ["${entry.androidMain}ApiElements", "${entry.androidMain}RuntimeElements"]) : []) :
+                        compilation.name == 'main' ? variantsFor(p, [target.apiElementsConfigurationName, target.runtimeElementsConfigurationName]) : []
+                    resolution.add([id: entry.id, references: refs])
+                    units.add([id: entry.id, project: projectId, language: entry.language,
+                        directory: relative(p.projectDir), variants: variants, sources: sources.collect(relative), generated: generated,
+                        references: (refs + generatedClasspath).unique(),
+                        outputs: entry.outputDirs.collect(relative), compiler_arguments: arguments(task.serializedCompilerArguments),
+                        extensions: [target: entry.target, compilation: entry.compilation, module: args.moduleName, source_roots: roots.collect(relative),
+                            associates: associateIds,
+                            language_version: args.languageVersion, api_version: args.apiVersion, jvm_target: args.jvmTarget, kgp_version: kgpVersion,
+                            kgp_tested_ranges: testedKgpRanges] + (androidVariant ? [android_variant: entry.androidMain] : [:])])
+                } else {
+                    def sourceSet = entry.sourceSet
+                    def task = entry.task
+                    def configuration = p.configurations.getByName(sourceSet.compileClasspathConfigurationName)
+                    def refs = projectReferences(configuration, projectId)
+                    def classpath = task.classpath.files.collectEntries { [(absolute(it)): it] }
+                    configuration.incoming.artifacts.artifacts.each { artifact ->
+                        if (artifact.id.componentIdentifier instanceof ProjectComponentIdentifier)
+                            classpath.remove(absolute(artifact.file))
+                    }
+                    entry.outputDirs.each { classpath.remove(absolute(it)) }
+                    def dependencies = compilations.findAll { dependency ->
+                        dependency.id != entry.id && dependency.outputDirs.any { classpath.containsKey(absolute(it)) }
+                    }
+                    dependencies.each { dependency ->
+                        refs.add(projectReference(projectId, dependency.id, 'classpath', [:]))
+                        dependency.outputDirs.each { classpath.remove(absolute(it)) }
+                    }
+                    classpath.values().each { refs.add(reference(it, 'classpath')) }
+                    scalaTools[projectId].plugins.each { refs.add(reference(it, 'plugin')) }
+                    def launcher = task.javaLauncher.orNull
+                    refs.add(runtime(launcher?.metadata?.installationPath?.asFile ?: Jvm.current().javaHome))
+                    def targetJvm = launcher?.metadata?.languageVersion?.toString() ?: JavaVersion.current().majorVersion
+                    def roots = (sourceSet.scala.srcDirs + sourceSet.java.srcDirs).unique()
+                    def sources = (sourceSet.scala.files + sourceSet.java.files)
+                        .findAll { it.name.endsWith('.scala') || it.name.endsWith('.java') }.sort { it.absolutePath }
+                    def generated = generatedSources(p, roots, sources, generatedInputs, preparing)
+                    def variants = variantsFor(p, [sourceSet.apiElementsConfigurationName, sourceSet.runtimeElementsConfigurationName])
+                    resolution.add([id: entry.id, references: refs])
+                    units.add([id: entry.id, project: projectId, language: entry.language,
+                        directory: relative(p.projectDir), variants: variants, sources: sources.collect(relative), generated: generated, references: refs,
+                        outputs: entry.outputDirs.collect(relative), compiler_arguments: arguments(task.scalaCompileOptions.additionalParameters ?: []),
+                        extensions: [target: entry.target, compilation: entry.compilation, jvm_target: targetJvm]])
+                }
+            }
+        }
+        scalaTools.each { projectId, tools -> resolution.add([project: projectId, zinc: tools.zinc]) }
+        def digest = HexFormat.of().formatHex(MessageDigest.getInstance('SHA-256').digest(JsonOutput.toJson(resolution).getBytes('UTF-8')))
+        def model = preparing ? [kind: 'gradle_dependencies', resolution: digest] :
+            [schema: 1, producer: 'gradle', producer_version: gradle.gradleVersion, units: units]
+        def output = destination
+        if (gradle.parent != null) {
+            output = Path.of(destination.toString() + '.parts', URLEncoder.encode(gradle.buildPath, 'UTF-8') + '.json')
+            // Internal fragments carry the digest until the root combines the whole build tree.
+            model.resolution = digest
+            model.skipped = skipped
+            if (requestedAndroidVariant != null) model.androidSelections = androidSelections
+        }
+        else {
+            gradle.includedBuilds.toList().sort { it.name }.each { included ->
+                def fragment = Path.of(destination.toString() + '.parts', URLEncoder.encode(':' + included.name, 'UTF-8') + '.json')
+                def part = new JsonSlurper().parse(fragment.toFile())
+                digest = HexFormat.of().formatHex(MessageDigest.getInstance('SHA-256')
+                    .digest((digest + part.resolution).getBytes('UTF-8')))
+                if (requestedAndroidVariant != null) androidSelections.addAll(part.androidSelections)
+                if (!preparing) {
+                    model.units.addAll(part.units)
+                    skipped.putAll(part.skipped)
+                }
+            }
+            if (requestedAndroidVariant != null) {
+                if (!androidSelections.any { it.exact }) {
+                    def active = androidSelections.collectMany { it.active }.unique().sort().join(', ')
+                    throw new GradleException("Android variant '${requestedAndroidVariant}' is unavailable in this build. Active variants: ${active}")
+                }
+                def unavailable = androidSelections.find { it.selected == null }
+                if (unavailable)
+                    throw new GradleException("${unavailable.project}: Android variant '${requestedAndroidVariant}' has no unique build type fallback. Active variants: ${unavailable.active.join(', ')}")
+            }
+            if (preparing) model.resolution = digest
+            if (!preparing) {
+                if (model.units.empty) throw new GradleException('No Kotlin or Scala JVM compilations in this build')
+                if (receipt.resolution != digest) throw new GradleException('Dependency resolution differs from gradle_dependencies input; run prepare again')
+                def unitsByProject = model.units.groupBy { it.project }
+                model.units.each { consumer ->
+                    consumer.references = consumer.references.collectMany { ref ->
+                        if (ref.kind != 'project') return [ref]
+                        def projectUnits = unitsByProject[ref.project] ?: []
+                        def candidates = projectUnits.findAll {
+                            ref.unit ? it.id == ref.unit : it.variants.contains(ref.attributes)
+                        }
+                        if (candidates.size() == 1) return [ref]
+                        if (!ref.unit && candidates.empty) {
+                            def android = androidReferenceUnits(projectUnits, ref.attributes)
+                            if (android.size() == 1) return [ref + [unit: android.first().id]]
+                        }
+                        // Kotlin/JVM and Scala can contribute outputs to the same Java variant.
+                        if (!ref.unit && candidates.size() == 2 && candidates*.language.toSet() == ['kotlin', 'scala'].toSet())
+                            return candidates.collect { ref + [unit: it.id] }
+                        def reason = skipped[ref.project] ?: 'no unique exported JVM compilation for the selected variant'
+                        throw new GradleException("${consumer.id} references ${ref.project}: ${reason}")
+                    }.unique()
+                }
+            }
+        }
+        write(output, model)
+    }
+    ['fughettaPrepare': true, 'fughettaModel': false].each { name, preparing ->
+        rootProject.tasks.register(name) {
+            gradle.includedBuilds.each { dependsOn(it.task(':' + name)) }
+            doLast { export(preparing) }
+        }
+    }
+    // The host graph selects both tasks when batched.
+    // Ordering does not introduce prepare as an undeclared model dependency.
+    rootProject.tasks.named('fughettaModel') { mustRunAfter(rootProject.tasks.named('fughettaPrepare')) }
+}

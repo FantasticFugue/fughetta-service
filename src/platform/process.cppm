@@ -5,6 +5,27 @@ import async;
 import httpant.io;
 
 export namespace native_process {
+    auto standard_input() -> native_io::handle;
+    auto standard_output() -> native_io::handle;
+    auto self_usage() noexcept -> std::optional<io::process_usage>;
+    auto sample(const io::process_record& process) noexcept -> std::optional<io::process_usage>;
+    inline auto usage(io::process_group& processes) -> std::optional<io::process_usage> {
+        std::lock_guard held{processes.mutex};
+        io::process_usage total{};
+        for (const auto& [pid, process] : processes.children) {
+            std::lock_guard active{process->mutex};
+            if (!process->live)
+                return {};
+            auto value = sample(*process);
+            if (!value)
+                return {};
+            total.resident_bytes += value->resident_bytes;
+            total.cpu_nanoseconds += value->cpu_nanoseconds;
+            total.threads += value->threads;
+            total.processes += value->processes;
+        }
+        return total;
+    }
     class child {
     public:
         static auto spawn(native_io::engine<concurrent::queue>& engine, const io::command& command) -> child;

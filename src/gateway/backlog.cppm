@@ -4,6 +4,7 @@ import native;
 import coroutine;
 import configuration;
 import world;
+import codec;
 
 namespace tools {
     namespace {
@@ -12,6 +13,42 @@ namespace tools {
         // Finished jobs the list still shows.
         constexpr std::size_t finished_shown = 20;
         constexpr auto busy_pause = std::chrono::seconds{1};
+
+        auto contains(const semantic::extent& available, const semantic::extent& requested) -> bool {
+            auto subset = [](const auto& all, const auto& selected) {
+                return std::ranges::all_of(selected, [&](const auto& value) { return std::ranges::contains(all, value); });
+            };
+            // Providers interpret an empty selector, including facts, as all.
+            auto scope = [&](const auto& all, const auto& selected) { return all.empty() || (!selected.empty() && subset(all, selected)); };
+            return scope(available.modules, requested.modules) && scope(available.files, requested.files) && scope(available.contexts, requested.contexts) &&
+                   scope(available.facts, requested.facts);
+        }
+
+        auto includes(const backlog::entry& available, const backlog::entry& requested) -> bool {
+            if (available.key == requested.key)
+                return true;
+            if (requested.operation != "prepare" || available.operation != "prepare" || requested.family.empty() || available.family != requested.family ||
+                available.project != requested.project || requested.demands.empty())
+                return false;
+            return std::ranges::all_of(requested.demands, [&](const auto& item) {
+                auto found = available.demands.find(item.first);
+                return found != available.demands.end() && contains(found->second, item.second);
+            });
+        }
+
+        auto overlaps(const backlog::entry& left, const backlog::entry& right) -> bool {
+            if (left.operation != "prepare" || right.operation != "prepare" || left.family.empty() || left.family != right.family ||
+                left.project != right.project)
+                return false;
+            auto intersects = [](const auto& a, const auto& b) {
+                return a.empty() || b.empty() || std::ranges::any_of(a, [&](const auto& value) { return std::ranges::contains(b, value); });
+            };
+            return std::ranges::any_of(right.demands, [&](const auto& item) {
+                auto found = left.demands.find(item.first);
+                return found != left.demands.end() && intersects(found->second.files, item.second.files) &&
+                       intersects(found->second.modules, item.second.modules) && intersects(found->second.contexts, item.second.contexts);
+            });
+        }
     } // namespace
 
     auto backlog::submit(std::size_t here, entry e, runner r) -> coroutine::task<std::shared_ptr<ticket>> {
@@ -25,6 +62,16 @@ namespace tools {
             auto operator()() -> coroutine::task<std::shared_ptr<ticket>> { co_return owner->enqueue(value, run); }
         };
         co_return co_await cores::call(rt_.get_scheduler(here), rt_.get_scheduler(0), submit_work{this, std::move(e), std::move(shared)});
+    }
+
+    auto backlog::active(std::size_t here) -> coroutine::task<activity> {
+        auto read = [this]() -> coroutine::task<activity> {
+            auto running = running_ + analyzing_;
+            co_return activity{jobs_.size() - running, running};
+        };
+        if (here == 0)
+            co_return co_await read();
+        co_return co_await cores::call(rt_.get_scheduler(here), rt_.get_scheduler(0), read);
     }
 
     auto backlog::list(std::size_t here) -> coroutine::task<std::vector<view>> {
@@ -97,7 +144,8 @@ namespace tools {
                 held->done_.store(true, std::memory_order_release);
                 return held;
             }
-        if (auto same = std::ranges::find_if(jobs_, [&](auto& j) { return !e.fresh && j->what.key == e.key; }); same != jobs_.end()) {
+        if (auto same = std::ranges::find_if(jobs_, [&](auto& j) { return !e.fresh && !j->stop.get_token().stop_requested() && includes(j->what, e); });
+            same != jobs_.end()) {
             held->reuse_ = "shared";
             held->job_ = (*same)->id;
             held->progress_ = (*same)->progress;
@@ -106,11 +154,19 @@ namespace tools {
         }
         auto j = std::make_shared<job>();
         j->id = next_id_++;
+        j->computation = "computation-" + nodes::hex(nodes::random_bytes(16));
         j->what = std::move(e);
         j->run = std::move(*r);
         held->job_ = j->id;
         held->progress_ = j->progress;
         j->tickets.push_back(held);
+        if (!j->what.fresh)
+            for (const auto& previous : jobs_)
+                if (!previous->stop.get_token().stop_requested() && overlaps(previous->what, j->what)) {
+                    auto dependency = std::make_shared<ticket>(j->what.actor);
+                    previous->tickets.push_back(dependency);
+                    j->predecessors.push_back(std::move(dependency));
+                }
         // A new asker comes before those who have had turns.
         if (!std::ranges::contains(turns_, j->what.actor))
             turns_.push_front(j->what.actor);
@@ -132,12 +188,9 @@ namespace tools {
                 finish(j, refused(j->what, "cancelled"), "cancelled");
         }
         auto cap = config::resolve_limits(*zero_.snapshot()).concurrent_builds;
-        while (running_ < cap) {
-            auto j = next();
-            if (!j)
-                break;
+        while (auto j = next(running_ < cap, analyzing_ < cap)) {
             j->running = true;
-            ++running_;
+            ++(j->what.operation == "prepare" ? analyzing_ : running_);
             rt_.spawn(0, launch(j));
         }
         std::size_t ahead = 0;
@@ -151,13 +204,17 @@ namespace tools {
     }
 
     // The oldest job of whoever's turn it is that may be tried now; that asker then waits for everyone else's turn.
-    auto backlog::next() -> std::shared_ptr<job> {
+    auto backlog::next(bool builds, bool analyses) -> std::shared_ptr<job> {
         auto now = std::chrono::steady_clock::now();
         for (std::size_t n = 0; n < turns_.size(); ++n) {
             auto actor = turns_.front();
             turns_.pop_front();
             turns_.push_back(actor);
-            auto found = std::ranges::find_if(jobs_, [&](auto& j) { return !j->running && j->what.actor == actor && j->retry_at <= now; });
+            auto found = std::ranges::find_if(jobs_, [&](auto& j) {
+                return !j->running && (j->what.operation == "prepare" ? analyses : builds) && j->what.actor == actor && j->retry_at <= now &&
+                       std::ranges::any_of(j->tickets, [](const auto& held) { return !held->left_.load(std::memory_order_acquire); }) &&
+                       std::ranges::all_of(j->predecessors, [](const auto& held) { return held->done(); });
+            });
             if (found != jobs_.end())
                 return *found;
         }
@@ -166,8 +223,8 @@ namespace tools {
 
     // The free tree of the job's set whose last build shared the most files with it, the least recently used of equals; a new one when all
     // are busy.
-    auto backlog::choose(const entry& e) -> tree& {
-        auto& set = trees_[e.trees];
+    auto backlog::choose(const entry& e, const std::string& group) -> tree& {
+        auto& set = trees_[group];
         tree* best = nullptr;
         std::size_t best_shared = 0;
         for (auto& t : set) {
@@ -180,47 +237,36 @@ namespace tools {
             }
         }
         if (!best)
-            best = &set.emplace_back(tree{.name = std::format("{}-{}", e.trees, set.size())});
+            best = &set.emplace_back(tree{.name = std::format("{}-{}", group, set.size())});
         return *best;
     }
 
     auto backlog::launch(std::shared_ptr<job> j) -> coroutine::task<> {
-        // Only jobs that build take a tree.
-        auto* tree = j->what.trees.empty() ? nullptr : &choose(j->what);
-        if (tree)
-            tree->busy = true;
-        j->started_at = std::chrono::steady_clock::now();
+        j->predecessors.clear();
+        // A busy retry retains these directories while releasing the dispatch
+        // turn. Other computations can run without changing this graph's inputs.
+        for (const auto& group : j->what.trees) {
+            if (j->placed.contains(group))
+                continue;
+            auto& selected = choose(j->what, group);
+            selected.busy = true;
+            j->directories.push_back(&selected);
+            j->placed.emplace(group, selected.name);
+        }
+        const auto started = std::chrono::steady_clock::now();
+        for (auto& ticket : j->tickets)
+            ticket->queued_ += std::max(0.0, std::chrono::duration<double>(started - std::max(j->queued_at, ticket->submitted_)).count());
         std::optional<std::optional<outcome>> out;
         std::string failure, failure_code;
         try {
-            out = co_await coroutine::under(j->stop.get_token(), j->run(zero_, *j->progress, tree ? tree->name : std::string{}));
+            out = co_await coroutine::under(j->stop.get_token(), j->run(zero_, *j->progress, j->placed, j->computation));
         } catch (const tool_error& e) {
             failure = e.what();
             failure_code = e.code;
         } catch (const std::exception& e) {
             failure = e.what();
         }
-        if (tree) {
-            tree->busy = false;
-            // A tree keeps what a worker built in it. A job that was stopped or failed may have changed it on the way, so its last build
-            // no longer says what it holds; a job that found every worker busy never reached it.
-            bool synced = false;
-            if (out && *out)
-                std::visit(
-                    [&](const auto& result) {
-                        if constexpr (std::same_as<std::remove_cvref_t<decltype(result)>, config_result>)
-                            synced = !result.worker.empty() && result.ok;
-                        else
-                            synced = !result.worker.empty() && result.status == "prepared";
-                    },
-                    **out);
-            if (synced) {
-                tree->files = {j->what.files.begin(), j->what.files.end()};
-                tree->used = ++clock_;
-            } else if (!out || !failure.empty() || *out)
-                tree->files.clear();
-        }
-        --running_;
+        --(j->what.operation == "prepare" ? analyzing_ : running_);
         if (!failure.empty()) {
             auto result = refused(j->what, std::move(failure));
             if (!failure_code.empty())
@@ -230,21 +276,36 @@ namespace tools {
             finish(j, refused(j->what, "cancelled"), "cancelled");
         else if (!*out) {
             j->running = false;
-            j->started_at = {};
-            j->retry_at = std::chrono::steady_clock::now() + busy_pause;
+            j->queued_at = std::chrono::steady_clock::now();
+            j->retry_at = j->queued_at + busy_pause;
         } else
             finish(j, std::move(**out), "done");
         step();
     }
 
     void backlog::finish(const std::shared_ptr<job>& j, outcome r, std::string state) {
+        for (const auto& held : j->predecessors)
+            held->leave();
+        j->predecessors.clear();
         auto* built = std::get_if<config_result>(&r);
         auto* analyzed = std::get_if<language::result>(&r);
+        const bool synced =
+            built ? !built->worker.empty() && built->ok : !analyzed->worker.empty() && analyzed->status == "prepared" && analyzed->analysis == "analyzed";
+        for (auto* directory : j->directories) {
+            directory->busy = false;
+            if (synced) {
+                directory->files = {j->what.files.begin(), j->what.files.end()};
+                directory->used = ++clock_;
+            } else
+                directory->files.clear();
+        }
+        j->directories.clear();
         auto reusable = built ? built->error.empty() && !built->worker.empty()
-                              : analyzed->status == "prepared" && analyzed->analysis == "analyzed" && !analyzed->worker.empty() && analyzed->outline &&
-                                    analyzed->outline->complete && analyzed->outline->cacheable;
+                              : analyzed->status == "prepared" && analyzed->analysis == "analyzed" && !analyzed->worker.empty() && analyzed->missing.empty() &&
+                                    analyzed->cacheable;
         if (built)
             reusable = reusable && built->export_error.empty() &&
+                       std::ranges::all_of(built->models, [](const auto& file) { return file.delivery_error.empty(); }) &&
                        std::ranges::all_of(built->exports, [](const auto& file) { return file.delivery_error.empty(); }) &&
                        std::ranges::all_of(built->steps, [](const auto& step) {
                            return step.log_error.empty() && step.cache_error.empty() && (!step.log || step.log->delivery_error.empty());
@@ -267,9 +328,10 @@ namespace tools {
             finished_.pop_back();
         for (auto& t : j->tickets) {
             t->result_ = r;
-            const auto end = j->started_at == std::chrono::steady_clock::time_point{} ? std::chrono::steady_clock::now() : j->started_at;
-            std::visit([&](auto& result) { result.timings.queue_seconds = std::max(0.0, std::chrono::duration<double>(end - t->submitted_).count()); },
-                       t->result_);
+            auto queued = t->queued_;
+            if (!j->running)
+                queued += std::max(0.0, std::chrono::duration<double>(std::chrono::steady_clock::now() - std::max(j->queued_at, t->submitted_)).count());
+            std::visit([&](auto& result) { result.timings.queue_seconds = queued; }, t->result_);
             t->done_.store(true, std::memory_order_release);
         }
         jobs_.remove(j);

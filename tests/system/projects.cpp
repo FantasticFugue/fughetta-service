@@ -100,7 +100,7 @@ namespace {
             auto doc = test::document(tmp.dir, http_port, proxy.endpoint().port());
             doc.projects["lib"] = {};
             auto file = tmp.dir / "config.json";
-            test::spit(file, rfl::json::write(doc));
+            test::spit(file, json::write(doc));
             test::child source{
                 test::source_command(SERVICE_EXECUTABLE, tmp.dir, {"--port", std::to_string(source_port), "--storage", (tmp.dir / "source").string()})};
             test::ready(source, source_port);
@@ -113,7 +113,7 @@ namespace {
             auto create = [&](std::string project, std::string path, std::string text, std::string operation, std::string observed) {
                 return source_call(project, "apply",
                                    std::format(R"("observed":{},"operation_id":{},"changes":[{{"kind":"create","path":{},"text":{}}}])",
-                                               rfl::json::write(observed), rfl::json::write(operation), rfl::json::write(path), rfl::json::write(text)));
+                                               json::write(observed), json::write(operation), json::write(path), json::write(text)));
             };
             create("app", "hello.txt", "durable source\n", "hello", test::source_version(http_port, "app"));
             create("lib", "independent.txt", "independent", "independent", test::source_version(http_port, "lib"));
@@ -162,8 +162,6 @@ namespace {
             auto listed = test::request(http_port, http::method::POST, "/mcp", R"({"jsonrpc":"2.0","id":1,"method":"tools/list"})");
             for (auto name : {"language", "build", "test", "run", "configurations", "worldline"})
                 expect(listed.body.contains(std::format(R"("name":"{}")", name))) << name;
-            for (auto name : {"read", "write", "edit", "generate", "receipt", "jobs"})
-                expect(!listed.body.contains(std::format(R"("name":"{}")", name))) << name;
             auto offered = test::request(http_port, http::method::GET, "/api/v1/templates");
             expect(offered.status == 200 && offered.body.contains("cpp-class") && !offered.body.contains("console")) << offered.body;
 

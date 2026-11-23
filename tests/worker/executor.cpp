@@ -1,4 +1,5 @@
 import std;
+import toolchain;
 import boost.ut;
 import coroutine;
 import native;
@@ -8,12 +9,17 @@ import replica;
 import executor;
 import runner;
 import support;
+import launch;
 import archive;
 import durability;
 import host;
 import dependencies;
 import constants;
-import reflection;
+import json;
+import knowledge;
+import delivery;
+import projectmodel;
+import process;
 
 namespace {
     using namespace boost::ut;
@@ -30,17 +36,69 @@ namespace {
         return {.path = std::move(path), .digest = content::hash_of(text), .size = text.size(), .executable = exec};
     }
 
+    struct discard_unit {
+        void operator()(language::evaluated_unit) const {}
+    };
+    struct reject_reuse {
+        auto operator()(jobs::reuse_request) const -> jobs::reuse_reply { return {}; }
+    };
+    struct absent_shard {
+        auto operator()(jobs::shard_read) const -> jobs::shard_piece { throw std::runtime_error("unexpected shard input"); }
+    };
+    struct absent_model {
+        auto operator()(jobs::model_read) const -> jobs::source_bytes { throw std::runtime_error("unexpected model input"); }
+    };
+    template <class Unit = discard_unit, class Reuse = reject_reuse, class Shard = absent_shard, class Model = absent_model> struct record_checks {
+        Unit unit{};
+        Reuse reuse{};
+        Shard shard{};
+        Model model{};
+    };
+    template <class Channel, class Request, class Checks>
+    auto analysis_call(Channel& channel, ctx io, const Request& request, Checks checks, jobs::progress_log* progress = nullptr)
+        -> coroutine::task<transport::call_result<jobs::build_report>> {
+        auto inputs = std::make_shared<jobs::analysis_exchange>(io, io);
+        auto serve = [&]() -> coroutine::task<> {
+            while (auto item = co_await inputs->next()) {
+                auto release = jobs::analysis_exchange::completion{item};
+                try {
+                    if (auto* unit = std::get_if<language::evaluated_unit>(&item->data)) {
+                        checks.unit(std::move(*unit));
+                        item->answer(std::monostate{});
+                    } else if (auto* reuse = std::get_if<jobs::reuse_request>(&item->data))
+                        item->answer(checks.reuse(std::move(*reuse)));
+                    else if (auto* shard = std::get_if<jobs::shard_read>(&item->data))
+                        item->answer(checks.shard(std::move(*shard)));
+                    else
+                        item->answer(checks.model(std::move(std::get<jobs::model_read>(item->data))));
+                } catch (...) {
+                    item->fail(std::current_exception());
+                }
+            }
+        };
+        auto run = [&](coroutine::scope& tasks) -> coroutine::task<transport::call_result<jobs::build_report>> {
+            auto close = jobs::analysis_exchange::lifetime{inputs};
+            tasks.spawn(serve());
+            if constexpr (std::same_as<Request, jobs::staged_analysis>)
+                co_return co_await transport::staged(channel, request, progress, inputs);
+            else
+                co_return co_await channel.call(request, progress, inputs);
+        };
+        co_return co_await coroutine::with_scope(std::move(run));
+    }
+
     template <class F>
-    void exercise(F work, std::optional<std::filesystem::path> dependency_cache = {}, std::optional<std::filesystem::path> dependency_upstream = {},
-                  std::optional<std::filesystem::path> dependency_publish = {}, std::optional<builds::dependency_recipe> recipe = {}) {
-        test::scratch tmp{"executor"};
+    void exercise_at(std::filesystem::path root, F work, std::optional<std::filesystem::path> dependency_cache = {},
+                     std::optional<std::filesystem::path> dependency_upstream = {}, std::optional<std::filesystem::path> dependency_publish = {},
+                     std::optional<builds::dependency_recipe> recipe = {}, std::optional<std::uint64_t> memory_bytes = {}) {
         cores::io_context<native::context> rt{2};
         execution::thread_pool disk{2};
         replica::service service{rt,
-                                 {.root = tmp.dir / "cache",
+                                 {.root = root / "cache",
                                   .worker = "worker-test",
                                   .env = {{"VALUE", "worker"}},
                                   .inherit_env = false,
+                                  .memory_bytes = memory_bytes,
                                   .dependency_cache = dependency_cache,
                                   .dependency_upstream = dependency_upstream,
                                   .dependency_publish = dependency_publish,
@@ -53,31 +111,106 @@ namespace {
             auto run_operation = [&]() -> coroutine::task<> {
                 auto listener = native::listener{io, {net::ip::address_v4::loopback(), 0}};
                 auto run_tasks = [&](coroutine::scope& tasks) -> coroutine::task<> {
-                    static constexpr auto run_child = [](ctx& io, auto& listener, auto& service, coroutine::scope& tasks) -> coroutine::task<> {
+                    static constexpr auto run_child = [](ctx& io, auto& listener, auto& service) -> coroutine::task<> {
                         auto [socket, endpoint] = co_await net::async_accept(listener);
                         transport::channel<native::socket> channel{socket};
                         transport::dispatcher<native::socket> dispatch;
                         service.install(dispatch, 0);
-                        for (;;)
-                            tasks.spawn(dispatch.handle(channel, co_await channel.recv()));
+                        auto serve = [&](coroutine::scope& requests) -> coroutine::task<> {
+                            co_await channel.pump([&](const transport::frame& frame) { requests.spawn(dispatch.handle(channel, frame)); });
+                        };
+                        co_await coroutine::with_scope(serve);
                     };
-                    tasks.spawn(run_child(io, listener, service, tasks));
+                    tasks.spawn(run_child(io, listener, service));
                     auto socket = co_await io::connect(io, {net::ip::address_v4{{127, 0, 0, 1}}, listener.local_endpoint().port()});
                     transport::channel<native::socket> channel{socket};
                     auto run_pump = [&](coroutine::scope& pump) -> coroutine::task<> {
                         pump.spawn(channel.pump([](const transport::frame&) {}));
-                        if constexpr (std::invocable<F&, decltype(channel)&, decltype(tmp.dir)&, replica::service&, ctx&>)
-                            co_await work(channel, tmp.dir, service, io);
-                        else if constexpr (std::invocable<F&, decltype(channel)&, decltype(tmp.dir)&, replica::service&>)
-                            co_await work(channel, tmp.dir, service);
+                        if constexpr (std::invocable<F&, decltype(channel)&, decltype(root)&, replica::service&, ctx&>)
+                            co_await work(channel, root, service, io);
+                        else if constexpr (std::invocable<F&, decltype(channel)&, decltype(root)&, replica::service&>)
+                            co_await work(channel, root, service);
                         else
-                            co_await work(channel, tmp.dir);
+                            co_await work(channel, root);
                     };
                     co_await coroutine::with_scope(std::move(run_pump));
                 };
                 co_await coroutine::with_scope(std::move(run_tasks));
             };
             co_await service.run(0, run_operation());
+        };
+        rt.run(std::move(run_core));
+    }
+
+    template <class F>
+    void exercise(F work, std::optional<std::filesystem::path> dependency_cache = {}, std::optional<std::filesystem::path> dependency_upstream = {},
+                  std::optional<std::filesystem::path> dependency_publish = {}, std::optional<builds::dependency_recipe> recipe = {},
+                  std::optional<std::uint64_t> memory_bytes = {}) {
+        test::scratch tmp{"executor"};
+        exercise_at(tmp.dir, std::move(work), std::move(dependency_cache), std::move(dependency_upstream), std::move(dependency_publish),
+                    std::move(recipe), memory_bytes);
+    }
+
+    // An execute service beside the front, with a controllable lifecycle and memory report.
+    struct execute_beside final : replica::execute_side {
+        std::filesystem::path dir;
+        transport::channel<native::stream_view>* chan = nullptr;
+        jobs::worker_memory reported_memory{.resident = 0, .baseline = 0};
+        std::size_t opens = 0;
+        bool running = true;
+        auto root() const -> const std::filesystem::path& override { return dir; }
+        auto memory() const -> jobs::worker_memory override { return reported_memory; }
+        auto open() -> coroutine::task<replica::execute_link> override {
+            ++opens;
+            if (!running)
+                throw std::runtime_error("the execute role is stopped");
+            co_return replica::execute_link{*chan, nullptr};
+        }
+    };
+
+    // Runs `work` against a Worker whose execute role is a second service with its own root.
+    template <class F> void beside(F work, std::optional<std::uint64_t> memory_bytes = {}) {
+        test::scratch tmp{"executor-beside"};
+        cores::io_context<native::context> rt{1};
+        execution::thread_pool disk{2};
+        replica::service execute{rt, {.root = tmp.dir / "execute", .worker = "worker-execute", .inherit_env = false}, disk};
+        replica::service front{rt, {.root = tmp.dir / "cache", .worker = "worker-test", .inherit_env = false, .memory_bytes = memory_bytes}, disk};
+        execute_beside side;
+        side.dir = tmp.dir / "execute";
+        front.set_execute(side);
+        auto run_core = [&](ctx& io, std::size_t) -> coroutine::task<> {
+            auto run_operation = [&]() -> coroutine::task<> {
+                auto to_execute = native::listener{io, {net::ip::address_v4::loopback(), 0}};
+                auto to_front = native::listener{io, {net::ip::address_v4::loopback(), 0}};
+                auto run_tasks = [&](coroutine::scope& tasks) -> coroutine::task<> {
+                    static constexpr auto run_child = [](auto& listener, auto& service) -> coroutine::task<> {
+                        auto [socket, endpoint] = co_await net::async_accept(listener);
+                        transport::channel<native::socket> channel{socket};
+                        transport::dispatcher<native::socket> dispatch;
+                        service.install(dispatch, 0, true);
+                        auto serve = [&](coroutine::scope& requests) -> coroutine::task<> {
+                            co_await channel.pump([&](const transport::frame& frame) { requests.spawn(dispatch.handle(channel, frame)); });
+                        };
+                        co_await coroutine::with_scope(serve);
+                    };
+                    tasks.spawn(run_child(to_execute, execute));
+                    tasks.spawn(run_child(to_front, front));
+                    auto execute_socket = co_await io::connect(io, {net::ip::address_v4{{127, 0, 0, 1}}, to_execute.local_endpoint().port()});
+                    native::stream_view execute_stream{execute_socket};
+                    transport::channel<native::stream_view> execute_channel{execute_stream};
+                    side.chan = &execute_channel;
+                    auto socket = co_await io::connect(io, {net::ip::address_v4{{127, 0, 0, 1}}, to_front.local_endpoint().port()});
+                    transport::channel<native::socket> channel{socket};
+                    auto run_pump = [&](coroutine::scope& pump) -> coroutine::task<> {
+                        pump.spawn(execute_channel.pump([](const transport::frame&) {}));
+                        pump.spawn(channel.pump([](const transport::frame&) {}));
+                        co_await work(channel, tmp.dir, front, side, io);
+                    };
+                    co_await coroutine::with_scope(std::move(run_pump));
+                };
+                co_await coroutine::with_scope(std::move(run_tasks));
+            };
+            co_await front.run(0, execute.run(0, run_operation()));
         };
         rt.run(std::move(run_core));
     }
@@ -101,11 +234,11 @@ namespace {
     static constexpr auto cases = [] {
         "dependency RPC rejects oversized payloads and undeclared registry fields before execution"_test = [] {
             jobs::dependency_fill valid{.manifest = builds::dependency_manifest(R"({"dependencies":["fmt",{"name":"zlib","features":["core"]}]})")};
-            expect(rfl::json::write(transport::codec<jobs::dependency_fill>::decode(transport::codec<jobs::dependency_fill>::encode(valid))) ==
-                   rfl::json::write(valid));
+            expect(json::write(transport::codec<jobs::dependency_fill>::decode(transport::codec<jobs::dependency_fill>::encode(valid))) ==
+                   json::write(valid));
             std::vector<std::byte> oversized(constants::dependency_request_bytes + 1);
             expect(throws<std::invalid_argument>([&] { transport::codec<jobs::dependency_fill>::decode(oversized); }));
-            auto text = rfl::json::write(jobs::dependency_fill{});
+            auto text = json::write(jobs::dependency_fill{});
             text.insert(1, "\"vcpkg-configuration\":{},");
             expect(throws([&] { transport::codec<jobs::dependency_fill>::decode(std::as_bytes(std::span{text})); }));
         };
@@ -243,6 +376,29 @@ set(VCPKG_ENV_PASSTHROUGH_UNTRACKED PROBE_LEDGER)
                 durability::dir_lock unlocked{published / "vcpkg", "publisher released"};
             };
             exercise(std::move(run_operation), cache, {}, published, recipe);
+        };
+        "a cross-compiling publisher requires both target and host selections"_test = [] {
+            test::scratch tmp{"publisher-triplets"};
+            auto recipe = recipe_script(tmp.dir, "printf '%s\\n' \"$@\"");
+            recipe.triplets = {"arm64-android", "x64-linux"};
+            auto run = [](auto& channel, auto&) -> coroutine::task<> {
+                expect(!(co_await channel.call(jobs::dependency_fill{})).has_value());
+                expect(!(co_await channel.call(jobs::dependency_fill{.triplet = "arm64-android"})).has_value());
+                expect(!(co_await channel.call(jobs::dependency_fill{.host_triplet = "x64-linux"})).has_value());
+                auto reply = co_await channel.call(jobs::dependency_fill{.triplet = "arm64-android", .host_triplet = "x64-linux"});
+                expect(reply.has_value() >> fatal);
+                expect(reply->ok() && reply->steps.front().output.contains("--triplet=arm64-android") &&
+                       reply->steps.front().output.contains("--host-triplet=x64-linux"));
+            };
+            exercise(run, tmp.dir / "private", {}, tmp.dir / "published", recipe);
+            recipe.triplets = {"x64-linux"};
+            auto single = [](auto& channel, auto&) -> coroutine::task<> {
+                auto reply = co_await channel.call(jobs::dependency_fill{});
+                expect(reply.has_value() >> fatal);
+                expect(reply->ok() && reply->steps.front().output.contains("--triplet=x64-linux") &&
+                       reply->steps.front().output.contains("--host-triplet=x64-linux"));
+            };
+            exercise(single, tmp.dir / "single-private", {}, tmp.dir / "single-published", recipe);
         };
         "worker binds a read-only upstream and never locks it"_test = [] {
             test::scratch shared{"dependency-upstream"};
@@ -388,6 +544,11 @@ set(VCPKG_ENV_PASSTHROUGH_UNTRACKED PROBE_LEDGER)
         };
         "workers bind the shared dependency cache outside fresh checkout trees"_test = [] {
             test::scratch shared{"dependency-cache"};
+            const auto old = shared.dir / "vcpkg/aa" / (std::string(64, 'a') + ".zip");
+            const auto recent = shared.dir / "vcpkg/bb" / (std::string(64, 'b') + ".zip");
+            test::spit(old, "expired");
+            test::spit(recent, "retained");
+            std::filesystem::last_write_time(old, std::filesystem::file_time_type::clock::now() - std::chrono::days{31});
             for (int worker = 0; worker < 2; ++worker) {
                 auto run_operation = [&](auto& channel, auto&) -> coroutine::task<> {
                     content::manifest tree;
@@ -407,6 +568,7 @@ set(VCPKG_ENV_PASSTHROUGH_UNTRACKED PROBE_LEDGER)
                     expect(result.has_value() >> fatal);
                     expect(result->ok() && result->steps.front().output == "compiled");
                     expect(test::slurp(shared.dir / "vcpkg/package") == "compiled");
+                    expect(!std::filesystem::exists(old) && test::slurp(recent) == "retained");
                 };
                 exercise(std::move(run_operation), shared.dir);
             }
@@ -435,6 +597,25 @@ set(VCPKG_ENV_PASSTHROUGH_UNTRACKED PROBE_LEDGER)
                     const auto& part = bytes->parts.at(0);
                     expect(std::string(reinterpret_cast<const char*>(part.bytes.data()), part.bytes.size()) == expected[index]);
                 }
+                // Both declared tasks share one managed process. A failed batch
+                // keeps its real task names and full log instead of inventing
+                // independent task outcomes or losing the earlier task's output.
+                const std::string command = "for task do printf '%s\\n' \"$task\"; test \"$task\" != failed || exit 7; done";
+                auto batched = co_await channel.call(jobs::build_request{
+                    .project = "app",
+                    .snapshot = tree.id(),
+                    .steps = {{.name = "first", .argv = {test::shell(), "-c", command, "batch", "first"}, .preparation = true, .batch_prefix = 4},
+                              {.name = "failed", .argv = {test::shell(), "-c", command, "batch", "failed"}, .preparation = true, .batch_prefix = 4}},
+                    .output_limit = 4});
+                expect((batched && batched->steps.size() == 1u) >> fatal);
+                const auto& batch = batched->steps.front();
+                expect(!batched->ok() && batch.exit_code == 7 && batch.name == "batch");
+                expect(batch.tasks == std::vector<std::string>{"first", "failed"});
+                expect(batch.log.has_value() && batch.truncated);
+                auto bytes = co_await channel.call(jobs::export_read{batch.log.value().digest});
+                expect(bytes.has_value() >> fatal);
+                const auto& part = bytes->parts.at(0);
+                expect(std::string(reinterpret_cast<const char*>(part.bytes.data()), part.bytes.size()) == "first\nfailed\n");
             };
             exercise(run_operation);
         };
@@ -451,6 +632,73 @@ set(VCPKG_ENV_PASSTHROUGH_UNTRACKED PROBE_LEDGER)
                 expect(failed.exit_code == 7 && failed.output == "kept" && !failed.log_error.empty()) << failed.exit_code << failed.output << failed.log_error;
             };
             rt.run(std::move(run_core));
+        };
+
+        "a model survives its producer and installs missing objects once on another worker"_test = [] {
+            test::scratch gateway{"model-gateway"};
+            const auto hash = content::hash_of("library");
+            projectmodel::document model{
+                .producer = "test",
+                .producer_version = "current",
+                .units = {{.id = "main",
+                           .project = "app",
+                           .language = "kotlin",
+                           .directory = ".",
+                           .references = {projectmodel::artifact_reference{.object = {hash.str(), "library.jar"}, .role = "classpath"}}}}};
+            const auto text = json::write(model);
+            builds::exported_file exported;
+            auto produce = [&](auto& channel, auto& root) -> coroutine::task<> {
+                content::manifest tree{{entry("model.json", text)}};
+                co_await channel.call(jobs::sync_offer{"app", tree});
+                co_await channel.call(jobs::source_bytes{{blob(text)}});
+                jobs::build_request request{
+                    .project = "app",
+                    .snapshot = tree.id(),
+                    .steps = {{.name = "model",
+                               .argv = {test::shell(), "-c", "mkdir -p \"$FUGHETTA_STAGING\"; printf library > \"$FUGHETTA_STAGING/" + hash.str() + "\""},
+                               .outputs = {{"model", "project_model", "model.json"}},
+                               .preparation = true}}};
+                auto report = co_await channel.call(request);
+                expect(report.has_value() >> fatal);
+                expect((report->models.size() == 1_u) >> fatal);
+                exported = report->models.front();
+                std::vector<builds::exported_object> objects = exported.objects;
+                objects.push_back({exported.digest, exported.size});
+                for (const auto& object : objects) {
+                    auto reply = co_await channel.call(jobs::export_read{object.digest});
+                    expect(reply.has_value() >> fatal);
+                    delivery::accept(gateway.dir, reply->parts.at(0));
+                }
+                delivery::retain_model(gateway.dir, exported.digest);
+                expect(!std::filesystem::exists(root / "cache/artifacts/objects"));
+            };
+            exercise(produce);
+            auto consume = [&](auto& channel, auto& root, replica::service&, ctx& io) -> coroutine::task<> {
+                content::manifest tree{{entry("model.json", text)}};
+                co_await channel.call(jobs::sync_offer{"app", tree});
+                co_await channel.call(jobs::source_bytes{{blob(text)}});
+                std::size_t reads = 0;
+                auto fetch = [&](jobs::model_read request) -> jobs::source_bytes {
+                    expect(request.model == exported.digest && request.parent != 0_u);
+                    ++reads;
+                    return delivery::read(gateway.dir, request.object);
+                };
+                jobs::build_request request{.project = "app",
+                                            .snapshot = tree.id(),
+                                            .steps = {{.name = "consumer",
+                                                       .argv = {test::shell(), "-c", "test -z \"$FUGHETTA_STAGING$FUGHETTA_SDKS\""},
+                                                       .inputs = {{"model", "project_model", "model.json"}}}},
+                                            .measure = {{"model", "project_model", "model.json"}}};
+                for (int attempt = 0; attempt < 2; ++attempt) {
+                    auto report = co_await analysis_call(channel, io, request, record_checks{.model = fetch});
+                    expect(report.has_value() >> fatal);
+                    expect(report->ok() && report->measured.size() == 1_u);
+                }
+                expect(reads == 1_u);
+                expect(test::slurp(root / "cache/exports" / hash.view()) == "library");
+                expect(delivery::references(root / "cache/exports", exported.digest).size() == 1_u);
+            };
+            exercise(consume);
         };
 
         "worker exports remain readable after the hot tree changes"_test = [] {
@@ -491,6 +739,43 @@ set(VCPKG_ENV_PASSTHROUGH_UNTRACKED PROBE_LEDGER)
             };
             exercise(run_operation);
         };
+        "a fork reuses its parent build directories after a worker restarts"_test = [] {
+            test::scratch tmp{"executor-retained-tree"};
+            std::optional<content::hash> parent_snapshot;
+            auto run_operation = [&](auto& channel, const auto& root, replica::service& service, ctx&) -> coroutine::task<> {
+                const bool child = parent_snapshot.has_value();
+                service.set_runtime({.id = child ? "second-installation" : "first-installation",
+                                     .platform = "platform",
+                                     .executables = {{toolchain::tool_path(test::shell()), "shell-object"},
+                                                     {"/tools/unrelated", child ? "second-tool" : "first-tool"}}});
+                const auto text = child ? "child" : "parent";
+                content::manifest tree{{entry("source.txt", text)}};
+                const auto offer = co_await channel.call(jobs::sync_offer{"app", tree});
+                expect(offer.has_value() >> fatal);
+                co_await channel.call(jobs::source_bytes{{blob(text)}});
+                jobs::build_request request{
+                    .project = "app",
+                    .snapshot = offer->snapshot,
+                    .tree = child ? "pool-1" : "pool-0",
+                    .steps = {{.name = "build", .argv = {test::shell(), "-c",
+                        "mkdir -p build/nested && if [ ! -f build/cache ]; then cat source.txt > build/cache; fi"
+                        " && cat source.txt > build/nested/record"}}},
+                    .relocatable_build_dirs = {"build/nested", "build"},
+                    .parent_snapshot = parent_snapshot};
+                const auto report = co_await channel.call(request);
+                expect((report.has_value() && report->ok()) >> fatal);
+                if (!child) {
+                    parent_snapshot = offer->snapshot;
+                    co_return;
+                }
+                const auto trees = root / "cache/trees/app";
+                expect(test::slurp(trees / "pool-1/build/cache") == "parent");
+                expect(test::slurp(trees / "pool-1/build/nested/record") == "child");
+                expect(test::slurp(trees / "pool-0/build/nested/record") == "parent");
+            };
+            exercise_at(tmp.dir, run_operation);
+            exercise_at(tmp.dir, run_operation);
+        };
         "a checkout writes what changed and keeps build outputs"_test = [] {
             test::scratch tmp{"replica"};
             replica::store s{tmp.dir};
@@ -507,16 +792,77 @@ set(VCPKG_ENV_PASSTHROUGH_UNTRACKED PROBE_LEDGER)
             expect(dir == tmp.dir / "trees/app/default");
             expect(test::slurp(dir / "src/a.txt") == "a1");
             expect(durability::is_executable(dir / "bin/run.sh"));
-            test::spit(dir / "build.out", "made by the build");
+            std::filesystem::create_directories(dir / "build");
+            const auto built = std::string(2u << 20, 'p') + "tail\n";
+            test::spit(dir / "build/output", built);
+            test::spit(dir / "build/settings", "build options");
 
             content::manifest v2{{entry("bin/run.sh", "#!/bin/sh\n", true), entry("src/a.txt", "a2")}};
             auto plan2 = s.offer({"app", v2});
             expect(plan2.missing == std::vector<content::hash>{content::hash_of("a2")});
             s.put({{blob("a2")}});
+            const auto child = s.checkout("app", plan2.snapshot, "fork", "app/default", {"build"});
+            expect(test::slurp(child / "src/a.txt") == "a2");
+            expect(!std::filesystem::exists(child / "src/old.txt"));
+            expect(test::slurp(child / "build/output") == built);
+            expect(test::slurp(child / "build/settings") == "build options");
+            {
+                std::fstream output{child / "build/output", std::ios::in | std::ios::out | std::ios::binary};
+                output.put('c');
+                output.close();
+                expect(output.good());
+            }
+            expect(test::slurp(child / "build/output") == "c" + built.substr(1));
+            expect(test::slurp(dir / "build/output") == built);
             s.checkout("app", plan2.snapshot);
             expect(test::slurp(dir / "src/a.txt") == "a2");
             expect(!std::filesystem::exists(dir / "src/old.txt"));
-            expect(std::filesystem::exists(dir / "build.out"));
+            expect(std::filesystem::exists(dir / "build/output"));
+        };
+
+        "generated contributions survive restart, retract per producer and recover interrupted writes"_test = [] {
+            test::scratch tmp{"generated-ownership"};
+            content::manifest source{{entry("source.txt", "source")}};
+            const builds::generation first{.producer = "native/first", .outputs = {{"headers", "directory", "generated", "directory"}}};
+            auto second = first;
+            second.producer = "native/second";
+            {
+                replica::store store{tmp.dir};
+                store.offer({"app", source});
+                store.put({{blob("source")}});
+                auto dir = store.checkout("app", source.id());
+                store.begin_generation("app", "", first);
+                test::spit(dir / "generated/old.hpp", "old");
+                store.commit_generation("app", "", first, {"generated/old.hpp"});
+                store.begin_generation("app", "", second);
+                test::spit(dir / "generated/retained.hpp", "retained");
+                store.commit_generation("app", "", second, {"generated/retained.hpp"});
+            }
+            {
+                replica::store store{tmp.dir};
+                store.offer({"app", source});
+                auto dir = store.checkout("app", source.id());
+                expect(store.generated_inputs("app", "").size() == 2u);
+                store.begin_generation("app", "", first);
+                store.commit_generation("app", "", first, {});
+                expect(!std::filesystem::exists(dir / "generated/old.hpp") && test::slurp(dir / "generated/retained.hpp") == "retained");
+                expect(store.generated_inputs("app", "").size() == 1u);
+                store.begin_generation("app", "", first);
+                test::spit(dir / "generated/old.hpp", "returned");
+                store.commit_generation("app", "", first, {"generated/old.hpp"});
+                store.reconcile_generations("app", "", {second.producer});
+                expect(!std::filesystem::exists(dir / "generated/old.hpp") && test::slurp(dir / "generated/retained.hpp") == "retained" &&
+                       store.generated_inputs("app", "").size() == 1u);
+
+                store.begin_generation("app", "", first);
+                test::spit(dir / "generated/partial.hpp", "incomplete");
+            }
+            {
+                replica::store store{tmp.dir};
+                store.offer({"app", source});
+                auto dir = store.checkout("app", source.id());
+                expect(test::slurp(dir / "source.txt") == "source" && !std::filesystem::exists(dir / "generated") && store.generated_inputs("app", "").empty());
+            }
         };
 
         "detached build trees can be reclaimed without changing a replacement tree"_test = [] {
@@ -658,6 +1004,7 @@ set(VCPKG_ENV_PASSTHROUGH_UNTRACKED PROBE_LEDGER)
             s.collect({"app/busy"});
             expect(std::filesystem::exists(s.tree("app/busy") / "a")) << "a build holds it";
             expect(!std::filesystem::exists(s.tree("app/idle")));
+            expect(s.slots().size() == 1u && s.slots().front().project == "app" && s.slots().front().tree == "busy");
             expect(std::filesystem::is_empty(tmp.dir / "blobs" / "partial"));
         };
 
@@ -718,8 +1065,103 @@ set(VCPKG_ENV_PASSTHROUGH_UNTRACKED PROBE_LEDGER)
             exercise(run_operation);
         };
 
-        "a hot directory keeps its language process across source changes and builds"_test = [] {
-            static constexpr auto run_operation = [](auto& channel, const auto& root, replica::service& service) -> coroutine::task<> {
+        "separate roles retain hot trees across execute collection and account for both processes"_test = [] {
+            static constexpr auto run_operation = [](auto& channel, const auto& root, replica::service& front, execute_beside& side,
+                                                     ctx& io) -> coroutine::task<> {
+                const std::string python = std::getenv("TEST_PYTHON") ? std::getenv("TEST_PYTHON") : "/usr/bin/python3";
+                front.set_runtime({.id = "lsp-runtime", .platform = "platform-object", .executables = {{python, "python-object"}}});
+                auto script = root / "language.py";
+                test::spit(script, R"python(
+import json, os, sys
+with open(os.path.join(os.path.dirname(__file__), "observed"), "w", newline="\n") as f:
+    f.write(os.environ.get("SECRET", "no-secret") + " " + os.getcwd())
+while True:
+    length = 0
+    while True:
+        line = sys.stdin.buffer.readline()
+        if not line: sys.exit(0)
+        if not line.strip(): break
+        if line.lower().startswith(b"content-length:"): length = int(line.split(b":")[1])
+    m = json.loads(sys.stdin.buffer.read(length))
+    if "id" not in m: continue
+    result = None
+    if m.get("method") == "initialize": result = {"capabilities": {"diagnosticProvider": True}}
+    if m.get("method") == "textDocument/diagnostic":
+        result = {"kind": "full", "items": [{"range": {"start":{"line":0,"character":0}, "end":{"line":0,"character":1}}, "message":"seen"}]}
+    body = json.dumps({"jsonrpc":"2.0", "id":m["id"], "result":result}).encode()
+    sys.stdout.buffer.write(b"Content-Length: %d\r\n\r\n" % len(body) + body)
+    sys.stdout.buffer.flush()
+)python");
+                content::manifest tree{{entry("a.py", "x = 1")}};
+                expect((co_await channel.call(jobs::sync_offer{"app", tree})).has_value());
+                expect((co_await channel.call(jobs::source_bytes{{blob("x = 1")}})).has_value());
+                expect(side.opens == 2_u && !std::filesystem::exists(root / "cache/trees/app")) << "sources reach the execute role";
+                jobs::staged_analysis request{.preparation = {.project = "app",
+                                                              .tree = "beside",
+                                                              .snapshot = tree.id(),
+                                                              .steps = {{.name = "prepare", .argv = {test::shell(), "-c", "printf $SECRET > prepared"}}},
+                                                              .preparation_tasks = {{.name = "prepare", .first_step = 0, .step_count = 1}},
+                                                              .timeout_s = 10,
+                                                              .env = {{"SECRET", "project-secret"}}},
+                                              .analysis = jobs::analysis_plan{.provider = "ty",
+                                                                              .argv = {python, script.string()},
+                                                                              .execution = {"language-request", "language-computation", "python"},
+                                                                              .slot_id = "app/beside",
+                                                                              .demand = {.facts = {std::string{"diagnostics"}}}}};
+                std::vector<language::evaluated_unit> received;
+                auto receive = [&](language::evaluated_unit unit) -> void { received.push_back(std::move(unit)); };
+                side.reported_memory = {};
+                auto report_memory = [&]() -> coroutine::task<> {
+                    co_await execution::schedule_after(io, std::chrono::milliseconds{25});
+                    side.reported_memory = {.resident = 0, .baseline = 0};
+                };
+                std::optional<transport::call_result<jobs::build_report>> completed;
+                auto forward = [&]() -> coroutine::task<> {
+                    completed.emplace(co_await analysis_call(channel, io, request, record_checks{.unit = receive}));
+                };
+                co_await execution::when_all(forward(), report_memory());
+                auto& first = *completed;
+                expect((first && first->analyzed && !first->analysis_error) >> fatal)
+                    << (first ? first->analysis_error.value_or("") : std::get<jobs::failure>(first.error()).message);
+                expect(test::slurp(root / "execute/trees" / "app" / "beside" / "prepared") == "project-secret") << "the build ran in the execute role";
+                expect(!std::filesystem::exists(root / "cache/trees/app")) << "this process keeps no tree of its own";
+                expect(test::slurp(root / "observed") == "no-secret " + (root / "execute/trees/app/beside").make_preferred().string());
+                expect(!received.empty() && received.back().shards.front().diagnostics.front().message == "seen");
+                const auto manifest = root / "execute/trees/app/beside.manifest";
+                std::filesystem::last_write_time(manifest, std::filesystem::file_time_type::clock::now() - std::chrono::hours{24 * 30});
+                expect((co_await channel.call(jobs::source_bytes{})).has_value());
+                expect(std::filesystem::exists(manifest) && std::filesystem::exists(root / "execute/trees/app/beside/prepared"))
+                    << "execute collection preserves the front's preparation and live language session";
+                side.reported_memory = {.reserved = 4096, .resident = 8192, .baseline = 4096};
+                auto combined = co_await front.status(0);
+                expect(combined.memory.reserved == 4096 && combined.memory.resident && *combined.memory.resident >= 8192);
+                side.reported_memory = {.resident = 0, .baseline = 0};
+                const auto opened = side.opens;
+                side.running = false;
+                auto stopped = co_await analysis_call(channel, io, request, record_checks{.unit = receive});
+                expect(stopped && stopped->analyzed && stopped->steps.empty()) << "an unchanged preparation answers while the execute role is stopped";
+                expect(side.opens == opened);
+                auto loading = request;
+                loading.analysis.project_code = true;
+                auto refused = co_await analysis_call(channel, io, loading, record_checks{.unit = receive});
+                expect(!refused && side.opens == opened + 1) << "an analysis that runs project code needs the execute role";
+                side.running = true;
+                auto outside = request;
+                outside.analysis.argv = {test::shell(), "-c", "true"};
+                outside.analysis.execution.stage_id = "outside";
+                auto foreign = co_await analysis_call(channel, io, outside, record_checks{.unit = receive});
+                expect(foreign && foreign->analysis_error) << "an executable outside the startup inventory does not start here";
+            };
+            beside(run_operation, 8ull << 30);
+        };
+
+        "a hot directory keeps stage sessions across source changes and retires them together"_test = [] {
+            static constexpr auto run_operation = [](auto& channel, const auto& root, replica::service& service, ctx& io) -> coroutine::task<> {
+                const std::string python = std::getenv("TEST_PYTHON") ? std::getenv("TEST_PYTHON") : "/usr/bin/python3";
+                toolchain::identity runtime{.id = "lsp-runtime",
+                                            .platform = "platform-object",
+                                            .executables = {{python, "python-object"}, {"/tools/unrelated", "unrelated-object"}}};
+                service.set_runtime(runtime);
                 auto script = root / "language.py";
                 test::spit(script, R"python(
 import json, os, sys
@@ -749,44 +1191,124 @@ while True:
                 content::manifest first{{entry("a.py", "x = 1")}};
                 expect((co_await channel.call(jobs::sync_offer{"app", first})).has_value());
                 expect((co_await channel.call(jobs::source_bytes{{blob("x = 1")}})).has_value());
-                jobs::build_request request{
-                    .project = "app",
-                    .tree = "hot-language",
-                    .snapshot = first.id(),
-                    .steps = {{.name = "prepare", .argv = {test::shell(), "-c", "printf preparation-output"}}},
-                    .timeout_s = 5,
-                    .output_limit = 4,
-                    .survey = jobs::survey{.provider = "ty",
-                                           .argv = {std::getenv("TEST_PYTHON") ? std::getenv("TEST_PYTHON") : "/usr/bin/python3", script.string()}}};
-                auto initial = co_await channel.call(request);
-                expect((initial && initial->outline) >> fatal);
+                jobs::staged_analysis request{
+                    .preparation = {.project = "app",
+                                    .tree = "hot-language",
+                                    .snapshot = first.id(),
+                                    .steps = {{.name = "prepare", .argv = {test::shell(), "-c", "printf preparation-output"}}},
+                                    .preparation_tasks = {{.name = "prepare", .first_step = 0, .step_count = 1}},
+                                    .timeout_s = 5,
+                                    .output_limit = 4,
+                                    .max_memory_bytes = 64ull << 20},
+                    .analysis = jobs::analysis_plan{.provider = "ty",
+                                                    .argv = {std::getenv("TEST_PYTHON") ? std::getenv("TEST_PYTHON") : "/usr/bin/python3", script.string()},
+                                                    .execution = {"language-request", "language-computation", "python"},
+                                                    .slot_id = "app/hot-language",
+                                                    .demand = {.facts = {std::string{"diagnostics"}}}}};
+                std::vector<language::evaluated_unit> received;
+                auto receive = [&](language::evaluated_unit unit) -> void {
+                    received.push_back(std::move(unit));
+                    return;
+                };
+                auto initial = co_await analysis_call(channel, io, request, record_checks{.unit = receive});
+                expect((initial && initial->analyzed && initial->analysis_session) >> fatal);
+                expect(initial->analysis_session->epoch == 1u && initial->analysis_session->snapshot == first.id().str() &&
+                       initial->analysis_session->phase == "ready");
                 expect(initial->steps.at(0).truncated && !initial->steps.at(0).log);
-                expect(initial->outline->diagnostics.front().message == "x = 1");
+                expect(received.back().shards.front().diagnostics.front().message == "x = 1");
+                expect(received.back().shards.front().unit.coverage.available.front().facts == std::vector<semantic::fact_kind>{std::string{"diagnostics"}});
                 auto invalid = request;
-                invalid.survey->query = {.action = "definitions", .path = "a.py", .symbol = "missing"};
-                auto refused = co_await channel.call(invalid);
-                expect(refused && refused->survey_error && refused->survey_error_code == "invalid_record");
-                auto valid = co_await channel.call(request);
-                expect(valid && valid->outline);
+                invalid.analysis.query = {.action = std::string{"definitions"},
+                                          .selector = semantic::selection{.name = semantic::named{.text = "missing", .path = "a.py"}}};
+                auto refused = co_await analysis_call(channel, io, invalid, record_checks{.unit = receive});
+                expect(refused && refused->analysis_error && refused->analysis_error_code == "invalid_record");
+                auto valid = co_await analysis_call(channel, io, request, record_checks{.unit = receive});
+                expect((valid && valid->analyzed && valid->analysis_session) >> fatal);
+                expect(valid->analysis_session->id == initial->analysis_session->id && valid->analysis_session->epoch == initial->analysis_session->epoch);
                 expect(test::slurp(root / "starts") == "start\n") << "a selection error keeps the warm language process";
-                auto build = request;
-                build.survey.reset();
+                auto sibling = request;
+                sibling.analysis.execution.stage_id = "review";
+                sibling.analysis.options = "python-review";
+                auto review = co_await analysis_call(channel, io, sibling, record_checks{.unit = receive});
+                expect((review && review->analyzed && review->analysis_session) >> fatal);
+                expect(review->analysis_session->id != initial->analysis_session->id && review->analysis_session->slot == initial->analysis_session->slot);
+                expect(review->steps.empty()) << "a sibling stage reuses completed preparation tasks";
+                auto build = request.preparation;
+                build.preparation_tasks.clear();
                 build.output_limit = 1024;
                 build.steps = {{.name = "build", .argv = {test::shell(), "-c", "echo built > artifact"}}};
                 expect((co_await channel.call(build))->ok());
+                auto rebuilt = co_await analysis_call(channel, io, request, record_checks{.unit = receive});
+                expect(rebuilt && rebuilt->steps.size() == 1u) << "an intervening build invalidates preparation receipts";
+                jobs::analysis_request direct{.project = "app",
+                                              .tree = "hot-language",
+                                              .snapshot = first.id(),
+                                              .inputs = rebuilt->inputs.value().id(),
+                                              .timeout_s = 5,
+                                              .max_memory_bytes = request.preparation.max_memory_bytes,
+                                              .analysis = request.analysis};
+                auto named = co_await analysis_call(channel, io, direct, record_checks{.unit = receive});
+                expect(named && named->analyzed && named->steps.empty()) << "an analysis runs on the inputs its preparation reported";
+                const auto writable = std::filesystem::perms::owner_write | std::filesystem::perms::group_write | std::filesystem::perms::others_write;
+                std::vector<std::filesystem::path> prepared_tree{named->tree};
+                for (const auto& entry : std::filesystem::recursive_directory_iterator{named->tree})
+                    prepared_tree.push_back(entry.path());
+                for (const auto& path : prepared_tree)
+                    std::filesystem::permissions(path, writable, std::filesystem::perm_options::remove);
+                auto reading = co_await analysis_call(channel, io, direct, record_checks{.unit = receive});
+                for (const auto& path : prepared_tree)
+                    std::filesystem::permissions(path, std::filesystem::perms::owner_write, std::filesystem::perm_options::add);
+                expect(reading && reading->analyzed && !reading->analysis_error) << "an analysis writes nothing into the tree it reads";
+                expect((co_await channel.call(build))->ok());
+                auto stale = co_await analysis_call(channel, io, direct, record_checks{.unit = receive});
+                expect(!stale && std::get<jobs::failure>(stale.error()).code == "stale_inputs") << "a build since the preparation withdraws its inputs";
+                rebuilt = co_await analysis_call(channel, io, request, record_checks{.unit = receive});
+                expect(rebuilt && rebuilt->steps.size() == 1u);
                 content::manifest second{{entry("a.py", "x = 2")}};
                 expect((co_await channel.call(jobs::sync_offer{"app", second})).has_value());
                 expect((co_await channel.call(jobs::source_bytes{{blob("x = 2")}})).has_value());
-                request.snapshot = second.id();
-                auto updated = co_await channel.call(request);
-                expect((updated && updated->outline) >> fatal);
-                expect(updated->outline->diagnostics.front().message == "x = 2");
-                expect(test::slurp(root / "starts") == "start\n") << "the language process survives the intervening build";
+                request.preparation.snapshot = second.id();
+                auto updated = co_await analysis_call(channel, io, request, record_checks{.unit = receive});
+                expect((updated && updated->analyzed && updated->analysis_session) >> fatal);
+                expect(updated->analysis_session->id == initial->analysis_session->id && updated->analysis_session->epoch == 2u &&
+                       updated->analysis_session->snapshot == second.id().str());
+                expect(received.back().shards.front().diagnostics.front().message == "x = 2");
+                auto previous = co_await analysis_call(channel, io, sibling, record_checks{.unit = receive});
+                expect((previous && previous->analysis_session) >> fatal);
+                expect(previous->analysis_session->id == review->analysis_session->id && previous->analysis_session->epoch == 1u);
+                expect(received.back().shards.front().diagnostics.front().message == "x = 1");
+                sibling.preparation.snapshot = second.id();
+                auto reviewed = co_await analysis_call(channel, io, sibling, record_checks{.unit = receive});
+                expect((reviewed && reviewed->analysis_session) >> fatal);
+                expect(reviewed->analysis_session->id == review->analysis_session->id && reviewed->analysis_session->epoch == 2u);
+                auto returned = co_await analysis_call(channel, io, request, record_checks{.unit = receive});
+                expect((returned && returned->analysis_session) >> fatal);
+                expect(returned->analysis_session->id == updated->analysis_session->id && returned->analysis_session->epoch == 2u);
+                expect(returned->steps.empty() && updated->steps.size() == 1u) << "preparation receipts follow the installed snapshot";
+                expect(received.back().shards.front().diagnostics.front().message == "x = 2");
+                expect(test::slurp(root / "starts") == "start\nstart\n") << "stage switches and a regular build preserve both language processes";
+                auto warm = co_await service.status(0);
+                expect(warm.slots.size() == 1u && warm.slots.front().sessions.size() == 2u && !warm.slots.front().busy &&
+                       std::ranges::all_of(warm.slots.front().sessions,
+                                           [&](const auto& session) { return session.snapshot == second.id().str() && session.epoch == 2u; }));
+                expect(warm.memory.limit.has_value() && warm.memory.resident.has_value() && warm.memory.baseline.has_value());
+                expect(std::ranges::all_of(warm.slots.front().sessions, [](const auto& session) {
+                    return session.usage && session.usage->resident_bytes > 0 && session.usage->processes > 0 &&
+                           session.high_water_bytes >= session.usage->resident_bytes && session.rebuild_seconds > 0;
+                })) << "warm sessions report their real child group resident memory";
                 co_await service.reclaim(0, true);
-                auto recovered = co_await channel.call(request);
-                expect((recovered && recovered->outline) >> fatal);
-                expect(recovered->outline->diagnostics.front().message == "x = 2");
-                expect(test::slurp(root / "starts") == "start\nstart\n") << "memory pressure retires the idle process and the next query recreates it";
+                auto reclaimed = co_await service.status(0);
+                expect(reclaimed.slots.size() == 1u && reclaimed.slots.front().sessions.empty())
+                    << "reclamation retains the directory but withdraws its provider sessions";
+                auto recovered = co_await analysis_call(channel, io, request, record_checks{.unit = receive});
+                expect((recovered && recovered->analyzed && recovered->analysis_session) >> fatal);
+                expect(recovered->analysis_session->id != updated->analysis_session->id && recovered->analysis_session->epoch == 1u);
+                expect(recovered->steps.size() == 1u) << "reclamation discards preparation receipts";
+                expect(received.back().shards.front().diagnostics.front().message == "x = 2");
+                auto recovered_review = co_await analysis_call(channel, io, sibling, record_checks{.unit = receive});
+                expect((recovered_review && recovered_review->analysis_session) >> fatal);
+                expect(recovered_review->analysis_session->id != reviewed->analysis_session->id && recovered_review->analysis_session->epoch == 1u);
+                expect(test::slurp(root / "starts") == "start\nstart\nstart\nstart\n") << "memory pressure retires every idle stage session";
                 expect(std::filesystem::exists(std::filesystem::path{recovered->tree} / "artifact")) << "regular builds keep generated outputs";
                 build.snapshot = second.id();
                 build.fresh = true;
@@ -794,31 +1316,394 @@ while True:
                 auto clean = co_await channel.call(build);
                 expect((clean && clean->ok()) >> fatal);
                 expect(clean->steps.front().output == "x = 2");
-                auto restarted = co_await channel.call(request);
-                expect((restarted && restarted->outline) >> fatal);
-                expect(restarted->outline->diagnostics.front().message == "x = 2");
-                expect(test::slurp(root / "starts") == "start\nstart\nstart\n") << "a clean build retires the directory's language process";
+                auto restarted = co_await analysis_call(channel, io, request, record_checks{.unit = receive});
+                expect((restarted && restarted->analyzed && restarted->analysis_session) >> fatal);
+                expect(restarted->analysis_session->id != recovered->analysis_session->id && restarted->analysis_session->epoch == 1u);
+                expect(received.back().shards.front().diagnostics.front().message == "x = 2");
+                auto restarted_review = co_await analysis_call(channel, io, sibling, record_checks{.unit = receive});
+                expect((restarted_review && restarted_review->analysis_session) >> fatal);
+                expect(restarted_review->analysis_session->id != recovered_review->analysis_session->id && restarted_review->analysis_session->epoch == 1u);
+                expect(test::slurp(root / "starts") == "start\nstart\nstart\nstart\nstart\nstart\n")
+                    << "a clean build retires all of the directory's stage sessions";
+                sibling.analysis.execution.computation_id = "next-computation";
+                auto next = co_await analysis_call(channel, io, sibling, record_checks{.unit = receive});
+                expect(next && next->steps.empty() && next->analysis_session->id == restarted_review->analysis_session->id)
+                    << "a new computation on the same snapshot reuses the preparation and the stage session";
+
+                const auto& evaluated = received.back();
+                const semantic::recipe recipe{evaluated.request.unit, evaluated.session.options};
+                auto saved_unit = evaluated.shards.front().unit;
+                saved_unit.coverage = {.requested = sibling.analysis.demand, .available = {sibling.analysis.demand}};
+                sibling.analysis.candidates = {{.id = "saved-python-unit", .recipe = recipe, .units = {saved_unit}, .nodes = 1}};
+                auto validate = [&](jobs::reuse_request input) -> jobs::reuse_reply {
+                    semantic::source_vector sources;
+                    for (const auto& file : second.files)
+                        sources["app"].emplace(file.path, file.digest.str());
+                    reuse::channel_values channels;
+                    const auto validators =
+                        language::providers::dispatch(input.session.provider, []<class Provider> { return language::input_validators<Provider>(); });
+                    reuse::environment current{sources, input.inputs, channels, "app", validators, {}, std::move(input.processes)};
+                    jobs::reuse_reply reply;
+                    for (const auto& candidate : sibling.analysis.candidates)
+                        if (reuse::accept(candidate, input.session, sibling.analysis.demand, current))
+                            reply.accepted.push_back({candidate.id, semantic::recipe_identifier(candidate.recipe)});
+                    return reply;
+                };
+                runtime.id = "lsp-unrelated-changed";
+                runtime.executables["/tools/unrelated"] = "unrelated-changed";
+                service.set_runtime(runtime);
+                auto reused = co_await analysis_call(channel, io, sibling, record_checks{.unit = receive, .reuse = validate});
+                expect(reused && !reused->analysis_error && received.back().reused == std::optional<std::string>{"saved-python-unit"})
+                    << "unaffected LSP candidates survive changes to unused tools";
+                runtime.id = "lsp-python-changed";
+                runtime.executables[python] = "python-changed";
+                service.set_runtime(runtime);
+                auto reevaluated = co_await analysis_call(channel, io, sibling, record_checks{.unit = receive, .reuse = validate});
+                expect(reevaluated && !reevaluated->analysis_error && !received.back().reused && received.back().shards.front().unit.cacheable)
+                    << "the selected executable invalidates the other LSP candidates";
+                auto uncapped = sibling;
+                uncapped.preparation.max_memory_bytes.reset();
+                auto admitted = co_await analysis_call(channel, io, uncapped, record_checks{.unit = receive});
+                expect(admitted && admitted->analyzed && !admitted->analysis_error) << "an undeclared task allowance uses the whole available worker budget";
+                auto exclusive = co_await service.status(0);
+                expect(exclusive.slots.front().sessions.size() == 1u && exclusive.memory.reserved == 0_u)
+                    << "full-budget admission reclaims idle siblings and releases its reservation on completion";
+            };
+            auto usage = native_process::self_usage();
+            expect(usage.has_value() >> fatal);
+            exercise(run_operation, {}, {}, {}, {}, usage->resident_bytes + (256ull << 20));
+        };
+
+        "semantic evaluation accounts exported units and recovers after exceeding its budget"_test = [] {
+            static constexpr auto run_operation = [](auto& channel, const auto& root, replica::service& service, ctx& io) -> coroutine::task<> {
+                const std::string python = std::getenv("TEST_PYTHON") ? std::getenv("TEST_PYTHON") : "/usr/bin/python3";
+                toolchain::identity runtime{
+                    .id = "worker-runtime",
+                    .platform = "platform-object",
+                    .executables = {{python, "python-object"}, {"/tools/compiler", "compiler-object"}, {"/tools/unrelated", "unrelated-object"}},
+                    .inputs = {{.name = "sdk/native", .object = "sdk-object", .roots = {(root / "sdk").generic_string()}},
+                               {.name = "sdk/headers", .object = "headers-object", .roots = {(root / "sdk/include").generic_string()}}}};
+                service.set_runtime(runtime);
+                test::spit(root / "configurations", R"({"a.cpp":"command-a.cpp","b.cpp":"command-b.cpp"})");
+                auto script = root / "semantic.py";
+                test::spit(script, R"python(
+import json, os, sys, time
+if os.name == "posix":
+    import resource
+    assert resource.getrlimit(resource.RLIMIT_CPU)[0] == 20
+    assert resource.getrlimit(resource.RLIMIT_AS)[0] == 512 * 1024 * 1024
+def configuration(path):
+    with open("commands.json") as source: return next(entry["configuration"] for entry in json.load(source) if entry["file"] == path)
+def publication(path):
+    sdk = os.path.join(os.path.dirname(__file__), "sdk", "include")
+    return {"configurations":{"commands":{path:configuration(path)},"complete":True}, "tools":{"executables":["/tools/compiler"],"complete":True}, "column_encoding":"utf8", "complete":True,
+                  "dependencies":[path, "shared.inc", os.path.join(sdk, "header.h")] + (["external/header.h"] if path == "a.cpp" else []),
+                  "absent":[os.path.join(sdk, "optional.h")],
+                  "directories":[],
+                  "symbols":[], "occurrences":[], "scopes":[], "relations":[], "diagnostics":[], "identities":[], "typed_ranges":[], "typedRanges":[],
+                  "types":[{"id":"int", "kind":"primitive", "name":"int" + "é" * 600000, "arguments":[],
+                            "parameters":[], "qualifiers":[], "type_parameters":[], "template_arguments":[]}]}
+if len(sys.argv) > 1:
+    with open(os.path.join(os.path.dirname(__file__), "commands"), "a", newline="\n") as log: log.write(" ".join(sys.argv[1:3]) + "\n")
+    if sys.argv[2] == "project-files": result = {"result":{"files":[{"path":"a.cpp","translationUnit":True,"translationUnits":["a.cpp"],"configuration":{"a.cpp":configuration("a.cpp")}},{"path":"b.cpp","translationUnit":False,"translationUnits":[],"configuration":{"b.cpp":configuration("b.cpp")}}]},"stale":[]}
+    elif sys.argv[2] == "semantic-contributions": result = {"result":[{"path":"a.cpp","contributions":[{"key":"records","kind":"records","file":"a.cpp","value":"published-a"}]}],"stale":[]}
+    else: result = {"result":publication(sys.argv[3]),"stale":[]}
+    print(json.dumps(result))
+    sys.exit(0)
+with open(os.path.join(os.path.dirname(__file__), "semantic-starts"), "a", newline="\n") as f: f.write("start\n")
+while True:
+    length = 0
+    while True:
+        line = sys.stdin.buffer.readline()
+        if not line: sys.exit(0)
+        if not line.strip(): break
+        if line.lower().startswith(b"content-length:"): length = int(line.split(b":")[1])
+    m = json.loads(sys.stdin.buffer.read(length))
+    if "id" not in m: continue
+    result = None
+    if m.get("method") == "initialize": result = {"capabilities": {"documentSymbolProvider": True, "diagnosticProvider": {"interFileDependencies": False, "workspaceDiagnostics": False}}}
+    if m.get("method") == "clice/index":
+        with open(os.path.join(os.path.dirname(__file__), "commands"), "a", newline="\n") as log: log.write("index stdio\n")
+        result = {"failed":[]}
+    if m.get("method") == "clice/semanticExport":
+        if m["params"]["uri"].endswith("b.cpp") and os.path.exists(os.path.join(os.path.dirname(__file__), "delay")): time.sleep(10)
+        result = publication(m["params"]["uri"].rsplit("/",1)[-1])
+    if m.get("method") == "textDocument/diagnostic":
+        with open(os.path.join(os.path.dirname(__file__), "commands"), "a") as log: log.write("diagnostic " + m["params"]["textDocument"]["uri"].rsplit("/",1)[-1] + "\n")
+        result = {"kind": "full", "items": [{"range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 1}}, "severity": 1, "message": "reported"}]}
+    body = json.dumps({"jsonrpc":"2.0", "id":m["id"], "result":result}).replace("column_encoding", "columnEncoding").replace("template_arguments", "templateArguments").replace("type_parameters", "typeParameters").encode()
+    sys.stdout.buffer.write(b"Content-Length: %d\r\n\r\n" % len(body) + body)
+    sys.stdout.buffer.flush()
+)python");
+                content::manifest tree{{entry("a.cpp", "int a;"), entry("b.cpp", "int b;"), entry("shared.inc", "// shared")}};
+                expect((co_await channel.call(jobs::sync_offer{"app", tree})).has_value() >> fatal);
+                expect((co_await channel.call(jobs::source_bytes{{blob("int a;"), blob("int b;"), blob("// shared")}})).has_value() >> fatal);
+
+                jobs::staged_analysis request{
+                    .preparation =
+                        {.project = "app",
+                         .tree = "semantic-budget",
+                         .snapshot = tree.id(),
+                         .steps = {{.name = "prepare",
+                                    .argv = {python, "-c",
+                                             "import json,sys; data=json.load(open(sys.argv[1])); json.dump([dict(file=path,directory='.',command='c++ "
+                                             "'+value,configuration=value) for path,value in data.items()],open('commands.json','w'))",
+                                             (root / "configurations").string()}}},
+                         .timeout_s = 5,
+                         .max_memory_bytes = 512u * 1024 * 1024,
+                         .max_cpu_seconds = 20,
+                         .measure = {{"commands", "compilation_database", "commands.json"}}},
+                    .analysis =
+                        jobs::analysis_plan{.provider = "clice",
+                                            .options = "cpp",
+                                            .artifacts = {{"commands", "compilation_database", "commands.json"}},
+                                            .argv = {std::getenv("TEST_PYTHON") ? std::getenv("TEST_PYTHON") : "/usr/bin/python3", script.string()},
+                                            .budget = {.units = 2, .nodes = 1},
+                                            .execution = {"semantic-request", "semantic-computation", "cpp"},
+                                            .slot_id = "app/semantic-budget",
+                                            .demand = {.facts = {std::string{"types"}}},
+                                            .commands = {{"query", {python, script.string(), "query"}}}}};
+                request.analysis.initialization = *json::read<json::value>(R"({"project":{}})");
+                semantic::store stored{root / "semantic"};
+                std::vector<semantic::view_id> committed;
+                auto receive = [&](language::evaluated_unit unit) -> void {
+                    expect(unit.session.snapshot == tree.id().str() && unit.session.options == "cpp" && unit.request.execution == request.analysis.execution &&
+                           unit.request.slot_id == unit.session.slot && unit.request.demand == request.analysis.demand &&
+                           std::ranges::equal(unit.request.inputs, unit.session.inputs));
+                    const auto& contribution = unit.shards.front().unit;
+                    const auto key = json::read<language::cpp::contribution_key>(unit.request.unit.name).value();
+                    const auto& path = key.translation_unit;
+                    expect(unit.request.unit.kind == semantic::unit_kind::group);
+                    const auto source = std::ranges::find(tree.files, path, &content::entry::path);
+                    std::vector<semantic::input_object> inputs{{semantic::input_kind::provider, path, "command-" + path, "clice/configuration"},
+                                                               {semantic::input_kind::tool, "/tools/compiler", "compiler-object"}};
+                    if (key.contribution == "immediate")
+                        inputs.insert(inputs.begin(), {semantic::input_kind::file, path, source->digest.str()});
+                    else
+                        inputs.push_back({semantic::input_kind::provider, unit.request.unit.name, "published-a", "clice/contribution"});
+                    inputs.push_back({semantic::input_kind::tool, toolchain::tool_path(python), "python-object"});
+                    for (const auto& [name, value] : std::map<std::string, std::string>{{"VALUE", "worker"},
+                                                                                   {"OMP_NUM_THREADS", "1"},
+                                                                                   {"JAVA_TOOL_OPTIONS", "-XX:ActiveProcessorCount=1"},
+                                                                                   {"DOTNET_PROCESSOR_COUNT", "1"}})
+                        inputs.push_back({semantic::input_kind::environment, name, content::hash_of(value).str()});
+                    expect(std::ranges::equal(contribution.direct_inputs, inputs));
+                    const auto& reads = contribution.observed_dependencies;
+                    expect(reads.size() == (path == "a.cpp" ? 5u : 4u) >> fatal);
+                    expect(reads[0].kind == semantic::dependency_kind::source && reads[0].value == source->digest.str() &&
+                           reads[1].kind == semantic::dependency_kind::source && reads[1].value == tree.files.back().digest.str());
+                    expect(reads[2].kind == semantic::dependency_kind::artifact && reads[2].value == "headers-object" && reads[2].scope == "sdk/headers" &&
+                           reads[2].key == "header.h");
+                    expect(reads.back().kind == semantic::dependency_kind::negative_lookup && reads.back().value == "headers-object" &&
+                           reads.back().scope == "sdk/headers" && reads.back().key == "optional.h");
+                    expect(unit.shards.front().unit.coverage.missing.empty() && unit.shards.front().unit.cacheable == (path == "b.cpp"))
+                        << "an unbound external read keeps its facts but prevents result reuse";
+                    expect(json::write(unit).size() > constants::semantic_batch_bytes) << "one unit spans multiple bounded frames";
+                    semantic::view selected{.snapshots = {{"app", "work", "v1", tree.id().str()}}, .configuration = "cpp"};
+                    committed.push_back(stored.publish_records(std::move(selected), std::move(unit.shards), {}));
+                    return;
+                };
+                // A demand that names its files compiles them without a workspace sweep, before this session has any index.
+                auto scoped_request = request;
+                scoped_request.analysis.demand.files = {"b.cpp"};
+                scoped_request.analysis.budget = {.units = 2, .nodes = 2};
+                scoped_request.analysis.execution = {"scoped-request", "scoped-computation", "cpp"};
+                std::size_t scoped_units = 0;
+                auto scoped = co_await analysis_call(channel, io, scoped_request, record_checks{.unit = [&](language::evaluated_unit unit) {
+                    ++scoped_units;
+                    const auto key = json::read<language::cpp::contribution_key>(unit.request.unit.name).value();
+                    expect(key.translation_unit == "b.cpp" && key.contribution == "immediate") << "a scoped demand compiles its own document";
+                    expect(unit.shards.front().unit.coverage.missing.empty()) << "facts of the demanded file are complete";
+                }});
+                expect((scoped && scoped->analyzed && !scoped->analysis_error) >> fatal);
+                expect(scoped_units == 1u && scoped->committed_units == 1u) << "only the file the demand names is analysed";
+                expect(test::slurp(root / "commands") == "query project-files\n")
+                    << "a scoped demand reads the file inventory without an index sweep, a contribution query or a semantic export";
+                auto limited = co_await analysis_call(channel, io, request, record_checks{.unit = receive});
+                if (!limited)
+                    transport::raise_call_error(std::move(limited.error()));
+                expect(!limited->analysis_error && limited->analyzed && !limited->missing.empty() && limited->missing.size() == 1u &&
+                       limited->missing.front().reason == "semantic node budget exhausted")
+                    << json::write(*limited);
+                expect(limited->committed_units == 1u && committed.size() == 1u) << "node exhaustion publishes the completed first unit and defers the second";
+                request.analysis.budget.nodes = 2;
+                jobs::progress_log progress;
+                auto recovered = co_await analysis_call(channel, io, request, record_checks{.unit = receive}, &progress);
+                std::size_t seen = 0;
+                auto events = progress.since(seen);
+                expect(!events.empty() && events.back().execution == request.analysis.execution && events.back().stage == "analysis");
+                expect((recovered && recovered->analyzed && !recovered->analysis_error) >> fatal) << (recovered ? json::write(*recovered) : "no reply");
+                expect(recovered->committed_units == 2u && committed.size() == 3u);
+                for (const auto& id : committed) {
+                    auto view = stored.load(id);
+                    expect(view->pieces.size() == 1u && view->pieces.front()->types().front().kind == "primitive");
+                }
+                expect(test::slurp(root / "semantic-starts") == "start\n") << "a completed response exceeding the output budget keeps its session";
+                expect(test::slurp(root / "commands") ==
+                       "query project-files\nindex stdio\nquery project-files\nquery semantic-contributions\nquery semantic-export\nquery "
+                       "semantic-export\n")
+                    << "one index sweep serves repeated evaluations of the installed epoch";
+                request.analysis.budget.units = 1;
+                auto partial = co_await analysis_call(channel, io, request, record_checks{.unit = receive});
+                expect(partial && !partial->analysis_error && partial->analyzed && !partial->missing.empty() && partial->committed_units == 1u &&
+                       partial->missing.size() == 1u && partial->missing.front().deferred &&
+                       partial->missing.front().units ==
+                           std::vector<std::string>{semantic::unit_identifier({"app", "cpp", "clice", "evaluate", semantic::unit_kind::group,
+                                                                               json::write(language::cpp::contribution_key{"b.cpp", "immediate"})})});
+                request.analysis.budget.units = 2;
+                test::spit(root / "delay", "delay second unit");
+                coroutine::stop_source stop;
+                auto cancel_after_commit = [&](language::evaluated_unit unit) {
+                    receive(std::move(unit));
+                    stop.request_stop();
+                };
+                auto cancelled = co_await coroutine::under(stop.get_token(), analysis_call(channel, io, request, record_checks{.unit = cancel_after_commit}));
+                expect(!cancelled && committed.size() == 5u) << "cancel stops the in-flight unit after the first is committed";
+                semantic::store reopened{root / "semantic"};
+                expect(reopened.load(committed.back())->pieces.front()->types().front().kind == "primitive")
+                    << "the committed unit survives cancellation and store restart";
+                request.analysis.budget.milliseconds = 1000;
+                auto timed = co_await analysis_call(channel, io, request, record_checks{.unit = receive});
+                expect(timed && timed->ok() && !timed->analysis_error && timed->analyzed && !timed->missing.empty() && timed->committed_units == 1u &&
+                       timed->missing.size() == 1u && timed->missing.front().scope.files.front() == "b.cpp" && committed.size() == 6u)
+                    << "time exhaustion keeps the committed prefix and identifies the interrupted unit";
+                std::filesystem::remove(root / "delay");
+                request.analysis.budget.milliseconds.reset();
+                auto resumed = co_await analysis_call(channel, io, request, record_checks{.unit = receive});
+                expect(resumed && resumed->analysis_session && resumed->analysis_session->id != recovered->analysis_session->id)
+                    << "the identified cancellation retires its active provider before the next request";
+                expect(resumed && resumed->ok() && resumed->analyzed && resumed->missing.empty() && committed.size() == 8u)
+                    << "evaluation completes after replacing the interrupted provider";
+
+                auto saved = stored.load(committed.back());
+                request.analysis.demand.files = {"b.cpp"};
+                request.analysis.candidates = {
+                    {.id = committed.back(), .recipe = saved->pieces.front()->unit.recipe, .units = {saved->pieces.front()->unit}, .nodes = 1}};
+                std::vector<language::evaluated_unit> evaluated;
+                auto collect = [&](language::evaluated_unit unit) -> void {
+                    evaluated.push_back(std::move(unit));
+                    return;
+                };
+                auto validate = [&](jobs::reuse_request input) -> jobs::reuse_reply {
+                    semantic::source_vector sources;
+                    for (const auto& file : tree.files)
+                        sources["app"].emplace(file.path, file.digest.str());
+                    reuse::channel_values channels;
+                    const auto validators =
+                        language::providers::dispatch(input.session.provider, []<class Provider> { return language::input_validators<Provider>(); });
+                    reuse::environment current{sources, input.inputs, channels, "app", validators, {}, std::move(input.processes)};
+                    jobs::reuse_reply reply;
+                    for (const auto& candidate : request.analysis.candidates)
+                        if (reuse::accept(candidate, input.session, request.analysis.demand, current))
+                            reply.accepted.push_back({candidate.id, semantic::recipe_identifier(candidate.recipe)});
+                    return reply;
+                };
+                runtime.id = "worker-other-sdk";
+                runtime.inputs.front().object = "unused-sdk-changed";
+                service.set_runtime(runtime);
+                auto unrelated = co_await analysis_call(channel, io, request, record_checks{.unit = collect, .reuse = validate});
+                expect((unrelated && !unrelated->analysis_error && evaluated.size() == 1u) >> fatal);
+                expect(evaluated.back().reused == committed.back() && evaluated.back().shards.empty())
+                    << "changing an unread SDK retains the persisted TU after its provider session restarts";
+
+                runtime.id = "worker-unrelated-tool";
+                runtime.executables.at("/tools/unrelated") = "unrelated-changed";
+                service.set_runtime(runtime);
+                auto unrelated_tool = co_await analysis_call(channel, io, request, record_checks{.unit = collect, .reuse = validate});
+                expect((unrelated_tool && !unrelated_tool->analysis_error && evaluated.size() == 2u) >> fatal);
+                expect(evaluated.back().reused == committed.back() && evaluated.back().shards.empty())
+                    << "the TU reuses its exported tool reads after an unrelated tool changes";
+                runtime.id = "worker-consumed-tool";
+                runtime.executables.at("/tools/compiler") = "compiler-changed";
+                service.set_runtime(runtime);
+                auto consumed_tool = co_await analysis_call(channel, io, request, record_checks{.unit = collect, .reuse = validate});
+                expect((consumed_tool && !consumed_tool->analysis_error && evaluated.size() == 3u && !evaluated.back().shards.empty()) >> fatal);
+                expect(!evaluated.back().reused && std::ranges::any_of(evaluated.back().shards.front().unit.direct_inputs, [](const auto& input) {
+                    return input.kind == semantic::input_kind::tool && input.name == "/tools/compiler" && input.object == "compiler-changed";
+                })) << "the TU evaluates again when its exported compiler input changes";
+                runtime.executables.at("/tools/compiler") = "compiler-object";
+                runtime.id = "worker-consumed-sdk";
+                runtime.inputs.back().object = "headers-changed";
+                service.set_runtime(runtime);
+                auto consumed = co_await analysis_call(channel, io, request, record_checks{.unit = collect, .reuse = validate});
+                expect((consumed && !consumed->analysis_error && evaluated.size() == 4u && !evaluated.back().shards.empty()) >> fatal);
+                expect(!evaluated.back().reused && std::ranges::any_of(evaluated.back().shards.front().unit.observed_dependencies, [](const auto& read) {
+                    return read.value == "headers-changed";
+                })) << "changing a consumed SDK evaluates the TU and replaces its SDK read";
+                runtime.inputs.back().object = "headers-object";
+                service.set_runtime(runtime);
+                test::spit(root / "configurations", R"({"a.cpp":"changed-a","b.cpp":"command-b.cpp"})");
+                auto other_command = co_await analysis_call(channel, io, request, record_checks{.unit = collect, .reuse = validate});
+                expect((other_command && !other_command->analysis_error && evaluated.size() == 5u) >> fatal);
+                expect(evaluated.back().reused == committed.back() && evaluated.back().shards.empty())
+                    << "changed preparation output with only another TU's command edit retains this TU";
+                test::spit(root / "configurations", R"({"a.cpp":"changed-a","b.cpp":"changed-b"})");
+                auto own_command = co_await analysis_call(channel, io, request, record_checks{.unit = collect, .reuse = validate});
+                expect((own_command && !own_command->analysis_error && evaluated.size() == 6u && !evaluated.back().shards.empty()) >> fatal);
+                expect(!evaluated.back().reused && std::ranges::any_of(evaluated.back().shards.front().unit.direct_inputs, [](const auto& input) {
+                    return input.kind == semantic::input_kind::provider && input.type == "clice/configuration" && input.name == "b.cpp" &&
+                           input.object == "changed-b";
+                })) << "the consumed command's edit evaluates and replaces the TU contribution";
+                const auto commands_before_diagnostics = test::slurp(root / "commands");
+                request.analysis.demand.facts = {std::string{"diagnostics"}};
+                request.analysis.candidates.clear();
+                evaluated.clear();
+                auto diagnostics = co_await analysis_call(channel, io, request, record_checks{.unit = collect});
+                expect((diagnostics && !diagnostics->analysis_error && evaluated.size() == 1u) >> fatal);
+                expect(evaluated.front().request.unit.kind == semantic::unit_kind::file && evaluated.front().request.unit.name == "b.cpp" &&
+                       test::slurp(root / "commands") == commands_before_diagnostics + "diagnostic b.cpp\n")
+                    << "diagnostics are the file unit's own report, without an index or an export";
+                const auto& reported = evaluated.front().shards.front();
+                expect(reported.unit.coverage.requested.facts == std::vector<semantic::fact_kind>{std::string{"diagnostics"}});
+                expect(reported.unit.coverage.available.size() == 1u &&
+                       reported.unit.coverage.available.front().facts == std::vector<semantic::fact_kind>{std::string{"diagnostics"}} &&
+                       reported.unit.coverage.missing.empty())
+                    << "a pull report declares diagnostics and nothing else";
+                expect(reported.symbols.empty() && reported.occurrences.empty() && reported.relations.empty())
+                    << "a diagnostic answer has no export";
+                expect(!reported.unit.cacheable) << "the diagnostic pull supplies no compiler observations";
+                expect(std::ranges::any_of(reported.unit.direct_inputs, [&](const auto& input) {
+                    return input.kind == semantic::input_kind::source && input.name == "app" && input.object == tree.id().str();
+                })) << "the unit binds the whole source snapshot the answer belongs to";
+                expect((reported.diagnostics.size() == 1u) >> fatal);
+                expect((reported.diagnostics.front().location.source.has_value()) >> fatal);
+                expect(reported.diagnostics.front().location.source->path == "b.cpp" && reported.diagnostics.front().location.source->begin == 0u &&
+                       reported.diagnostics.front().location.source->end == 1u && reported.diagnostics.front().message == "reported")
+                    << "the report's own range places the diagnostic";
             };
             exercise(run_operation);
         };
 
-        "language analysis shares the preparation execution deadline"_test = [] {
+        "language analysis honors both preparation and evaluation deadlines"_test = [] {
             static constexpr auto run_operation = [](auto& channel, const auto&) -> coroutine::task<> {
                 content::manifest tree{{entry("a.cpp", "int a;")}};
                 auto offered = co_await channel.call(jobs::sync_offer{"app", tree});
                 expect(offered.has_value() >> fatal);
                 expect((co_await channel.call(jobs::source_bytes{{blob("int a;")}})).has_value());
-                jobs::build_request request{.project = "app",
-                                            .tree = "analysis-deadline",
-                                            .snapshot = tree.id(),
-                                            .steps = {{.name = "prepare", .argv = {test::shell(), "-c", "sleep 0.7"}}},
-                                            .timeout_s = 1,
-                                            .survey = jobs::survey{.provider = "clice", .argv = {test::shell(), "-c", "sleep 10"}, .seconds = 30}};
+                jobs::staged_analysis request{.preparation = {.project = "app",
+                                                              .tree = "analysis-deadline",
+                                                              .snapshot = tree.id(),
+                                                              .steps = {{.name = "prepare", .argv = {test::shell(), "-c", "sleep 0.7"}}},
+                                                              .timeout_s = 1},
+                                              .analysis = jobs::analysis_plan{.provider = "clice",
+                                                                              .argv = {test::shell(), "-c", "sleep 10"},
+                                                                              .seconds = 30,
+                                                                              .execution = {"deadline-request", "deadline-computation", "cpp"},
+                                                                              .slot_id = "app/analysis-deadline"}};
                 auto started = std::chrono::steady_clock::now();
-                auto report = co_await channel.call(request);
+                auto report = co_await transport::staged(channel, request);
                 expect(report.has_value() >> fatal);
                 expect(!report->ok() && report->steps.back().name == "analysis" && report->steps.back().timed_out);
                 expect(std::chrono::steady_clock::now() - started < 3s) << "the survey receives only the remaining execution time";
+                request.preparation.steps.clear();
+                request.preparation.timeout_s = 30;
+                request.analysis.budget.milliseconds = 100;
+                started = std::chrono::steady_clock::now();
+                auto bounded = co_await transport::staged(channel, request);
+                expect(bounded.has_value() >> fatal);
+                expect(bounded->ok() && bounded->analyzed && !bounded->missing.empty() && bounded->committed_units == 0u && bounded->missing.size() == 1u &&
+                       bounded->missing.front().deferred && !bounded->analysis_session);
+                expect(std::chrono::steady_clock::now() - started < 2s) << "the analysis budget limits a longer build deadline";
             };
             exercise(run_operation);
         };
@@ -838,6 +1723,122 @@ while True:
 } // namespace
 
 int main(int argc, const char** argv) {
+    if (argc == 7) {
+        test::require(std::string_view{argv[1]}.compare("--fsharp") == 0, "unknown executor integration command");
+        const std::filesystem::path fixture{argv[2]};
+        const std::string dotnet{argv[3]}, host{argv[4]}, adapter{argv[5]}, sdk{argv[6]};
+        auto run = [&](auto& channel, auto&, replica::service& service, ctx& io) -> coroutine::task<> {
+            service.set_runtime({.inputs = {{"sdk/dotnet", "dotnet", {sdk}}}});
+            const auto model = test::slurp(fixture / "model/model.json");
+            const auto consumer = test::slurp(fixture / "App.fs");
+            jobs::staged_analysis request{.preparation = {.project = "project", .tree = "fsharp", .measure = {{"model", "project_model", "model/model.json"}}},
+                                          .analysis = {.provider = "fsharp",
+                                                       .options = "fsharp-test",
+                                                       .artifacts = {{"model", "project_model", "model/model.json"}},
+                                                       .argv = {dotnet, host, "--adapter", adapter},
+                                                       .env = {{"TMPDIR", fixture.string()}},
+                                                       .execution = {"request", "computation", "fsharp"},
+                                                       .slot_id = "project/fsharp",
+                                                       .demand = {.files = {"App.fs"}, .facts = {std::string{"symbols"}, std::string{"types"}}}}};
+            std::size_t reads = 0;
+            auto fetch = [&](jobs::model_read request) -> jobs::source_bytes {
+                ++reads;
+                return delivery::read(fixture / "objects", request.object);
+            };
+            std::string session;
+            for (const auto& value : {std::string{"42"}, std::string{"\"updated\""}}) {
+                const auto source = "namespace Sample\nmodule Library =\n    let value = " + value + "\n";
+                content::manifest tree{{entry("model/model.json", model), entry("Library.fs", source), entry("App.fs", consumer)}};
+                test::require((co_await channel.call(jobs::sync_offer{"project", tree})).has_value(), "offer failed");
+                test::require((co_await channel.call(jobs::source_bytes{{blob(model), blob(source), blob(consumer)}})).has_value(), "source transfer failed");
+                request.preparation.snapshot = tree.id();
+                std::vector<language::evaluated_unit> units;
+                auto receive = [&](language::evaluated_unit unit) -> void {
+                    units.push_back(std::move(unit));
+                    return;
+                };
+                auto report = co_await analysis_call(channel, io, request, record_checks{.unit = receive, .model = fetch});
+                test::require(report.has_value() && report->analyzed && report->analysis_session.has_value(),
+                              report ? json::write(*report) : "analysis transport failed");
+                test::require(!units.empty() && !units.front().shards.empty(), "worker returned no F# shard");
+                const auto& shard = units.front().shards.front();
+                const auto result = std::ranges::find(shard.symbols, "result", &semantic::records::symbol::name);
+                test::require(result != shard.symbols.end() && result->type.has_value(), "F# consumer has no inferred type");
+                const auto type = std::ranges::find(shard.types, *result->type, &semantic::records::type::id);
+                test::require(type != shard.types.end() && type->name == (value == "42" ? "Microsoft.FSharp.Core.int" : "Microsoft.FSharp.Core.string"),
+                              "F# predecessor edit did not update consumer type");
+                if (!session.empty())
+                    test::require(session == report->analysis_session->id, "source edit replaced FCS helper session");
+                session = report->analysis_session->id;
+            }
+            test::require(reads > 0, "worker did not fetch generated model objects");
+        };
+        exercise(run);
+        return 0;
+    }
+    if (argc == 8) {
+        test::require(std::string_view{argv[1]} == "--kotlin", "unknown executor integration command");
+        const std::filesystem::path fixture{argv[2]};
+        const std::string java{argv[3]}, host{argv[4]}, adapter{argv[5]}, jdk{argv[6]}, stdlib{argv[7]};
+        auto run = [&](auto& channel, auto&, replica::service& service, ctx& io) -> coroutine::task<> {
+            service.set_runtime({.inputs = {{"jdk", "jdk", {jdk}}, {"stdlib", "stdlib", {stdlib}}}});
+            const auto model = test::slurp(fixture / "model.json");
+            jobs::staged_analysis request{.preparation = {.project = "project", .tree = "kotlin", .measure = {{"model", "project_model", "model.json"}}},
+                                          .analysis = {.provider = "kotlin",
+                                                       .options = "kotlin-test",
+                                                       .artifacts = {{"model", "project_model", "model.json"}},
+                                                       .argv = {java, "-Djava.io.tmpdir=" + fixture.string(), "-jar", host, "--adapter", adapter},
+                                                       .execution = {"request", "computation", "kotlin"},
+                                                       .slot_id = "project/kotlin",
+                                                       .demand = {.files = {"Main.kt"}, .facts = {std::string{"symbols"}, std::string{"types"}}}}};
+            std::size_t reads = 0;
+            auto fetch = [&](jobs::model_read request) -> jobs::source_bytes {
+                ++reads;
+                return delivery::read(fixture / "objects", request.object);
+            };
+            std::string session;
+            for (const auto& source : {std::string{"fun answer() = listOf(42).first()\n"}, std::string{"fun answer() = listOf(\"updated\").first()\n"}}) {
+                const auto kotlin_source = source + "fun javaAnswer() = JavaApi.value()\n";
+                const auto java_source = source.contains("42") ? std::string{"public class JavaApi { public static int value() { return 42; } }"}
+                                                               : std::string{"public class JavaApi { public static String value() { return \"updated\"; } }"};
+                content::manifest tree{{entry("model.json", model), entry("Main.kt", kotlin_source), entry("JavaApi.java", java_source)}};
+                test::require((co_await channel.call(jobs::sync_offer{"project", tree})).has_value(), "offer failed");
+                test::require((co_await channel.call(jobs::source_bytes{{blob(model), blob(kotlin_source), blob(java_source)}})).has_value(),
+                              "source transfer failed");
+                request.preparation.snapshot = tree.id();
+                std::vector<language::evaluated_unit> units;
+                auto receive = [&](language::evaluated_unit unit) -> void {
+                    units.push_back(std::move(unit));
+                    return;
+                };
+                auto report = co_await analysis_call(channel, io, request, record_checks{.unit = receive, .model = fetch});
+                test::require(report.has_value(), "analysis transport failed");
+                test::require(report->analyzed && report->analysis_session.has_value(), json::write(*report));
+                test::require(!units.empty() && !units.front().shards.empty(), "worker returned no Kotlin shard");
+                const auto records = json::write(units.front().shards);
+                test::require(records.contains("answer") && records.contains(source.contains("42") ? "kotlin.Int" : "kotlin.String"), records);
+                const auto& shard = units.front().shards.front();
+                const auto function = std::ranges::find(shard.symbols, "javaAnswer", &semantic::records::symbol::name);
+                test::require(function != shard.symbols.end() && function->type.has_value(), "Java consumer has no function type");
+                auto type = [&](const semantic::type_id& id) -> const semantic::records::type& {
+                    const auto found = std::ranges::find(shard.types, id, &semantic::records::type::id);
+                    test::require(found != shard.types.end(), "Java consumer type is absent");
+                    return *found;
+                };
+                const auto& signature = type(*function->type);
+                test::require(signature.return_type.has_value(), "Java consumer has no return type");
+                const auto& result = type(*signature.return_type);
+                const auto& value = result.kind == "flexible" ? type(*result.lower_bound) : result;
+                test::require(value.name == (source.contains("42") ? "kotlin.Int" : "kotlin.String"), "Java edit did not update Kotlin inference");
+                if (!session.empty())
+                    test::require(session == report->analysis_session->id, "source edit replaced the helper session");
+                session = report->analysis_session->id;
+            }
+            test::require(reads > 0, "worker did not fetch the model library object");
+        };
+        exercise(run);
+        return 0;
+    }
     boost::ut::suite<"cache">{cases};
     return boost::ut::cfg<>.run({.argc = argc, .argv = argv}) ? 1 : 0;
 }

@@ -1,0 +1,72 @@
+name: Load build settings
+description: Read CI profiles and the project toolchain versions.
+outputs:
+  settings:
+    description: settings
+    value: ${{ steps.read.outputs.settings }}
+  check_preset:
+    description: check preset
+    value: ${{ steps.read.outputs.check_preset }}
+  check_configure:
+    description: check configure
+    value: ${{ steps.read.outputs.check_configure }}
+  check_targets:
+    description: check targets
+    value: ${{ steps.read.outputs.check_targets }}
+  check_pattern:
+    description: check pattern
+    value: ${{ steps.read.outputs.check_pattern }}
+  retain_test_log:
+    description: retain test log
+    value: ${{ steps.read.outputs.retain_test_log }}
+  package_preset:
+    description: package preset
+    value: ${{ steps.read.outputs.package_preset }}
+  package_configure:
+    description: package configure
+    value: ${{ steps.read.outputs.package_configure }}
+  package_targets:
+    description: package targets
+    value: ${{ steps.read.outputs.package_targets }}
+  vcpkg_revision:
+    description: vcpkg revision
+    value: ${{ steps.read.outputs.vcpkg_revision }}
+runs:
+  using: composite
+  steps:
+    - id: read
+      shell: bash
+      run: |
+        node <<'JS_SETTINGS'
+        const { appendFileSync, readFileSync } = require('node:fs');
+        const read = path => readFileSync(path, 'utf8');
+        const config = JSON.parse(read('.github/ci.json'));
+        const { major, minor, patch } = JSON.parse(read('CMakePresets.json')).cmakeMinimumRequired;
+        config.toolchain.cmake = [major, minor, patch].join('.');
+        const clr = read('providers/clr/Directory.Build.props');
+        const property = name => clr.match(new RegExp(`<${name}>([^<]+)</${name}>`))[1].trim();
+        const frameworks = new Set([
+          property('TargetFramework').replace(/^net/, ''),
+          property('FughettaMinimumSdkVersion'),
+        ]);
+        config.toolchain.dotnet = [...frameworks].map(version => version + '.x').join('\n');
+        config.toolchain.java.version = read('providers/jvm/gradle.properties')
+          .match(/^fughetta\.javaVersion=(.*)$/m)[1].trim();
+        const { check = {}, package: bundle = {} } = config.runners.find(r => r.id === process.env.PLATFORM);
+        const profiles = config.profiles;
+        const vcpkg = JSON.parse(read('vcpkg-configuration.json'));
+        const outputs = {
+          settings: JSON.stringify(config),
+          check_preset: profiles.check.preset,
+          check_configure: check.configure ?? '',
+          check_targets: profiles.check.targets ?? '',
+          check_pattern: check.test_pattern ?? '',
+          retain_test_log: Boolean(check.retain_test_log),
+          package_preset: profiles.package.preset,
+          package_configure: bundle.configure ?? '',
+          package_targets: bundle.targets ?? profiles.package.targets ?? '',
+          vcpkg_revision: vcpkg['default-registry'].baseline,
+        };
+        appendFileSync(process.env.GITHUB_OUTPUT,
+          Object.entries(outputs).map(([key, value]) => key + '=' + value + '\n').join(''));
+        JS_SETTINGS

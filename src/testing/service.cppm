@@ -1,6 +1,6 @@
 module support;
-import coroutine;
 import server;
+import coroutine;
 
 namespace test {
     struct source_service::state {

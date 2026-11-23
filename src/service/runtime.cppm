@@ -3,8 +3,9 @@ import std;
 import native;
 import coroutine;
 import configuration;
-import reflection;
+import constants;
 import durability;
+import host;
 
 export namespace runtime {
     // Service processes share the host scheduler; spawning a child must not inherit a single pinned CPU.
@@ -75,13 +76,13 @@ export namespace runtime {
             tasks.spawn(watch(io, result));
             return result;
         }
-        static auto ready(native::scheduler& io, child& c) -> coroutine::task<> {
-            auto until = std::chrono::steady_clock::now() + std::chrono::seconds{15};
+        static auto ready(native::scheduler& io, child& c, std::chrono::seconds limit) -> coroutine::task<> {
+            auto until = std::chrono::steady_clock::now() + limit;
             while (!c.ready) {
                 if (c.exited)
                     throw std::runtime_error(std::format("{} exited during startup: {}", c.role, c.status));
                 if (std::chrono::steady_clock::now() >= until)
-                    throw std::runtime_error(c.role + " startup deadline exceeded");
+                    throw std::runtime_error(std::format("{} startup deadline exceeded after {}s", c.role, limit.count()));
                 co_await execution::schedule_after(io, std::chrono::milliseconds{10});
             }
         }
@@ -98,32 +99,53 @@ export namespace runtime {
             // Managed links stay on loopback; deployment changes only the public HTTP listener.
             if (doc.server.source != std::format("127.0.0.1:{}", endpoint.port()) || doc.server.worker_bind != "127.0.0.1")
                 throw std::invalid_argument("managed source and worker listeners must use 127.0.0.1");
+            auto source_environment = host::child_environment();
+            if (doc.public_shards) {
+                for (const auto* name : {"FUG_R2_ACCESS_KEY_ID", "FUG_R2_SECRET_ACCESS_KEY", "FUG_R2_READ_ACCESS_KEY_ID", "FUG_R2_READ_SECRET_ACCESS_KEY"})
+                    source_environment.erase(name);
+                if (doc.public_shards->publish)
+                    source_environment.erase(doc.public_shards->publish->secret_key_env);
+            }
+            auto worker_environment = source_environment;
             io::command source_command{.argv = {executable.string(), "--role", "source", "--port", std::to_string(endpoint.port()), "--storage",
-                                                (root / "source").string(), "--threads", std::to_string(plan.source_disk)},
-                                       .cwd = std::filesystem::current_path()};
+                                                (root / constants::managed_source_directory).string(), "--threads", std::to_string(plan.source_disk)},
+                                       .cwd = std::filesystem::current_path(),
+                                       .env = std::move(source_environment)};
             auto& source = launch(io, tasks, std::move(source_command), "source");
-            co_await ready(io, source);
+            co_await ready(io, source, std::chrono::seconds{15});
+            // Internal RPC credentials belong to the processes that speak that protocol: the gateway mints the source token in
+            // its own environment and a worker never reads it, so leaving it out keeps the Worker's toolchain identity free of a
+            // value that changes with every start. The source child keeps it.
+            worker_environment.erase("SOURCE_TOKEN");
             for (std::size_t i = 0; i < plan.workers.size(); ++i) {
                 config::worker worker;
                 worker.gateway = std::format("127.0.0.1:{}", doc.server.worker_port);
                 worker.token = doc.worker_token;
                 worker.name = std::format("local-{}", i);
-                worker.data_root = (root / "source").string();
+                worker.data_root = (root / constants::managed_source_directory).string();
                 worker.work_root = (root / "workers" / worker.name).string();
                 worker.dependency_cache = (root / "dependencies").string();
                 worker.compute_threads = 1;
                 worker.max_inflight = 1;
+                worker.max_analyses = 1;
                 worker.tools = doc.tools;
+                worker.sdk_manifests = doc.sdk_manifests;
+                worker.backend = doc.worker_backend;
                 worker.parallel = plan.workers[i].parallel;
+                worker.memory_bytes = plan.workers[i].memory_bytes;
                 auto file = directory / (worker.name + ".json");
                 std::ofstream out{file, std::ios::trunc};
                 out << config::write(worker);
                 out.close();
                 if (!out)
                     throw std::runtime_error("cannot write worker configuration: " + file.string());
-                auto& process =
-                    launch(io, tasks, {.argv = {executable.string(), "--role", "worker", file.string()}, .cwd = std::filesystem::current_path()}, "worker");
-                co_await ready(io, process);
+                auto& process = launch(io, tasks,
+                                       {.argv = {executable.string(), "--role", "worker", file.string()},
+                                        .cwd = std::filesystem::current_path(),
+                                        .env = worker_environment},
+                                       "worker");
+                // The worker inventories tools and SDK manifests before announcing readiness.
+                co_await ready(io, process, std::chrono::seconds{60});
             }
             std::cerr << std::format("service budget: {} execution threads, {} build jobs, {} workers\n", doc.runtime.threads, doc.runtime.jobs,
                                      plan.workers.size());

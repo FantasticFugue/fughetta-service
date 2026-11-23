@@ -1,8 +1,53 @@
 export module utility;
 
 import std;
+#ifdef _WIN32
+import httpant.io;
+#endif
 
 export namespace util {
+    struct retained_exception {
+        virtual ~retained_exception() = default;
+        virtual auto retain() const noexcept -> std::exception_ptr = 0;
+    };
+
+    template <class Error> auto copy_current_exception(const Error& error) noexcept -> std::exception_ptr {
+#ifdef _WIN32
+        if (typeid(error) != typeid(Error))
+            return std::current_exception();
+        // Use this from an out-of-line definition in the error's own module.
+        // This throw emits a copy callback even when the original came from an importer.
+        struct captured final : Error {
+            explicit captured(const Error& original) : Error(original) {}
+        };
+        try {
+            throw captured{error};
+        } catch (...) {
+            return std::current_exception();
+        }
+#else
+        static_cast<void>(error);
+        return std::current_exception();
+#endif
+    }
+
+#ifdef _WIN32
+    auto capture_current_exception() noexcept -> std::exception_ptr;
+#else
+    inline auto capture_current_exception() noexcept -> std::exception_ptr { return std::current_exception(); }
+#endif
+
+    template <class Error> auto make_exception_ptr(Error&& error) noexcept -> std::exception_ptr {
+#ifdef _WIN32
+        try {
+            throw std::forward<Error>(error);
+        } catch (...) {
+            return capture_current_exception();
+        }
+#else
+        return std::make_exception_ptr(std::forward<Error>(error));
+#endif
+    }
     // A move-only, type-erased callable with a small buffer, for the places the
     // scheduler and the service layers hand a callback to somebody and forget
     // the concrete type (a post to a worker, a notification sink, a gate
@@ -227,3 +272,45 @@ export namespace util {
         auto operator()(const std::string& s) const noexcept -> std::size_t { return std::hash<std::string_view>{}(s); }
     };
 } // namespace util
+
+#ifdef _WIN32
+namespace util {
+    auto capture_current_exception() noexcept -> std::exception_ptr {
+        try {
+            throw;
+        } catch (const retained_exception& error) {
+            return error.retain();
+        } catch (const std::filesystem::filesystem_error& error) {
+            return copy_current_exception(error);
+        } catch (const std::ios_base::failure& error) {
+            return copy_current_exception(error);
+        } catch (const http::io::net::closed& error) {
+            return copy_current_exception(error);
+        } catch (const std::system_error& error) {
+            return copy_current_exception(error);
+        } catch (const std::format_error& error) {
+            return copy_current_exception(error);
+        } catch (const std::invalid_argument& error) {
+            return copy_current_exception(error);
+        } catch (const std::domain_error& error) {
+            return copy_current_exception(error);
+        } catch (const std::length_error& error) {
+            return copy_current_exception(error);
+        } catch (const std::out_of_range& error) {
+            return copy_current_exception(error);
+        } catch (const std::logic_error& error) {
+            return copy_current_exception(error);
+        } catch (const std::range_error& error) {
+            return copy_current_exception(error);
+        } catch (const std::overflow_error& error) {
+            return copy_current_exception(error);
+        } catch (const std::underflow_error& error) {
+            return copy_current_exception(error);
+        } catch (const std::runtime_error& error) {
+            return copy_current_exception(error);
+        } catch (...) {
+            return std::current_exception();
+        }
+    }
+}
+#endif

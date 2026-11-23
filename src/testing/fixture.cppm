@@ -6,13 +6,16 @@ import codec;
 import mcp;
 import protocol;
 import tools;
-export import reflection;
+export import json;
 export import configuration;
 
 export namespace fixture {
-    template <meta::fixed_string Name> auto options(builds::builder& b) -> builds::config<Name>& { return rfl::get<builds::with<Name>>(b.variant()).options; }
+    auto profile(language::stage stage) -> language::configuration {
+        return {.stages = {{"main", std::move(stage)}}, .outputs = {{"facts", {{"main", "facts"}}}}};
+    }
+    template <meta::fixed_string Name> auto options(builds::builder& b) -> builds::config<Name>& { return std::get<builds::with<Name>>(b.variant()).options; }
     template <meta::fixed_string Name> auto options(const builds::builder& b) -> const builds::config<Name>& {
-        return rfl::get<builds::with<Name>>(b.variant()).options;
+        return std::get<builds::with<Name>>(b.variant()).options;
     }
     auto needs(builds::builder& b) -> builds::requirements& {
         return b.visit([](auto& w) -> builds::requirements& { return w.needs.get(); });
@@ -123,13 +126,13 @@ export namespace fixture {
 
     auto write_file(tools::services& s, write_input in, mcp::notifier&, const worlds::actor& actor) -> coroutine::task<tools::mutation> {
         config::check_name("project", in.project);
-        std::string input = content::hash_of(rfl::json::write(std::tuple{std::string{"write"}, in.path, in.content})).str();
+        std::string input = content::hash_of(json::write(std::tuple{std::string{"write"}, in.path, in.content})).str();
         auto apply_once = [&]() -> coroutine::task<tools::mutation> {
             auto observed = co_await tools::main_tree(s, in.project, actor);
             bool exists = std::ranges::contains(observed.files, in.path, &nodes::file_view::path);
             auto r = co_await tools::main_apply(s, in.project, actor, observed,
                                                 {tools::change{.kind = exists ? "write" : "create", .path = in.path, .text = in.content}}, in.operation_id,
-                                                "write " + in.path, rfl::json::write(tools::record{input}));
+                                                "write " + in.path, json::write(tools::record{input}));
             co_return tools::mutation{r.version, r.receipt, in.operation_id, r.replayed};
         };
         co_return co_await tools::once<tools::mutation>(
@@ -140,7 +143,7 @@ export namespace fixture {
     auto edit_text(tools::services& s, edit_input in, mcp::notifier&, const worlds::actor& actor) -> coroutine::task<edit_output> {
         config::check_name("project", in.project);
         std::string input =
-            content::hash_of(rfl::json::write(std::tuple{std::string{"edit"}, in.path, in.old_string, in.new_string, in.replace_all.value_or(false)})).str();
+            content::hash_of(json::write(std::tuple{std::string{"edit"}, in.path, in.old_string, in.new_string, in.replace_all.value_or(false)})).str();
         auto apply_once = [&]() -> coroutine::task<edit_output> {
             auto r = co_await tools::node_call(s, in.project, {.action = "read", .worldline = "main", .target = in.path}, actor, true);
             auto file = std::ranges::find(r.files, in.path, &nodes::file_view::path);
@@ -167,9 +170,9 @@ export namespace fixture {
             auto begin = tools::lines::scalars(std::string_view{file->text}.substr(0, at.front()));
             auto count = tools::lines::scalars(std::string_view{file->text}.substr(at.front(), last - at.front()));
             auto tree = co_await tools::selected(s, in.project, "main", r.version, actor);
-            auto done = co_await tools::main_apply(s, in.project, actor, tree,
-                                                   {tools::change{.kind = "edit", .path = in.path, .offset = begin, .count = count, .text = replaced}},
-                                                   in.operation_id, "edit " + in.path, rfl::json::write(tools::record{input, at.size()}));
+            auto done = co_await tools::main_apply(
+                s, in.project, actor, tree, {tools::change{.kind = std::string{"edit"}, .path = in.path, .offset = begin, .count = count, .text = replaced}},
+                in.operation_id, "edit " + in.path, json::write(tools::record{input, at.size()}));
             co_return edit_output{done.version, done.receipt, in.operation_id, at.size(), done.replayed};
         };
         co_return co_await tools::once<edit_output>(
@@ -179,11 +182,11 @@ export namespace fixture {
 
     auto remove_file(tools::services& s, remove_input in, mcp::notifier&, const worlds::actor& actor) -> coroutine::task<tools::mutation> {
         config::check_name("project", in.project);
-        std::string input = content::hash_of(rfl::json::write(std::tuple{std::string{"remove"}, in.path})).str();
+        std::string input = content::hash_of(json::write(std::tuple{std::string{"remove"}, in.path})).str();
         auto apply_once = [&]() -> coroutine::task<tools::mutation> {
             auto observed = co_await tools::main_tree(s, in.project, actor);
-            auto r = co_await tools::main_apply(s, in.project, actor, observed, {tools::change{.kind = "remove", .path = in.path}}, in.operation_id,
-                                                "remove " + in.path, rfl::json::write(tools::record{input}));
+            auto r = co_await tools::main_apply(s, in.project, actor, observed, {tools::change{.kind = std::string{"remove"}, .path = in.path}},
+                                                in.operation_id, "remove " + in.path, json::write(tools::record{input}));
             co_return tools::mutation{r.version, r.receipt, in.operation_id, r.replayed};
         };
         co_return co_await tools::once<tools::mutation>(
@@ -193,11 +196,12 @@ export namespace fixture {
 
     auto move_file(tools::services& s, move_input in, mcp::notifier&, const worlds::actor& actor) -> coroutine::task<tools::mutation> {
         config::check_name("project", in.project);
-        std::string input = content::hash_of(rfl::json::write(std::tuple{std::string{"move"}, in.from, in.to})).str();
+        std::string input = content::hash_of(json::write(std::tuple{std::string{"move"}, in.from, in.to})).str();
         auto apply_once = [&]() -> coroutine::task<tools::mutation> {
             auto observed = co_await tools::main_tree(s, in.project, actor);
-            auto r = co_await tools::main_apply(s, in.project, actor, observed, {tools::change{.kind = "move", .path = in.from, .destination = in.to}},
-                                                in.operation_id, "move " + in.from, rfl::json::write(tools::record{input}));
+            auto r =
+                co_await tools::main_apply(s, in.project, actor, observed, {tools::change{.kind = std::string{"move"}, .path = in.from, .destination = in.to}},
+                                           in.operation_id, "move " + in.from, json::write(tools::record{input}));
             co_return tools::mutation{r.version, r.receipt, in.operation_id, r.replayed};
         };
         co_return co_await tools::once<tools::mutation>(

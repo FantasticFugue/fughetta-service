@@ -100,7 +100,7 @@ namespace {
             expect(token.size() == 64_u) << token;
             auto saved = config::load(tmp.dir / "config.json");
             auto found = std::ranges::find(saved.server.auth.tokens, "agent", &config::token::name);
-            expect(found != saved.server.auth.tokens.end() && found->role == "member" && found->hash == content::hash_of(token).str());
+            expect(found != saved.server.auth.tokens.end() && found->role == config::token_role::member && found->hash == content::hash_of(token).str());
             {
                 test::child process{clean_command(tmp.dir)};
                 test::ready(process, port);

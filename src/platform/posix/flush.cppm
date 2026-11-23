@@ -30,6 +30,10 @@ namespace durability {
     using descriptor::open;
     using descriptor::sync;
     using descriptor::write_all;
+    auto try_clone_file(const std::filesystem::path& source, const std::filesystem::path& destination) -> bool {
+        return posix::try_clone_file(source, destination);
+    }
+
     void write_part(const std::filesystem::path& path, std::uint64_t offset, std::span<const std::byte> bytes, bool complete) {
         auto f = open(path, O_WRONLY | O_CREAT);
         if (::lseek(f.get(), static_cast<off_t>(offset), SEEK_SET) < 0)
@@ -50,6 +54,19 @@ namespace durability {
         auto f = open(path, O_RDONLY | O_DIRECTORY);
         if (!posix::sync_filesystem(f.get()))
             fail("cannot sync the filesystem of", path);
+        f.close(path);
+    }
+
+    void touch_file(const std::filesystem::path& path) {
+        auto f = open(path, O_RDONLY | O_NOFOLLOW | O_NONBLOCK);
+        struct stat info {};
+        if (::fstat(f.get(), &info) != 0)
+            fail("cannot inspect", path);
+        if (!S_ISREG(info.st_mode))
+            throw unreadable{path.string()};
+        const timespec times[2]{{0, UTIME_OMIT}, {0, UTIME_NOW}};
+        if (::futimens(f.get(), times) != 0)
+            fail("cannot update the time of", path);
         f.close(path);
     }
 
@@ -164,9 +181,15 @@ namespace durability {
         return read_checked(path, limit, true);
     }
 
+    auto remove_file(const std::filesystem::path& p) -> bool {
+        if (::unlink(p.c_str()) == 0)
+            return true;
+        if (errno == ENOENT)
+            return false;
+        fail("cannot remove", p);
+    }
     void durable_remove(const std::filesystem::path& p) {
-        if (::unlink(p.c_str()) != 0 && errno != ENOENT)
-            fail("cannot remove", p);
+        remove_file(p);
         sync_dir(p.parent_path());
     }
 

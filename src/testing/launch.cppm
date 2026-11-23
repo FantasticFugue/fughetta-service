@@ -4,7 +4,7 @@ export import support;
 export import native;
 export import coroutine;
 export import http;
-export import reflection;
+export import json;
 export import configuration;
 import keyring;
 import usage;
@@ -53,7 +53,7 @@ export namespace test {
                         throw std::runtime_error("child wait was stopped");
                     promise_.set_value(*result);
                 } catch (...) {
-                    promise_.set_exception(std::current_exception());
+                    promise_.set_exception(util::capture_current_exception());
                 }
             });
         }
@@ -70,6 +70,7 @@ export namespace test {
             return output_;
         }
         auto finished() -> bool { return result_.wait_for(std::chrono::seconds{0}) == std::future_status::ready; }
+        auto pid() const noexcept -> int { return process_.pid(); }
         auto wait(std::chrono::seconds timeout = std::chrono::seconds{10}) -> int {
             if (result_.wait_for(timeout) != std::future_status::ready) {
                 process_.kill();
@@ -80,9 +81,9 @@ export namespace test {
             reaped_ = true;
             return result_.get();
         }
-        auto stop() -> int {
+        auto stop(std::chrono::seconds timeout = std::chrono::seconds{10}) -> int {
             process_.terminate();
-            return wait();
+            return wait(timeout);
         }
     };
 
@@ -162,11 +163,13 @@ export namespace test {
         int status;
         std::string body;
     };
-    auto request(std::uint16_t port, http::method method, std::string path, std::string body = {}, std::string token = "sk_test") -> response {
+    inline constexpr auto request_timeout = std::chrono::seconds{30};
+    auto request(std::uint16_t port, http::method method, std::string path, std::string body = {}, std::string token = "sk_test",
+                 std::chrono::seconds timeout = request_timeout) -> response {
         native::context context;
         auto run = [&]() -> coroutine::task<response> {
             auto peer = co_await io::connect(context.get_scheduler(), {net::ip::address_v4{{127, 0, 0, 1}}, port});
-            web::stream<native::socket> stream{peer};
+            http_stream stream{peer};
             http::v1::client client{stream};
             http::request head{
                 .method = method, .target = std::move(path), .scheme = "http", .authority = "localhost", .fields = {{"content-type", "application/json"}}};
@@ -176,13 +179,13 @@ export namespace test {
             co_return response{result.head.status.code(), std::string{result.text()}};
         };
         auto scheduler = context.get_scheduler();
-        auto result = cores::run(context, coroutine::deadline(scheduler, std::chrono::seconds{30}, run()));
+        auto result = cores::run(context, coroutine::deadline(scheduler, timeout, run()));
         require(result && result->has_value(), "HTTP deadline exceeded");
         return std::move(**result);
     }
 
     template <class T> auto decode(std::string_view text) -> T {
-        auto parsed = rfl::json::read<T, rfl::DefaultIfMissing>(std::string{text});
+        auto parsed = json::read<T, json::defaults>(std::string{text});
         require(bool(parsed), "invalid response: " + std::string{text});
         return std::move(*parsed);
     }
@@ -194,27 +197,28 @@ export namespace test {
         };
         return request(port, http::method::PUT, path, std::format(R"({{"revision":{},"value":{}}})", decode<revision>(current.body).revision, value));
     }
-    auto tool(std::uint16_t port, std::string name, std::string args, bool error = false, std::string credential = "sk_test") -> std::string {
+    auto tool(std::uint16_t port, std::string name, std::string args, bool error = false, std::string credential = "sk_test",
+              std::chrono::seconds timeout = request_timeout) -> std::string {
         if (credential == "sk_test" && (name == "worldline" || name == "language" || name == "scope" || name == "build" || name == "test" || name == "run")) {
-            auto object = decode<rfl::Generic>(args).to_object().value();
+            auto object = decode<json::value>(args).to_object().value();
             if (!object.get("worldline"))
                 object["worldline"] = "main";
-            args = rfl::json::write(object);
+            args = json::write(object);
         }
         auto response =
             request(port, http::method::POST, "/mcp",
-                    std::format(R"({{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{{"name":"{}","arguments":{}}}}})", name, args), credential);
+                    std::format(R"({{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{{"name":"{}","arguments":{}}}}})", name, args), credential, timeout);
         require(response.status == 200, response.body);
         struct payload {
             bool isError = false;
-            rfl::Generic structuredContent;
+            json::value structuredContent;
         };
         struct reply {
             std::optional<payload> result;
         };
         auto parsed = decode<reply>(response.body);
         require(parsed.result && parsed.result->isError == error, response.body);
-        return error ? response.body : rfl::json::write(parsed.result->structuredContent);
+        return error ? response.body : json::write(parsed.result->structuredContent);
     }
     inline constexpr std::string_view project = "/api/v1/projects/app";
     auto worldline(std::uint16_t port, std::string project, std::string action, std::string fields = {}, bool error = false) -> std::string {
@@ -225,7 +229,7 @@ export namespace test {
         }
         auto response =
             request(port, http::method::POST, "/api/v1/projects/" + project + "/worldline",
-                    std::format(R"({{"project":{},"action":{}{}}})", rfl::json::write(project), rfl::json::write(action), fields.empty() ? "" : "," + fields));
+                    std::format(R"({{"project":{},"action":{}{}}})", json::write(project), json::write(action), fields.empty() ? "" : "," + fields));
         require(error ? response.status >= 400 : response.status == 200, response.body);
         return response.body;
     }

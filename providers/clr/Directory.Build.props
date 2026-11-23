@@ -1,0 +1,12 @@
+<Project>
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <!-- This compiler emits E: documentation IDs for CLI events. -->
+    <FughettaMinimumSdkVersion>11.0</FughettaMinimumSdkVersion>
+  </PropertyGroup>
+  <!-- One build of the plugin also builds the host; CMake points both at its build tree. -->
+  <PropertyGroup Condition="'$(FughettaOutput)' != ''">
+    <BaseIntermediateOutputPath>$(FughettaOutput)/obj/$(MSBuildProjectName)/</BaseIntermediateOutputPath>
+    <OutDir>$(FughettaOutput)/$(MSBuildProjectName)/</OutDir>
+  </PropertyGroup>
+</Project>

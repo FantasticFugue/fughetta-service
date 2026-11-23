@@ -2,7 +2,7 @@ export module mcp;
 import std;
 import constants;
 export import utility;
-import reflection;
+import json;
 import coroutine;
 import http;
 import world;
@@ -28,25 +28,61 @@ export namespace mcp {
         std::string jsonrpc;
         std::string method;
         std::optional<key> id;
-        std::optional<rfl::Generic> params;
+        std::optional<json::value> params;
     };
 
     struct error {
-        int code = 0;
-        std::string message;
+        json::required<std::int64_t, "code"> code;
+        json::required<std::string, "message"> message;
     };
 
     struct response {
-        std::string jsonrpc = "2.0";
-        std::optional<key> id;
-        std::optional<rfl::Generic> result;
-        std::optional<mcp::error> error;
+        json::required<std::string_view, "jsonrpc"> version{"2.0"};
+        json::optional<key, "id"> id;
+        json::optional<json::value, "result"> result;
+        json::optional<mcp::error, "error"> error;
     };
+
+    // An audit projection of a reply. The tool result itself is relayed as received.
+    inline auto response_failed(std::string_view text, std::string_view expected_id) -> std::optional<bool> {
+        using id_view = std::variant<std::int64_t, std::string_view>;
+        struct response_fields {
+            json::required<id_view, decltype(response::id)::name> id;
+            json::optional<json::view, decltype(response::result)::name> result;
+            json::optional<json::view, decltype(response::error)::name> error;
+        };
+        struct result_fields {
+            json::optional<bool, "isError"> failed;
+        };
+        const json::document document{text};
+        auto response = json::read<response_fields>(document.root());
+        if (!response)
+            return {};
+        const auto matches = std::visit(
+            [&](const auto& id) {
+                if constexpr (std::is_same_v<std::decay_t<decltype(id)>, std::string_view>)
+                    return expected_id.starts_with("s:") && expected_id.substr(2) == id;
+                else {
+                    char digits[24];
+                    const auto end = std::to_chars(digits, digits + sizeof(digits), id).ptr;
+                    return expected_id.starts_with("n:") && expected_id.substr(2) == std::string_view{digits, end};
+                }
+            },
+            response->id.value);
+        if (!matches)
+            return {};
+        if (response->error.value)
+            return true;
+        if (response->result.value)
+            if (auto result = json::read<result_fields>(*response->result.value))
+                return result->failed.value.value_or(false);
+        return false;
+    }
 
     struct notification {
         std::string jsonrpc = "2.0";
         std::string method;
-        rfl::Generic params;
+        json::value params;
     };
 
     inline auto key_text(const key& k) -> std::string {
@@ -88,7 +124,7 @@ export namespace mcp {
         explicit notifier(web::event_stream& stream) : stream_(&stream) {}
 
         // The same stream for a call that asked for progress under `token`; nowhere for one that did not.
-        auto tagged(std::optional<rfl::Generic> token) const -> notifier {
+        auto tagged(std::optional<json::value> token) const -> notifier {
             notifier out;
             if (token) {
                 out.stream_ = stream_;
@@ -104,7 +140,7 @@ export namespace mcp {
             auto sent = n;
             if (token_)
                 if (auto o = n.params.to_object()) {
-                    rfl::Generic::Object p;
+                    json::object p;
                     for (auto& [key, value] : *o)
                         if (n.method != "notifications/progress" || key != "total")
                             p[key] = value;
@@ -113,27 +149,20 @@ export namespace mcp {
                     p["progressToken"] = *token_;
                     sent.params = p;
                 }
-            stream_->push(web::event_stream::message(rfl::json::write(sent)));
+            stream_->push(web::event_stream::message(json::write(sent)));
         }
 
     private:
         web::event_stream* stream_ = nullptr;
-        std::optional<rfl::Generic> token_;
+        std::optional<json::value> token_;
         std::shared_ptr<std::int64_t> progress_;
     };
-
-    inline auto object(std::initializer_list<std::pair<std::string, rfl::Generic>> fields) -> rfl::Generic::Object {
-        rfl::Generic::Object out;
-        for (auto& [k, v] : fields)
-            out.insert(k, v);
-        return out;
-    }
 
     struct tool {
         std::string name;
         std::string description;
-        rfl::Generic inputSchema;
-        std::optional<rfl::Generic> outputSchema;
+        json::value inputSchema;
+        std::optional<json::value> outputSchema;
     };
 
     struct block {
@@ -143,23 +172,23 @@ export namespace mcp {
 
     struct tool_result {
         std::vector<block> content;
-        std::optional<rfl::Generic> structuredContent;
+        std::optional<json::value> structuredContent;
         bool isError = false;
     };
 
     struct call_params {
         std::string name;
-        std::optional<rfl::Generic> arguments;
-        std::optional<rfl::Generic> _meta;
+        std::optional<json::value> arguments;
+        std::optional<json::value> _meta;
     };
 
     struct tool_outcome {
         std::string text;
-        std::optional<rfl::Generic> structured;
+        std::optional<json::value> structured;
         bool error = false;
     };
 
-    inline auto progress_token(const request& req) -> std::optional<rfl::Generic> {
+    inline auto progress_token(const request& req) -> std::optional<json::value> {
         if (req.method != "tools/call" || !req.params)
             return std::nullopt;
         auto params = req.params->to_object();
@@ -178,7 +207,7 @@ export namespace mcp {
     }
 
     template <class T>
-    concept toolset = requires(T& t, std::string_view name, rfl::Generic args, notifier& out, const worlds::actor& who) {
+    concept toolset = requires(T& t, std::string_view name, json::value args, notifier& out, const worlds::actor& who) {
         { t.list() } -> std::convertible_to<const std::vector<tool>&>;
         { t.call(name, std::move(args), out, who, call_context{}) } -> std::same_as<coroutine::task<tool_outcome>>;
     };
@@ -197,9 +226,9 @@ export namespace mcp {
                 if (req.method == "initialize")
                     answer = reply(*req.id, initialize(req));
                 else if (req.method == "ping")
-                    answer = reply(*req.id, rfl::Generic::Object{});
+                    answer = reply(*req.id, json::object{});
                 else if (req.method == "tools/list")
-                    answer = reply(*req.id, object({{"tools", rfl::to_generic(tools.list())}}));
+                    answer = reply(*req.id, json::object({{"tools", json::to_value(tools.list())}}));
                 else if (req.method != "tools/call")
                     answer = fail(*req.id, code::method_not_found, "method not found: " + req.method);
             } catch (const std::exception& e) {
@@ -208,7 +237,7 @@ export namespace mcp {
             if (answer)
                 co_return answer;
 
-            auto params = rfl::from_generic<call_params>(req.params.value_or(rfl::Generic::Object{}));
+            auto params = json::from_value<call_params>(req.params.value_or(json::object{}));
             if (!params)
                 co_return fail(*req.id, code::invalid_params, params.error().what());
             auto progress = out.tagged(progress_token(req));
@@ -216,7 +245,7 @@ export namespace mcp {
             if (params->_meta) {
                 if (auto meta = params->_meta->to_object()) {
                     if (auto value = meta->get("fughetta/client_sync_seconds")) {
-                        auto seconds = rfl::from_generic<double>(*value);
+                        auto seconds = json::from_value<double>(*value);
                         if (seconds && std::isfinite(*seconds) && *seconds >= 0 &&
                             *seconds <= std::chrono::duration<double>(constants::client_sync_limit).count())
                             context.client_sync_seconds = *seconds;
@@ -224,8 +253,8 @@ export namespace mcp {
                 }
             }
             try {
-                auto outcome = co_await tools.call(params->name, params->arguments.value_or(rfl::Generic::Object{}), progress, who, context);
-                co_return reply(*req.id, rfl::to_generic(tool_result{.content = {block{.text = std::move(outcome.text)}},
+                auto outcome = co_await tools.call(params->name, params->arguments.value_or(json::object{}), progress, who, context);
+                co_return reply(*req.id, json::to_value(tool_result{.content = {block{.text = std::move(outcome.text)}},
                                                                      .structuredContent = std::move(outcome.structured),
                                                                      .isError = outcome.error}));
             } catch (const std::exception& e) {
@@ -234,22 +263,22 @@ export namespace mcp {
         }
 
     private:
-        auto initialize(const request& req) const -> rfl::Generic {
+        auto initialize(const request& req) const -> json::value {
             std::string version{protocol_version};
             if (req.params)
                 if (auto o = req.params->to_object())
                     if (auto v = o->get("protocolVersion"))
                         if (auto s = v->to_string(); s && supported(*s))
                             version = *s;
-            return object({
+            return json::object({
                 {"protocolVersion", version},
-                {"capabilities", object({{"tools", object({{"listChanged", false}})}})},
-                {"serverInfo", object({{"name", name_}, {"version", version_}})},
+                {"capabilities", json::object({{"tools", json::object({{"listChanged", false}})}})},
+                {"serverInfo", json::object({{"name", name_}, {"version", version_}})},
             });
         }
 
-        static auto reply(const key& id, rfl::Generic result) -> response { return {.id = id, .result = std::move(result)}; }
-        static auto fail(const key& id, int code, std::string message) -> response { return {.id = id, .error = mcp::error{code, std::move(message)}}; }
+        static auto reply(const key& id, json::value result) -> response { return {.id = {id}, .result = {std::move(result)}}; }
+        static auto fail(const key& id, int code, std::string message) -> response { return {.id = {id}, .error = {mcp::error{{code}, {std::move(message)}}}}; }
 
         std::string name_;
         std::string version_;

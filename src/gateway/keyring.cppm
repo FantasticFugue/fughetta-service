@@ -9,9 +9,11 @@ import world;
 
 // Who sends a request to this core: the holder of a bearer token, or the caller a front on the private network names.
 export namespace keyring {
-    struct unauthorized : std::runtime_error {
+    struct unauthorized : std::runtime_error, util::retained_exception {
         using std::runtime_error::runtime_error;
+        auto retain() const noexcept -> std::exception_ptr override;
     };
+    auto unauthorized::retain() const noexcept -> std::exception_ptr { return util::copy_current_exception(*this); }
 
     inline auto hash(std::string_view token) -> std::string { return content::hash_of(token).str(); }
 
@@ -30,10 +32,25 @@ export namespace keyring {
         return out;
     }
 
+    inline auto bearer(std::string_view value) -> std::optional<std::string_view> {
+        if (value.size() <= 7 ||
+            !std::ranges::equal(value.substr(0, 7), std::string_view{"bearer "}, {},
+                                [](char c) { return static_cast<char>(std::tolower(static_cast<unsigned char>(c))); }))
+            return std::nullopt;
+        return value.substr(7);
+    }
+
+    inline auto accepts_front(const config::auth& auth, std::string_view authorization) -> bool {
+        auto token = bearer(authorization);
+        return token && auth.front_token && content::secure_equal(hash(*token), hash(*auth.front_token));
+    }
+
     // `header` reads a request header by its lowercase name and returns an optional string_view.
     template <class Header> auto authenticate(const config::auth& auth, Header header) -> worlds::actor {
         auto text = [&](std::string_view name) { return std::string{header(name).value_or("")}; };
-        if (auth.mode == "trusted") {
+        if (auth.mode == config::auth_mode::trusted) {
+            if (!accepts_front(auth, header("authorization").value_or("")))
+                throw unauthorized("send the front bearer token");
             if (auth.workspace.empty() || text("x-fughetta-workspace") != auth.workspace)
                 throw unauthorized("the front named a different workspace (x-fughetta-workspace)");
             worlds::actor who{.issuer = text("x-fughetta-issuer"),
@@ -53,14 +70,13 @@ export namespace keyring {
                 who.client = std::move(client);
             return who;
         }
-        auto value = header("authorization").value_or("");
-        auto scheme = value.substr(0, std::min<std::size_t>(value.size(), 7));
-        if (!std::ranges::equal(scheme, std::string_view{"bearer "}, {}, [](char c) { return static_cast<char>(std::tolower(static_cast<unsigned char>(c))); }))
+        auto token = bearer(header("authorization").value_or(""));
+        if (!token)
             throw unauthorized("send a bearer token");
-        auto digest = hash(value.substr(7));
+        auto digest = hash(*token);
         auto found = std::ranges::find_if(auth.tokens, [&](const config::token& t) { return content::secure_equal(digest, t.hash); });
         if (found == auth.tokens.end())
             throw unauthorized("unknown bearer token");
-        return {.issuer = "token", .user = found->name, .caller = found->name, .role = found->role, .client = hash("client:" + digest)};
+        return {.issuer = "token", .user = found->name, .caller = found->name, .role = found->role == config::token_role::owner ? "owner" : "member", .client = hash("client:" + digest)};
     }
 } // namespace keyring

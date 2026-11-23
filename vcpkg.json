@@ -1,6 +1,9 @@
 {
     "dependencies": [
+        "ada-url",
         "argparse",
+        {"name": "libzip", "default-features": false},
+        "roaring",
         "c-ares",
         "asio",
         "bext-ut",
@@ -8,16 +11,12 @@
         "nghttp2",
         "nghttp3",
         "libsodium",
-        {
-            "name": "reflectcpp",
-            "features": [
-                "xml"
-            ]
-        },
+        "pugixml",
         "sqlite3",
         "stdexec",
         "wolfssl",
         "zstd",
+        "yyjson",
         {
             "name": "liburing",
             "platform": "linux"

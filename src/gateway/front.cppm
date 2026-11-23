@@ -3,7 +3,7 @@ import std;
 import enrollment;
 import constants;
 import native;
-import reflection;
+import json;
 import coroutine;
 import http;
 import mcp;
@@ -18,6 +18,7 @@ import keyring;
 import nodes;
 import codec;
 import utility;
+import websocket;
 
 export namespace front {
 
@@ -72,7 +73,7 @@ export namespace front {
 
     private:
         auto message(unsigned changes, std::string_view event) const -> std::string {
-            return std::format("event: {}\ndata: {{\"workspace_id\":{},\"changes\":{}}}\n\n", event, rfl::json::write(workspace_), changes);
+            return std::format("event: {}\ndata: {{\"workspace_id\":{},\"changes\":{}}}\n\n", event, json::write(workspace_), changes);
         }
         cores::context<native::scheduler>& rt_;
         std::string workspace_;
@@ -176,12 +177,14 @@ export namespace front {
         bool remote_listener = false;
     };
 
-    struct coded_error : std::runtime_error {
+    struct coded_error : std::runtime_error, util::retained_exception {
         http::status status;
         std::string code;
         std::vector<std::string> missing, conflicts, frontier;
         coded_error(http::status status, std::string_view code, std::string message) : std::runtime_error(std::move(message)), status(status), code(code) {}
+        auto retain() const noexcept -> std::exception_ptr override;
     };
+    auto coded_error::retain() const noexcept -> std::exception_ptr { return util::copy_current_exception(*this); }
 
     namespace api {
         template <class T> struct section_view {
@@ -213,13 +216,13 @@ export namespace front {
 
     inline auto conflict_reply(const config::revision_conflict& e) -> web::reply {
         return web::json_reply(409, std::format(R"({{"code":"revision_conflict","message":{},"revision":{},"value":{}}})",
-                                                rfl::json::write(std::string{e.what()}), e.revision, e.value));
+                                                json::write(std::string{e.what()}), e.revision, e.value));
     }
 
     inline auto coded_reply(const coded_error& e) -> web::reply {
-        return web::json_reply(e.status, std::format(R"({{"code":{},"message":{},"missing":{},"conflicts":{},"frontier":{}}})", rfl::json::write(e.code),
-                                                     rfl::json::write(std::string{e.what()}), rfl::json::write(e.missing), rfl::json::write(e.conflicts),
-                                                     rfl::json::write(e.frontier)));
+        return web::json_reply(e.status, std::format(R"({{"code":{},"message":{},"missing":{},"conflicts":{},"frontier":{}}})", json::write(e.code),
+                                                     json::write(std::string{e.what()}), json::write(e.missing), json::write(e.conflicts),
+                                                     json::write(e.frontier)));
     }
 
     // Answers one REST request; the configuration MCP answers through it too.
@@ -249,11 +252,11 @@ export namespace front {
             tools_.insert(tools_.end(), configuration.begin(), configuration.end());
         }
         auto list() const -> const std::vector<mcp::tool>& { return tools_; }
-        auto call(std::string_view name, rfl::Generic args, mcp::notifier& note, const worlds::actor& who, mcp::call_context call = {})
+        auto call(std::string_view name, json::value args, mcp::notifier& note, const worlds::actor& who, mcp::call_context call = {})
             -> coroutine::task<mcp::tool_outcome> {
             if (std::ranges::any_of(settings_.list(), [name](const auto& tool) { return tool.name == name; })) {
                 if (!who.run.empty())
-                    co_return mcp::tool_outcome{.text = "execution credentials cannot access project settings", .error = true};
+                    co_return tools::refuse_tool({nodes::code::permission_denied, "execution credentials cannot access project settings"});
                 co_return co_await settings_.call(name, std::move(args), note, who, call);
             }
             co_return co_await execution_.call(name, std::move(args), note, who, call);
@@ -282,6 +285,40 @@ export namespace front {
                     auto origin = web::header(in.head, "origin");
                     bool allowed = !origin || std::ranges::contains(doc->server.allowed_origins, *origin);
 
+                    auto method = in.head.method.token();
+                    const bool health = method == "GET" && t.path == "/healthz";
+                    const bool preflight = method == "OPTIONS" && origin;
+                    const bool trusted = doc->server.auth.mode == config::auth_mode::trusted;
+                    auto authorization = web::header(in.head, "authorization").value_or("");
+                    auto credential = trusted ? web::header(in.head, "x-fughetta-execution") : std::nullopt;
+                    if (!trusted && !health && !preflight) {
+                        if (auto token = keyring::bearer(authorization); token && token->starts_with("fugrun."))
+                            credential = token;
+                    }
+                    std::optional<worlds::actor> who;
+                    if (trusted && (!health || credential)) {
+                        std::optional<web::reply> refused;
+                        if (!preflight || credential)
+                            refused = authenticate(doc->server.auth, in.head, who);
+                        else if (!keyring::accepts_front(doc->server.auth, authorization))
+                            refused = unauthorized("send the front bearer token");
+                        if (refused) {
+                            refused->head.fields.push_back({"connection", "close"});
+                            if (origin && allowed) {
+                                refused->head.fields.push_back({"access-control-allow-origin", std::string{*origin}});
+                                refused->head.fields.push_back({"vary", "origin"});
+                            }
+                            co_await web::respond(conn, std::move(in.token), std::move(refused->head), std::move(refused->body));
+                            peer.shutdown(net::socket_base::shutdown_send);
+                            auto drain = [&peer]() -> coroutine::task<> {
+                                std::array<std::byte, 4096> buffer;
+                                while (co_await io::async_read_some(peer, net::buffer(buffer))) {}
+                            };
+                            co_await coroutine::deadline(ctx_.rt.get_scheduler(ctx_.core), std::chrono::seconds{1}, drain());
+                            break;
+                        }
+                    }
+
                     std::string body;
                     bool too_large = false;
                     try {
@@ -301,34 +338,19 @@ export namespace front {
                         continue;
                     }
 
-                    auto method = in.head.method.token();
                     web::reply r;
                     auto c = ctx_;
-                    std::optional<worlds::actor> who;
                     std::optional<web::reply> refused;
-                    if (!(method == "OPTIONS" && origin) && t.path != "/healthz") {
-                        auto authorization = web::header(in.head, "authorization").value_or("");
-                        const bool execution = authorization.size() > 14 && authorization.substr(7).starts_with("fugrun.") &&
-                                               std::ranges::equal(authorization.substr(0, 7), std::string_view{"bearer "}, {},
-                                                                  [](char c) { return static_cast<char>(std::tolower(static_cast<unsigned char>(c))); });
-                        if (execution) {
-                            if (t.path != "/mcp")
-                                refused = error(403, "execution credentials are restricted to the task MCP endpoint");
-                            else {
-                                try {
-                                    who = co_await tools::execution_actor(*ctx_.services, std::string{authorization.substr(7)});
-                                } catch (const std::exception& e) {
-                                    refused = error(401, e.what());
-                                }
-                            }
-                        } else
-                            refused = authenticate(doc->server.auth, in.head, who);
-                        if (who)
-                            c.who = &*who;
-                    }
+                    if (credential)
+                        refused = co_await authenticate_execution(t, *credential, who);
+                    else if (!trusted && !health && !preflight)
+                        refused = authenticate(doc->server.auth, in.head, who);
+                    if (who)
+                        c.who = &*who;
                     std::optional<allocation::control::lease> admitted;
                     bool control_read = method == "OPTIONS" || (method == "GET" && (t.path == "/healthz" || t.path == "/api/v1/config/runtime" ||
-                                                                                    t.path == "/api/v1/builds" || t.path == "/api/v1/events"));
+                                                                                    t.path == "/api/v1/builds" || t.path == "/api/v1/events" ||
+                                                                                    t.path == "/api/v1/hosting/activity"));
                     // Status polling must not prevent a drained instance from rebuilding its processes.
                     if (!refused && c.runtime && !control_read) {
                         if (auto held = c.runtime->enter(t.path == "/api/v1/config/runtime"))
@@ -343,7 +365,7 @@ export namespace front {
                     }
                     if (refused) {
                         r = std::move(*refused);
-                    } else if (method == "OPTIONS" && origin) {
+                    } else if (preflight && !credential) {
                         r = {.head = {.status = 204,
                                       .fields = {{"access-control-allow-methods", "GET, PUT, POST, DELETE, OPTIONS"},
                                                  {"access-control-allow-headers", "authorization, content-type, accept, mcp-protocol-version, last-event-id"},
@@ -406,7 +428,59 @@ export namespace front {
             peer.close();
         }
 
+        auto serve_worker(socket peer) -> coroutine::task<> {
+            auto tunnel = std::make_shared<web::ws::worker_tunnel>(std::move(peer));
+            auto io = ctx_.rt.get_scheduler(ctx_.core);
+            try {
+                auto upgraded = co_await coroutine::deadline(io, std::chrono::seconds{10}, upgrade_worker(*tunnel));
+                if (!upgraded.value_or(false))
+                    co_return;
+                auto run = [&](coroutine::scope& children) -> coroutine::task<> {
+                    children.spawn(tunnel->watch(io));
+                    co_await ctx_.workers.workers(ctx_.core).admit(io, tunnel, ctx_.identities, ctx_.pool,
+                        [this] { return ctx_.config.current(ctx_.core)->server.remote_worker_enrollment; });
+                };
+                co_await coroutine::with_scope(std::move(run));
+            } catch (const std::exception& e) {
+                logging::warn(std::format("worker tunnel: {}", e.what()));
+            }
+        }
+
     private:
+        auto upgrade_worker(web::ws::worker_tunnel& tunnel) -> coroutine::task<bool> {
+            http::v1::server conn{tunnel.transport()};
+            auto in = co_await http::coroutine::receive(conn);
+            auto doc = ctx_.config.current(ctx_.core);
+            std::optional<web::reply> refused;
+            http::response head;
+            if (doc->server.auth.mode == config::auth_mode::trusted &&
+                !keyring::accepts_front(doc->server.auth, web::header(in.head, "authorization").value_or("")))
+                refused = unauthorized("send the front bearer token");
+            else if (web::header(in.head, "origin"))
+                refused = error(403, "Worker tunnels refuse Origin");
+            else if (in.head.target != constants::worker_tunnel_path)
+                refused = error(404, "Worker tunnel endpoint not found");
+            else {
+                try {
+                    if (!conn.upgraded() || conn.should_close() || web::header(in.head, "transfer-encoding") ||
+                        web::header(in.head, "content-length").value_or("0") != "0")
+                        throw http::websocket::failure(1002, "Worker tunnel requires a WebSocket upgrade without request content");
+                    head = http::websocket::opening_response(in.head, constants::worker_tunnel_protocol);
+                } catch (const http::websocket::failure& e) {
+                    refused = error(400, e.what());
+                }
+            }
+            if (refused) {
+                refused->head.fields.push_back({"connection", "close"});
+                co_await web::respond(conn, std::move(in.token), std::move(refused->head), std::move(refused->body));
+                co_return false;
+            }
+            http::span_body empty{std::span<const std::byte>{}};
+            co_await http::coroutine::respond(conn, std::move(in.token), std::move(head), empty);
+            tunnel.start(http::websocket::side::server, conn.take_pending());
+            co_return true;
+        }
+
         auto heartbeat(workspace_events::subscription& sub, const http::request& head, const worlds::actor& initial, coroutine::scope& children)
             -> coroutine::task<> {
             for (;;) {
@@ -425,7 +499,7 @@ export namespace front {
         }
 
         static auto draining_cancel(std::string_view body) -> bool {
-            auto rpc = rfl::json::read<mcp::request>(std::string{body});
+            auto rpc = json::read<mcp::request>(std::string{body});
             return rpc && mcp::cancelled_request(*rpc).has_value();
         }
 
@@ -440,14 +514,37 @@ export namespace front {
             return coded_reply(coded_error{status, code, std::move(why)});
         }
 
+        static auto unauthorized(std::string why) -> web::reply {
+            auto r = error(401, std::move(why));
+            r.head.fields.push_back({"www-authenticate", std::string{constants::bearer_challenge}});
+            return r;
+        }
+
+        auto authenticate_execution(const web::target& target, std::string_view credential, std::optional<worlds::actor>& who)
+            -> coroutine::task<std::optional<web::reply>> {
+            if (target.path != "/mcp")
+                co_return error(403, "execution credentials are restricted to the task MCP endpoint");
+            try {
+                auto execution = co_await tools::execution_actor(*ctx_.services, std::string{credential});
+                if (who) {
+                    if (execution.issuer != who->issuer || execution.user != who->user)
+                        co_return unauthorized("execution belongs to another caller");
+                    execution.role = std::move(who->role);
+                    execution.email = std::move(who->email);
+                }
+                who = std::move(execution);
+            } catch (const std::exception& e) {
+                co_return unauthorized(e.what());
+            }
+            co_return std::nullopt;
+        }
+
         template <class Head>
         static auto authenticate(const config::auth& auth, const Head& head, std::optional<worlds::actor>& who) -> std::optional<web::reply> {
             try {
                 who = keyring::authenticate(auth, [&head](std::string_view name) { return web::header(head, name); });
             } catch (const keyring::unauthorized& e) {
-                auto r = error(401, e.what());
-                r.head.fields.push_back({"www-authenticate", std::string{constants::bearer_challenge}});
-                return r;
+                return unauthorized(e.what());
             }
             return std::nullopt;
         }
@@ -458,9 +555,9 @@ export namespace front {
             if (auto v = web::header(in.head, "mcp-protocol-version"); v && !mcp::supported(*v)) {
                 co_return error(400, std::format("unsupported MCP-Protocol-Version '{}'", *v));
             }
-            auto rpc = rfl::json::read<mcp::request>(body);
+            auto rpc = json::read<mcp::request>(body);
             if (!rpc) {
-                co_return web::json_reply(400, rfl::json::write(mcp::response{.error = mcp::error{mcp::code::parse_error, rpc.error().what()}}));
+                co_return web::json_reply(400, json::write(mcp::response{.error = {mcp::error{{mcp::code::parse_error}, {rpc.error().what()}}}}));
             }
             if (auto cancelled = mcp::cancelled_request(*rpc)) {
                 if (ctx_.requests && who)
@@ -473,10 +570,10 @@ export namespace front {
                 co_return web::reply{.head = {.status = 202}};
             }
             auto accept = web::header(in.head, "accept").value_or("");
-            if (accept.find("text/event-stream") == std::string_view::npos || !mcp::progress_token(*rpc)) {
+            if (accept.find("text/event-stream") == std::string_view::npos || rpc->method != "tools/call") {
                 mcp::notifier drop;
                 auto out = co_await cancellable(*rpc, drop, *who, configuration);
-                co_return web::json_reply(200, rfl::json::write(out ? **out : cancelled(*rpc)));
+                co_return web::json_reply(200, json::write(out ? **out : cancelled(*rpc)));
             }
 
             web::event_stream events;
@@ -519,9 +616,11 @@ export namespace front {
                 if (disconnected.stop_requested()) {
                     // The request ticket has been released; no response can reach this peer.
                 } else if (!out)
-                    events.push(web::event_stream::message(rfl::json::write(cancelled(*rpc))));
+                    events.finish(web::event_stream::message(json::write(cancelled(*rpc))));
                 else if (*out)
-                    events.push(web::event_stream::message(rfl::json::write(**out)));
+                    // The answer is committed to the stream after the progress it still holds, and read in pieces as the reader
+                    // takes them.
+                    events.finish(web::event_stream::message(json::write(**out)));
                 heartbeat_stop.request_stop();
                 events.close();
                 co_await children.join();
@@ -567,7 +666,7 @@ export namespace front {
             try {
                 r = co_await coroutine::under(source.get_token(), handle(rpc, out, who, configuration));
             } catch (...) {
-                failure = std::current_exception();
+                failure = util::capture_current_exception();
             }
             if (failure)
                 std::rethrow_exception(failure);
@@ -580,7 +679,7 @@ export namespace front {
         }
 
         static auto cancelled(const mcp::request& rpc) -> mcp::response {
-            return {.id = rpc.id, .error = mcp::error{mcp::code::request_cancelled, "the request was cancelled"}};
+            return {.id = {rpc.id}, .error = {mcp::error{{mcp::code::request_cancelled}, {"the request was cancelled"}}}};
         }
 
         context ctx_;

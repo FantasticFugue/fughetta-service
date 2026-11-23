@@ -1,6 +1,6 @@
 export module settings;
 import std;
-import reflection;
+import json;
 import coroutine;
 import http;
 import mcp;
@@ -12,19 +12,19 @@ import world;
 export namespace settings {
     struct empty {};
     using project =
-        rfl::Description<"Project name: 1-64 letters, digits, dots, underscores or hyphens; start with a letter or digit. Example: app", std::string>;
+        json::described<"Project name: 1-64 letters, digits, dots, underscores or hyphens; start with a letter or digit. Example: app", std::string>;
     struct location {
         settings::project project;
     };
     template <class T> struct save {
-        rfl::Description<"Revision returned by the corresponding GET; 0 creates a new project. Example: 0", std::uint64_t> revision;
+        json::described<"Revision returned by the corresponding GET; 0 creates a new project. Example: 0", std::uint64_t> revision;
         T value;
     };
     // The value is checked when saved, and a refusal names the field; its schema stays out of the tool list, read with `schema`.
     using project_value =
-        rfl::Description<"Project settings as project returns them: ignore, env, build_configurations, run_configurations, default_configurations and "
+        json::described<"Project settings as project returns them: ignore, env, build_configurations, run_configurations, default_configurations and "
                          "analysis. Read schema for their fields.",
-                         std::map<std::string, rfl::Generic>>;
+                         std::map<std::string, json::value>>;
     struct project_save {
         settings::project project;
         save<project_value> body;
@@ -68,7 +68,7 @@ export namespace settings {
             }();
             return all;
         }
-        auto call(std::string_view name, rfl::Generic args, mcp::notifier&, const worlds::actor& who, mcp::call_context = {})
+        auto call(std::string_view name, json::value args, mcp::notifier&, const worlds::actor& who, mcp::call_context = {})
             -> coroutine::task<mcp::tool_outcome> {
             auto found = std::ranges::find_if(catalog(), [name](const entry& e) { return e.tool.name == name; });
             if (found == catalog().end())
@@ -88,13 +88,13 @@ export namespace settings {
                     path.replace(at, marker.size(), value);
                 }
                 auto body = fields.get("body");
-                result = co_await dispatch_(who, found->method, std::move(path), body ? rfl::json::write(*body) : "{}");
+                result = co_await dispatch_(who, found->method, std::move(path), body ? json::write(*body) : "{}");
             } catch (const std::exception& e) {
                 error = e.what();
             }
             if (!result)
                 co_return mcp::tool_outcome{.text = std::move(error), .error = true};
-            auto parsed = rfl::json::read<rfl::Generic>(result->body);
+            auto parsed = json::read<json::value>(result->body);
             if (!parsed)
                 co_return mcp::tool_outcome{
                     .text = std::format("the core answered status {} with a body that is not JSON: {}", result->head.status.code(), parsed.error().what()),

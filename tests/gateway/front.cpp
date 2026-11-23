@@ -3,9 +3,10 @@ import boost.ut;
 import coroutine;
 import native;
 import http;
+import constants;
 import configuration;
 import content;
-import reflection;
+import json;
 import nodes;
 import registry;
 import tools;
@@ -20,6 +21,8 @@ import usage;
 import support;
 import enrollment;
 import protocol;
+import projectmodel;
+import durability;
 
 namespace {
     using namespace boost::ut;
@@ -31,6 +34,7 @@ namespace {
         std::string body;
         std::string content_type;
         std::string allow_origin;
+        std::string execution_scope;
     };
 
     constexpr auto PUT = http::method::PUT;
@@ -39,16 +43,18 @@ namespace {
 
     struct harness {
         std::string mode;
+        // What the harness accepts in one request: a test that seeds a large file raises it.
+        std::size_t max_request_bytes = 4096;
         test::scratch tmp{"front"};
         cores::io_context<native::context> rt{1};
         routing::router router{rt};
         execution::thread_pool pool{2};
         front::config_hub hub{rt,
                               config::store{config::parse(std::format(R"({{
-      "server": {{ "allowed_origins": ["http://ok.example"], "max_request_bytes": 4096, "storage": "{}",
-                   "auth": {{ "mode": "{}", "workspace": "{}", "tokens": [{{ "name": "tester", "hash": "{}" }}] }} }}
+      "server": {{ "allowed_origins": ["http://ok.example"], "max_request_bytes": {}, "storage": "{}",
+                   "auth": {{ "mode": "{}", "workspace": "{}", "front_token": "sk_front", "tokens": [{{ "name": "tester", "hash": "{}" }}] }} }}
     }})",
-                                                                      (tmp.dir / "storage").generic_string(), mode, mode == "trusted" ? "acme-id" : "",
+                                                                      max_request_bytes, (tmp.dir / "storage").generic_string(), mode, mode == "trusted" ? "acme-id" : "",
                                                                       keyring::hash("sk_test"))),
                                             tmp.dir / "gateway.json"},
                               pool};
@@ -58,8 +64,9 @@ namespace {
         tools::backlog queue{rt, services};
         std::chrono::milliseconds heartbeat;
         front::server server{front::context{hub, files, router, rt, 0, nullptr, nullptr, nullptr, &services}, services, heartbeat};
-        explicit harness(std::string mode = "token", std::chrono::milliseconds interval = std::chrono::seconds{15})
-            : mode(std::move(mode)), heartbeat(interval) {
+        explicit harness(std::string mode = "token", std::chrono::milliseconds interval = std::chrono::seconds{15},
+                         std::size_t max_request_bytes = 4096)
+            : mode(std::move(mode)), max_request_bytes(max_request_bytes), heartbeat(interval) {
             services.queue = &queue;
         }
         std::uint16_t port = 0;
@@ -69,13 +76,14 @@ namespace {
             auto s = co_await io::connect(io, {net::ip::address_v4{{127, 0, 0, 1}}, port});
             test::http_stream transport{s};
             if (authenticated)
-                fields.push_back({"authorization", "Bearer sk_test"});
+                fields.push_back({"authorization", mode == "trusted" ? "Bearer sk_front" : "Bearer sk_test"});
             http::request req{.method = method, .target = std::move(target), .scheme = "http", .authority = "localhost", .fields = std::move(fields)};
             http::v1::client client{transport};
             auto got = co_await http::coroutine::fetch(client, std::move(req), std::string_view{body});
             s.close();
             co_return answer{got.head.status, std::string{got.text()}, std::string{http::find_header(got.head.fields, "content-type").value_or("")},
-                             std::string{http::find_header(got.head.fields, "access-control-allow-origin").value_or("")}};
+                             std::string{http::find_header(got.head.fields, "access-control-allow-origin").value_or("")},
+                             std::string{http::find_header(got.head.fields, "x-fughetta-execution").value_or("")}};
         }
 
         auto save(ctx& io, std::string path, std::string_view value, std::vector<http::header> fields = {}) -> coroutine::task<answer> {
@@ -95,10 +103,10 @@ namespace {
     auto call(std::string_view tool, std::string_view args, std::string_view meta = "") -> std::string {
         std::string selected{args};
         if (tool == "worldline" || tool == "language" || tool == "scope" || tool == "build" || tool == "test" || tool == "run") {
-            auto object = rfl::json::read<rfl::Generic>(selected)->to_object().value();
+            auto object = json::read<json::value>(selected)->to_object().value();
             if (!object.get("worldline"))
                 object["worldline"] = "main";
-            selected = rfl::json::write(object);
+            selected = json::write(object);
         }
         return std::format(R"({{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{{"name":"{}","arguments":{}{}}}}})", tool, selected,
                            meta.empty() ? "" : std::format(R"(,"_meta":{})", meta));
@@ -118,6 +126,18 @@ namespace {
                 transport::dispatcher<socket> dispatch;
                 const std::string data = "verified artifact";
                 const auto digest = content::hash_of(data);
+                projectmodel::document model{
+                    .producer = "test",
+                    .producer_version = "current",
+                    .units = {{.id = "main",
+                               .project = "app",
+                               .language = "kotlin",
+                               .directory = ".",
+                               .references = {projectmodel::artifact_reference{.object = {digest.str(), "library.jar"}, .role = "classpath"}}}}};
+                const auto model_text = json::write(model);
+                const auto model_digest = content::hash_of(model_text);
+                builds::exported_file model_file{
+                    .name = "build/model", .path = "model.json", .digest = model_digest, .size = model_text.size(), .objects = {{digest, data.size()}}};
                 const std::string log = "complete compiler log";
                 const auto log_digest = content::hash_of(log);
                 int builds = 0, downloads = 0;
@@ -137,20 +157,22 @@ namespace {
                                                             .output = "log",
                                                             .truncated = true,
                                                             .log = builds::exported_file{"step-0.log", "0.log", log_digest, log.size(), false}}},
-                                                 .exports = {{"binary", "app", digest, data.size(), true}}};
+                                                 .exports = {{"binary", "app", digest, data.size(), true}},
+                                                 .models = {model_file}};
                 };
                 dispatch.on<jobs::build_request>(std::move(handle_build_request));
                 auto handle_export_read = [&](jobs::export_read request, auto&) -> coroutine::task<jobs::source_bytes> {
                     ++downloads;
                     if (fail_download)
                         throw std::runtime_error("artifact transport unavailable");
-                    const auto& value = request.digest == log_digest ? log : data;
+                    const auto& value = request.digest == log_digest ? log : request.digest == model_digest ? model_text : data;
                     auto part = std::as_bytes(std::span{value}).subspan(request.offset, request.length);
                     co_return jobs::source_bytes{{{request.digest, request.offset, value.size(), {part.begin(), part.end()}}}};
                 };
                 dispatch.on<jobs::export_read>(std::move(handle_export_read));
                 co_await channel.post(
-                    jobs::hello{.name = "export-builder", .protocol = jobs::protocol_version, .tools = {"true"}, .toolchain_id = "export-toolchain"});
+                    jobs::hello{.name = "export-builder", .protocol = jobs::protocol_version, .tools = {"true"}, .toolchain_id = "export-toolchain",
+                                .capabilities = test::capabilities({"true"})});
                 auto run_children = [&](coroutine::scope& children) -> coroutine::task<> {
                     static constexpr auto run_child_2 = [](harness& h, native::listener& listener, coroutine::scope& children) -> coroutine::task<> {
                         for (;;) {
@@ -170,6 +192,8 @@ namespace {
                         co_await execution::schedule_after(io, 1ms);
                     config::settings project;
                     project.build_configurations["native"] = fixture::commands({"true"});
+                    fixture::options<"command">(project.build_configurations["native"].builders.at("main")).operations.at("build").outputs = {
+                        {"model", {"project_model", "out/model.json"}}};
                     project.build_configurations["native"].operations["build"].exports = {{"binary", "out/app"}};
                     project.default_configurations = {"native"};
                     for (auto name : {"app", "other"}) {
@@ -181,6 +205,15 @@ namespace {
                     const auto first = co_await h.mcp(io, call("build", R"({"project":"app"})"));
                     expect(first.status == 200 && first.body.contains(digest.str())) << first.body;
                     expect(builds == 1);
+                    auto model_object = co_await h.files.read_model(0, "app", {.model = model_digest, .object = {digest}});
+                    expect(model_object.parts.at(0).total == data.size());
+                    bool denied = false;
+                    try {
+                        co_await h.files.read_model(0, "other", {.model = model_digest, .object = {digest}});
+                    } catch (const std::invalid_argument&) {
+                        denied = true;
+                    }
+                    expect(denied) << "model references require the requesting project's grant";
                     const auto log_reply = co_await h.ask(io, GET, "/api/v1/projects/app/exports/" + log_digest.str());
                     expect(log_reply.status == 200 && log_reply.body.contains(tools::lines::base64(log)));
                     const auto part = co_await h.ask(io, GET, path + "?offset=9&length=8");
@@ -191,6 +224,8 @@ namespace {
                     const auto cached = co_await h.mcp(io, call("build", R"({"project":"other"})"));
                     expect(cached.status == 200 && cached.body.contains(digest.str())) << cached.body;
                     expect(builds == 1) << "identical inputs reuse the existing result";
+                    model_object = co_await h.files.read_model(0, "other", {.model = model_digest, .object = {digest}});
+                    expect(model_object.parts.at(0).total == data.size()) << "cached models grant their objects to the new project";
                     expect((co_await h.ask(io, GET, other)).status == 200) << "cache recipients gain download access";
                     expect((co_await h.ask(io, GET, "/api/v1/projects/missing/exports/" + digest.str())).status != 200);
                     expect((co_await h.ask(io, GET, path + "?offset=99")).status != 200);
@@ -199,7 +234,7 @@ namespace {
                     const auto reused = co_await h.mcp(io, call("build", R"({"project":"app","fresh":true})"));
                     expect(reused.status == 200 && !reused.body.contains("artifact transport unavailable")) << reused.body;
                     expect(builds == 2 && downloads == previous_downloads) << "fresh execution reuses stored artifact and log bytes";
-                    std::filesystem::remove(h.tmp.dir / "storage/.exports/blobs" / digest.view());
+                    durability::remove_file(h.tmp.dir / "storage/.exports/blobs" / digest.view());
                     const auto failed = co_await h.mcp(io, call("build", R"({"project":"app","fresh":true})"));
                     expect(failed.status == 200 && failed.body.contains("artifact transport unavailable") && failed.body.contains(R"("exit_code":0)"))
                         << failed.body;
@@ -208,7 +243,7 @@ namespace {
                     fail_download = false;
                     const auto rebuilt = co_await h.mcp(io, call("build", R"({"project":"app"})"));
                     expect(rebuilt.status == 200 && builds == 4) << "failed delivery invalidates the result cache";
-                    std::filesystem::remove(h.tmp.dir / "storage/.exports/blobs" / digest.view());
+                    durability::remove_file(h.tmp.dir / "storage/.exports/blobs" / digest.view());
                     const auto stale = co_await h.mcp(io, call("build", R"({"project":"app"})"));
                     struct execution_reply {
                         struct payload {
@@ -216,13 +251,19 @@ namespace {
                         };
                         payload result;
                     };
-                    const auto stale_result = rfl::json::read<execution_reply>(stale.body).value();
-                    expect(stale.status == 200 && builds == 4 && !stale_result.result.structuredContent.results.at(0).exports.at(0).delivery_error.empty());
+                    const auto stale_result = json::read<execution_reply>(stale.body).value();
+                    expect(stale.status == 200 && builds == 5 && stale_result.result.structuredContent.results.at(0).models.at(0).delivery_error.empty())
+                        << "a missing model dependency makes this call rebuild instead of returning stale cache";
                     const auto repaired = co_await h.mcp(io, call("build", R"({"project":"app"})"));
                     expect(repaired.status == 200 && builds == 5) << "missing objects do not trap later calls in a stale cache";
+                    durability::remove_file(h.tmp.dir / "storage/.exports/blobs" / model_digest.view());
+                    const auto model_miss = co_await h.mcp(io, call("build", R"({"project":"app"})"));
+                    expect(model_miss.status == 200 && builds == 6);
+                    model_object = co_await h.files.read_model(0, "app", {.model = model_digest, .object = {digest}});
+                    expect(model_object.parts.at(0).total == data.size()) << "an evicted model is republished on the same cache lookup";
                     remove_project = true;
                     const auto removed = co_await h.mcp(io, call("build", R"({"project":"app","fresh":true})"));
-                    const auto removed_result = rfl::json::read<execution_reply>(removed.body).value();
+                    const auto removed_result = json::read<execution_reply>(removed.body).value();
                     const auto& completed = removed_result.result.structuredContent.results.at(0);
                     expect(removed.status == 200 && completed.steps.at(0).exit_code == 0 && completed.error.empty());
                     expect(!completed.exports.at(0).delivery_error.empty());
@@ -232,14 +273,6 @@ namespace {
                 co_await coroutine::with_scope(std::move(run_children));
             };
             h.rt.run(std::move(run_core));
-        };
-        "trusted authentication requires a configured workspace identity"_test = [] {
-            expect(throws<std::invalid_argument>([] { config::parse(R"({"server":{"auth":{"mode":"trusted"}}})"); }))
-                << "trusted mode must name the workspace it serves";
-            expect(throws<std::invalid_argument>([] { config::parse(R"({"server":{"auth":{"mode":"trusted","workspace":""}}})"); }))
-                << "an empty workspace identity is refused";
-            auto configured = config::parse(R"({"server":{"auth":{"mode":"trusted","workspace":"acme-id"}}})");
-            expect(configured.server.auth.workspace == "acme-id") << "a configured workspace identity is accepted";
         };
         "Workspace event subscriptions reset, coalesce and bound slow consumers"_test = [] {
             cores::io_context<native::context> rt{1};
@@ -316,7 +349,7 @@ namespace {
             };
             h.rt.run(std::move(run_core));
         };
-        "MCP keepalives detect a disconnected caller and release its queued ticket"_test = [] {
+        static constexpr auto keepalive_case = [](std::string_view meta) {
             using namespace std::chrono_literals;
             harness h{"token", 10ms};
             auto run_core = [&](ctx& io, std::size_t) -> coroutine::task<> {
@@ -327,7 +360,8 @@ namespace {
                 auto [worker_peer, endpoint] = co_await net::async_accept(worker_listener);
                 transport::channel<socket> worker_channel{worker_socket};
                 co_await worker_channel.post(
-                    jobs::hello{.name = "queued-builder", .protocol = jobs::protocol_version, .tools = {"true"}, .toolchain_id = "test-toolchain"});
+                    jobs::hello{.name = "queued-builder", .protocol = jobs::protocol_version, .tools = {"true"}, .toolchain_id = "test-toolchain",
+                                .capabilities = test::capabilities({"true"})});
                 auto run_children = [&](coroutine::scope& children) -> coroutine::task<> {
                     static constexpr auto run_child = [](harness& h, native::listener& listener, coroutine::scope& children) -> coroutine::task<> {
                         for (;;) {
@@ -348,12 +382,13 @@ namespace {
                     co_await h.ask(
                         io, http::method::POST, "/api/v1/projects/app/worldline",
                         R"({"project":"app","worldline":"main","action":"apply","observed":"","operation_id":"seed","changes":[{"kind":"create","path":"a.txt","text":"a"}]})");
-                    auto run_operation = [&io](tools::services&, jobs::progress_log&, std::string) -> coroutine::task<std::optional<tools::backlog::outcome>> {
+                    auto run_operation = [&io](tools::services&, jobs::progress_log&, std::map<std::string, std::string>,
+                                               std::string) -> coroutine::task<std::optional<tools::backlog::outcome>> {
                         co_await execution::schedule_after(io, 30s);
                         co_return tools::config_result{.ok = true};
                     };
                     auto blocker = co_await h.queue.submit(
-                        0, {.key = "blocker", .project = "app", .configuration = "blocker", .operation = "blocker", .actor = "blocker", .trees = "blocker"},
+                        0, {.key = "blocker", .project = "app", .configuration = "blocker", .operation = "blocker", .actor = "blocker", .trees = {"blocker"}},
                         std::move(run_operation));
                     struct release {
                         std::shared_ptr<tools::backlog::ticket> ticket;
@@ -368,20 +403,21 @@ namespace {
                         .scheme = "http",
                         .authority = "localhost",
                         .fields = {{"authorization", "Bearer sk_test"}, {"accept", "text/event-stream"}, {"content-type", "application/json"}}};
-                    auto body = call("build", R"({"project":"app"})", R"({"progressToken":"heartbeat"})");
+                    auto body = call("build", R"({"project":"app"})", meta);
                     request.fields.push_back({"content-length", std::to_string(body.size())});
                     request.fields.push_back({"host", "localhost"});
                     http::span_body payload{std::as_bytes(std::span{body.data(), body.size()})};
                     auto response = co_await http::coroutine::request(client, std::move(request), payload);
                     std::array<std::byte, 4096> buffer;
                     std::string frames;
-                    while (!frames.contains(": keepalive\n\n") || !frames.contains("queued, ")) {
+                    while (!frames.contains(": keepalive\n\n") || (!meta.empty() && !frames.contains("queued, "))) {
                         auto count = co_await coroutine::deadline(io, 2s, http::coroutine::read(response.body, buffer));
                         if (!count || !*count)
                             break;
                         frames.append(reinterpret_cast<const char*>(buffer.data()), *count);
                     }
                     expect(frames.contains(": keepalive\n\n")) << frames;
+                    expect(meta.empty() != frames.contains("progressToken")) << frames;
                     socket.close();
                     bool cancelled = false;
                     for (int attempt = 0; attempt < 100 && !cancelled; ++attempt) {
@@ -393,6 +429,85 @@ namespace {
                     blocker->leave();
                     while (!h.queue.idle())
                         co_await execution::schedule_after(io, 20ms);
+                };
+                co_await coroutine::with_scope(std::move(run_children));
+            };
+            h.rt.run(std::move(run_core));
+        };
+        "MCP keepalives detect a disconnected caller and release its queued ticket"_test = [] { keepalive_case(R"({"progressToken":"heartbeat"})"); };
+        "an MCP call without a progress token still streams keepalives"_test = [] { keepalive_case(""); };
+        "an MCP answer larger than the progress buffer reaches an SSE reader"_test = [] {
+            harness h{"token", std::chrono::seconds{15}, 64000};
+            auto run_core = [&](ctx& io, std::size_t) -> coroutine::task<> {
+                auto listener = native::listener{io, {net::ip::address_v4::loopback(), 0}};
+                h.port = listener.local_endpoint().port();
+                auto run_children = [&](coroutine::scope& children) -> coroutine::task<> {
+                    static constexpr auto run_child = [](harness& h, native::listener& l, coroutine::scope& children) -> coroutine::task<> {
+                        for (;;) {
+                            auto [connection, peer] = co_await net::async_accept(l);
+                            children.spawn(h.server.serve(std::move(connection)));
+                        }
+                    };
+                    children.spawn(run_child(h, listener, children));
+                    config::settings project;
+                    project.build_configurations["test"] = fixture::commands({"true"});
+                    project.default_configurations = {"test"};
+                    co_await h.save(io, "/api/v1/projects/app", config::write(project));
+                    // A file whose read result is larger than the buffer that bounds what the stream queues ahead of it.
+                    const std::string content(24000, 'x');
+                    auto seeded = co_await h.ask(
+                        io, http::method::POST, "/api/v1/projects/app/worldline",
+                        std::format(R"({{"project":"app","worldline":"main","action":"apply","observed":"","operation_id":"seed","changes":[{{"kind":"create","path":"a.txt","text":"{}"}}]}})",
+                                    content));
+                    expect(seeded.status == 200) << seeded.body.substr(0, 300);
+                    auto socket = co_await io::connect(io, listener.local_endpoint());
+                    web::stream<decltype(socket)> transport{socket};
+                    http::v1::client client{transport};
+                    http::request request{
+                        .method = http::method::POST,
+                        .target = "/mcp",
+                        .scheme = "http",
+                        .authority = "localhost",
+                        .fields = {{"authorization", "Bearer sk_test"}, {"accept", "text/event-stream"}, {"content-type", "application/json"}}};
+                    auto body = call("worldline", R"({"project":"app","action":"read","path":"a.txt","count":100000})", R"({"progressToken":"large"})");
+                    request.fields.push_back({"content-length", std::to_string(body.size())});
+                    request.fields.push_back({"host", "localhost"});
+                    http::span_body payload{std::as_bytes(std::span{body.data(), body.size()})};
+                    auto response = co_await http::coroutine::request(client, std::move(request), payload);
+                    std::array<std::byte, 4096> buffer;
+                    std::string frames;
+                    for (;;) {
+                        auto count = co_await coroutine::deadline(io, std::chrono::seconds{5}, http::coroutine::read(response.body, buffer));
+                        expect(static_cast<bool>(count)) << "the stream ends by itself";
+                        if (!count || !*count)
+                            break;
+                        frames.append(reinterpret_cast<const char*>(buffer.data()), *count);
+                    }
+                    expect(frames.size() > constants::event_stream_buffer_bytes) << "the answer is larger than the buffer that bounds progress";
+                    const std::string_view open_marker{"event: message\ndata: "};
+                    auto open = frames.rfind(open_marker);
+                    expect(open != std::string::npos) >> fatal;
+                    auto final_event = frames.substr(open + open_marker.size());
+                    expect(final_event.ends_with("\n\n")) << "the response event is complete";
+                    auto reply = json::read<json::value>(final_event.substr(0, final_event.size() - 2));
+                    expect(reply.has_value()) >> fatal;
+                    auto outer = reply->to_object();
+                    expect(outer.has_value()) >> fatal;
+                    auto id = outer->get("id");
+                    auto result = outer->get("result");
+                    auto error = outer->get("error");
+                    expect(id.has_value() && result.has_value()) >> fatal;
+                    expect(id->to_int64().value_or(0) == 1) << "the answer belongs to the request";
+                    expect(!error.has_value()) << "the request did not fail";
+                    auto structured = result->to_object();
+                    expect(structured.has_value()) >> fatal;
+                    auto structured_content = structured->get("structuredContent");
+                    expect(structured_content.has_value()) >> fatal;
+                    auto fields = structured_content->to_object();
+                    expect(fields.has_value()) >> fatal;
+                    auto read_text = fields->get("text");
+                    expect(read_text.has_value()) >> fatal;
+                    expect(read_text->to_string().value_or("") == content) << "every byte of the 24 KiB text arrives";
                 };
                 co_await coroutine::with_scope(std::move(run_children));
             };
@@ -413,80 +528,95 @@ namespace {
                         };
                         children.spawn(run_child(h, l, children));
                         auto anonymous = co_await h.ask(io, GET, "/api/v1/me");
-                        expect(anonymous.status == 401) << "a bearer token means nothing behind a trusted front: " << anonymous.body;
+                        expect(anonymous.status == 401) << anonymous.body;
+                        std::vector<http::header> caller{
+                            {"x-fughetta-workspace", "acme-id"}, {"x-fughetta-user", "user-2"}, {"x-fughetta-role", "member"}};
+                        auto missing_token = co_await h.ask(io, GET, "/api/v1/me", {}, caller, false);
+                        expect(missing_token.status == 401) << missing_token.body;
+                        caller.push_back({"authorization", "Bearer sk_wrong"});
+                        auto wrong_token = co_await h.ask(io, GET, "/api/v1/me", {}, caller, false);
+                        expect(wrong_token.status == 401) << wrong_token.body;
+                        auto health = co_await h.ask(io, GET, "/healthz", {}, {}, false);
+                        expect(health.status == 200) << health.body;
+                        auto post_health = co_await h.ask(io, http::method::POST, "/healthz", {}, {}, false);
+                        expect(post_health.status == 401) << post_health.body;
+                        auto preflight = co_await h.ask(io, http::method::OPTIONS, "/api/v1/me", {}, {{"origin", "http://ok.example"}}, false);
+                        expect(preflight.status == 401) << preflight.body;
                         for (const auto& role : {"member", "owner", "host"}) {
                             std::vector<http::header> identity{{"x-fughetta-user", "user-2"}, {"x-fughetta-role", role}};
-                            auto missing = co_await h.ask(io, GET, "/api/v1/me", {}, identity, false);
+                            auto missing = co_await h.ask(io, GET, "/api/v1/me", {}, identity);
                             expect(missing.status == 401) << role << " without a workspace identity: " << missing.body;
                             identity.push_back({"x-fughetta-workspace", "other-id"});
-                            auto wrong = co_await h.ask(io, GET, "/api/v1/me", {}, identity, false);
+                            auto wrong = co_await h.ask(io, GET, "/api/v1/me", {}, identity);
                             expect(wrong.status == 401) << role << " with another workspace identity: " << wrong.body;
                             identity.back().value = "acme";
-                            auto slug = co_await h.ask(io, GET, "/api/v1/me", {}, identity, false);
+                            auto slug = co_await h.ask(io, GET, "/api/v1/me", {}, identity);
                             expect(slug.status == 401) << role << " with a slug instead of the immutable identity: " << slug.body;
                             identity.back().value = "acme-id";
-                            auto matched = co_await h.ask(io, GET, "/api/v1/me", {}, identity, false);
+                            auto matched = co_await h.ask(io, GET, "/api/v1/me", {}, identity);
                             expect(matched.status == 200 && matched.body.contains(std::format(R"("role":"{}")", role)))
                                 << role << " with the configured workspace identity: " << matched.body;
                         }
                         std::vector<http::header> member{
                             {"x-fughetta-workspace", "acme-id"}, {"x-fughetta-user", "user-2"}, {"x-fughetta-role", "member"}, {"x-fughetta-issuer", "cloud"}};
-                        auto me = co_await h.ask(io, GET, "/api/v1/me", {}, member, false);
+                        auto me = co_await h.ask(io, GET, "/api/v1/me", {}, member);
                         expect(me.status == 200 && me.body.contains(R"("user":"user-2")") && me.body.contains(R"("role":"member")") &&
                                me.body.contains(R"("issuer":"cloud")"))
                             << me.body;
-                        auto limited = co_await h.ask(io, PUT, "/api/v1/config/limits", R"({"revision":0,"value":{}})", member, false);
+                        auto limited = co_await h.ask(io, PUT, "/api/v1/config/limits", R"({"revision":0,"value":{}})", member);
                         expect(limited.status == 403) << limited.body;
-                        auto config = co_await h.ask(io, GET, "/api/v1/config", {}, member, false);
+                        auto config = co_await h.ask(io, GET, "/api/v1/config", {}, member);
                         expect(config.status == 200 && !config.body.contains(keyring::hash("sk_test"))) << "a member sees no token hashes";
                         auto owner = co_await h.ask(io, PUT, "/api/v1/config/limits", R"({"revision":0,"value":{}})",
-                                                    {{"x-fughetta-workspace", "acme-id"}, {"x-fughetta-user", "user-1"}, {"x-fughetta-role", "owner"}}, false);
+                                                    {{"x-fughetta-workspace", "acme-id"}, {"x-fughetta-user", "user-1"}, {"x-fughetta-role", "owner"}});
                         expect(owner.status == 200) << owner.body;
                         auto unknown =
                             co_await h.ask(io, GET, "/api/v1/me", {},
-                                           {{"x-fughetta-workspace", "acme-id"}, {"x-fughetta-user", "user-3"}, {"x-fughetta-role", "operator"}}, false);
+                                           {{"x-fughetta-workspace", "acme-id"}, {"x-fughetta-user", "user-3"}, {"x-fughetta-role", "operator"}});
                         expect(unknown.status == 401) << unknown.body;
                         std::vector<http::header> owner_headers{
                             {"x-fughetta-workspace", "acme-id"}, {"x-fughetta-user", "user-1"}, {"x-fughetta-role", "owner"}};
                         std::vector<http::header> host_headers{{"x-fughetta-workspace", "acme-id"}, {"x-fughetta-user", "cloud"}, {"x-fughetta-role", "host"}};
                         auto grant = R"({"revision":0,"value":{"max_projects":3}})";
-                        auto by_owner = co_await h.ask(io, PUT, "/api/v1/config/granted", grant, owner_headers, false);
+                        auto by_owner = co_await h.ask(io, PUT, "/api/v1/config/granted", grant, owner_headers);
                         expect(by_owner.status == 403) << "an owner cannot raise what the host grants: " << by_owner.body;
-                        auto by_member = co_await h.ask(io, PUT, "/api/v1/config/granted", grant, member, false);
+                        auto by_member = co_await h.ask(io, PUT, "/api/v1/config/granted", grant, member);
                         expect(by_member.status == 403) << by_member.body;
-                        auto by_host = co_await h.ask(io, PUT, "/api/v1/config/granted", grant, host_headers, false);
+                        auto by_host = co_await h.ask(io, PUT, "/api/v1/config/granted", grant, host_headers);
                         expect(by_host.status == 200 && by_host.body.contains(R"("max_projects":3)")) << by_host.body;
-                        auto stale = co_await h.ask(io, PUT, "/api/v1/config/granted", R"({"revision":0,"value":{"max_projects":9}})", host_headers, false);
+                        auto stale = co_await h.ask(io, PUT, "/api/v1/config/granted", R"({"revision":0,"value":{"max_projects":9}})", host_headers);
                         expect(stale.status == 409 && stale.body.contains(R"("max_projects":3)"))
                             << "a stale grant is refused with the current one: " << stale.body;
                         expect(config::load(h.tmp.dir / "gateway.json").granted->max_projects == std::optional<std::uint32_t>{3}) << "a grant is saved";
-                        auto server = co_await h.ask(io, GET, "/api/v1/config/server", {}, owner_headers, false);
+                        auto server = co_await h.ask(io, GET, "/api/v1/config/server", {}, owner_headers);
+                        expect(server.status == 200 && !server.body.contains("sk_front")) << server.body;
+                        auto owner_config = co_await h.ask(io, GET, "/api/v1/config", {}, owner_headers);
+                        expect(owner_config.status == 200 && !owner_config.body.contains("sk_front")) << owner_config.body;
                         auto server_revision = std::stoull(server.body.substr(server.body.find(R"("revision":)") + 11));
                         auto to_tokens = co_await h.ask(io, PUT, "/api/v1/config/server",
                                                         std::format(R"({{"revision":{},"value":{{"storage":"{}","auth":{{"mode":"token"}}}}}})",
                                                                     server_revision, (h.tmp.dir / "storage").generic_string()),
-                                                        owner_headers, false);
+                                                        owner_headers);
                         expect(to_tokens.status == 403) << "no caller changes how callers are checked: " << to_tokens.body;
                         auto effective =
-                            co_await h.ask(io, PUT, "/api/v1/config/limits", R"({"revision":1,"value":{"max_projects":50}})", owner_headers, false);
+                            co_await h.ask(io, PUT, "/api/v1/config/limits", R"({"revision":1,"value":{"max_projects":50}})", owner_headers);
                         expect(effective.status == 200) << effective.body;
                         expect(config::resolve_limits(*h.hub.current(0)).max_projects == 3u) << "the grant caps the owner's own limit";
-                        auto events = co_await h.ask(io, GET, "/api/v1/usage/events?after=0", {}, member, false);
+                        auto events = co_await h.ask(io, GET, "/api/v1/usage/events?after=0", {}, member);
                         expect(events.status == 403) << "a member does not read the event log";
-                        events = co_await h.ask(io, GET, "/api/v1/usage/events?after=0", {}, host_headers, false);
+                        events = co_await h.ask(io, GET, "/api/v1/usage/events?after=0", {}, host_headers);
                         expect(events.status == 200 && events.body.contains(R"("oldest":)")) << events.body;
-                        auto granted = co_await h.ask(io, GET, "/api/v1/config/granted", {}, member, false);
+                        auto granted = co_await h.ask(io, GET, "/api/v1/config/granted", {}, member);
                         auto granted_revision = std::stoull(granted.body.substr(granted.body.find(R"("revision":)") + 11));
                         auto cleared = co_await h.ask(io, PUT, "/api/v1/config/granted", std::format(R"({{"revision":{},"value":null}})", granted_revision),
-                                                      host_headers, false);
+                                                      host_headers);
                         expect(cleared.status == 200 && !config::load(h.tmp.dir / "gateway.json").granted.has_value()) << cleared.body;
                         auto named = co_await h.ask(io, GET, "/api/v1/me", {},
                                                     {{"x-fughetta-workspace", "acme-id"},
                                                      {"x-fughetta-user", "user-2"},
                                                      {"x-fughetta-role", "member"},
                                                      {"x-fughetta-caller", "agent-a"},
-                                                     {"x-fughetta-email", "two@example.com"}},
-                                                    false);
+                                                     {"x-fughetta-email", "two@example.com"}});
                         expect(named.status == 200 && named.body.contains(R"("caller":"agent-a")") && named.body.contains(R"("email":"two@example.com")") &&
                                named.body.contains(R"("issuer":"front")"))
                             << named.body;
@@ -495,6 +625,90 @@ namespace {
                     co_await coroutine::with_scope(std::move(run_children));
                 };
                 return run_operation(h, io);
+            };
+            h.rt.run(std::move(run_core));
+        };
+        "trusted task MCP uses the run resolved by the source"_test = [] {
+            harness h{"trusted"};
+            auto run_core = [&](ctx& io, std::size_t) -> coroutine::task<> {
+                auto listener = native::listener{io, {net::ip::address_v4::loopback(), 0}};
+                h.port = listener.local_endpoint().port();
+                auto serve = [&](coroutine::scope& children) -> coroutine::task<> {
+                    for (;;) {
+                        auto [peer, endpoint] = co_await net::async_accept(listener);
+                        children.spawn(h.server.serve(std::move(peer)));
+                    }
+                };
+                auto run_children = [&](coroutine::scope& children) -> coroutine::task<> {
+                    children.spawn(serve(children));
+                    std::vector<http::header> owner{{"x-fughetta-workspace", "acme-id"}, {"x-fughetta-user", "user-1"},
+                                                    {"x-fughetta-issuer", "supabase"}, {"x-fughetta-role", "owner"}};
+                    auto project = co_await h.ask(io, PUT, "/api/v1/projects/app", R"({"revision":0,"value":{}})", owner);
+                    expect(project.status == 200) << project.body;
+                    auto created = co_await h.mcp(
+                        io, call("task", R"({"action":"create","project":"app","task":"issue","worldline":"main","operation_id":"create"})"), owner);
+                    expect(created.status == 200 && created.body.contains(R"("active":true)")) << created.body;
+                    auto started = co_await h.mcp(io, call("task", R"({"action":"start","project":"app","task":"issue","operation_id":"start"})"), owner);
+                    struct task_result {
+                        struct payload {
+                            struct output {
+                                std::string credential, run;
+                            } structuredContent;
+                        } result;
+                    };
+                    auto run = json::read<task_result>(started.body);
+                    expect(run.has_value()) << started.body;
+                    if (!run) {
+                        children.request_stop();
+                        co_return;
+                    }
+                    const auto& issued = run->result.structuredContent;
+                    const auto identity_path = "/api/v1/executions/identity";
+                    auto host = owner;
+                    host.back().value = "host";
+                    auto body = json::write(json::object({{"credential", issued.credential}}));
+                    auto identity = co_await h.ask(io, http::method::POST, identity_path, body, host);
+                    expect(identity.status == 200 && identity.execution_scope == "scoped") << identity.body;
+                    auto actor = json::read<worlds::actor>(identity.body);
+                    expect(actor && actor->run == issued.run && actor->project == "app" && actor->worldline == "main" && actor->execution_token.empty())
+                        << identity.body;
+
+                    auto relay = owner;
+                    relay.push_back({"x-fughetta-caller", "user-1/run/" + issued.run});
+                    relay.push_back({"x-fughetta-execution", issued.credential});
+                    const auto inspect = R"({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"worldline","arguments":{"action":"inspect"}}})";
+                    auto read = co_await h.mcp(io, inspect, relay);
+                    expect(read.status == 200 && read.body.contains(R"("worldline":"main")") && !read.body.contains(R"("isError":true)")) << read.body;
+                    auto missing_bearer = co_await h.ask(io, http::method::POST, "/mcp", inspect, relay, false);
+                    expect(missing_bearer.status == 401) << missing_bearer.body;
+                    auto other_caller = relay;
+                    other_caller[1].value = "user-2";
+                    auto mismatch = co_await h.mcp(io, inspect, other_caller);
+                    expect(mismatch.status == 401) << mismatch.body;
+
+                    for (auto rpc : {call("configurations", R"({"project":"other"})"),
+                                     call("worldline", R"({"action":"inspect","worldline":"other"})"),
+                                     call("task", R"({"action":"stop","project":"app","task":"issue","run":"another-run"})"),
+                                     call("project", R"({"project":"app"})")}) {
+                        auto refused = co_await h.mcp(io, rpc, relay);
+                        expect(refused.status == 200 && refused.body.contains(R"("isError":true)") &&
+                               refused.body.contains(R"("code":"permission_denied")")) << refused.body;
+                    }
+                    auto rest = co_await h.ask(io, GET, "/api/v1/projects/app", {}, relay);
+                    expect(rest.status == 403 && rest.body.contains(R"("code":"permission_denied")")) << rest.body;
+                    auto config = co_await h.ask(io, http::method::POST, "/mcp/config", call("schema", "{}"), relay);
+                    expect(config.status == 403 && config.body.contains(R"("code":"permission_denied")")) << config.body;
+
+                    auto stop = std::format(R"({{"action":"stop","project":"app","task":"issue","run":{}}})", json::write(issued.run));
+                    auto stopped = co_await h.mcp(io, call("task", stop), owner);
+                    expect(stopped.status == 200 && stopped.body.contains(R"("active":false)")) << stopped.body;
+                    auto expired = co_await h.mcp(io, inspect, relay);
+                    expect(expired.status == 401) << expired.body;
+                    auto unknown = co_await h.ask(io, http::method::POST, identity_path, body, host);
+                    expect(unknown.status == 401 && unknown.execution_scope.empty()) << unknown.body;
+                    children.request_stop();
+                };
+                co_await coroutine::with_scope(std::move(run_children));
             };
             h.rt.run(std::move(run_core));
         };
@@ -664,13 +878,14 @@ namespace {
             h.rt.run(std::move(run_core));
         };
 
-        "build plans and status remain available while manual analysis routes are removed"_test = [] {
+        "build plans and status remain available"_test = [] {
             harness h;
             auto run_core = [&](ctx& io, std::size_t) -> coroutine::task<> {
                 co_await h.hub.edit(0, [](config::store& store) {
                     config::settings project;
                     project.build_configurations["Debug"] = fixture::commands({"python3", "-c", "print('built')"});
-                    language::configuration analysis{.build_configuration = "Analysis"};
+                    language::stage analysis{.build_configuration = "Analysis",
+                                             .inputs = {{"compilation_database", {language::build_input{"Analysis", "db", "db"}}}}};
                     builds::configuration analysis_build;
                     builds::config<"command"> command;
                     command.operations["prepare"] = {
@@ -683,7 +898,7 @@ namespace {
                     analysis_build.operations["prepare"] = {.tasks = {"db"}};
                     analysis_build.outputs["db"] = {.task = "db", .output = "db"};
                     project.build_configurations["Analysis"] = analysis_build;
-                    project.analysis["Cpp"] = analysis;
+                    project.analysis["Cpp"] = fixture::profile(analysis);
                     store.put_project("app", project, 0);
                 });
                 const worlds::actor principal{.issuer = "token", .user = "tester", .caller = "tester", .role = "owner"};
@@ -715,21 +930,6 @@ namespace {
                 auto metrics = co_await request("GET", "/metrics");
                 expect(metrics.body.contains("gateway_builds_total") && metrics.body.contains("gateway_synced_bytes_total"));
                 expect(metrics.body.contains(R"(result="unknown"} 0)") && metrics.body.contains(R"(result="cancelled"} 0)"));
-                for (auto action : {"plan", "prepare", "receipt"}) {
-                    auto removed = co_await request(action == std::string_view{"receipt"} ? "GET" : "POST", base + "/analysis/Cpp/" + action);
-                    expect(removed.head.status == 404);
-                }
-                mcp::notifier note;
-                const worlds::actor actor{.issuer = "token", .user = "tester", .role = "owner"};
-                for (auto action : {"plan", "prepare", "receipt", "scopes"}) {
-                    bool rejected = false;
-                    try {
-                        co_await tools::language_query::run(h.services, {}, {.project = "app", .configuration = "Cpp", .action = action}, note, actor);
-                    } catch (const tools::tool_error&) {
-                        rejected = true;
-                    }
-                    expect(rejected) << action;
-                }
             };
             h.rt.run(std::move(run_core));
         };
@@ -757,30 +957,30 @@ namespace {
                         std::string base = "/api/v1/projects/app/node";
                         auto empty = co_await h.ask(io, GET, base + "/source");
                         expect(empty.status == 200) << "a project's node starts with an empty main" << empty.body;
-                        auto capture_body = rfl::json::write(front::api::node_capture{content::hash_of("browser-capture").str(), {}, "Capture project files"});
+                        auto capture_body = json::write(front::api::node_capture{content::hash_of("browser-capture").str(), {}, "Capture project files"});
                         auto captured = co_await h.ask(io, http::method::POST, base + "/capture", capture_body);
                         expect(captured.status == 200) << captured.body;
                         auto replay = co_await h.ask(io, http::method::POST, base + "/capture", capture_body);
-                        auto first = rfl::json::read<nodes::node_reply>(captured.body), second = rfl::json::read<nodes::node_reply>(replay.body);
+                        auto first = json::read<nodes::node_reply>(captured.body), second = json::read<nodes::node_reply>(replay.body);
                         expect(bool(first) && bool(second) >> fatal);
                         expect(first->receipt == second->receipt);
                         expect(second->replayed);
                         auto changed_capture =
-                            rfl::json::write(front::api::node_capture{content::hash_of("browser-capture").str(), {}, "Changed capture intent"});
+                            json::write(front::api::node_capture{content::hash_of("browser-capture").str(), {}, "Changed capture intent"});
                         auto rejected = co_await h.ask(io, http::method::POST, base + "/capture", changed_capture);
                         expect(rejected.status == 409 && rejected.body.contains("identity_conflict")) << rejected.body;
                         auto original = co_await h.ask(io, GET, base + "/source/file?revision=" + first->version + "&path=captured.txt");
                         expect(original.status == 200 && original.body.contains(R"("content":"captured file\n")")) << original.body;
                         auto binary = co_await h.ask(io, GET, base + "/source/file?revision=" + first->version + "&path=captured.bin");
-                        auto binary_view = rfl::json::read<front::api::node_source_file>(binary.body);
+                        auto binary_view = json::read<front::api::node_source_file>(binary.body);
                         expect(binary.status == 200 && bool(binary_view) >> fatal) << binary.body;
                         expect(binary_view->binary && binary_view->content.empty());
                         auto recapture =
-                            rfl::json::write(front::api::node_capture{content::hash_of("browser-recapture").str(), first->frontier, "Capture project files"});
+                            json::write(front::api::node_capture{content::hash_of("browser-recapture").str(), first->frontier, "Capture project files"});
                         auto occupied = co_await h.ask(io, http::method::POST, base + "/capture", recapture);
                         expect(occupied.status == 409 && occupied.body.contains("source_conflict")) << occupied.body;
                         auto large = co_await h.ask(io, GET, base + "/source/file?revision=" + first->version + "&path=long.txt");
-                        auto bounded = rfl::json::read<front::api::node_source_file>(large.body);
+                        auto bounded = json::read<front::api::node_source_file>(large.body);
                         expect(large.status == 200 && bool(bounded) >> fatal) << large.body.substr(0, 300);
                         expect(bounded->truncated && bounded->lines == 1u && bounded->total_lines == 1u && bounded->content.size() == 1024 * 1024 - 2u);
 
@@ -789,32 +989,32 @@ namespace {
                         nodes::node_request request{.action = "apply",
                                                     .operation = content::hash_of("browser-seed").str(),
                                                     .expected = first->frontier,
-                                                    .edits = {{.kind = "create", .path = "src/hello.txt", .text = "one\ntwo\nthree\n"}}};
-                        auto accepted = co_await h.ask(io, http::method::POST, base, rfl::json::write(request));
-                        auto parsed = rfl::json::read<nodes::node_reply>(accepted.body);
+                                                    .edits = {{.kind = nodes::edit_kind::create, .path = "src/hello.txt", .text = "one\ntwo\nthree\n"}}};
+                        auto accepted = co_await h.ask(io, http::method::POST, base, json::write(request));
+                        auto parsed = json::read<nodes::node_reply>(accepted.body);
                         expect(bool(parsed) >> fatal) << accepted.body;
                         auto head_reply = co_await h.ask(io, GET, base + "/source");
-                        auto head = rfl::json::read<front::api::node_source_head>(head_reply.body);
+                        auto head = json::read<front::api::node_source_head>(head_reply.body);
                         expect(head_reply.status == 200 && bool(head) >> fatal);
                         expect(head->node == parsed->node);
                         auto concurrent = request;
                         concurrent.operation = content::hash_of("browser-concurrent-save").str();
                         concurrent.expected = first->frontier;
-                        concurrent.edits = {{.kind = "create", .path = "src/other.txt", .text = "other\n"}};
-                        auto joined = co_await h.ask(io, http::method::POST, base, rfl::json::write(concurrent));
-                        auto both = rfl::json::read<nodes::node_reply>(joined.body);
+                        concurrent.edits = {{.kind = nodes::edit_kind::create, .path = "src/other.txt", .text = "other\n"}};
+                        auto joined = co_await h.ask(io, http::method::POST, base, json::write(concurrent));
+                        auto both = json::read<nodes::node_reply>(joined.body);
                         expect(joined.status == 200 && bool(both) >> fatal) << joined.body;
                         expect(both->frontier.size() == 2u) << "a save from an older state of the worldline joins it";
                         auto outside = request;
                         outside.operation = content::hash_of("browser-outside-save").str();
                         outside.expected = {content::hash_of("unknown-event").str()};
-                        auto refused = co_await h.ask(io, http::method::POST, base, rfl::json::write(outside));
+                        auto refused = co_await h.ask(io, http::method::POST, base, json::write(outside));
                         expect(refused.status == 503 && refused.body.contains("missing_objects")) << refused.body;
                         auto revision = both->version;
                         request.operation = content::hash_of("browser-next").str();
                         request.expected = both->frontier;
-                        request.edits = {{.kind = "write", .path = "src/hello.txt", .text = "changed\n"}};
-                        replies.push_back(co_await h.ask(io, http::method::POST, base, rfl::json::write(request)));
+                        request.edits = {{.kind = nodes::edit_kind::write, .path = "src/hello.txt", .text = "changed\n"}};
+                        replies.push_back(co_await h.ask(io, http::method::POST, base, json::write(request)));
                         replies.push_back(co_await h.ask(io, GET, base + "/source?revision=" + revision));
                         replies.push_back(co_await h.ask(io, GET, base + "/source/file?revision=" + revision + "&path=src%2Fhello.txt&offset=2&limit=1"));
                         replies.push_back(co_await h.ask(io, GET, base + "/source/file?path=src%2Fhello.txt"));
@@ -942,34 +1142,6 @@ namespace {
                                                                                                                                                                                               .mcp(
                                                                                                                                                                                                   io,
                                                                                                                                                                                                   R"({"jsonrpc":"2.0","id":1,"method":"tools/list"})"));
-                                                                                                                                                                                      for (
-                                                                                                                                                                                          const auto
-                                                                                                                                                                                              name :
-                                                                                                                                                                                          {"read",
-                                                                                                                                                                                           "write",
-                                                                                                                                                                                           "edit",
-                                                                                                                                                                                           "remove",
-                                                                                                                                                                                           "move",
-                                                                                                                                                                                           "list",
-                                                                                                                                                                                           "glob",
-                                                                                                                                                                                           "search",
-                                                                                                                                                                                           "generate",
-                                                                                                                                                                                           "jobs"}) {
-                                                                                                                                                                                          auto refused =
-                                                                                                                                                                                              co_await h
-                                                                                                                                                                                                  .mcp(
-                                                                                                                                                                                                      io,
-                                                                                                                                                                                                      call(
-                                                                                                                                                                                                          name,
-                                                                                                                                                                                                          R"({"project":"app"})"));
-                                                                                                                                                                                          expect(
-                                                                                                                                                                                              refused
-                                                                                                                                                                                                  .body
-                                                                                                                                                                                                  .contains(
-                                                                                                                                                                                                      "unknown tool"))
-                                                                                                                                                                                              << refused
-                                                                                                                                                                                                     .body;
-                                                                                                                                                                                      }
                                                                                                                                                                                       a.push_back(
                                                                                                                                                                                           co_await h
                                                                                                                                                                                               .ask(
@@ -1031,7 +1203,7 @@ namespace {
                                                                                                                                                                                                   endpoint,
                                                                                                                                                                                                   R"({"project":"app","worldline":"main","action":"inspect"})");
                                                                                                                                                                                       const auto initial =
-                                                                                                                                                                                          rfl::json::read<
+                                                                                                                                                                                          json::read<
                                                                                                                                                                                               tools::worldline::
                                                                                                                                                                                                   output>(
                                                                                                                                                                                               inspected
@@ -1113,8 +1285,6 @@ namespace {
             expect((a.size() == 16u) >> fatal);
             for (const auto name : {"configurations", "build", "test", "run", "language"})
                 expect(a[0].body.contains(std::format(R"("name":"{}")", name)));
-            for (const auto name : {"read", "write", "edit", "remove", "move", "list", "glob", "search", "generate", "jobs"})
-                expect(!a[0].body.contains(std::format(R"("name":"{}")", name)));
             expect(a[0].status == 200 && a[0].body.contains("outputSchema"));
             for (auto name : {"worldline", "artifact", "project", "save_project", "schema", "effective"})
                 expect(a[0].body.contains(std::format(R"("name":"{}")", name)));

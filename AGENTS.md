@@ -21,7 +21,7 @@ built as a subproject, so its module BMIs are compiled by this build's compiler;
 the manifest lists its dependencies too. `FetchContent` stays until httpant has
 a vcpkg port. A local checkout replaces the fetched one through
 `FETCHCONTENT_SOURCE_DIR_HTTPANT`. `cmake/platform/<system>.cmake` describes
-each target system: its platform units, its I/O backend (io_uring on Linux,
+each target system: its platform units, its I/O backend (epoll on Linux, io_uring for deployment,
 IOCP on Windows, kqueue on macOS) and its service-manager template;
 `tests/platform/<system>.cmake` adds that system's tests. Platform choices go in
 those files, not in `if()` branches elsewhere. The layers link
@@ -77,7 +77,7 @@ and the module registrations in `CMakeLists.txt` must agree.
 
 ## What is not here any more
 
-The front ends (console, admin, agent-cloud, landing and the component
+The front ends (console, admin, landing and the component
 library) are
 their own repositories beside this one; see `README.md`. Frontend work does not
 belong here. An API change a front end needs is a change to `/api/v1` or `/mcp`,

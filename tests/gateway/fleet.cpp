@@ -3,6 +3,7 @@ import boost.ut;
 import coroutine;
 import native;
 import protocol;
+import json;
 import fleet;
 import configuration;
 import enrollment;
@@ -58,7 +59,8 @@ namespace {
     auto linux_platform() -> jobs::platform { return {.os = "linux", .arch = "x86_64"}; }
 
     auto fake_worker(socket& s, std::string name, std::vector<std::string> tools = {"cmake"}, std::uint32_t max_inflight = 4, std::string auth = "",
-                     bool publisher = false) -> coroutine::task<> {
+                     bool publisher = false, jobs::slot_report* report = nullptr, ctx* delay_io = nullptr, std::chrono::milliseconds delay = 0ms,
+                     bool announce_slots = false) -> coroutine::task<> {
         transport::channel<socket> chan{s};
         co_await chan.post(jobs::hello{.name = name,
                                        .auth = auth,
@@ -67,13 +69,27 @@ namespace {
                                        .protocol = jobs::protocol_version,
                                        .tools = tools,
                                        .toolchain_id = std::string(64, 'a'),
-                                       .dependency_publisher = publisher});
+                                       .dependency_publisher = publisher,
+                                       .memory_bytes = report ? report->memory.limit : std::nullopt,
+                                       .slots = announce_slots ? report->slots : std::vector<jobs::worker_slot>{},
+                                       .capabilities = test::capabilities(tools)});
+        if (!announce_slots) {
+            if (report)
+                ++report->sequence;
+            co_await chan.post(report ? *report : jobs::slot_report{});
+        }
         try {
             for (;;) {
                 auto f = co_await chan.recv();
                 auto job = transport::decode<jobs::hash_file>(f);
+                if (delay_io && delay > 0ms)
+                    co_await execution::schedule_after(*delay_io, delay);
                 for (std::uint64_t i = 1; i <= 3; ++i)
                     co_await chan.post(jobs::progress{.done = i, .total = 3}, f.corr);
+                if (report) {
+                    ++report->sequence;
+                    co_await chan.post(*report);
+                }
                 co_await chan.reply(f.corr, jobs::digest{.hex = name + ":" + job.path.value(), .bytes = 3});
             }
         } catch (const std::exception&) {
@@ -81,7 +97,6 @@ namespace {
     }
 
     struct outcome {
-        std::optional<std::size_t> first_pick;
         std::string hex;
         std::vector<std::uint64_t> progress;
         std::string missing;
@@ -111,7 +126,6 @@ namespace {
 
         auto submit(ctx&) -> coroutine::task<> {
             co_await ready.wait();
-            out.first_pick = router.routes(0).pick(std::vector<bool>(3, false));
 
             jobs::progress_log log;
             auto d = co_await router.run(0, {}, jobs::hash_file{.path = "acme/a.txt"}, &log);
@@ -138,7 +152,84 @@ namespace {
         }
     };
 
+    struct distributed_picker {
+        cores::io_context<native::context> rt{2};
+        routing::router router{rt};
+        event remote_ready, remote_done, release_local;
+        std::uint64_t resident = 0;
+
+        auto host(ctx& io) -> coroutine::task<> {
+            auto listener = native::listener{io, {net::ip::address_v4::loopback(), 0}};
+            auto client = co_await io::connect(io, {net::ip::address_v4{{127, 0, 0, 1}}, listener.local_endpoint().port()});
+            auto [peer, endpoint] = co_await net::async_accept(listener);
+            jobs::slot_report report{.slots = {{.project = "app", .tree = "native", .sessions = {{"main", "clice", "recipe", "source", 1}}}}};
+            auto run = [&](coroutine::scope& children) -> coroutine::task<> {
+                children.spawn(router.workers(1).admit(io, std::move(peer)));
+                children.spawn(fake_worker(client, "remote", {"clice", "slow"}, 1, "", false, &report, &io, 80ms));
+                while (router.workers(1).describe(1).empty() || router.workers(1).describe(1).front().slots.empty())
+                    co_await execution::schedule_after(io, 1ms);
+                const auto worker = router.workers(1).propose({}).candidates.front().worker;
+                rt.post(0, [this, worker] {
+                    resident = worker;
+                    remote_ready.fire();
+                });
+                co_await remote_done.wait();
+            };
+            co_await coroutine::with_scope(std::move(run));
+        }
+
+        auto submit(ctx& io) -> coroutine::task<> {
+            auto listener = native::listener{io, {net::ip::address_v4::loopback(), 0}};
+            auto client = co_await io::connect(io, {net::ip::address_v4{{127, 0, 0, 1}}, listener.local_endpoint().port()});
+            auto [peer, endpoint] = co_await net::async_accept(listener);
+            auto run = [&](coroutine::scope& children) -> coroutine::task<> {
+                children.spawn(router.workers(0).admit(io, std::move(peer)));
+                jobs::slot_report local_report{.memory = {.limit = 1000, .baseline = 100}};
+                children.spawn(fake_worker(client, "local", {"clice", "fast"}, 2, "", false, &local_report));
+                while (!router.workers(0).holds({}))
+                    co_await execution::schedule_after(io, 1ms);
+                co_await remote_ready.wait();
+                routing::selection request{.needs = {.tools = {"clice"}}, .tree_key = "app/native", .options = "recipe", .snapshot = "source", .stage = "main"};
+                auto other_stage = request;
+                other_stage.stage = "other";
+                const auto other_proposal = co_await cores::call(rt.get_scheduler(0), rt.get_scheduler(1), [&]() -> coroutine::task<routing::proposals> {
+                    co_return router.workers(1).propose(other_stage);
+                });
+                expect(other_proposal.candidates.front().heat == 1_i) << "another stage does not inherit a ready session";
+                auto first = co_await router.run(0, request, jobs::hash_file{.path = "who"});
+                expect(first.hex == "remote:who") << "a remote ready session participates even when a local worker is available";
+                auto local = request;
+                local.needs.tools = {"fast"};
+                auto prepared = co_await router.run(0, local, jobs::hash_file{.path = "who"});
+                expect(prepared.hex == "local:who");
+                auto cheaper = co_await router.run(0, request, jobs::hash_file{.path = "who"});
+                expect(cheaper.hex == "local:who") << "measured execution cost can outweigh session warmth";
+                auto same_group = request;
+                same_group.core = 1;
+                same_group.worker = resident;
+                auto next_stage = co_await router.run(0, same_group, jobs::hash_file{.path = "who"});
+                expect(next_stage.hex == "remote:who") << "an admitted directory group retains its worker between stages";
+                auto hold = [this, local]() -> coroutine::task<> {
+                    co_await router.workers(0).with(local, [this](auto&) -> coroutine::task<> { co_await release_local.wait(); });
+                };
+                children.spawn(hold());
+                while (!router.workers(0).describe(0).front().inflight)
+                    co_await execution::schedule_after(io, 1ms);
+                auto overflow = co_await router.run(0, request, jobs::hash_file{.path = "who"});
+                expect(overflow.hex == "remote:who") << "a full-budget reservation excludes concurrent work even with an available inflight slot";
+                release_local.fire();
+                rt.post(1, [this] { remote_done.fire(); });
+            };
+            co_await coroutine::with_scope(std::move(run));
+        }
+    };
+
     static constexpr auto routing_suite = [] {
+        "cross-core dispatch uses ready sessions, measured costs and available capacity"_test = [] {
+            distributed_picker h;
+            h.rt.run([&](ctx& io, std::size_t core) { return core == 0 ? h.submit(io) : h.host(io); });
+        };
+
         "revoked identities stop dispatch immediately without waiting for the fleet watcher"_test = [] {
             test::scratch scratch{"fleet-identity-revoke"};
             enrollment::store registry{scratch.dir, "workspace-a"};
@@ -185,6 +276,14 @@ namespace {
                     auto refusal = transport::decode<jobs::admission>(co_await next_channel.recv());
                     expect(!refusal.accepted && refusal.code == "worker_enrollment_disabled");
                     expect(router.workers(0).holds({}));
+                    auto older = co_await io::connect(io, listener.local_endpoint());
+                    auto [older_peer, older_endpoint] = co_await net::async_accept(listener);
+                    transport::channel<socket> older_channel{older};
+                    const json::object greeting{{"name", "machine"}, {"auth", credential.secret}, {"protocol", jobs::protocol_version ^ 1u}};
+                    co_await older_channel.send(jobs::code<jobs::hello>, 0, greeting);
+                    children.spawn(router.workers(0).admit(io, std::move(older_peer), &registry, &pool, [&] { return enabled; }));
+                    auto mismatch = transport::decode<jobs::admission>(co_await older_channel.recv());
+                    expect(!mismatch.accepted && mismatch.code == "worker_protocol_mismatch");
                     registry.revoke(credential.worker_id);
                     expect(!router.workers(0).holds({}));
                     expect(!router.workers(0).describe(0).front().online);
@@ -193,7 +292,7 @@ namespace {
             };
             rt.run(std::move(run_core));
         };
-        "long-lived workers keep bounded recent tree affinity"_test = [] {
+        "worker reports replace bounded slot inventory and withdraw reclaimed directories"_test = [] {
             cores::io_context<native::context> rt{1};
             routing::router router{rt};
             auto run_core = [&](ctx& io, std::size_t) -> coroutine::task<> {
@@ -203,18 +302,31 @@ namespace {
                 auto& fleet = router.workers(0);
                 auto run_children = [&](coroutine::scope& children) -> coroutine::task<> {
                     children.spawn(fleet.admit(io, std::move(peer)));
-                    children.spawn(fake_worker(socket, "persistent"));
-                    while (!fleet.holds({}))
-                        co_await execution::schedule_after(io, 1ms);
-                    for (int i = 0; i < 600; ++i) {
-                        static constexpr auto run_operation = [](auto&) -> coroutine::task<> { co_return; };
-                        co_await fleet.with({.tree_key = std::format("app/tree-{}", i)}, run_operation);
-                    }
-                    auto views = fleet.describe(0);
-                    expect((views.size() == 1u) >> fatal);
-                    expect(views.front().trees.size() <= 256u);
-                    expect(std::ranges::contains(views.front().trees, "app/tree-599"));
-                    expect(!std::ranges::contains(views.front().trees, "app/tree-0"));
+                    jobs::slot_report report;
+                    for (int i = 0; i < 257; ++i)
+                        report.slots.push_back({.project = "app", .tree = std::format("tree-{}", i)});
+                    report.slots.front().snapshot = "source";
+                    report.slots.front().cached = {{"compile", "recipe", "source", std::string(64, 'a')}};
+                    auto run_worker = [&]() { return fake_worker(socket, "persistent", {"cmake"}, 4, "", false, &report, nullptr, 0ms, true); };
+                    co_await coroutine::with_scope([&](coroutine::scope& worker) -> coroutine::task<> {
+                        worker.spawn(run_worker());
+                        while (fleet.describe(0).empty() || fleet.describe(0).front().slots.empty())
+                            co_await execution::schedule_after(io, 1ms);
+                        expect(fleet.describe(0).front().slots.size() == 256u);
+                        auto initial = fleet.propose({.tree_key = "app/tree-0", .options = "recipe", .snapshot = "source", .stage = "compile"});
+                        expect((!initial.candidates.empty()) >> fatal);
+                        expect(initial.candidates.front().heat == 3_i);
+                        report.slots = {{.project = "app", .tree = "retained"}};
+                        auto dispatch = [](auto& channel) -> coroutine::task<> {
+                            auto response = co_await channel.call(jobs::hash_file{.path = "who"});
+                            expect(response.has_value());
+                        };
+                        co_await fleet.with({}, dispatch);
+                        expect(fleet.describe(0).front().slots.size() == 1u && fleet.describe(0).front().slots.front().tree == "retained");
+                        report.slots.clear();
+                        co_await fleet.with({.tree_key = "app/retained"}, dispatch);
+                        expect(fleet.describe(0).front().slots.empty()) << "finishing a call must not recreate a withdrawn slot hint";
+                    });
                 };
                 co_await coroutine::with_scope(std::move(run_children));
             };
@@ -264,10 +376,9 @@ namespace {
                 return run_operation(io);
             };
             h.rt.run(std::move(run_core));
-            expect(h.out.first_pick == std::optional<std::size_t>{2});
             expect(h.out.hex == "fake:acme/a.txt");
             expect(h.out.progress == std::vector<std::uint64_t>{1, 2, 3});
-            expect(h.out.missing.starts_with("no build machine is online")) << h.out.missing;
+            expect(h.out.missing.contains("tool mold (worker 'fake' (core 2): not installed)")) << h.out.missing;
         };
     };
 
@@ -308,12 +419,11 @@ namespace {
                     expect(fleet.describe(0).front().dependency_publisher);
                     expect(!fleet.holds({}));
                     expect(!fleet.busy({}));
-                    expect(fleet.diagnose({}) == "no live general build worker is available");
                     bool refused = false;
                     try {
                         co_await h.who({});
                     } catch (const routing::no_worker& error) {
-                        refused = !error.busy;
+                        refused = !error.busy && std::string_view{error.what()} == "no live general build worker is available";
                     }
                     expect(refused);
                     expect(co_await h.who({.needs = {.dependency_publisher = true}}) == "publisher:who");
@@ -330,20 +440,23 @@ namespace {
                 auto [pa, endpoint] = co_await net::async_accept(l);
                 auto b = co_await io::connect(io, {net::ip::address_v4{{127, 0, 0, 1}}, l.local_endpoint().port()});
                 auto [pb, endpoint_2] = co_await net::async_accept(l);
+                jobs::slot_report alpha{.slots = {{.project = "app", .tree = "t1"}}};
+                jobs::slot_report beta{.slots = {{.project = "app", .tree = "t2"}}};
                 auto run_children = [&](coroutine::scope& children) -> coroutine::task<> {
                     children.spawn(h.router.workers(0).admit(io, std::move(pa)));
                     children.spawn(h.router.workers(0).admit(io, std::move(pb)));
-                    children.spawn(fake_worker(a, "alpha", {"cmake"}, 1));
-                    children.spawn(fake_worker(b, "beta", {"cmake"}, 1));
-                    while (h.router.workers(0).describe(0).size() < 2)
+                    children.spawn(fake_worker(a, "alpha", {"cmake"}, 1, "", false, &alpha));
+                    children.spawn(fake_worker(b, "beta", {"cmake", "beta"}, 1, "", false, &beta));
+                    while (h.router.workers(0).describe(0).size() < 2 ||
+                           std::ranges::any_of(h.router.workers(0).describe(0), [](const auto& worker) { return worker.slots.empty(); }))
                         co_await execution::schedule_after(io, 1ms);
 
-                    routing::selection t1{.tree_key = "t1"};
+                    routing::selection t1{.tree_key = "app/t1"};
                     h.out.first = co_await h.who(t1);
                     auto resident = h.out.first.substr(0, h.out.first.find(':'));
                     auto other = resident == "alpha" ? "beta" : "alpha";
 
-                    h.out.second = co_await h.who({.tree_key = "t2"});
+                    h.out.second = co_await h.who({.tree_key = "app/t2"});
                     h.out.third = co_await h.who(t1);
 
                     static constexpr auto run_child = [](auto& h, routing::selection t1) -> coroutine::task<> {
@@ -365,6 +478,14 @@ namespace {
                     h.out.overflow = co_await h.who(t1);
                     h.held.fire();
 
+                    beta.slots.push_back({.project = "app", .tree = "t1", .sessions = {{"main", "clice", "recipe", "source", 3}}});
+                    co_await h.who({.needs = {.tools = {"beta"}}});
+                    expect(co_await h.who({.tree_key = "app/t1", .options = "recipe", .snapshot = "source", .stage = "main"}) == "beta:who")
+                        << "a ready session outranks a directory without that provider context";
+                    beta.slots.clear();
+                    co_await h.who({.needs = {.tools = {"beta"}}});
+                    expect(co_await h.who({.tree_key = "app/t1", .options = "recipe", .snapshot = "source", .stage = "main"}) == "alpha:who")
+                        << "reclaimed state stops attracting dispatches";
                     h.out.capacity_err = other;
                 };
                 co_await coroutine::with_scope(std::move(run_children));
@@ -387,17 +508,28 @@ namespace {
                 auto run_children = [&](coroutine::scope& children) -> coroutine::task<> {
                     children.spawn(h.router.workers(0).admit(io, std::move(pa)));
                     children.spawn(h.router.workers(0).admit(io, std::move(pb)));
-                    children.spawn(fake_worker(a, "gcc-builder", {"gcc", "cmake"}));
-                    children.spawn(fake_worker(b, "clang-builder", {"clang", "cmake"}));
+                    children.spawn(fake_worker(a, "clang-18-builder", {"clang@18.1.8", "cmake"}));
+                    children.spawn(fake_worker(b, "clang-19-builder", {"clang@19.1.0", "cmake"}));
                     while (h.router.workers(0).describe(0).size() < 2)
                         co_await execution::schedule_after(io, 1ms);
 
-                    h.out.first = co_await h.who({.needs = {.tools = {"clang"}}});
+                    h.out.first = co_await h.who({.needs = {.tools = {"clang>=19"}}});
+                    const routing::requirements needs{.tools = {"clang>=20", "mold"}, .sdks = {{"jdk", "^21"}}};
                     try {
-                        co_await h.who({.needs = {.tools = {"mold"}}});
+                        co_await h.who({.needs = needs});
                     } catch (const routing::no_worker& e) {
                         h.out.capacity_err = e.what();
                     }
+                    auto& fleet = h.router.workers(0);
+                    const auto constraints = routing::parse_constraints(needs);
+                    co_await fleet.with({.needs = {.tools = {"clang>=19"}}}, [&](auto& worker) -> coroutine::task<> {
+                        try {
+                            (void)fleet.resolve(worker, constraints);
+                        } catch (const routing::no_worker& error) {
+                            h.out.second = error.what();
+                        }
+                        co_return;
+                    });
                     try {
                         co_await h.who({.needs = {.os = "windows"}});
                     } catch (const routing::no_worker& e) {
@@ -407,8 +539,12 @@ namespace {
                 co_await coroutine::with_scope(std::move(run_children));
             };
             h.rt.run(std::move(run_core));
-            expect(h.out.first == "clang-builder:who") << h.out.first;
-            expect(h.out.capacity_err == "no attached worker provides all required tools (missing: mold)") << h.out.capacity_err;
+            expect(h.out.first == "clang-19-builder:who") << h.out.first;
+            expect(h.out.capacity_err.contains("clang>=20") && h.out.capacity_err.find("clang>=20") == h.out.capacity_err.rfind("clang>=20") &&
+                   h.out.capacity_err.contains("worker 'clang-18-builder' (core 0): 18.1.8") &&
+                   h.out.capacity_err.contains("worker 'clang-19-builder' (core 0): 19.1.0") && h.out.capacity_err.contains("SDK jdk ^21"))
+                << h.out.capacity_err;
+            expect(h.out.second.contains("tool clang>=20") && h.out.second.contains("tool mold") && h.out.second.contains("SDK jdk ^21")) << h.out.second;
             expect(h.out.overflow == "no attached worker matches the required platform os=windows") << h.out.overflow;
         };
 
@@ -439,6 +575,8 @@ namespace {
                     } catch (const routing::no_worker& e) {
                         h.out.capacity_err = e.what();
                     }
+                    expect(!h.router.workers(0).holds({}) && h.router.workers(0).holds({.analysis = true}))
+                        << "an analysis has its own place on a worker whose builds are at their limit";
                     h.held.fire();
                 };
                 co_await coroutine::with_scope(std::move(run_children));

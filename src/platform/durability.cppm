@@ -6,18 +6,25 @@ import utility;
 export namespace durability {
     auto is_executable(const std::filesystem::path& path) -> bool;
     void set_executable(const std::filesystem::path& path, bool executable);
+    // Create a separate file using copy-on-write extents. A false result leaves
+    // the destination absent so the caller can write an independent copy.
+    auto try_clone_file(const std::filesystem::path& source, const std::filesystem::path& destination) -> bool;
     void write_part(const std::filesystem::path& path, std::uint64_t offset, std::span<const std::byte> bytes, bool complete);
     void sync_dir(const std::filesystem::path& dir);
     void sync_filesystem(const std::filesystem::path& path);
+    // Refresh the modification time of a regular file without following a link.
+    void touch_file(const std::filesystem::path& path);
     void durable_write(const std::filesystem::path& target, std::span<const std::byte> bytes, bool executable = false,
                        std::string_view temp_suffix = constants::temporary_suffix);
     void durable_write(const std::filesystem::path& target, std::string_view text, bool executable = false,
                        std::string_view temp_suffix = constants::temporary_suffix);
     void durable_private_write(const std::filesystem::path& target, std::string_view text);
     // Why a file could not be read: not a regular file within the limit, not owner-only where required, unreadable, or resized while read.
-    struct unreadable : std::runtime_error {
+    struct unreadable : std::runtime_error, util::retained_exception {
         using std::runtime_error::runtime_error;
+        auto retain() const noexcept -> std::exception_ptr override;
     };
+    auto unreadable::retain() const noexcept -> std::exception_ptr { return util::copy_current_exception(*this); }
     // Yields `path` in pieces if it is a regular file, not a link, of at most `limit` bytes, checked on the opened file itself; a FIFO is
     // never waited on. Throws `unreadable` when it is anything else, or changes size while read.
     auto read_plain(const std::filesystem::path& path, std::uint64_t limit) -> util::generator<std::span<const std::byte>>;
@@ -33,13 +40,63 @@ export namespace durability {
         std::unique_ptr<state> state_;
     };
     void durable_append(const std::filesystem::path& log, std::string_view record);
+    // Remove one file, including a read-only file, without changing its other
+    // hard links. Returns false when the name is already absent.
+    auto remove_file(const std::filesystem::path& path) -> bool;
+    // Do not follow directory links. Keep deleting siblings after a failure and
+    // return the first error; callers can retry the remaining tree later.
+    void remove_tree(const std::filesystem::path& path, std::error_code& error) noexcept try {
+        error.clear();
+        auto status = std::filesystem::symlink_status(path, error);
+        if (error == std::errc::no_such_file_or_directory) {
+            error.clear();
+            return;
+        }
+        if (error)
+            return;
+        if (!std::filesystem::is_directory(status)) {
+            remove_file(path);
+            return;
+        }
+        std::error_code next;
+        auto entries = std::filesystem::directory_iterator(path, next);
+        while (!next && entries != std::filesystem::directory_iterator{}) {
+            std::error_code child;
+            remove_tree(entries->path(), child);
+            if (child && !error)
+                error = child;
+            entries.increment(next);
+        }
+        if (next && !error)
+            error = next;
+        std::filesystem::remove(path, next);
+        if (next && !error)
+            error = next;
+    } catch (const std::system_error& failure) {
+        if (!error)
+            error = failure.code();
+    } catch (const std::bad_alloc&) {
+        if (!error)
+            error = std::make_error_code(std::errc::not_enough_memory);
+    } catch (...) {
+        if (!error)
+            error = std::make_error_code(std::errc::io_error);
+    }
+    void remove_tree(const std::filesystem::path& path) {
+        std::error_code error;
+        remove_tree(path, error);
+        if (error)
+            throw std::filesystem::filesystem_error("remove tree", path, error);
+    }
     void durable_remove(const std::filesystem::path& path);
     void durable_rename(const std::filesystem::path& from, const std::filesystem::path& to);
     void durable_directories(const std::filesystem::path& dir);
 
-    struct lock_busy : std::runtime_error {
+    struct lock_busy : std::runtime_error, util::retained_exception {
         using std::runtime_error::runtime_error;
+        auto retain() const noexcept -> std::exception_ptr override;
     };
+    auto lock_busy::retain() const noexcept -> std::exception_ptr { return util::copy_current_exception(*this); }
 
     class dir_lock {
     public:

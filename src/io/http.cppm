@@ -1,3 +1,5 @@
+module;
+#include <ada.h>
 export module http;
 import std;
 import coroutine;
@@ -66,6 +68,17 @@ export namespace web {
             wake();
         }
 
+        // The message that ends the stream: it is committed once, after what push() has already queued, and then read in
+        // pieces as the reader takes it. A stream that has ended ignores a later push() or finish().
+        void finish(std::string body) {
+            if (closed_)
+                return;
+            closed_ = true;
+            tail_ = std::move(body);
+            tail_offset_ = 0;
+            wake();
+        }
+
         static auto message(std::string_view data) -> std::string { return std::format("event: message\ndata: {}\n\n", data); }
         // What was pushed and not read yet, taken without waiting.
         auto take() -> std::string { return std::exchange(pending_, {}); }
@@ -81,7 +94,7 @@ export namespace web {
                     s_.waiter_ = {};
             }
 
-            auto await_ready() const noexcept -> bool { return !s_.pending_.empty() || s_.closed_; }
+            auto await_ready() const noexcept -> bool { return !s_.pending_.empty() || s_.tail_offset_ < s_.tail_.size() || s_.closed_; }
             auto await_suspend(std::coroutine_handle<> h) -> bool {
                 if (stop_.stop_requested()) {
                     cancelled_ = true;
@@ -97,9 +110,20 @@ export namespace web {
                 on_stop_.reset();
                 if (cancelled_)
                     throw http::stopped{};
-                auto n = std::min(into_.size(), s_.pending_.size());
-                std::memcpy(into_.data(), s_.pending_.data(), n);
-                s_.pending_.erase(0, n);
+                if (!s_.pending_.empty()) {
+                    auto n = std::min(into_.size(), s_.pending_.size());
+                    std::memcpy(into_.data(), s_.pending_.data(), n);
+                    s_.pending_.erase(0, n);
+                    return n;
+                }
+                // The ending body is handed over as much at a time as the reader asked for, and forgotten as it goes.
+                auto n = std::min(into_.size(), s_.tail_.size() - s_.tail_offset_);
+                std::memcpy(into_.data(), s_.tail_.data() + s_.tail_offset_, n);
+                s_.tail_offset_ += n;
+                if (s_.tail_offset_ == s_.tail_.size()) {
+                    s_.tail_.clear();
+                    s_.tail_offset_ = 0;
+                }
                 return n;
             }
 
@@ -130,6 +154,9 @@ export namespace web {
         }
 
         std::string pending_;
+        // What finish() committed: not queued, and read only after pending_ is empty.
+        std::string tail_;
+        std::size_t tail_offset_ = 0;
         bool closed_ = false;
         std::size_t max_pending_bytes_ = constants::event_stream_buffer_bytes;
         std::coroutine_handle<> waiter_{};
@@ -201,13 +228,9 @@ export namespace web {
             t.path = raw.substr(0, q);
             if (q == std::string_view::npos)
                 return t;
-            for (auto part : std::views::split(raw.substr(q + 1), '&')) {
-                std::string_view kv{part.begin(), part.end()};
-                if (kv.empty())
-                    continue;
-                auto eq = kv.find('=');
-                t.query[decode(kv.substr(0, eq))] = eq == std::string_view::npos ? "" : decode(kv.substr(eq + 1));
-            }
+            const ada::url_search_params params{raw.substr(q + 1)};
+            for (const auto& [key, value] : params)
+                t.query.insert_or_assign(key, value);
             return t;
         }
 
@@ -227,23 +250,15 @@ export namespace web {
             return it == query.end() ? std::nullopt : std::optional<std::string_view>{it->second};
         }
         // A percent-encoded path segment, as written.
-        static auto unescape(std::string_view segment) -> std::string { return decode(segment); }
-
-    private:
-        static auto decode(std::string_view s) -> std::string {
-            std::string out;
-            for (std::size_t i = 0; i < s.size(); ++i) {
-                if (s[i] == '+')
-                    out += ' ';
-                else if (s[i] == '%' && i + 2 < s.size()) {
-                    unsigned v = 0;
-                    std::from_chars(s.data() + i + 1, s.data() + i + 3, v, 16);
-                    out += static_cast<char>(v);
-                    i += 2;
-                } else
-                    out += s[i];
-            }
-            return out;
+        static auto unescape(std::string_view segment) -> std::string {
+            const auto first = segment.find('%');
+            if (first == std::string_view::npos)
+                return std::string{segment};
+            for (auto i = first; i != std::string_view::npos; i = segment.find('%', i + 3))
+                if (segment.size() - i < 3 || !std::isxdigit(static_cast<unsigned char>(segment[i + 1])) ||
+                    !std::isxdigit(static_cast<unsigned char>(segment[i + 2])))
+                    throw std::invalid_argument("invalid percent-encoded path");
+            return ada::unicode::percent_decode(segment, first);
         }
     };
 } // namespace web

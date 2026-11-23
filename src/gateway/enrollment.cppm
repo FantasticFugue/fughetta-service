@@ -1,24 +1,28 @@
 export module enrollment;
 import utility;
 import std;
-import reflection;
+import json;
 import content;
 import durability;
 import constants;
+import records;
 
 export namespace enrollment {
     auto mint(std::size_t bytes) -> std::string;
     auto secret_matches(std::string_view digest, std::string_view secret) -> bool;
     inline auto now() -> std::int64_t { return std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count(); }
-    struct refused : std::runtime_error {
+    struct refused : std::runtime_error, util::retained_exception {
         int status;
         std::string code;
         refused(int status, std::string code, std::string message) : std::runtime_error(std::move(message)), status(status), code(std::move(code)) {}
+        auto retain() const noexcept -> std::exception_ptr override;
     };
+    auto refused::retain() const noexcept -> std::exception_ptr { return util::copy_current_exception(*this); }
     struct worker {
         std::string worker_id, name, secret_hash, created_by;
         std::int64_t created_at = 0, last_connected_at = 0;
         std::optional<std::int64_t> revoked_at;
+        std::string receipt_public_key;
     };
     struct record {
         std::string worker_id, name, created_by;
@@ -47,7 +51,7 @@ export namespace enrollment {
                 } catch (const durability::unreadable&) {
                     throw std::runtime_error("cannot read Worker registry");
                 }
-                auto parsed = rfl::json::read<document, rfl::DefaultIfMissing, rfl::NoExtraFields>(json);
+                auto parsed = json::read<document, json::defaults, json::strict>(json);
                 if (!parsed || parsed->workspace_id != data_.workspace_id)
                     throw std::runtime_error("Worker registry belongs to another workspace or is invalid");
                 data_ = std::move(*parsed);
@@ -62,7 +66,8 @@ export namespace enrollment {
                     throw refused(429, "worker_limit", "Worker registry is full");
                 result = {next.workspace_id, "worker_" + mint(16), mint(32)};
                 next.workers.emplace(result.worker_id,
-                                     worker{result.worker_id, std::move(name), content::hash_of(result.secret).str(), std::move(actor), at, 0, std::nullopt});
+                                     worker{result.worker_id, std::move(name), content::hash_of(result.secret).str(), std::move(actor), at, 0, std::nullopt,
+                                            content::receipt_key{result.secret}.public_key()});
             });
             return result;
         }
@@ -75,6 +80,8 @@ export namespace enrollment {
                     throw refused(401, "worker_authentication_failed", "Worker credentials were refused");
                 if (found->second.revoked_at)
                     throw refused(401, "worker_revoked", "Worker identity was revoked");
+                if (found->second.receipt_public_key.empty())
+                    found->second.receipt_public_key = content::receipt_key{secret}.public_key();
                 found->second.last_connected_at = at;
                 result = public_record(found->second);
             });
@@ -85,6 +92,15 @@ export namespace enrollment {
             std::lock_guard held{mutex_};
             auto found = data_.workers.find(std::string{id});
             return !poisoned_ && found != data_.workers.end() && !found->second.revoked_at;
+        }
+        auto verify(std::string_view id, const semantic::execution_receipt& receipt) const -> std::optional<std::string> {
+            std::lock_guard held{mutex_};
+            auto found = data_.workers.find(std::string{id});
+            if (poisoned_ || found == data_.workers.end() || found->second.revoked_at || receipt.worker_id != id ||
+                receipt.workspace_id != data_.workspace_id ||
+                !content::receipt_key::verify(found->second.receipt_public_key, receipt.payload(), receipt.signature))
+                return {};
+            return found->second.receipt_public_key;
         }
         void revoke(std::string_view id, std::int64_t at = now()) {
             transact([&](document& next) {
@@ -134,7 +150,7 @@ export namespace enrollment {
             auto next = data_;
             change(next);
             try {
-                durability::durable_private_write(file_, rfl::json::write(next));
+                durability::durable_private_write(file_, json::write(next));
             } catch (...) {
                 poisoned_ = true;
                 throw refused(503, "worker_registry_unavailable", "Worker registry persistence failed");

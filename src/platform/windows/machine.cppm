@@ -6,6 +6,12 @@ import std;
 import winapi;
 
 namespace host {
+    auto available_cpus() noexcept -> unsigned {
+        DWORD_PTR process, system;
+        if (::GetProcessAffinityMask(::GetCurrentProcess(), &process, &system) && process)
+            return static_cast<unsigned>(std::popcount(process));
+        return ::GetActiveProcessorCount(ALL_PROCESSOR_GROUPS);
+    }
     auto executable() -> std::filesystem::path {
         std::wstring buffer(32768, L'\0');
         auto size = ::GetModuleFileNameW(nullptr, buffer.data(), static_cast<DWORD>(buffer.size()));
@@ -96,6 +102,12 @@ namespace host {
         }
         for (const auto& [name, path] : mapped) {
             found.erase(name);
+            // A mapped tool can be a helper assembly or an interpreted script.
+            std::error_code ec;
+            if (std::filesystem::is_regular_file(path, ec) && !ec) {
+                found[name] = std::filesystem::absolute(path).string();
+                continue;
+            }
             auto wanted = winapi::wide(path);
             auto count = ::SearchPathW(nullptr, wanted.c_str(), L".exe", 0, nullptr, nullptr);
             if (!count)

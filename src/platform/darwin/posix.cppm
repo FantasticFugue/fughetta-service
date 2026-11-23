@@ -1,12 +1,82 @@
 module;
+#include <cerrno>
 #include <crt_externs.h>
 #include <mach-o/dyld.h>
 #include <unistd.h>
+#include <libproc.h>
+#include <sys/resource.h>
+#include <sys/clonefile.h>
+#include <fcntl.h>
+#include <mach/mach_time.h>
 
 module posix;
 import std;
+import async;
+import descriptor;
 
 namespace posix {
+    auto try_clone_file(const std::filesystem::path& source, const std::filesystem::path& destination) -> bool {
+        auto input = descriptor::open(source, O_RDONLY | O_NOFOLLOW | O_NONBLOCK);
+        if (::fclonefileat(input.get(), AT_FDCWD, destination.c_str(), CLONE_NOOWNERCOPY) == 0)
+            return true;
+        const auto error = errno;
+        if (error == ENOTSUP || error == EXDEV || error == EINVAL || error == ENOSYS)
+            return false;
+        descriptor::fail("cannot clone into", destination, error);
+    }
+
+    namespace {
+        auto sample_process(int pid, bool children) -> std::optional<io::process_usage> {
+            rusage_info_v2 resource{};
+            proc_taskinfo task{};
+            mach_timebase_info_data_t clock{};
+            if (::proc_pid_rusage(pid, RUSAGE_INFO_V2, reinterpret_cast<rusage_info_t*>(&resource)) != 0 ||
+                ::proc_pidinfo(pid, PROC_PIDTASKINFO, 0, &task, sizeof task) != sizeof task || ::mach_timebase_info(&clock) != KERN_SUCCESS || clock.denom == 0)
+                return {};
+            auto ticks = resource.ri_user_time + resource.ri_system_time;
+            if (children)
+                ticks += resource.ri_child_user_time + resource.ri_child_system_time;
+            // Kernel task accounting uses Mach absolute time, including on Apple Silicon.
+            auto nanos = static_cast<std::uint64_t>(static_cast<unsigned __int128>(ticks) * clock.numer / clock.denom);
+            return io::process_usage{resource.ri_resident_size, nanos, static_cast<std::uint32_t>(task.pti_threadnum), 1};
+        }
+    } // namespace
+    auto process_usage(int pid, bool group) noexcept -> std::optional<io::process_usage> {
+        try {
+            if (!group)
+                return sample_process(pid, false);
+            std::vector<int> members(64);
+            int bytes;
+            for (;;) {
+                bytes = ::proc_listpids(PROC_PGRP_ONLY, static_cast<std::uint32_t>(pid), members.data(), static_cast<int>(members.size() * sizeof(int)));
+                if (bytes <= 0)
+                    return {};
+                if (static_cast<std::size_t>(bytes) < members.size() * sizeof(int))
+                    break;
+                members.resize(members.size() * 2);
+            }
+            io::process_usage total;
+            for (int index = 0; index < bytes / static_cast<int>(sizeof(int)); ++index) {
+                auto member = members[index];
+                if (member <= 0)
+                    continue;
+                auto sample = sample_process(member, true);
+                if (!sample) {
+                    if (::getpgid(member) != pid)
+                        continue;
+                    return {};
+                }
+                total.resident_bytes += sample->resident_bytes;
+                total.cpu_nanoseconds += sample->cpu_nanoseconds;
+                total.threads += sample->threads;
+                total.processes += sample->processes;
+            }
+            return total.processes ? std::optional{total} : std::nullopt;
+        } catch (...) {
+            return {};
+        }
+    }
+
     auto environment() noexcept -> char**& { return *::_NSGetEnviron(); }
     auto executable() -> std::filesystem::path {
         std::uint32_t size = 0;
