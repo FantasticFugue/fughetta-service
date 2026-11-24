@@ -263,12 +263,29 @@ and [launchd hosting](https://developer.apple.com/library/archive/documentation/
 
 ## Host Executor
 
-Run the Host Executor as a privileged Linux service with an owner-only JSON
-configuration file.
+Run the Host Executor as a privileged service with an owner-only JSON configuration file. On Linux:
 
 ```sh
 fughetta-service --role host /etc/fughetta/host.json
 ```
+
+On a Windows host, run `fughetta-service.exe --role host R:\fughetta\host.json`. Configure
+`socket` with the local containerd named pipe and `isolation.runtimes` with
+`io.containerd.runhcs.v1`. Set `windows_base_snapshot` to the unpacked Windows
+image chain ID in the configured containerd namespace. The Windows snapshotter
+stores its layers on NTFS. A retained writable VHDX belongs to each environment.
+The Host Executor prepares a dedicated directory at the root of this disk. A Job
+Object mounts it locally, and Server Silo and Hyper-V workspaces use
+`C:\FughettaWorkspace` inside the container. Keep the Windows executable and
+toolchain on storage that allows the AppContainer to read and execute them.
+The storage budget must accommodate the image's scratch disk template.
+`rootfs` names the dedicated directory containing the Windows service executable.
+For private container networking, `windows_network` names the existing HCN network
+GUID whose subnet matches `network_prefix`. The process tier runs in an
+AppContainer inside a Job Object and binds to the host's configured private address.
+The process and shared-kernel tiers require an exclusive host. Hyper-V isolation
+uses a utility VM. The Windows backend uses local persistent layers for both Core
+and overflow Workers.
 
 Set the following fields inside `host`.
 
@@ -299,13 +316,18 @@ Set the following fields inside `host`.
   host utilities and defaults to 60. `operation_timeout_seconds` limits each
   provisioning attempt and defaults to 300.
 
-The executor uses cgroup v2 for CPU, memory, swap, PID, and device policy. It
+On an exclusive Linux host, configure the `systemd.service` runtime and a
+`process` boundary for a workspace process sandbox. The executor creates a
+transient service with an unprivileged UID, a private network namespace,
+a read-only root directory and toolchain, and a writable workspace volume.
+Stopping the unit reaps its process group before releasing the volume.
+
+The OCI executor uses cgroup v2 for CPU, memory, swap, PID, and device policy. It
 builds an OCI spec with isolated namespaces, a seccomp policy, empty capability
 sets, and a read-only root filesystem. A `sandbox` selects
-`io.containerd.runsc.v1` and a `vm` selects `io.containerd.kata.v2` when
-offered. A shared-kernel `container` requires `io.containerd.runc.v2` on an
-exclusive host. A VM placement on an exclusive host may use runc when Kata is
-absent because the dedicated host supplies the workspace boundary.
+`io.containerd.runsc.v1` and a `microvm` selects `io.containerd.kata.v2` when
+offered. A shared-kernel `container` uses `io.containerd.runc.v2` or `systemd-nspawn` on an
+exclusive host. A microVM placement requires a guest kernel even on an exclusive host.
 
 Install `/usr/local/bin/fughetta-service` and its runtime dependencies in the
 base filesystem. Build the service inside the root filesystem with
@@ -342,7 +364,7 @@ addresses and route the workspace prefix through the host. The Core's HTTP and
 personal Worker listeners accept those gateway sources and the local host.
 Enable `remote_worker_enrollment` to enroll personal Workers. The paired
 overflow Worker and claimed pool Workers can reach their Core's native
-execution listener through its private redirect.
+execution listener on its private interface.
 
 `GET /healthz` answers 200. All other requests require
 `Authorization: Bearer <host token>`. `POST /v1/operations` accepts the
@@ -378,8 +400,10 @@ Run the `host.api`, `host.oci`, `host.containerd`, and `host.volume` CTest
 suites on a Linux test host. The containerd suite uses noninteractive sudo
 and the local runc runtime to exercise mounts, quotas, egress, fencing, and
 admission of a claimed Worker by a native Core. The volume suite also uses a
-loop device to check data persistence and filesystem preservation. OCI unit
-tests cover runsc and Kata selection.
+loop device to check data persistence and filesystem preservation. Run
+`host.process`, `host.nspawn`, `host.userspace`, or `host.microvm` to exercise
+the same volume lifecycle with systemd, nspawn, gVisor, or Kata respectively.
+The Kata suite needs a KVM-enabled host and the containerd Kata shim.
 
 ## Run
 

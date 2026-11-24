@@ -80,8 +80,11 @@ export namespace host_oci {
         if (!host.shared_cache.empty())
             mounts.emplace_back(bind_mount(cache_path, host.shared_cache, true));
 
+        const bool guest = contract.boundary.kind == "microvm";
+        const auto uid = guest ? host.mapped_id : 0u;
         json::array namespaces;
-        for (const auto type : {"user", "mount", "pid", "ipc", "uts", "cgroup"})
+        if (!guest) namespaces.emplace_back(json::object{{"type", "user"}});
+        for (const auto type : {"mount", "pid", "ipc", "uts", "cgroup"})
             namespaces.emplace_back(json::object{{"type", type}});
         namespaces.emplace_back(json::object{{"type", "network"}, {"path", netns}});
         const json::array mapping{json::object{{"containerID", 0}, {"hostID", host.mapped_id}, {"size", 1}}};
@@ -99,7 +102,7 @@ export namespace host_oci {
             const auto type = S_ISCHR(node.st_mode) ? "c" : "b";
             const auto major_id = major(node.st_rdev), minor_id = minor(node.st_rdev);
             devices.emplace_back(json::object{{"path", path}, {"type", type}, {"major", major_id},
-                                              {"minor", minor_id}, {"fileMode", 0600}, {"uid", 0}, {"gid", 0}});
+                                              {"minor", minor_id}, {"fileMode", 0600}, {"uid", uid}, {"gid", uid}});
             access.emplace_back(device_rule(type, major_id, minor_id));
         }
 
@@ -120,10 +123,10 @@ export namespace host_oci {
         const json::object document{
             {"ociVersion", "1.1.0"}, {"hostname", "workspace"},
             {"root", json::object{{"path", "rootfs"}, {"readonly", true}}},
-            {"process", json::object{{"user", json::object{{"uid", 0}, {"gid", 0}}}, {"args", std::move(args)},
+            {"process", json::object{{"user", json::object{{"uid", uid}, {"gid", uid}}}, {"args", std::move(args)},
                                      {"env", std::move(env)}, {"cwd", work_path}, {"noNewPrivileges", true}, {"capabilities", empty_caps}}},
             {"mounts", std::move(mounts)},
-            {"linux", json::object{{"namespaces", std::move(namespaces)}, {"uidMappings", mapping}, {"gidMappings", mapping},
+            {"linux", json::object{{"namespaces", std::move(namespaces)}, {"uidMappings", guest ? json::array{} : mapping}, {"gidMappings", guest ? json::array{} : mapping},
                                    {"cgroupsPath", "/fughetta/" + std::string{id}}, {"devices", std::move(devices)},
                                    {"resources", resources}, {"seccomp", seccomp()},
                                    {"maskedPaths", json::array{"/proc/acpi", "/proc/kcore", "/proc/keys", "/proc/timer_list", "/proc/scsi"}},

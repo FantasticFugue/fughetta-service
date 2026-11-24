@@ -99,6 +99,7 @@ export namespace config {
         std::string http_bind = "127.0.0.1";
         std::uint16_t http_port = 8080;
         std::string worker_bind = "127.0.0.1";
+        std::string overflow_worker_bind;
         std::uint16_t worker_port = 9090;
         std::string remote_worker_bind = "127.0.0.1";
         std::uint16_t remote_worker_port = 0;
@@ -429,6 +430,8 @@ export namespace config {
             (void)toolchain::installation(key, true);
     }
 
+    inline auto private_listener(net::ip::address address) -> bool;
+
     inline void validate(const document& d) {
         allocation::distribute(d.runtime);
         validate_sdk_keys(d.sdk_manifests);
@@ -440,6 +443,10 @@ export namespace config {
             throw std::invalid_argument("overflow waiting requires a hosted Core, a private Worker token, and a deadline of at most 600 seconds");
         io::parse_endpoint(d.server.http_bind, d.server.http_port);
         io::parse_endpoint(d.server.worker_bind, d.server.worker_port);
+        if (!d.server.overflow_worker_bind.empty() &&
+            (!d.server.overflow_wait_seconds || d.server.overflow_worker_bind == d.server.worker_bind ||
+             !private_listener(io::parse_endpoint(d.server.overflow_worker_bind, d.server.worker_port).address())))
+            throw std::invalid_argument("overflow Worker listener requires a distinct private address and a hosted overflow policy");
         if (d.server.remote_worker_port) {
             io::parse_endpoint(d.server.remote_worker_bind, d.server.remote_worker_port);
             if (d.server.auth.workspace.empty())
@@ -478,6 +485,18 @@ export namespace config {
 
     template <class T> auto write(const T& value) -> std::string { return json::write(value); }
 
+    inline auto read_workspace_config(std::istream& input) -> std::string {
+        std::array<char, 8192> buffer;
+        std::string text;
+        while (input.read(buffer.data(), buffer.size()) || input.gcount()) {
+            text.append(buffer.data(), static_cast<std::size_t>(input.gcount()));
+            if (text.size() > (1u << 20))
+                throw std::invalid_argument("workspace configuration exceeds the size limit");
+        }
+        if (!input.eof()) throw std::runtime_error("cannot read provisioned workspace configuration");
+        return text;
+    }
+
     inline auto load(const std::filesystem::path& file, std::optional<allocation::budget> self_hosted_runtime = {}) -> document {
         std::ifstream in{file, std::ios::binary};
         if (!in)
@@ -486,9 +505,13 @@ export namespace config {
         return parse(text, self_hosted_runtime);
     }
 
+    inline constexpr std::string_view systemd = "systemd.service";
+    inline constexpr std::string_view nspawn = "systemd-nspawn";
     inline constexpr std::string_view runc = "io.containerd.runc.v2";
     inline constexpr std::string_view runsc = "io.containerd.runsc.v1";
     inline constexpr std::string_view kata = "io.containerd.kata.v2";
+
+    inline constexpr std::string_view runhcs = "io.containerd.runhcs.v1";
 
     struct host_limits {
         std::uint32_t cpu_millis = 0;
@@ -509,6 +532,7 @@ export namespace config {
         std::string token, front_token, host_id, socket = "/run/containerd/containerd.sock";
         std::string name_space, storage, rootfs, toolchain_root, work_root, shared_cache;
         std::string volume_devices = "/dev/disk/by-id/";
+        std::string windows_network, windows_base_snapshot;
         host_policy isolation;
         host_limits capacity;
         std::string network_prefix = "10.203";
@@ -571,7 +595,7 @@ export namespace config {
             (!h.shared_cache.empty() && !path(h.shared_cache)))
             throw std::invalid_argument("host socket and directories require absolute paths");
         const std::filesystem::path devices{h.volume_devices};
-        if (!path(h.volume_devices) || devices == devices.root_path() || devices != devices.lexically_normal())
+        if (host::os != "windows" && (!path(h.volume_devices) || devices == devices.root_path() || devices != devices.lexically_normal()))
             throw std::invalid_argument("host.volume_devices requires a normalized absolute directory");
         std::error_code error;
         const auto prefix = net::ip::make_address_v4(h.network_prefix + ".0.0", error);
@@ -588,9 +612,11 @@ export namespace config {
             !h.mapped_id || !h.pids || !h.timeout_seconds || !h.operation_timeout_seconds)
             throw std::invalid_argument("host capacity, mapped ID, PID limit, and timeouts must be positive and storage at least 16 MiB");
         if (h.isolation.runtimes.empty() || !std::ranges::all_of(h.isolation.runtimes, [&](std::string_view runtime) {
-                return runtime == runsc || runtime == kata || (runtime == runc && h.isolation.exclusive);
+                if (host::os == "windows")
+                    return runtime == runhcs && !h.windows_base_snapshot.empty() && h.isolation.devices.empty();
+                return runtime == runsc || runtime == kata || ((runtime == runc || runtime == systemd || runtime == nspawn) && h.isolation.exclusive);
             }))
-            throw std::invalid_argument("host isolation requires supported runtimes and an exclusive host for runc");
+            throw std::invalid_argument("host isolation requires supported runtimes and an exclusive host for process and runc workloads");
         for (const auto& device : h.isolation.devices)
             if (!device.starts_with("/dev/") || !path(device) || std::filesystem::path{device}.lexically_normal() != device)
                 throw std::invalid_argument("host isolation devices must name paths under /dev");
@@ -761,11 +787,32 @@ export namespace config {
         inline void bump(document& d, std::uint64_t& section) { section = ++d.revisions.counter; }
     } // namespace detail
 
+    struct workspace_settings {
+        config::limits limits;
+        decltype(document::projects) projects;
+        decltype(server::allowed_origins) allowed_origins;
+        std::uint64_t max_request_bytes = server{}.max_request_bytes;
+        config::revisions revisions;
+
+        void apply(document& doc) && {
+            doc.limits = limits;
+            doc.projects = std::move(projects);
+            doc.server.allowed_origins = std::move(allowed_origins);
+            doc.server.max_request_bytes = max_request_bytes;
+            doc.revisions.counter = revisions.counter;
+            doc.revisions.projects = std::move(revisions.projects);
+            doc.revisions.limits = revisions.limits;
+            doc.revisions.server = revisions.server;
+            validate(doc);
+        }
+    };
+
     class store {
     public:
         using snapshot = std::shared_ptr<const document>;
 
-        store(document d, std::optional<std::filesystem::path> file) : current_(std::make_shared<const document>(std::move(d))), file_(std::move(file)) {}
+        store(document d, std::optional<std::filesystem::path> file, bool provisioned = false)
+            : current_(std::make_shared<const document>(std::move(d))), file_(std::move(file)), provisioned_(provisioned) {}
 
         auto current() const -> snapshot { return current_; }
 
@@ -799,6 +846,13 @@ export namespace config {
         void put_server(server s, std::uint64_t expected) {
             change([&](document& d) {
                 detail::check_revision(d.revisions.server, expected, [&] { return write(public_server(d.server)); });
+                if (provisioned_) {
+                    auto allowed = d.server;
+                    allowed.allowed_origins = s.allowed_origins;
+                    allowed.max_request_bytes = s.max_request_bytes;
+                    if (write(allowed) != write(s))
+                        throw std::invalid_argument("the host manages workspace listeners, storage and authentication");
+                }
                 d.server = std::move(s);
                 detail::bump(d, d.revisions.server);
             });
@@ -836,6 +890,11 @@ export namespace config {
         }
 
         void save(const document& d) const {
+            if (provisioned_) {
+                workspace_settings state{d.limits, d.projects, d.server.allowed_origins, d.server.max_request_bytes, d.revisions};
+                durability::durable_write(*file_, write(state), false, ".tmp");
+                return;
+            }
             auto text = write(d);
             if (d.server.auth.front_token)
                 durability::durable_private_write(*file_, text);
@@ -845,6 +904,7 @@ export namespace config {
 
         snapshot current_;
         std::optional<std::filesystem::path> file_;
+        bool provisioned_;
     };
 
     // One snapshot per core, so a core reads its configuration without a lock. The owner on core 0 publishes a new snapshot to each core

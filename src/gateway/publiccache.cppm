@@ -118,8 +118,8 @@ export namespace public_shards {
             unsigned port = scheme_ == "https" ? 443 : 80;
             if (colon != endpoint.npos) {
                 const auto value = endpoint.substr(colon + 1);
-                const auto [end, ec] = std::from_chars(value.begin(), value.end(), port);
-                if (ec != std::errc{} || end != value.end() || !port || port > 65535)
+                const auto [end, ec] = std::from_chars(value.data(), value.data() + value.size(), port);
+                if (ec != std::errc{} || end != value.data() + value.size() || !port || port > 65535)
                     throw std::invalid_argument("invalid public shard port");
             }
             port_ = static_cast<std::uint16_t>(port);

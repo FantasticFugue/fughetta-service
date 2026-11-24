@@ -7,7 +7,6 @@ import configuration;
 import executor;
 import backend;
 import host;
-import durability;
 import codec;
 import constants;
 import process;
@@ -79,8 +78,6 @@ export namespace sibling {
 
         auto launch() -> coroutine::task<std::shared_ptr<instance>> {
             std::filesystem::create_directories(root_);
-            const auto directory = front_ / "execute";
-            std::filesystem::create_directories(directory);
             auto execute = cfg_;
             execute.execute_stdio = true;
             execute.token.reset();
@@ -94,14 +91,11 @@ export namespace sibling {
             execute.backend = {};
             execute.worker_id.reset();
             execute.workspace_id.reset();
-            const auto file = directory / "worker.json";
-            durability::durable_private_write(file, config::write(execute));
-            const auto executable = host::executable();
-            auto command = backend::launch(cfg_.backend, executable, file, root_, std::move(execute.env));
+            auto command = backend::launch(cfg_.backend, host::executable(), root_, execute.env);
             auto started = std::make_shared<instance>(io::spawn_process(io_, command));
             tasks_.spawn(watch(started));
             try {
-                if (!co_await coroutine::deadline(io_, constants::execute_start, accept(*started)))
+                if (!co_await coroutine::deadline(io_, constants::execute_start, accept(*started, execute)))
                     throw std::runtime_error(std::format("the execute role did not start in {}s", constants::execute_start.count()));
             } catch (...) {
                 started->process.kill();
@@ -111,7 +105,8 @@ export namespace sibling {
             co_return started;
         }
 
-        static auto accept(instance& started) -> coroutine::task<> {
+        static auto accept(instance& started, const config::worker& execute) -> coroutine::task<> {
+            co_await started.chan.send(transport::execute_config, 0, execute);
             auto first = co_await started.chan.recv(constants::worker_hello_bytes);
             if (first.kind != jobs::code<jobs::hello>)
                 throw std::runtime_error("invalid execute role greeting");

@@ -75,14 +75,14 @@ int main() {
 
         contract.boundary.shared_kernel = true;
         require(spec().runtime == config::runsc, "sandbox must select runsc when sharing is permitted");
-        contract.boundary.kind = "vm";
+        contract.boundary.kind = "microvm";
         require(spec().runtime == config::kata, "VM must prefer Kata when sharing is permitted");
         contract.boundary.shared_kernel = false;
         require(spec().runtime == config::kata, "VM must prefer Kata");
         host.isolation.runtimes = {std::string{config::runc}};
         require(denied(host, contract), "VM must reject shared runc host");
         host.isolation.exclusive = true;
-        require(spec().runtime == config::runc, "exclusive VM host must select runc");
+        require(denied(host, contract), "exclusive host must still provide a guest kernel for a microVM");
         contract.boundary.kind = "sandbox";
         require(denied(host, contract), "sandbox must reject runc");
         contract.boundary.kind = "container";

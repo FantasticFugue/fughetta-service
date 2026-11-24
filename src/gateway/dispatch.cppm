@@ -745,7 +745,11 @@ export namespace tools {
             done =
                 co_await s.workers.with_worker(s.core,
                                                routing::selection{.needs = needs,
-                                                                  .tree_key = request.project + "/" + request.tree,
+                                                                  .tree_key = request.fresh ? std::string{} : request.project + "/" + request.tree,
+                                                                  .options = config.name,
+                                                                  .snapshot = held.cancelled.snapshot,
+                                                                  .parent_snapshot = request.parent_snapshot ? request.parent_snapshot->str() : std::string{},
+                                                                  .stage = operation,
                                                                   .memory_bytes = request.max_memory_bytes},
                                                constraints, std::move(run_on_worker), &progress);
         } catch (const routing::no_worker& e) {
@@ -1246,6 +1250,7 @@ export namespace tools {
                                             .tree_key = build.preparation.project + "/" + build.preparation.tree,
                                             .options = build.analysis.options,
                                             .snapshot = build.preparation.snapshot.str(),
+                                            .parent_snapshot = build.preparation.parent_snapshot ? build.preparation.parent_snapshot->str() : std::string{},
                                             .stage = build.analysis.execution.stage_id,
                                             .memory_bytes = build.preparation.max_memory_bytes,
                                             .worker = residence ? std::optional{residence->worker} : std::nullopt,

@@ -5,7 +5,7 @@ import fixture;
 namespace {
     using namespace boost::ut;
     static constexpr auto cases = [] {
-        "HTTP command workflow remains available after gateway restart"_test = [] {
+        auto workflow_restart = [](bool provisioned) {
             test::scratch tmp{"workflow"};
             auto port = test::port();
             auto doc = test::document(tmp.dir, port, test::port());
@@ -16,7 +16,10 @@ namespace {
             settings.build_configurations["npm"] = workflow;
             settings.default_configurations = std::vector<std::string>{"npm"};
             auto start = [&] {
-                auto process = std::make_unique<test::child>(test::gateway_command(SERVICE_EXECUTABLE, tmp.dir, {file.string()}));
+                std::vector<std::string> args;
+                if (provisioned) args.emplace_back("--workspace-config");
+                args.push_back(file.string());
+                auto process = std::make_unique<test::child>(test::gateway_command(SERVICE_EXECUTABLE, tmp.dir, std::move(args)));
                 test::ready(*process, port);
                 return process;
             };
@@ -56,10 +59,14 @@ namespace {
             };
             auto revision = check();
             expect(process->stop() == 0);
+            if (provisioned)
+                expect(config::load(file).revisions.projects == doc.revisions.projects);
             process = start();
             expect(check() == revision);
             expect(process->stop() == 0);
         };
+        "HTTP command workflow remains available after gateway restart"_test = [=] { workflow_restart(false); };
+        "hosted projects survive a Core restart with a read-only bootstrap configuration"_test = [=] { workflow_restart(true); };
     };
 } // namespace
 

@@ -465,7 +465,6 @@ export namespace host_resources {
         });
 
         const auto rules = directory / "network.nft";
-        const auto worker_rules = directory / "worker.nft";
         co_await io::blocking(io, pool, [&] {
             durability::durable_private_write(rules, firewall(host, net, op, endpoints));
             std::string hosts = "127.0.0.1 localhost\n::1 localhost\n";
@@ -475,21 +474,12 @@ export namespace host_resources {
             const auto hosts_file = directory / "hosts";
             durability::durable_private_write(hosts_file, hosts);
             fs::permissions(hosts_file, fs::perms::owner_read | fs::perms::group_read | fs::perms::others_read);
-            if (op.overflow_wait_seconds)
-                durability::durable_private_write(worker_rules, std::format(
-                    "table ip worker {{ chain redirect {{ type nat hook prerouting priority dstnat; policy accept; "
-                    "iifname \"eth0\" ip daddr {} tcp dport {} dnat to 127.0.0.1; }} }}\n",
-                    net.address, constants::host_worker_port));
             return true;
         });
         co_await command(io, host, {"nft", "-f", rules.string()});
         co_await command(io, host, {"ip", "link", "add", "name", net.name, "type", "veth", "peer", "name", "eth0", "netns", net.name});
         co_await command(io, host, {"ip", "addr", "add", net.peer + "/30", "dev", net.name});
         co_await command(io, host, {"ip", "-n", net.name, "addr", "add", net.address + "/30", "dev", "eth0"});
-        if (op.overflow_wait_seconds) {
-            co_await command(io, host, {"ip", "netns", "exec", net.name, "sysctl", "-qw", "net.ipv4.conf.eth0.route_localnet=1"});
-            co_await command(io, host, {"ip", "netns", "exec", net.name, "nft", "-f", worker_rules.string()});
-        }
         co_await command(io, host, {"ip", "link", "set", net.name, "up"});
         co_await command(io, host, {"ip", "-n", net.name, "link", "set", "eth0", "up"});
         if (!host_operation::pooled(op))

@@ -793,6 +793,8 @@ export namespace jobs {
 } // namespace jobs
 
 export namespace transport {
+    inline constexpr std::uint32_t execute_config = 0x45584543;
+
     struct frame {
         std::uint32_t kind = 0;
         std::uint64_t corr = 0;

@@ -18,3 +18,13 @@ add_dependencies(host.containerd-test host-workload)
 set_tests_properties(host.containerd PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE)
 add_test(NAME host.volume COMMAND host.containerd-test volume)
 set_tests_properties(host.volume PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 120)
+
+add_test(NAME host.process COMMAND host.containerd-test process)
+set_tests_properties(host.process PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 120)
+add_test(NAME host.userspace COMMAND host.containerd-test userspace)
+set_tests_properties(host.userspace PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 120)
+
+add_test(NAME host.microvm COMMAND host.containerd-test microvm)
+set_tests_properties(host.microvm PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 300)
+add_test(NAME host.nspawn COMMAND host.containerd-test nspawn)
+set_tests_properties(host.nspawn PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 120)

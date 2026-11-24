@@ -162,7 +162,8 @@ namespace {
             auto listener = native::listener{io, {net::ip::address_v4::loopback(), 0}};
             auto client = co_await io::connect(io, {net::ip::address_v4{{127, 0, 0, 1}}, listener.local_endpoint().port()});
             auto [peer, endpoint] = co_await net::async_accept(listener);
-            jobs::slot_report report{.slots = {{.project = "app", .tree = "native", .sessions = {{"main", "clice", "recipe", "source", 1}}}}};
+            jobs::slot_report report{.slots = {{.project = "app", .tree = "build-0", .snapshot = "parent"},
+                                               {.project = "app", .tree = "native", .sessions = {{"main", "clice", "recipe", "source", 1}}}}};
             auto run = [&](coroutine::scope& children) -> coroutine::task<> {
                 children.spawn(router.workers(1).admit(io, std::move(peer)));
                 children.spawn(fake_worker(client, "remote", {"clice", "slow"}, 1, "", false, &report, &io, 80ms));
@@ -189,6 +190,9 @@ namespace {
                 while (!router.workers(0).holds({}))
                     co_await execution::schedule_after(io, 1ms);
                 co_await remote_ready.wait();
+                routing::selection fork{.tree_key = "app/build-1", .snapshot = "child", .parent_snapshot = "parent"};
+                auto seeded = co_await router.run(0, fork, jobs::hash_file{.path = "fork"});
+                expect(seeded.hex == "remote:fork") << "dispatch the fork to the Worker holding its reusable parent";
                 routing::selection request{.needs = {.tools = {"clice"}}, .tree_key = "app/native", .options = "recipe", .snapshot = "source", .stage = "main"};
                 auto other_stage = request;
                 other_stage.stage = "other";

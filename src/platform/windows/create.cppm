@@ -188,7 +188,13 @@ namespace native_process {
             winapi::fail("CreateJobObject child");
         winapi::limits(s->job.value, cmd.max_memory_bytes, cmd.max_cpu_seconds);
         static std::atomic<std::uint64_t> serial{0};
-        auto name = std::format(L"\\\\.\\pipe\\child-{}-{}", ::GetCurrentProcessId(), serial.fetch_add(1));
+        static const auto pipe_root = [] {
+            DWORD isolated{}, bytes{};
+            if (!::GetTokenInformation(::GetCurrentProcessToken(), TokenIsAppContainer, &isolated, sizeof(isolated), &bytes))
+                winapi::fail("read child pipe namespace");
+            return isolated ? LR"(\\.\pipe\LOCAL\)" : LR"(\\.\pipe\)";
+        }();
+        auto name = std::format(L"{}child-{}-{}", pipe_root, ::GetCurrentProcessId(), serial.fetch_add(1));
         s->out = winapi::handle{::CreateNamedPipeW(name.c_str(), PIPE_ACCESS_INBOUND | FILE_FLAG_OVERLAPPED | FILE_FLAG_FIRST_PIPE_INSTANCE,
                                                    PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS, 1, 65536, 65536, 0, nullptr)};
         if (s->out.value == INVALID_HANDLE_VALUE)
@@ -203,7 +209,7 @@ namespace native_process {
             winapi::fail("open child output");
         winapi::handle input, errors;
         if (interactive) {
-            auto inbound = std::format(L"\\\\.\\pipe\\child-input-{}-{}", ::GetCurrentProcessId(), serial.fetch_add(1));
+            auto inbound = std::format(L"{}child-input-{}-{}", pipe_root, ::GetCurrentProcessId(), serial.fetch_add(1));
             s->in = winapi::handle{::CreateNamedPipeW(inbound.c_str(), PIPE_ACCESS_OUTBOUND | FILE_FLAG_OVERLAPPED | FILE_FLAG_FIRST_PIPE_INSTANCE,
                                                       PIPE_TYPE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS, 1, 65536, 65536, 0, nullptr)};
             if (s->in.value == INVALID_HANDLE_VALUE)
@@ -259,7 +265,7 @@ namespace native_process {
         PROCESS_INFORMATION process{};
         auto cwd = cmd.cwd.empty() ? std::wstring{} : std::filesystem::absolute(cmd.cwd).wstring();
         if (!::CreateProcessW(nullptr, command.data(), nullptr, nullptr, TRUE,
-                              CREATE_SUSPENDED | CREATE_NEW_PROCESS_GROUP | CREATE_UNICODE_ENVIRONMENT | EXTENDED_STARTUPINFO_PRESENT,
+                              CREATE_SUSPENDED | CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP | CREATE_UNICODE_ENVIRONMENT | EXTENDED_STARTUPINFO_PRESENT,
                               cmd.env ? env.data() : nullptr, cwd.empty() ? nullptr : cwd.c_str(), &start.StartupInfo, &process))
             winapi::fail("CreateProcess");
         s->process = winapi::handle{process.hProcess};

@@ -26,6 +26,7 @@ auto run_host(int argc, char** argv) -> int {
             return host_backend::reconcile(io, pool, settings, operation);
         };
         host_api::server server{io, settings, provision};
+        co_await server.restore_windows_environments();
         native::listener listener{io, io::parse_endpoint(settings.bind, settings.port)};
         lifecycle::publish(lifecycle::phase::ready);
         std::cerr << "service-ready:host\n";

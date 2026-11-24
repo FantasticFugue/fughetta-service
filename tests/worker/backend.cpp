@@ -9,9 +9,9 @@ namespace {
     static constexpr auto cases = [] {
         "execute child starts directly with its resource bounds and standard streams"_test = [] {
             const config::worker_backend limits{.max_memory_bytes = 1ull << 30, .max_cpu_seconds = 600};
-            const auto command = backend::launch(limits, "/bin/service", "/work/config.json", "/work/execute", {{"PATH", "/usr/bin"}});
+            const auto command = backend::launch(limits, "/bin/service", "/work/execute", {{"PATH", "/usr/bin"}});
             expect(command.stdio == io::process_stdio::asynchronous);
-            expect(command.argv == std::vector<std::string>{"/bin/service", "--role", "worker", "/work/config.json"});
+            expect(command.argv == std::vector<std::string>{"/bin/service", "--role", "worker", "--execute-stdio"});
             expect(command.cwd == "/work/execute" && command.env->at("PATH") == "/usr/bin");
             expect(command.max_memory_bytes == (1ull << 30) && command.max_cpu_seconds == 600);
         };

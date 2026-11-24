@@ -1,5 +1,7 @@
 module;
 #include <windows.h>
+#include <stdlib.h>
+#include <wchar.h>
 module signals;
 import std;
 import winapi;
@@ -122,8 +124,19 @@ namespace lifecycle {
         }
     } // namespace
     void publish(phase value) {
+        static const winapi::handle workspace_event{[]() -> HANDLE {
+            wchar_t text[32]{};
+            const auto length = ::GetEnvironmentVariableW(L"FUG_HOST_READY_HANDLE", text, 32);
+            if (!length || length >= 32) return nullptr;
+            ::_wputenv_s(L"FUG_HOST_READY_HANDLE", L"");
+            wchar_t* end{};
+            const auto raw = ::wcstoull(text, &end, 10);
+            return end == text + length ? reinterpret_cast<HANDLE>(static_cast<std::uintptr_t>(raw)) : nullptr;
+        }()};
         if (current.exchange(value) == value)
             return;
+        if (value == phase::ready && workspace_event.value && !::SetEvent(workspace_event.value))
+            winapi::fail("notify workspace readiness");
         std::lock_guard lock{status_mutex};
         if (!handle || status.dwCurrentState == SERVICE_STOP_PENDING)
             return;

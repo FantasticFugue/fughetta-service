@@ -97,8 +97,9 @@ export namespace runtime {
             std::filesystem::permissions(directory, std::filesystem::perms::owner_all, std::filesystem::perm_options::replace);
             auto endpoint = io::parse_endpoint(doc.server.source);
             // Managed links stay on loopback; deployment changes only the public HTTP listener.
-            if (doc.server.source != std::format("127.0.0.1:{}", endpoint.port()) || doc.server.worker_bind != "127.0.0.1")
-                throw std::invalid_argument("managed source and worker listeners must use 127.0.0.1");
+            const auto loopback = endpoint.address().to_string();
+            if (!endpoint.address().is_loopback() || !endpoint.address().is_v4() || doc.server.worker_bind != loopback)
+                throw std::invalid_argument("managed source and worker listeners must share an IPv4 loopback address");
             auto source_environment = host::child_environment();
             if (doc.public_shards) {
                 for (const auto* name : {"FUG_R2_ACCESS_KEY_ID", "FUG_R2_SECRET_ACCESS_KEY", "FUG_R2_READ_ACCESS_KEY_ID", "FUG_R2_READ_SECRET_ACCESS_KEY"})
@@ -107,7 +108,7 @@ export namespace runtime {
                     source_environment.erase(doc.public_shards->publish->secret_key_env);
             }
             auto worker_environment = source_environment;
-            io::command source_command{.argv = {executable.string(), "--role", "source", "--port", std::to_string(endpoint.port()), "--storage",
+            io::command source_command{.argv = {executable.string(), "--role", "source", "--bind", loopback, "--port", std::to_string(endpoint.port()), "--storage",
                                                 (root / constants::managed_source_directory).string(), "--threads", std::to_string(plan.source_disk)},
                                        .cwd = std::filesystem::current_path(),
                                        .env = std::move(source_environment)};
@@ -119,7 +120,7 @@ export namespace runtime {
             worker_environment.erase("SOURCE_TOKEN");
             for (std::size_t i = 0; i < plan.workers.size(); ++i) {
                 config::worker worker;
-                worker.gateway = std::format("127.0.0.1:{}", doc.server.worker_port);
+                worker.gateway = std::format("{}:{}", loopback, doc.server.worker_port);
                 worker.token = doc.worker_token;
                 worker.name = std::format("local-{}", i);
                 worker.data_root = (root / constants::managed_source_directory).string();

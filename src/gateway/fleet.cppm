@@ -153,6 +153,7 @@ export namespace routing {
         requirements needs;
         std::string tree_key;
         std::string options, snapshot;
+        std::string parent_snapshot;
         std::string stage;
         std::optional<std::uint64_t> memory_bytes;
         std::optional<std::uint64_t> worker;
@@ -181,8 +182,6 @@ export namespace routing {
     inline auto preferred(const placement& a, const placement& b, bool costs) -> bool {
         if (a.personal != b.personal)
             return a.personal;
-        if (a.personal && a.heat != b.heat)
-            return a.heat > b.heat;
         if (costs && a.seconds != b.seconds)
             return *a.seconds < *b.seconds;
         return std::tuple{-a.heat, a.inflight, a.used, a.core, a.worker} < std::tuple{-b.heat, b.inflight, b.used, b.core, b.worker};
@@ -656,17 +655,29 @@ export namespace routing {
         }
         static auto warmth(const member& m, const selection& sel) -> int {
             int heat = 0;
-            for (const auto& slot : m.slots)
-                if (!slot.busy && slot.project + "/" + slot.tree == sel.tree_key) {
-                    heat = std::max(heat, !sel.snapshot.empty() && slot.snapshot == sel.snapshot ? 2 : 1);
-                    for (const auto& cache : slot.cached)
-                        if (!sel.options.empty() && cache.options == sel.options && cache.stage == sel.stage &&
-                            !sel.snapshot.empty() && cache.snapshot == sel.snapshot && cache.toolchain == m.hello.toolchain_id)
-                            heat = std::max(heat, 3);
-                    for (const auto& session : slot.sessions)
-                        if (!sel.options.empty() && session.options == sel.options && session.stage == sel.stage)
-                            heat = std::max(heat, !sel.snapshot.empty() && session.snapshot == sel.snapshot ? 4 : 2);
+            const auto project_end = sel.tree_key.find('/');
+            const auto project = std::string_view{sel.tree_key}.substr(0, project_end);
+            const auto split = sel.tree_key.rfind('-');
+            const auto pool = std::string_view{sel.tree_key}.substr(0, split + 1);
+            for (const auto& slot : m.slots) {
+                if (slot.busy)
+                    continue;
+                const auto key = slot.project + "/" + slot.tree;
+                if (key != sel.tree_key) {
+                    if (!sel.parent_snapshot.empty() && slot.snapshot == sel.parent_snapshot &&
+                        project_end != std::string::npos && slot.project == project && key.starts_with(pool))
+                        heat = std::max(heat, 1);
+                    continue;
                 }
+                heat = std::max(heat, !sel.snapshot.empty() && slot.snapshot == sel.snapshot ? 2 : 1);
+                for (const auto& cache : slot.cached)
+                    if (!sel.options.empty() && cache.options == sel.options && cache.stage == sel.stage &&
+                        !sel.snapshot.empty() && cache.snapshot == sel.snapshot && cache.toolchain == m.hello.toolchain_id)
+                        heat = std::max(heat, 3);
+                for (const auto& session : slot.sessions)
+                    if (!sel.options.empty() && session.options == sel.options && session.stage == sel.stage)
+                        heat = std::max(heat, !sel.snapshot.empty() && session.snapshot == sel.snapshot ? 4 : 2);
+            }
             return heat;
         }
         static void observe(member& m, const selection& sel, int heat, double seconds) {

@@ -1,5 +1,6 @@
 #include <cerrno>
 #include <elf.h>
+#include <sched.h>
 #include <stdlib.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -60,9 +61,10 @@ namespace {
             if (fs::path{word}.is_absolute())
                 copy(word, root / fs::path{word}.relative_path());
         copy(executable, root / "usr/local/bin/fughetta-service");
-        for (const auto* name : {"proc", "dev", "work", "opt/fug/toolchain", "opt/fug/shared", "etc"})
+        for (const auto* name : {"proc", "sys", "run", "tmp", "dev", "var", "work", "opt/fug/toolchain", "opt/fug/shared", "etc"})
             fs::create_directories(root / name);
         std::ofstream{root / "etc/hosts"} << "127.0.0.1 localhost\n";
+        std::ofstream{root / "etc/os-release"} << "ID=fughetta\n";
         std::ofstream{root / "marker"};
     }
 
@@ -134,7 +136,7 @@ namespace {
         }
     };
 
-    void volume_scenario(const fs::path& dir) {
+    void volume_scenario(const fs::path& dir, std::string_view runtime) {
         rootfs(dir / "rootfs", HOST_WORKLOAD, dir);
         fs::create_directories(dir / "tools");
         fs::create_directories(dir / "shared");
@@ -158,16 +160,17 @@ namespace {
         host.toolchain_root = (dir / "tools").string();
         host.work_root = (dir / "volumes").string();
         host.volume_devices = (dir / "devices").string();
-        host.isolation = {{std::string{config::runc}}, true, {}};
-        host.pids = 16;
-        host.capacity = {2000, 512u << 20, 128u << 20};
+        host.isolation = {{std::string{runtime}}, true, {}};
+        if (runtime == config::systemd || runtime == config::runc)
+            host.pids = 16;
+        host.capacity = {2000, runtime == config::kata ? 2048u << 20 : 512u << 20, 128u << 20};
 
         const auto work = dir / "volumes/work";
         operation start{.workspace_id = "test-workspace", .kind = environment_kind::core,
             .desired = environment_state::running, .host_id = host.host_id,
             .contract = {.os = "linux", .arch = std::string{host_api::linux_arch()}, .toolchain = "test",
-                .boundary = {.kind = "container", .shared_kernel = true, .network = "none"},
-                .limits = {450, 64u << 20, 32u << 20}, .toolchain_root = host.toolchain_root, .work_root = work.string(),
+                .boundary = {.kind = runtime == config::systemd ? "process" : runtime == config::kata ? "microvm" : runtime == config::runsc ? "sandbox" : "container", .shared_kernel = runtime == config::runc || runtime == config::nspawn, .network = "none"},
+                .limits = {450, runtime == config::kata ? 1024u << 20 : runtime == config::runsc ? 256u << 20 : 64u << 20, 32u << 20}, .toolchain_root = host.toolchain_root, .work_root = work.string(),
                 .runtime = {.threads = 6, .jobs = 1, .workers = 0}},
             .work_volume = volume{alias.string(), 32u << 20}};
         start.environment_id = name(start.workspace_id, start.kind);
@@ -234,6 +237,8 @@ namespace {
 
     void check_isolation(unsigned port, const fs::path& state, operation start, const operation& stop_op) {
         const fs::path work{start.contract.work_root};
+        const bool online = start.contract.boundary.network == "private";
+        if (online) start.overflow_wait_seconds = 30;
         const auto lease = state / "writers" / (start.environment_id + ".json");
         const auto actual = operate(port, start);
         const auto pid = actual.instance_id.substr(actual.instance_id.rfind('-') + 1);
@@ -241,10 +246,12 @@ namespace {
         const auto cgroup = fs::path{"/sys/fs/cgroup"} / fs::path{group.substr(group.find("::") + 2)}.relative_path();
         test::require(actual.volume_fenced && fs::exists(lease), "workspace volume lacks its writer reservation");
         const auto marker = work / "persistent";
-        const bool online = start.contract.boundary.network == "private";
-        if (online)
+        if (online) {
+            const auto server = config::load(work / "config.json").server;
+            test::require(actual.executor_address == std::format("{}:{}", server.overflow_worker_bind, server.worker_port),
+                          "advertised executor endpoint differs from the Core listener");
             test::require(test::slurp(marker) == "workspace data", "workspace data did not survive restart");
-        else
+        } else
             std::ofstream{marker} << "workspace data";
         test::require(clean(cgroup / "cpu.max") == "45000 100000" && clean(cgroup / "pids.max") == "16" &&
                       clean(cgroup / "memory.max") == std::to_string(64u << 20) && clean(cgroup / "memory.swap.max") == "0",
@@ -268,6 +275,7 @@ namespace {
         competing.operation_id = competing.environment_id + "-1";
         competing.contract.boundary.network = "private";
         competing.egress.clear();
+        competing.overflow_wait_seconds = 0;
         competing.core_address = "10.236.0.10:9090";
         const auto refused = submit(port, competing);
         test::require(refused.status == 409 && refused.body.contains("workspace volume already has a writer"), refused.body);
@@ -445,13 +453,17 @@ int main(int argc, char** argv) {
             const auto code = WEXITSTATUS(state);
             return code == 1 ? 77 : code;
         }
-        if (!fs::is_socket("/run/containerd/containerd.sock")) {
+        const bool nspawn = argc == 2 && std::string_view{argv[1]} == "nspawn";
+        const bool microvm = argc == 2 && std::string_view{argv[1]} == "microvm";
+        const bool userspace = argc == 2 && std::string_view{argv[1]} == "userspace";
+        const bool process = argc == 2 && std::string_view{argv[1]} == "process";
+        if (!process && !nspawn && !fs::is_socket("/run/containerd/containerd.sock")) {
             std::cerr << "runc suite requires /run/containerd/containerd.sock\n";
             return 77;
         }
         const auto path = std::getenv("PATH") ? std::getenv("PATH") : "";
-        const bool volume_only = argc == 2 && std::string_view{argv[1]} == "volume";
-        auto tools = std::vector<std::string_view>{"runc", "ip", "nft", "fallocate", "mkfs.ext4", "mount", "umount"};
+        const bool volume_only = nspawn || microvm || process || userspace || (argc == 2 && std::string_view{argv[1]} == "volume");
+        auto tools = std::vector<std::string_view>{nspawn ? "systemd-nspawn" : process ? "systemd-run" : microvm ? "containerd-shim-kata-v2" : userspace ? "runsc" : "runc", "ip", "nft", "fallocate", "mkfs.ext4", "mount", "umount"};
         if (volume_only)
             tools.insert(tools.end(), {"blkid", "losetup"});
         for (const auto tool : tools) {
@@ -474,8 +486,11 @@ int main(int argc, char** argv) {
                 std::cerr << "volume suite requires /dev/loop-control\n";
                 return 77;
             }
-            volume_scenario(scratch.dir);
+            volume_scenario(scratch.dir, nspawn ? config::nspawn : process ? config::systemd : microvm ? config::kata : userspace ? config::runsc : config::runc);
         } else {
+            test::require(::unshare(CLONE_NEWNET) == 0, "create the test host network namespace");
+            utility(scratch.dir, {"ip", "link", "set", "lo", "up"});
+            utility(scratch.dir, {"sysctl", "-qw", "net.ipv4.ip_forward=1"});
             scenario(scratch.dir);
         }
         return 0;

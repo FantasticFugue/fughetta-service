@@ -89,7 +89,7 @@ export namespace host_journal {
                         (!previous.result && !(request.action == verb::destroy && previous.failure)))
                         throw conflict("warm Worker operation is out of sequence");
                 } else if (serial - 1 != sequence(previous.request) ||
-                    (!previous.result && !(previous.failure && previous.request.work_volume && request.desired == environment_state::stopped)) ||
+                    (!previous.result && !(previous.failure && request.desired == environment_state::stopped)) ||
                     previous.request.host_id != request.host_id ||
                     previous.request.contract.work_root != request.contract.work_root ||
                     previous.request.desired == request.desired)

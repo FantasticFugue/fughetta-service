@@ -32,12 +32,19 @@ export namespace host_operation {
         if (!std::ranges::all_of(boundary.devices, [&](const auto& device) { return std::ranges::contains(host.devices, device); }))
             return {};
         const auto offers = [&](std::string_view runtime) { return std::ranges::contains(host.runtimes, runtime); };
+        if (offers(config::runhcs) && boundary.devices.empty() &&
+            (boundary.kind == "microvm" || (host.exclusive && (boundary.kind == "process" || (boundary.kind == "container" && boundary.shared_kernel)))))
+            return config::runhcs;
+        if (boundary.kind == "process" && host.exclusive && boundary.devices.empty() && offers(config::systemd))
+            return config::systemd;
         if (boundary.kind == "sandbox" && offers(config::runsc))
             return config::runsc;
-        if (boundary.kind == "vm" && offers(config::kata))
+        if (boundary.kind == "microvm" && offers(config::kata))
             return config::kata;
-        if (host.exclusive && offers(config::runc) && (boundary.kind == "vm" || (boundary.kind == "container" && boundary.shared_kernel)))
-            return config::runc;
+        if (host.exclusive && boundary.kind == "container" && boundary.shared_kernel) {
+            if (offers(config::runc)) return config::runc;
+            if (boundary.devices.empty() && offers(config::nspawn)) return config::nspawn;
+        }
         return {};
     }
 
@@ -95,6 +102,7 @@ export namespace host_operation {
         bool volume_fenced = false, toolchain_read_only = false;
         std::optional<environment> applied;
         std::optional<volume> work_volume;
+        std::optional<std::string> local_work_root;
     };
 
     template <class T> auto read(const std::filesystem::path& file) -> T {

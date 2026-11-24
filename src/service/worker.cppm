@@ -84,7 +84,7 @@ namespace worker {
                 return toolchain::inspect(toolchain::discover(cfg_.tools), env, cfg_.sdk_manifests, cfg_.tools);
             });
             if (!identity)
-                throw std::runtime_error(identity.error());
+                throw std::runtime_error("inspect worker toolchain: " + identity.error());
             tools_ = identity->tools;
             capabilities_ = toolchain::capabilities(*identity);
             toolchain_ = identity->id;
@@ -199,6 +199,7 @@ namespace worker {
                 logging::info(std::format("worker {} workspace {}: online", *cfg_.worker_id, *cfg_.workspace_id));
             }
 
+            lifecycle::publish(lifecycle::phase::ready);
             std::cerr << "service-ready:worker\n";
             // Child requests can finish after the scope body; keep their counter alive through the join.
             std::atomic<std::size_t> inflight{0};
@@ -249,7 +250,11 @@ namespace worker {
         }
 
         auto connect(native::scheduler& io, std::optional<socket>& sock) -> coroutine::task<> {
-            sock.emplace(co_await io::connect(io, io::parse_endpoint(config::worker_gateway_address(cfg_.gateway))));
+            try {
+                sock.emplace(co_await io::connect(io, io::parse_endpoint(config::worker_gateway_address(cfg_.gateway))));
+            } catch (const std::system_error& error) {
+                throw std::system_error(error.code(), "connect Worker to " + std::string{config::worker_gateway_address(cfg_.gateway)});
+            }
         }
 
         template <io::stream S> auto beat(native::scheduler& io, transport::channel<S>& chan) -> coroutine::task<> {
@@ -310,12 +315,27 @@ export int run_worker(int argc, char** argv, bool private_file = false) {
         if (awaiting)
             while (!std::filesystem::exists(argv[2]))
                 std::this_thread::sleep_for(std::chrono::milliseconds{25});
-        auto cfg = awaiting ? config::load_worker(argv[2], true) :
+        const bool execute = !private_file && argc == 2 && std::string_view{argv[1]} == "--execute-stdio";
+        auto cfg = execute ? config::worker{} : awaiting ? config::load_worker(argv[2], true) :
+            argc == 2 && std::string_view{argv[1]} == "-" ? config::parse_worker(config::read_workspace_config(std::cin)) :
             argc > 1 ? config::load_worker(argv[1], private_file) : config::worker{};
         cores::io_context<runtime::context> context{1};
         cores::signal_watch signals{context};
-        worker::node node{std::move(cfg), context};
-        context.run([&](auto& io, std::size_t core) { return node.run(io, core); });
+        std::optional<worker::node> node;
+        context.run([&](native::scheduler& io, std::size_t core) -> coroutine::task<> {
+            if (execute) {
+                native::stdio_stream stream{io};
+                transport::channel channel{stream};
+                const auto frame = co_await channel.recv(1u << 20);
+                if (frame.kind != transport::execute_config || frame.corr || frame.payload.empty())
+                    throw std::invalid_argument("missing execute configuration");
+                cfg = config::parse_worker({reinterpret_cast<const char*>(frame.payload.data()), frame.payload.size()});
+                if (!cfg.execute_stdio)
+                    throw std::invalid_argument("expected an execute role on standard streams");
+            }
+            node.emplace(std::move(cfg), context);
+            co_await node->run(io, core);
+        });
     } catch (const worker::refused& e) {
         logging::error(std::format("worker: {}", e.what()));
         return 2;

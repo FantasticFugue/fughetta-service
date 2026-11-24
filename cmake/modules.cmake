@@ -88,6 +88,7 @@ add_modules(worker worker executor dependencies backend sibling)
 add_layer(host_executor)
 add_modules(host_executor host api journal operation ${HOST_MODULES})
 target_link_libraries(host_executor PUBLIC session PRIVATE gateway ${HOST_LIBRARIES})
+target_link_options(host_executor INTERFACE ${HOST_LINK_OPTIONS})
 
 ## Platform provider
 #

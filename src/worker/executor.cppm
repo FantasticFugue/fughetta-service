@@ -512,7 +512,9 @@ export namespace replica {
             if (before.size() != after.size() || steps.empty())
                 return false;
             static constexpr std::array<std::string_view, 8> suffixes{".kt", ".java", ".scala", ".sc", ".cs", ".fs", ".fsi", ".fsx"};
-            for (const auto& [old, file] : std::views::zip(before, after)) {
+            for (std::size_t i = 0; i < before.size(); ++i) {
+                const auto& old = before[i];
+                const auto& file = after[i];
                 if (old.path != file.path || old.executable != file.executable)
                     return false;
                 if (old.digest == file.digest)
@@ -1140,9 +1142,12 @@ export namespace replica {
                             const auto next = s.files(r.project, r.snapshot);
                             if (previous->files.size() != next.size())
                                 return false;
-                            for (const auto& [old, file] : std::views::zip(previous->files, next))
+                            for (std::size_t i = 0; i < next.size(); ++i) {
+                                const auto& old = previous->files[i];
+                                const auto& file = next[i];
                                 if (old.path != file.path || old.executable != file.executable)
                                     return false;
+                            }
                             return true;
                         });
                     }

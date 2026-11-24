@@ -115,10 +115,12 @@ export namespace host_api {
                     if (limits.cpu_millis > capacity.cpu_millis || limits.memory_bytes > capacity.memory_bytes ||
                         limits.storage_bytes > capacity.storage_bytes)
                         throw std::invalid_argument("environment limits exceed host capacity");
-                    if (contract.os != "linux" || contract.arch != linux_arch() || runtime_for(contract.boundary, settings_.isolation).empty() ||
+                    if (contract.os != host::os || contract.arch != (host::os == "linux" ? linux_arch() : host::arch) || runtime_for(contract.boundary, settings_.isolation).empty() ||
                         (contract.boundary.network != "none" && contract.boundary.network != "private") ||
                         limits.storage_bytes < constants::host_minimum_storage || op.overflow_wait_seconds > 600)
                         throw std::invalid_argument("host cannot enforce the requested environment");
+                    if (pooled(op) && (host::os == "windows" || runtime_for(contract.boundary, settings_.isolation) == config::nspawn))
+                        throw std::invalid_argument("this runtime starts workspace-bound Workers");
                     if (op.kind == environment_kind::overflow && op.action != verb::warm &&
                         (contract.boundary.network != "private" || op.core_address.empty() || io::parse_endpoint(op.core_address).port() == 0))
                         throw std::invalid_argument("overflow Worker needs a private Core endpoint");
@@ -200,6 +202,21 @@ export namespace host_api {
                std::chrono::milliseconds answer_limit = constants::host_answer_limit)
             : io_(io), settings_(settings), digest_(keyring::hash(settings.token)),
               journal_(std::filesystem::path{settings.storage} / "operations"), provision_(std::move(provision)), answer_limit_(answer_limit) {}
+
+        auto restore_windows_environments() -> coroutine::task<> {
+            if (host::os != "windows")
+                co_return;
+            for (const auto& prior : journal_.inventory()) {
+                const auto* entry = journal_.find(prior.operation_id);
+                if (!entry || !journal_.latest(*entry) || prior.state != environment_state::running)
+                    continue;
+                auto actual = co_await provision_(entry->request);
+                if (actual.state != prior.state || actual.applied != prior.applied || !actual.volume_fenced ||
+                    !actual.toolchain_read_only || actual.instance_id.empty())
+                    throw std::runtime_error("could not restore the Windows workspace environment");
+                journal_.complete(entry->request.operation_id, std::move(actual));
+            }
+        }
 
         auto run(native::listener& listener) -> coroutine::task<> {
             auto accept = [&](coroutine::scope& operations) -> coroutine::task<> {

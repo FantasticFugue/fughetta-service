@@ -1,14 +1,6 @@
-module;
-#include <cerrno>
-#include <csignal>
-#include <poll.h>
-#include <sys/socket.h>
-#include <sys/un.h>
-#include <unistd.h>
-
 export module containerd;
 import std;
-import descriptor;
+import containerd_transport;
 import protobuf;
 import httpant.dependencies.nghttp2;
 
@@ -34,79 +26,8 @@ export namespace containerd {
 }
 
 namespace containerd::detail {
-    using clock = std::chrono::steady_clock;
+    using namespace containerd_transport;
     constexpr auto message_limit = 1u << 20;
-
-    [[noreturn]] void socket_error(std::string_view operation) {
-        throw std::system_error(errno, std::generic_category(), std::string{operation});
-    }
-
-    class connection {
-    public:
-        connection(std::string_view path, clock::time_point deadline) : deadline_(deadline) {
-            sockaddr_un address{};
-            if (!std::filesystem::path{path}.is_absolute() || path.size() >= sizeof address.sun_path || path.contains('\0'))
-                throw std::invalid_argument("containerd requires an absolute Unix socket path");
-            address.sun_family = AF_UNIX;
-            std::ranges::copy(path, address.sun_path);
-            fd_ = descriptor::fd{::socket(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0)};
-            if (fd_.get() < 0)
-                socket_error("containerd socket");
-            if (::connect(fd_.get(), reinterpret_cast<const sockaddr*>(&address), sizeof address) < 0) {
-                if (errno != EINPROGRESS)
-                    socket_error("containerd connect");
-                wait(POLLOUT);
-                int error = 0;
-                socklen_t len = sizeof error;
-                if (::getsockopt(fd_.get(), SOL_SOCKET, SO_ERROR, &error, &len) < 0)
-                    socket_error("containerd connect status");
-                if (error)
-                    throw std::system_error(error, std::generic_category(), "containerd connect");
-            }
-        }
-
-        void send(std::span<const std::uint8_t> bytes) const {
-            while (!bytes.empty()) {
-                wait(POLLOUT);
-                const auto size = ::send(fd_.get(), bytes.data(), bytes.size(), MSG_NOSIGNAL);
-                if (size > 0)
-                    bytes = bytes.subspan(size);
-                else if (size == 0 || (errno != EINTR && errno != EAGAIN))
-                    socket_error("containerd send");
-            }
-        }
-
-        auto receive(std::span<std::uint8_t> bytes) const -> std::size_t {
-            for (;;) {
-                wait(POLLIN);
-                const auto size = ::recv(fd_.get(), bytes.data(), bytes.size(), 0);
-                if (size > 0)
-                    return size;
-                if (size == 0)
-                    throw std::runtime_error("containerd closed the connection before completing the RPC");
-                if (errno != EINTR && errno != EAGAIN)
-                    socket_error("containerd receive");
-            }
-        }
-
-    private:
-        void wait(short events) const {
-            for (;;) {
-                const auto remaining = std::chrono::ceil<std::chrono::milliseconds>(deadline_ - clock::now());
-                if (remaining.count() <= 0)
-                    throw std::runtime_error("containerd RPC deadline exceeded");
-                pollfd entry{fd_.get(), events, 0};
-                const auto result = ::poll(&entry, 1, static_cast<int>(remaining.count()));
-                if (result > 0)
-                    return;
-                if (result < 0 && errno != EINTR)
-                    socket_error("containerd poll");
-            }
-        }
-
-        descriptor::fd fd_{-1};
-        clock::time_point deadline_;
-    };
 
     void check(nghttp2_ssize result) {
         if (result < 0)
@@ -223,9 +144,11 @@ namespace containerd::detail {
         const std::unique_ptr<nghttp2_session, decltype(&nghttp2_session_del)> session{session_raw, nghttp2_session_del};
         const nghttp2_settings_entry settings[]{{NGHTTP2_SETTINGS_ENABLE_PUSH, 0}, {NGHTTP2_SETTINGS_MAX_HEADER_LIST_SIZE, 16u << 10}};
         check(nghttp2_submit_settings(session.get(), NGHTTP2_FLAG_NONE, settings, std::size(settings)));
+        const bool provisioning = method.ends_with("/Prepare") || method.ends_with("/Create") || method.ends_with("/Start");
+        const auto timeout = std::chrono::seconds{provisioning ? 90 : 10};
         const std::array fields{header(":method", "POST"), header(":scheme", "http"), header(":authority", "localhost"), header(":path", method),
                                 header("content-type", "application/grpc"), header("te", "trailers"), header("containerd-namespace", ns),
-                                header("grpc-timeout", "10S")};
+                                header("grpc-timeout", provisioning ? "90S" : "10S")};
         const nghttp2_data_provider2 body{.source = {}, .read_callback = [](nghttp2_session*, std::int32_t, std::uint8_t* out, std::size_t size,
                 std::uint32_t* flags, nghttp2_data_source*, void* user) -> nghttp2_ssize {
             auto& outgoing = static_cast<exchange*>(user)->outgoing;
@@ -237,7 +160,7 @@ namespace containerd::detail {
             return chunk.size();
         }};
         check(nghttp2_submit_request2(session.get(), nullptr, fields.data(), fields.size(), &body, nullptr));
-        const connection peer{socket, clock::now() + std::chrono::seconds{10}};
+        connection peer{socket, clock::now() + timeout};
         while (!state.stream_closed) {
             for (;;) {
                 const std::uint8_t* bytes = nullptr;
@@ -319,6 +242,55 @@ namespace containerd::detail {
 }
 
 export namespace containerd {
+    auto writable_snapshot(std::string_view socket, std::string_view ns, const std::string& id,
+                           const std::string& parent, std::uint64_t bytes) -> std::vector<mount> {
+        using namespace detail;
+        struct key {
+            protobuf::field<1, std::string> snapshotter;
+            protobuf::field<2, std::string> name;
+        };
+        struct prepare {
+            protobuf::field<1, std::string> snapshotter;
+            protobuf::field<2, std::string> name;
+            protobuf::field<3, std::string> parent;
+            protobuf::field<4, std::vector<label>> labels;
+        };
+        struct info {
+            protobuf::field<1, std::string> name;
+            protobuf::field<2, std::string> parent;
+            protobuf::field<3, std::uint32_t> kind;
+            protobuf::field<6, std::vector<label>> labels;
+        };
+        struct stat { protobuf::field<1, std::optional<info>> snapshot; };
+        struct response { protobuf::field<1, std::vector<mount>> mounts; };
+        const auto call = [&](std::string_view method, const auto& request) {
+            return rpc(socket, ns, std::string{"/containerd.services.snapshots.v1.Snapshots/"} + std::string{method}, protobuf::write(request));
+        };
+        const key target{"windows", id};
+        const std::vector<label> labels{{owner_label, id}, {"containerd.io/snapshot/windows/rootfs.sizebytes", std::to_string(bytes)},
+                                        {"containerd.io/gc.root", "fughetta"}};
+        std::optional<std::string> result;
+        if (auto prior = call("Stat", target)) {
+            const auto entry = protobuf::read<stat>(*prior).snapshot.get();
+            if (!entry || entry->name.get() != id || entry->kind.get() != 2 || entry->parent.get() != parent ||
+                !std::ranges::all_of(labels, [&](const label& expected) {
+                    return std::ranges::any_of(entry->labels.get(), [&](const label& actual) {
+                        return actual.key.get() == expected.key.get() && actual.value.get() == expected.value.get();
+                    });
+                }))
+                throw std::runtime_error("workspace snapshot differs from the retained Windows layer");
+            result = call("Mounts", target);
+        } else {
+            result = call("Prepare", prepare{"windows", id, parent, labels});
+        }
+        if (!result)
+            throw std::runtime_error("containerd could not open the Windows workspace snapshot");
+        auto mounts = protobuf::read<response>(*result).mounts.get();
+        if (mounts.empty())
+            throw std::runtime_error("containerd returned an empty Windows workspace snapshot");
+        return mounts;
+    }
+
     auto get_task(std::string_view socket, std::string_view ns, std::string_view id) -> std::optional<task> {
         if (ns.empty() || id.empty())
             throw std::invalid_argument("containerd requires a namespace and task ID");
@@ -374,7 +346,7 @@ export namespace containerd {
             if (!record)
                 throw std::runtime_error("cannot stop a task without its Fughetta container record");
             if (state->status.get() != stopped) {
-                (void)task_call(socket, ns, "Kill", task_kill{id, std::uint32_t{SIGKILL}, true});
+                (void)task_call(socket, ns, "Kill", task_kill{id, std::uint32_t{9}, true});
                 (void)task_call(socket, ns, "Wait", key);
             }
             (void)task_call(socket, ns, "Delete", key);

@@ -27,10 +27,10 @@ namespace gateway {
         using listener = native::listener;
 
         node(config::document doc, std::optional<std::filesystem::path> file, cores::context<native::scheduler>& rt, std::filesystem::path executable = {},
-             std::atomic<bool>* interrupted = nullptr)
+             std::atomic<bool>* interrupted = nullptr, bool provisioned = false)
             : interrupted_(interrupted), executable_(std::move(executable)), doc_(doc), server_(doc.server), rt_(rt),
               control_(doc.runtime, doc.revisions.runtime), io_pool_(allocation::distribute(doc.runtime).gateway_disk),
-              hub_(rt, config::store(std::move(doc), std::move(file)), io_pool_), identities_(server_.storage, server_.auth.workspace),
+              hub_(rt, config::store(std::move(doc), std::move(file), provisioned), io_pool_), identities_(server_.storage, server_.auth.workspace),
               router_(rt, routing::stale_after, &hub_),
               files_(rt, server_.storage, hub_, io_pool_, io::parse_endpoint(server_.source), doc_.public_shards) {
             files_.changed = [this] { hub_.events().publish(6); };
@@ -51,6 +51,9 @@ namespace gateway {
             runtime::group processes;
             auto http = native::listener{io, io::parse_endpoint(server_.http_bind, server_.http_port)};
             auto workers = native::listener{io, io::parse_endpoint(server_.worker_bind, server_.worker_port)};
+            std::optional<listener> overflow;
+            if (!server_.overflow_worker_bind.empty())
+                overflow.emplace(native::listener{io, io::parse_endpoint(server_.overflow_worker_bind, server_.worker_port)});
             std::optional<listener> remote;
             if (server_.remote_worker_port)
                 remote.emplace(native::listener{io, io::parse_endpoint(server_.remote_worker_bind, server_.remote_worker_port)});
@@ -65,6 +68,8 @@ namespace gateway {
                 }
                 children.spawn(router_.workers(core).watch(io));
                 children.spawn(accept_workers(workers, core, children));
+                if (overflow)
+                    children.spawn(accept_workers(*overflow, core, children));
                 if (remote)
                     children.spawn(accept_tunnels(*remote, here, children));
                 if (core == 0) {
@@ -77,6 +82,7 @@ namespace gateway {
             co_await coroutine::with_scope(std::move(run_children));
         }
 
+        auto settings() { return hub_.current(0); }
         auto reconfiguring() const -> bool { return reconfigure_; }
 
     private:
@@ -200,16 +206,29 @@ export int run_gateway(int argc, char** argv, bool managed) {
     try {
         if (argc > 1 && std::string_view{argv[1]} == "token")
             return add_token(argc - 1, argv + 1);
-        if (argc > 2)
+        const bool provisioned = argc == 3 && std::string_view{argv[1]} == "--workspace-config";
+        if (argc > 2 && !provisioned)
             throw std::invalid_argument("usage: fughetta-service [config.json] | fughetta-service token NAME owner|member [config.json]");
-        std::filesystem::path file = argc > 1 ? argv[1] : "config.json";
-        environment::load(file.parent_path() / ".env");
+        std::filesystem::path file = provisioned ? argv[2] : argc > 1 ? argv[1] : "config.json";
+        if (!provisioned) environment::load(file.parent_path() / ".env");
+        config::store::snapshot next;
         std::atomic<bool> interrupted{false};
         for (;;) {
             lifecycle::publish(lifecycle::phase::starting);
             config::document doc;
-            const auto budget = managed ? std::optional{allocation::self_hosted(host::available_cpus())} : std::nullopt;
-            if (argc > 1 || std::filesystem::exists(file))
+            const auto budget = managed && !provisioned ? std::optional{allocation::self_hosted(host::available_cpus())} : std::nullopt;
+            if (next) {
+                doc = *next;
+            } else if (provisioned) {
+                doc = file == "-" ? config::parse(config::read_workspace_config(std::cin)) : config::load(file);
+                file = std::filesystem::path{doc.server.storage} / "workspace.json";
+                if (std::filesystem::exists(file)) {
+                    std::ifstream input{file, std::ios::binary};
+                    if (!input) throw std::runtime_error("cannot open workspace settings: " + file.string());
+                    std::string text{std::istreambuf_iterator<char>{input}, {}};
+                    config::parse_as<config::workspace_settings>(text, "workspace settings").apply(doc);
+                }
+            } else if (argc > 1 || std::filesystem::exists(file))
                 doc = config::load(file, budget);
             else if (budget)
                 doc.runtime = *budget;
@@ -232,10 +251,11 @@ export int run_gateway(int argc, char** argv, bool managed) {
                 }
             } stop{context, interrupted, managed};
             cores::signal_watch signals{stop};
-            gateway::node node{std::move(doc), file, context, managed ? host::executable() : std::filesystem::path{}, &interrupted};
+            gateway::node node{std::move(doc), file, context, managed ? host::executable() : std::filesystem::path{}, &interrupted, provisioned};
             context.run([&](auto& io, std::size_t core) { return node.run(io, core); });
             if (interrupted.load() || !node.reconfiguring())
                 break;
+            if (provisioned) next = node.settings();
         }
     } catch (const std::exception& e) {
         lifecycle::publish(lifecycle::phase::stopping);

@@ -14,6 +14,7 @@ import durability;
 import keyring;
 import host_oci;
 import host_resources;
+import runner;
 import async;
 
 export namespace host_backend {
@@ -102,6 +103,7 @@ export namespace host_backend {
             conf.server.overflow_wait_seconds = op.overflow_wait_seconds;
             conf.worker_token = token;
             if (online) {
+                if (op.overflow_wait_seconds) conf.server.overflow_worker_bind = network.address;
                 conf.server.remote_worker_bind = network.address;
                 conf.server.remote_worker_port = constants::host_remote_port;
                 conf.server.remote_worker_enrollment = host.remote_worker_enrollment;
@@ -264,6 +266,81 @@ export namespace host_backend {
         co_return result;
     }
 
+    auto process_unit(const config::host_settings& host, std::string_view id) -> std::string {
+        return std::format("fughetta-{}-{}.service", host.name_space, id);
+    }
+
+    auto main_pid(native::scheduler& io, const config::host_settings& host, const std::string& unit)
+        -> coroutine::task<std::uint32_t> {
+        auto result = co_await runner::run_step(io,
+            {.argv = {"systemctl", "show", "--property=MainPID", "--value", unit}, .cwd = host.storage},
+            std::chrono::seconds{host.timeout_seconds}, 4096, "read process unit");
+        if (result.timed_out || result.truncated || result.exit_code)
+            throw std::runtime_error("cannot inspect " + unit + ": " + result.output);
+        auto text = std::string_view{result.output};
+        while (!text.empty() && std::isspace(static_cast<unsigned char>(text.back())))
+            text.remove_suffix(1);
+        std::uint32_t pid{};
+        const auto [end, ec] = std::from_chars(text.data(), text.data() + text.size(), pid);
+        if (ec != std::errc{} || end != text.data() + text.size())
+            throw std::runtime_error("invalid MainPID for " + unit);
+        co_return pid;
+    }
+
+    auto start_process(native::scheduler& io, const config::host_settings& host, const host_operation::operation& op,
+                       const host_operation::environment& contract, const host_resources::network& net, const std::string& hosts_file)
+        -> coroutine::task<std::uint32_t> {
+        const auto property_path = [](const std::string& path) -> const std::string& {
+            if (path.find_first_of(":%\\\"' \t\r\n") != std::string::npos)
+                throw std::invalid_argument("systemd mount path contains a property delimiter");
+            return path;
+        };
+        const auto unit = process_unit(host, op.environment_id);
+        std::vector<std::string> args{"systemd-run", "--collect", "--unit=" + unit,
+            "--property=TasksMax=" + std::to_string(host.pids), "--property=MemorySwapMax=0",
+            "--property=MemoryMax=" + std::to_string(contract.limits.memory_bytes),
+            std::format("--property=CPUQuota={}.{}%", contract.limits.cpu_millis / 10, contract.limits.cpu_millis % 10)};
+        if (host_operation::runtime_for(contract.boundary, host.isolation) == config::nspawn) {
+            args.insert(args.end(), {"--service-type=notify", "--property=NotifyAccess=all", "--property=Delegate=yes", "--property=NetworkNamespacePath=" + net.path,
+                "--", "systemd-nspawn", "--settings=no", "--keep-unit", "--register=no", "--as-pid2",
+                "--machine=" + op.environment_id.substr(0, 63), "--read-only", "--directory=" + host.rootfs,
+                "--private-users=" + std::to_string(host.mapped_id) + ":1", "--private-users-ownership=off",
+                "--drop-capability=all", "--no-new-privileges=yes", "--timezone=off", "--resolv-conf=off",
+                "--bind=" + property_path(contract.work_root) + ":/work",
+                "--bind-ro=" + property_path(contract.toolchain_root) + ":/opt/fug/toolchain", "--chdir=/work"});
+            if (!host.shared_cache.empty()) args.push_back("--bind-ro=" + property_path(host.shared_cache) + ":/opt/fug/shared");
+            if (!hosts_file.empty()) args.push_back("--bind-ro=" + property_path(hosts_file) + ":/etc/hosts");
+        } else {
+            args.insert(args.end(), {"--service-type=exec",
+            "--property=User=" + std::to_string(host.mapped_id), "--property=Group=" + std::to_string(host.mapped_id),
+            "--property=RootDirectory=" + property_path(host.rootfs), "--property=WorkingDirectory=/work",
+            "--property=NetworkNamespacePath=" + net.path, "--property=ProtectSystem=strict", "--property=ProtectHome=yes",
+            "--property=MountAPIVFS=yes", "--property=PrivateDevices=yes", "--property=PrivateIPC=yes",
+            "--property=ProtectProc=invisible", "--property=RestrictNamespaces=yes", "--property=NoNewPrivileges=yes",
+            "--property=CapabilityBoundingSet=", "--property=KillMode=control-group", "--property=ProtectControlGroups=yes",
+            "--property=ProtectKernelTunables=yes", "--property=ProtectKernelModules=yes",
+            "--property=BindPaths=" + property_path(contract.work_root) + ":/work", "--property=ReadWritePaths=/work",
+            "--property=BindReadOnlyPaths=" + property_path(contract.toolchain_root) + ":/opt/fug/toolchain"});
+            if (!host.shared_cache.empty())
+                args.push_back("--property=BindReadOnlyPaths=" + property_path(host.shared_cache) + ":/opt/fug/shared");
+            if (!hosts_file.empty())
+                args.push_back("--property=BindReadOnlyPaths=" + property_path(hosts_file) + ":/etc/hosts");
+        }
+        args.insert(args.end(), {"--setenv=HOME=/work", "--setenv=TMPDIR=/work/tmp",
+            "--setenv=PATH=/opt/fug/toolchain/bin:/usr/local/bin:/usr/bin:/bin", "--"});
+        args.emplace_back(host_oci::service);
+        if (op.kind == host_operation::environment_kind::overflow)
+            args.insert(args.end(), {"--role", "worker"});
+        else
+            args.emplace_back("--workspace-config");
+        args.emplace_back("/work/config.json");
+        co_await host_resources::command(io, host, std::move(args));
+        const auto pid = co_await main_pid(io, host, unit);
+        if (!pid)
+            throw std::runtime_error("process unit exited during startup");
+        co_return pid;
+    }
+
     auto reconcile(native::scheduler& io, execution::thread_pool& pool, const config::host_settings& host, const host_operation::operation& op)
         -> coroutine::task<host_operation::observed> {
         if (host_operation::pooled(op))
@@ -313,7 +390,16 @@ export namespace host_backend {
         if (!start) {
             const bool pending = !previous || previous->request.operation_id != op.operation_id;
             if (previous && previous->request.desired == host_operation::environment_state::running) {
-                co_await io::blocking(io, pool, [&] {
+                const auto previous_runtime = host_operation::runtime_for(previous->request.contract.boundary, previous->host.isolation);
+                if (previous_runtime == config::systemd || previous_runtime == config::nspawn) {
+                    const auto unit = process_unit(host, op.environment_id);
+                    auto result = co_await runner::run_step(io,
+                        {.argv = {"systemctl", "stop", unit}, .cwd = host.storage},
+                        std::chrono::seconds{host.timeout_seconds}, 4096, "stop process unit");
+                    if (result.timed_out || result.truncated ||
+                        (result.exit_code && (result.exit_code != 5 || co_await main_pid(io, host, unit))))
+                        throw std::runtime_error("cannot stop " + unit + ": " + result.output);
+                } else co_await io::blocking(io, pool, [&] {
                     containerd::stop(host.socket, host.name_space, op.environment_id);
                     return true;
                 });
@@ -329,6 +415,8 @@ export namespace host_backend {
                 return true;
             });
             result.volume_fenced = true;
+            if (fs::is_regular_file(image))
+                result.local_work_root = contract.work_root;
             co_return result;
         }
 
@@ -340,6 +428,8 @@ export namespace host_backend {
             if (volume->size < std::max(op.work_volume->size_bytes, contract.limits.storage_bytes))
                 throw std::invalid_argument("workspace block device is smaller than the requested storage");
         }
+        const auto runtime = host_operation::runtime_for(contract.boundary, host.isolation);
+        const bool managed_unit = runtime == config::systemd || runtime == config::nspawn;
         const auto workload = co_await io::blocking(io, pool, [&] {
             if (device) {
                 const bool retry = previous && previous->request.operation_id == op.operation_id;
@@ -352,8 +442,10 @@ export namespace host_backend {
             host_oci::process program{{std::string{host_oci::service}}, {}};
             if (op.kind == host_operation::environment_kind::overflow)
                 program.args.insert(program.args.end(), {"--role", "worker"});
+            else
+                program.args.emplace_back("--workspace-config");
             program.args.emplace_back("/work/config.json");
-            auto workload = host_oci::spec(host, contract, net.path, op.environment_id, program, hosts_file);
+            auto workload = managed_unit ? containerd::workload{} : host_oci::spec(host, contract, net.path, op.environment_id, program, hosts_file);
             host_resources::check_cgroups();
             if (!fs::is_directory(host.rootfs) || (!host.shared_cache.empty() && !fs::is_directory(host.shared_cache)))
                 throw std::invalid_argument("Linux rootfs and shared_cache must name host directories");
@@ -363,15 +455,20 @@ export namespace host_backend {
             durability::durable_private_write(journal, config::write(record{saved, op, contract.work_root, slot, 0, device}));
             return workload;
         });
-        const auto task = co_await io::blocking(io, pool, [&] {
-            return containerd::get_task(host.socket, host.name_space, op.environment_id);
-        });
-        if (!task || task->status.get() == containerd::task_stopped) {
-            if (task)
-                co_await io::blocking(io, pool, [&] {
+        std::uint32_t pid = 0;
+        if (managed_unit) {
+            pid = co_await main_pid(io, host, process_unit(host, op.environment_id));
+        } else {
+            pid = co_await io::blocking(io, pool, [&] {
+                const auto task = containerd::get_task(host.socket, host.name_space, op.environment_id);
+                if (task && task->status.get() == containerd::task_stopped)
                     containerd::stop(host.socket, host.name_space, op.environment_id);
-                    return true;
-                });
+                else if (task)
+                    return task->pid.get();
+                return std::uint32_t{};
+            });
+        }
+        if (!pid) {
             if (volume)
                 co_await host_resources::mount_volume(io, pool, host, contract.work_root, *volume);
             else
@@ -382,12 +479,17 @@ export namespace host_backend {
                 return true;
             });
         }
-        const auto running = co_await io::blocking(io, pool, [&] {
-            if (!host_resources::mounted(contract.work_root, image, device) || !fs::exists(net.path))
-                throw std::runtime_error("Linux task is missing its provisioned resources");
-            return containerd::start(host.socket, host.name_space, op.environment_id, workload);
-        });
-        result.instance_id = op.operation_id + "-" + std::to_string(running.pid.get());
+        if (!host_resources::mounted(contract.work_root, image, device) || !fs::exists(net.path))
+            throw std::runtime_error("Linux task is missing its provisioned resources");
+        if (managed_unit) {
+            if (!pid)
+                pid = co_await start_process(io, host, op, contract, net, hosts_file);
+        } else {
+            pid = co_await io::blocking(io, pool, [&] {
+                return containerd::start(host.socket, host.name_space, op.environment_id, workload).pid.get();
+            });
+        }
+        result.instance_id = op.operation_id + "-" + std::to_string(pid);
         if (op.kind == host_operation::environment_kind::core && private_network) {
             result.address = endpoint(constants::host_core_port);
             result.worker_address = endpoint(constants::host_remote_port);
